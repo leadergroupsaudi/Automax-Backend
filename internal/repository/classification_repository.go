@@ -72,7 +72,8 @@ func (r *classificationRepository) ListByType(ctx context.Context, classType str
 	var classifications []models.Classification
 	query := r.db.WithContext(ctx)
 	if classType != "" {
-		query = query.Where("type = ? OR type = 'both'", classType)
+		// Support 'all' type which matches any type, 'both' matches incident/request
+		query = query.Where("type = ? OR type = 'both' OR type = 'all'", classType)
 	}
 	err := query.Order("sort_order, name").Find(&classifications).Error
 	return classifications, err
@@ -97,11 +98,11 @@ func (r *classificationRepository) GetTree(ctx context.Context) ([]models.Classi
 func (r *classificationRepository) GetTreeByType(ctx context.Context, classType string) ([]models.Classification, error) {
 	var roots []models.Classification
 	typeFilter := func(db *gorm.DB) *gorm.DB {
-		return db.Where("type = ? OR type = 'both'", classType).Order("sort_order, name")
+		return db.Where("type = ? OR type = 'both' OR type = 'all'", classType).Order("sort_order, name")
 	}
 	err := r.db.WithContext(ctx).
 		Where("parent_id IS NULL").
-		Where("type = ? OR type = 'both'", classType).
+		Where("type = ? OR type = 'both' OR type = 'all'", classType).
 		Preload("Children", typeFilter).
 		Preload("Children.Children", typeFilter).
 		Preload("Children.Children.Children", typeFilter).

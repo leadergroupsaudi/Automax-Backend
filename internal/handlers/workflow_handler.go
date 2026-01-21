@@ -112,6 +112,43 @@ func (h *WorkflowHandler) DeleteWorkflow(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, "Workflow deleted", nil)
 }
 
+func (h *WorkflowHandler) ListDeletedWorkflows(c *fiber.Ctx) error {
+	workflows, err := h.service.ListDeletedWorkflows(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Deleted workflows retrieved", workflows)
+}
+
+func (h *WorkflowHandler) PermanentDeleteWorkflow(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID")
+	}
+
+	if err := h.service.PermanentDeleteWorkflow(c.Context(), id); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Workflow permanently deleted", nil)
+}
+
+func (h *WorkflowHandler) RestoreWorkflow(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID")
+	}
+
+	if err := h.service.RestoreWorkflow(c.Context(), id); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Workflow restored", nil)
+}
+
 func (h *WorkflowHandler) DuplicateWorkflow(c *fiber.Ctx) error {
 	idStr := c.Params("id")
 	id, err := uuid.Parse(idStr)

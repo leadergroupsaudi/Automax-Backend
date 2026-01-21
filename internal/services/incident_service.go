@@ -24,6 +24,10 @@ type IncidentService interface {
 	// Convert incident to request
 	ConvertToRequest(ctx context.Context, incidentID uuid.UUID, req *models.ConvertToRequestRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.ConvertToRequestResponse, error)
 
+	// Complaint operations
+	CreateComplaint(ctx context.Context, req *models.CreateComplaintRequest, creatorID uuid.UUID) (*models.IncidentResponse, error)
+	IncrementEvaluationCount(ctx context.Context, id uuid.UUID) error
+
 	// State transitions
 	ExecuteTransition(ctx context.Context, incidentID uuid.UUID, req *models.IncidentTransitionRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.IncidentResponse, error)
 	GetAvailableTransitions(ctx context.Context, incidentID uuid.UUID, userRoleIDs []uuid.UUID) ([]models.AvailableTransitionResponse, error)
@@ -46,8 +50,8 @@ type IncidentService interface {
 
 	// Stats and user queries
 	GetStats(ctx context.Context, filter *models.IncidentFilter) (*models.IncidentStatsResponse, error)
-	GetMyAssigned(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.IncidentResponse, int64, error)
-	GetMyReported(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.IncidentResponse, int64, error)
+	GetMyAssigned(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.IncidentResponse, int64, error)
+	GetMyReported(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.IncidentResponse, int64, error)
 	GetSLABreached(ctx context.Context) ([]models.IncidentResponse, error)
 
 	// SLA monitoring
@@ -1169,8 +1173,8 @@ func (s *incidentService) GetStats(ctx context.Context, filter *models.IncidentF
 	return s.incidentRepo.GetStats(ctx, filter)
 }
 
-func (s *incidentService) GetMyAssigned(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.IncidentResponse, int64, error) {
-	incidents, total, err := s.incidentRepo.GetAssignedToUser(ctx, userID, page, limit)
+func (s *incidentService) GetMyAssigned(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.IncidentResponse, int64, error) {
+	incidents, total, err := s.incidentRepo.GetAssignedToUser(ctx, userID, recordType, page, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1183,8 +1187,8 @@ func (s *incidentService) GetMyAssigned(ctx context.Context, userID uuid.UUID, p
 	return responses, total, nil
 }
 
-func (s *incidentService) GetMyReported(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.IncidentResponse, int64, error) {
-	incidents, total, err := s.incidentRepo.GetReportedByUser(ctx, userID, page, limit)
+func (s *incidentService) GetMyReported(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.IncidentResponse, int64, error) {
+	incidents, total, err := s.incidentRepo.GetReportedByUser(ctx, userID, recordType, page, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1277,6 +1281,146 @@ func (s *incidentService) CreateRevision(ctx context.Context, incidentID uuid.UU
 	}
 
 	return s.incidentRepo.CreateRevision(ctx, revision)
+}
+
+// Complaint operations
+
+func (s *incidentService) CreateComplaint(ctx context.Context, req *models.CreateComplaintRequest, creatorID uuid.UUID) (*models.IncidentResponse, error) {
+	// Parse workflow ID
+	workflowID, err := uuid.Parse(req.WorkflowID)
+	if err != nil {
+		return nil, errors.New("invalid workflow_id")
+	}
+
+	// Get the initial state of the workflow
+	initialState, err := s.workflowRepo.GetInitialState(ctx, workflowID)
+	if err != nil {
+		return nil, errors.New("workflow has no initial state configured")
+	}
+
+	// Generate complaint number
+	complaintNumber, err := s.incidentRepo.GenerateComplaintNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse classification ID
+	classificationID, err := uuid.Parse(req.ClassificationID)
+	if err != nil {
+		return nil, errors.New("invalid classification_id")
+	}
+
+	complaint := &models.Incident{
+		IncidentNumber:   complaintNumber,
+		Title:            req.Title,
+		Description:      req.Description,
+		RecordType:       "complaint",
+		ClassificationID: &classificationID,
+		WorkflowID:       workflowID,
+		CurrentStateID:   initialState.ID,
+		Channel:          req.Channel,
+	}
+
+	// Set reporter - use provided reporter_id or fall back to creator
+	if req.ReporterID != nil && *req.ReporterID != "" {
+		reporterID, err := uuid.Parse(*req.ReporterID)
+		if err == nil {
+			complaint.ReporterID = &reporterID
+		}
+	} else {
+		complaint.ReporterID = &creatorID
+	}
+
+	// Parse optional source incident ID
+	if req.SourceIncidentID != nil && *req.SourceIncidentID != "" {
+		sourceID, err := uuid.Parse(*req.SourceIncidentID)
+		if err == nil {
+			// Validate source incident exists
+			_, err := s.incidentRepo.FindByID(ctx, sourceID)
+			if err != nil {
+				return nil, errors.New("source incident not found")
+			}
+			complaint.SourceIncidentID = &sourceID
+		}
+	}
+
+	// Parse optional UUIDs
+	if req.AssigneeID != nil && *req.AssigneeID != "" {
+		assigneeID, err := uuid.Parse(*req.AssigneeID)
+		if err == nil {
+			complaint.AssigneeID = &assigneeID
+		}
+	}
+
+	if req.DepartmentID != nil && *req.DepartmentID != "" {
+		deptID, err := uuid.Parse(*req.DepartmentID)
+		if err == nil {
+			complaint.DepartmentID = &deptID
+		}
+	}
+
+	if req.LocationID != nil && *req.LocationID != "" {
+		locID, err := uuid.Parse(*req.LocationID)
+		if err == nil {
+			complaint.LocationID = &locID
+		}
+	}
+
+	// Calculate SLA deadline based on initial state
+	if initialState.SLAHours != nil && *initialState.SLAHours > 0 {
+		deadline := time.Now().Add(time.Duration(*initialState.SLAHours) * time.Hour)
+		complaint.SLADeadline = &deadline
+	}
+
+	if err := s.incidentRepo.Create(ctx, complaint); err != nil {
+		return nil, err
+	}
+
+	// Set lookup values if provided
+	if len(req.LookupValueIDs) > 0 {
+		var lookupValues []models.LookupValue
+		for _, idStr := range req.LookupValueIDs {
+			id, err := uuid.Parse(idStr)
+			if err == nil {
+				lookupValues = append(lookupValues, models.LookupValue{ID: id})
+			}
+		}
+		if err := s.incidentRepo.SetLookupValues(ctx, complaint.ID, lookupValues); err != nil {
+			fmt.Printf("Warning: failed to set lookup values: %v\n", err)
+		}
+	}
+
+	// Fetch with relations
+	created, err := s.incidentRepo.FindByIDWithRelations(ctx, complaint.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create initial revision
+	description := fmt.Sprintf("Complaint %s created", complaintNumber)
+	_ = s.CreateRevision(ctx, complaint.ID, models.RevisionActionCreated, description, nil, creatorID)
+
+	resp := models.ToIncidentResponse(created)
+	return &resp, nil
+}
+
+func (s *incidentService) IncrementEvaluationCount(ctx context.Context, id uuid.UUID) error {
+	// Verify it's a complaint and is closed
+	incident, err := s.incidentRepo.FindByIDWithRelations(ctx, id)
+	if err != nil {
+		return errors.New("complaint not found")
+	}
+
+	if incident.RecordType != "complaint" {
+		return errors.New("can only evaluate complaints")
+	}
+
+	// Check if complaint is in a terminal state (closed)
+	if incident.CurrentState == nil || incident.CurrentState.StateType != "terminal" {
+		return errors.New("can only evaluate closed complaints")
+	}
+
+	return s.incidentRepo.IncrementEvaluationCount(ctx, id)
 }
 
 // Helper function to truncate string for descriptions

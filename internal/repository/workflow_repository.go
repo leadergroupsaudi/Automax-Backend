@@ -18,6 +18,9 @@ type WorkflowRepository interface {
 	ListByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.Workflow, error)
 	Update(ctx context.Context, workflow *models.Workflow) error
 	Delete(ctx context.Context, id uuid.UUID) error
+	HardDelete(ctx context.Context, id uuid.UUID) error   // Permanently delete with cascading
+	ListDeleted(ctx context.Context) ([]models.Workflow, error) // List soft-deleted workflows
+	Restore(ctx context.Context, id uuid.UUID) error      // Restore a soft-deleted workflow
 
 	// Workflow-Classification assignments
 	AssignClassifications(ctx context.Context, workflowID uuid.UUID, classificationIDs []uuid.UUID) error
@@ -142,7 +145,8 @@ func (r *workflowRepository) ListByRecordType(ctx context.Context, recordType st
 		Preload("CreatedBy")
 
 	if recordType != "" {
-		query = query.Where("record_type = ? OR record_type = 'both'", recordType)
+		// Support 'all' type which matches any type, 'both' matches incident/request
+		query = query.Where("record_type = ? OR record_type = 'both' OR record_type = 'all'", recordType)
 	}
 
 	if activeOnly {
@@ -159,6 +163,114 @@ func (r *workflowRepository) Update(ctx context.Context, workflow *models.Workfl
 
 func (r *workflowRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&models.Workflow{}, "id = ?", id).Error
+}
+
+// HardDelete permanently removes a workflow and all its related entities from the database
+func (r *workflowRepository) HardDelete(ctx context.Context, id uuid.UUID) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 1. Get all transitions for this workflow
+		var transitions []models.WorkflowTransition
+		if err := tx.Unscoped().Where("workflow_id = ?", id).Find(&transitions).Error; err != nil {
+			return err
+		}
+
+		// 2. Delete transition requirements and actions for each transition
+		for _, t := range transitions {
+			// Delete transition requirements
+			if err := tx.Unscoped().Where("transition_id = ?", t.ID).Delete(&models.TransitionRequirement{}).Error; err != nil {
+				return err
+			}
+			// Delete transition actions
+			if err := tx.Unscoped().Where("transition_id = ?", t.ID).Delete(&models.TransitionAction{}).Error; err != nil {
+				return err
+			}
+			// Clear transition allowed roles (many2many)
+			if err := tx.Exec("DELETE FROM transition_allowed_roles WHERE workflow_transition_id = ?", t.ID).Error; err != nil {
+				return err
+			}
+		}
+
+		// 3. Delete all transitions for this workflow
+		if err := tx.Unscoped().Where("workflow_id = ?", id).Delete(&models.WorkflowTransition{}).Error; err != nil {
+			return err
+		}
+
+		// 4. Get all states for this workflow
+		var states []models.WorkflowState
+		if err := tx.Unscoped().Where("workflow_id = ?", id).Find(&states).Error; err != nil {
+			return err
+		}
+
+		// 5. Clear state viewable roles (many2many) for each state
+		for _, s := range states {
+			if err := tx.Exec("DELETE FROM state_viewable_roles WHERE workflow_state_id = ?", s.ID).Error; err != nil {
+				return err
+			}
+		}
+
+		// 6. Delete all states for this workflow
+		if err := tx.Unscoped().Where("workflow_id = ?", id).Delete(&models.WorkflowState{}).Error; err != nil {
+			return err
+		}
+
+		// 7. Clear workflow classifications (many2many)
+		if err := tx.Exec("DELETE FROM workflow_classifications WHERE workflow_id = ?", id).Error; err != nil {
+			return err
+		}
+
+		// 8. Clear workflow locations (many2many)
+		if err := tx.Exec("DELETE FROM workflow_locations WHERE workflow_id = ?", id).Error; err != nil {
+			return err
+		}
+
+		// 9. Finally, hard delete the workflow itself
+		if err := tx.Unscoped().Delete(&models.Workflow{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// ListDeleted returns all soft-deleted workflows
+func (r *workflowRepository) ListDeleted(ctx context.Context) ([]models.Workflow, error) {
+	var workflows []models.Workflow
+	err := r.db.WithContext(ctx).
+		Unscoped().
+		Where("deleted_at IS NOT NULL").
+		Preload("States", func(db *gorm.DB) *gorm.DB {
+			return db.Unscoped().Order("sort_order ASC")
+		}).
+		Preload("Transitions", func(db *gorm.DB) *gorm.DB {
+			return db.Unscoped()
+		}).
+		Preload("Classifications").
+		Preload("CreatedBy").
+		Order("deleted_at DESC").
+		Find(&workflows).Error
+	return workflows, err
+}
+
+// Restore restores a soft-deleted workflow
+func (r *workflowRepository) Restore(ctx context.Context, id uuid.UUID) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Restore the workflow
+		if err := tx.Unscoped().Model(&models.Workflow{}).Where("id = ?", id).Update("deleted_at", nil).Error; err != nil {
+			return err
+		}
+
+		// Restore all states for this workflow
+		if err := tx.Unscoped().Model(&models.WorkflowState{}).Where("workflow_id = ?", id).Update("deleted_at", nil).Error; err != nil {
+			return err
+		}
+
+		// Restore all transitions for this workflow
+		if err := tx.Unscoped().Model(&models.WorkflowTransition{}).Where("workflow_id = ?", id).Update("deleted_at", nil).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
 }
 
 // Workflow-Classification assignments

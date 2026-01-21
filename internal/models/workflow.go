@@ -17,7 +17,7 @@ type Workflow struct {
 	Version     int                `gorm:"default:1" json:"version"`
 	IsActive    bool               `gorm:"default:true" json:"is_active"`
 	IsDefault   bool               `gorm:"default:false" json:"is_default"`
-	RecordType  string             `gorm:"size:20;default:'incident'" json:"record_type"` // 'incident', 'request', 'both'
+	RecordType  string             `gorm:"size:20;default:'incident'" json:"record_type"` // 'incident', 'request', 'complaint', 'both', 'all'
 
 	// Visual designer metadata (stores canvas layout as JSON)
 	CanvasLayout string `gorm:"type:text" json:"canvas_layout"`
@@ -191,7 +191,7 @@ type WorkflowCreateRequest struct {
 	Name              string   `json:"name" validate:"required,min=2,max=100"`
 	Code              string   `json:"code" validate:"required,min=2,max=50"`
 	Description       string   `json:"description" validate:"max=500"`
-	RecordType        string   `json:"record_type" validate:"omitempty,oneof=incident request both"`
+	RecordType        string   `json:"record_type" validate:"omitempty,oneof=incident request complaint both all"`
 	ClassificationIDs []string `json:"classification_ids"`
 	RequiredFields    []string `json:"required_fields"`
 }
@@ -200,7 +200,7 @@ type WorkflowUpdateRequest struct {
 	Name              string   `json:"name" validate:"omitempty,min=2,max=100"`
 	Code              string   `json:"code" validate:"omitempty,min=2,max=50"`
 	Description       string   `json:"description" validate:"max=500"`
-	RecordType        *string  `json:"record_type" validate:"omitempty,oneof=incident request both"`
+	RecordType        *string  `json:"record_type" validate:"omitempty,oneof=incident request complaint both all"`
 	IsActive          *bool    `json:"is_active"`
 	IsDefault         *bool    `json:"is_default"`
 	CanvasLayout      string   `json:"canvas_layout"`

@@ -168,6 +168,25 @@ func main() {
 	attachments := v1.Group("/attachments", authMiddleware.Authenticate())
 	attachments.Get("/:attachment_id", incidentHandler.DownloadAttachment)
 
+	// Complaint routes (authenticated users)
+	complaints := v1.Group("/complaints", authMiddleware.Authenticate())
+	complaints.Post("/", incidentHandler.CreateComplaint)
+	complaints.Get("/", incidentHandler.ListComplaints)
+	complaints.Get("/:id", incidentHandler.GetComplaint)
+	complaints.Put("/:id", incidentHandler.UpdateIncident)
+	complaints.Post("/:id/transition", incidentHandler.ExecuteTransition)
+	complaints.Get("/:id/available-transitions", incidentHandler.GetAvailableTransitions)
+	complaints.Get("/:id/history", incidentHandler.GetTransitionHistory)
+	complaints.Post("/:id/comments", incidentHandler.AddComment)
+	complaints.Get("/:id/comments", incidentHandler.ListComments)
+	complaints.Put("/:id/comments/:comment_id", incidentHandler.UpdateComment)
+	complaints.Delete("/:id/comments/:comment_id", incidentHandler.DeleteComment)
+	complaints.Post("/:id/attachments", incidentHandler.UploadAttachment)
+	complaints.Get("/:id/attachments", incidentHandler.ListAttachments)
+	complaints.Delete("/:id/attachments/:attachment_id", incidentHandler.DeleteAttachment)
+	complaints.Post("/:id/evaluate", incidentHandler.IncrementEvaluation)
+	complaints.Get("/:id/revisions", incidentHandler.ListRevisions)
+
 	// Admin routes
 	admin := v1.Group("/admin", authMiddleware.Authenticate())
 
@@ -241,11 +260,14 @@ func main() {
 	workflows := admin.Group("/workflows")
 	workflows.Post("/", workflowHandler.CreateWorkflow)
 	workflows.Get("/", workflowHandler.ListWorkflows)
+	workflows.Get("/deleted", workflowHandler.ListDeletedWorkflows) // List soft-deleted workflows
 	workflows.Post("/match", workflowHandler.MatchWorkflow) // For mobile apps - matches workflow based on criteria
 	workflows.Get("/by-classification/:classification_id", workflowHandler.GetWorkflowByClassification)
 	workflows.Get("/:id", workflowHandler.GetWorkflow)
 	workflows.Put("/:id", workflowHandler.UpdateWorkflow)
 	workflows.Delete("/:id", workflowHandler.DeleteWorkflow)
+	workflows.Delete("/:id/permanent", workflowHandler.PermanentDeleteWorkflow) // Hard delete
+	workflows.Post("/:id/restore", workflowHandler.RestoreWorkflow) // Restore soft-deleted workflow
 	workflows.Post("/:id/duplicate", workflowHandler.DuplicateWorkflow)
 	workflows.Post("/:id/classifications", workflowHandler.AssignClassifications)
 	workflows.Get("/:id/initial-state", workflowHandler.GetInitialState)

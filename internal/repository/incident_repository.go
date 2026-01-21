@@ -24,6 +24,7 @@ type IncidentRepository interface {
 	// Incident number generation
 	GenerateIncidentNumber(ctx context.Context) (string, error)
 	GenerateRequestNumber(ctx context.Context) (string, error)
+	GenerateComplaintNumber(ctx context.Context) (string, error)
 
 	// State transitions
 	UpdateState(ctx context.Context, incidentID, newStateID uuid.UUID) error
@@ -57,8 +58,8 @@ type IncidentRepository interface {
 	MarkSLABreached(ctx context.Context) (int64, error)
 
 	// User-specific queries
-	GetAssignedToUser(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.Incident, int64, error)
-	GetReportedByUser(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.Incident, int64, error)
+	GetAssignedToUser(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.Incident, int64, error)
+	GetReportedByUser(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.Incident, int64, error)
 
 	// Revisions
 	CreateRevision(ctx context.Context, revision *models.IncidentRevision) error
@@ -70,6 +71,9 @@ type IncidentRepository interface {
 	FindFeedbackByID(ctx context.Context, id uuid.UUID) (*models.IncidentFeedback, error)
 	ListFeedback(ctx context.Context, incidentID uuid.UUID) ([]models.IncidentFeedback, error)
 	LinkFeedbackToTransition(ctx context.Context, feedbackID uuid.UUID, transitionHistoryID uuid.UUID) error
+
+	// Complaint-specific
+	IncrementEvaluationCount(ctx context.Context, id uuid.UUID) error
 }
 
 type incidentRepository struct {
@@ -103,6 +107,10 @@ func (r *incidentRepository) FindByIDWithRelations(ctx context.Context, id uuid.
 	err := r.db.WithContext(ctx).Session(&gorm.Session{}).
 		Preload("Classification").
 		Preload("Workflow").
+		Preload("Workflow.States", func(db *gorm.DB) *gorm.DB {
+			return db.Order("sort_order ASC")
+		}).
+		Preload("Workflow.Transitions").
 		Preload("CurrentState").
 		Preload("Assignee").
 		Preload("Assignees").
@@ -110,6 +118,7 @@ func (r *incidentRepository) FindByIDWithRelations(ctx context.Context, id uuid.
 		Preload("Location").
 		Preload("LookupValues.Category").
 		Preload("Reporter").
+		Preload("SourceIncident").
 		Preload("Comments", func(db *gorm.DB) *gorm.DB {
 			return db.Order("created_at DESC")
 		}).
@@ -176,6 +185,9 @@ func (r *incidentRepository) List(ctx context.Context, filter *models.IncidentFi
 	}
 	if filter.RecordType != nil {
 		query = query.Where("record_type = ?", *filter.RecordType)
+	}
+	if filter.Channel != nil && *filter.Channel != "" {
+		query = query.Where("channel = ?", *filter.Channel)
 	}
 	if filter.StartDate != nil {
 		query = query.Where("created_at >= ?", *filter.StartDate)
@@ -259,6 +271,19 @@ func (r *incidentRepository) GenerateRequestNumber(ctx context.Context) (string,
 		return "", err
 	}
 	return fmt.Sprintf("REQ-%d-%06d", year, count+1), nil
+}
+
+func (r *incidentRepository) GenerateComplaintNumber(ctx context.Context) (string, error) {
+	year := time.Now().Year()
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Incident{}).
+		Where("EXTRACT(YEAR FROM created_at) = ?", year).
+		Where("record_type = 'complaint'").
+		Count(&count).Error
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("COMP-%d-%06d", year, count+1), nil
 }
 
 // State transitions
@@ -581,7 +606,7 @@ func (r *incidentRepository) MarkSLABreached(ctx context.Context) (int64, error)
 
 // User-specific queries
 
-func (r *incidentRepository) GetAssignedToUser(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.Incident, int64, error) {
+func (r *incidentRepository) GetAssignedToUser(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.Incident, int64, error) {
 	var incidents []models.Incident
 	var total int64
 
@@ -594,6 +619,11 @@ func (r *incidentRepository) GetAssignedToUser(ctx context.Context, userID uuid.
 	offset := (page - 1) * limit
 
 	baseQuery := r.db.WithContext(ctx).Model(&models.Incident{}).Where("assignee_id = ?", userID)
+
+	// Filter by record_type if provided
+	if recordType != "" {
+		baseQuery = baseQuery.Where("record_type = ?", recordType)
+	}
 
 	if err := baseQuery.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -613,7 +643,7 @@ func (r *incidentRepository) GetAssignedToUser(ctx context.Context, userID uuid.
 	return incidents, total, nil
 }
 
-func (r *incidentRepository) GetReportedByUser(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.Incident, int64, error) {
+func (r *incidentRepository) GetReportedByUser(ctx context.Context, userID uuid.UUID, recordType string, page, limit int) ([]models.Incident, int64, error) {
 	var incidents []models.Incident
 	var total int64
 
@@ -626,6 +656,11 @@ func (r *incidentRepository) GetReportedByUser(ctx context.Context, userID uuid.
 	offset := (page - 1) * limit
 
 	baseQuery := r.db.WithContext(ctx).Model(&models.Incident{}).Where("reporter_id = ?", userID)
+
+	// Filter by record_type if provided
+	if recordType != "" {
+		baseQuery = baseQuery.Where("record_type = ?", recordType)
+	}
 
 	if err := baseQuery.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -743,4 +778,14 @@ func (r *incidentRepository) LinkFeedbackToTransition(ctx context.Context, feedb
 		Model(&models.IncidentFeedback{}).
 		Where("id = ?", feedbackID).
 		Update("transition_history_id", transitionHistoryID).Error
+}
+
+// Complaint-specific
+
+func (r *incidentRepository) IncrementEvaluationCount(ctx context.Context, id uuid.UUID) error {
+	return r.db.WithContext(ctx).
+		Model(&models.Incident{}).
+		Where("id = ?", id).
+		Where("record_type = 'complaint'").
+		Update("evaluation_count", gorm.Expr("evaluation_count + 1")).Error
 }

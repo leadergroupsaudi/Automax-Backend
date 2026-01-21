@@ -19,6 +19,9 @@ type WorkflowService interface {
 	ListWorkflowsByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.WorkflowResponse, error)
 	UpdateWorkflow(ctx context.Context, id uuid.UUID, req *models.WorkflowUpdateRequest) (*models.WorkflowResponse, error)
 	DeleteWorkflow(ctx context.Context, id uuid.UUID) error
+	PermanentDeleteWorkflow(ctx context.Context, id uuid.UUID) error
+	RestoreWorkflow(ctx context.Context, id uuid.UUID) error
+	ListDeletedWorkflows(ctx context.Context) ([]models.WorkflowResponse, error)
 	DuplicateWorkflow(ctx context.Context, id uuid.UUID, createdByID uuid.UUID) (*models.WorkflowResponse, error)
 
 	// Classification assignment
@@ -217,7 +220,30 @@ func (s *workflowService) UpdateWorkflow(ctx context.Context, id uuid.UUID, req 
 }
 
 func (s *workflowService) DeleteWorkflow(ctx context.Context, id uuid.UUID) error {
+	// Soft delete - marks workflow as deleted but keeps in database
 	return s.repo.Delete(ctx, id)
+}
+
+func (s *workflowService) PermanentDeleteWorkflow(ctx context.Context, id uuid.UUID) error {
+	// Hard delete - permanently removes workflow and all related data from database
+	return s.repo.HardDelete(ctx, id)
+}
+
+func (s *workflowService) RestoreWorkflow(ctx context.Context, id uuid.UUID) error {
+	return s.repo.Restore(ctx, id)
+}
+
+func (s *workflowService) ListDeletedWorkflows(ctx context.Context) ([]models.WorkflowResponse, error) {
+	workflows, err := s.repo.ListDeleted(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	responses := make([]models.WorkflowResponse, len(workflows))
+	for i, w := range workflows {
+		responses[i] = models.ToWorkflowResponse(&w)
+	}
+	return responses, nil
 }
 
 func (s *workflowService) DuplicateWorkflow(ctx context.Context, id uuid.UUID, createdByID uuid.UUID) (*models.WorkflowResponse, error) {

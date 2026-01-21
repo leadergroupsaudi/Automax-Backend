@@ -18,7 +18,7 @@ type Incident struct {
 	Title          string    `gorm:"size:200;not null" json:"title"`
 	Description    string    `gorm:"type:text" json:"description"`
 
-	// Record Type: 'incident' or 'request'
+	// Record Type: 'incident', 'request', or 'complaint'
 	RecordType       string     `gorm:"size:20;default:'incident';index" json:"record_type"`
 	SourceIncidentID *uuid.UUID `gorm:"type:uuid;index" json:"source_incident_id"`
 	SourceIncident   *Incident  `gorm:"foreignKey:SourceIncidentID" json:"source_incident,omitempty"`
@@ -64,6 +64,12 @@ type Incident struct {
 	Reporter      *User      `gorm:"foreignKey:ReporterID" json:"reporter,omitempty"`
 	ReporterEmail string     `gorm:"size:100" json:"reporter_email"`
 	ReporterName  string     `gorm:"size:200" json:"reporter_name"`
+
+	// Complaint-specific fields
+	Channel         string `gorm:"size:100" json:"channel"`
+	CreatedByName   string `gorm:"size:255" json:"created_by_name"`
+	CreatedByMobile string `gorm:"size:50" json:"created_by_mobile"`
+	EvaluationCount int    `gorm:"default:0" json:"evaluation_count"`
 
 	// Custom Fields (JSON)
 	CustomFields string `gorm:"type:text" json:"custom_fields"`
@@ -330,6 +336,21 @@ type IncidentCommentRequest struct {
 	IsInternal bool   `json:"is_internal"`
 }
 
+// CreateComplaintRequest for creating a new complaint
+type CreateComplaintRequest struct {
+	Title            string   `json:"title" validate:"required,min=5,max=200"`
+	Description      string   `json:"description"`
+	ClassificationID string   `json:"classification_id" validate:"required,uuid"`
+	WorkflowID       string   `json:"workflow_id" validate:"required,uuid"`
+	SourceIncidentID *string  `json:"source_incident_id" validate:"omitempty,uuid"` // optional reference to source incident
+	Channel          string   `json:"channel"`
+	ReporterID       *string  `json:"reporter_id" validate:"omitempty,uuid"` // link to user who created the complaint
+	DepartmentID     *string  `json:"department_id" validate:"omitempty,uuid"`
+	AssigneeID       *string  `json:"assignee_id" validate:"omitempty,uuid"`
+	LocationID       *string  `json:"location_id" validate:"omitempty,uuid"`
+	LookupValueIDs   []string `json:"lookup_value_ids" validate:"omitempty,dive,uuid"`
+}
+
 // ConvertToRequestRequest for converting an incident to a request
 type ConvertToRequestRequest struct {
 	TransitionID      *string                  `json:"transition_id" validate:"omitempty,uuid"`
@@ -360,7 +381,8 @@ type IncidentFilter struct {
 	LocationID       *uuid.UUID  `json:"location_id"`
 	ReporterID       *uuid.UUID  `json:"reporter_id"`
 	SLABreached      *bool       `json:"sla_breached"`
-	RecordType       *string     `json:"record_type"` // 'incident' or 'request'
+	RecordType       *string     `json:"record_type"` // 'incident', 'request', or 'complaint'
+	Channel          *string     `json:"channel"`     // for complaints
 	StartDate        *time.Time  `json:"start_date"`
 	EndDate          *time.Time  `json:"end_date"`
 	Page             int         `json:"page"`
@@ -395,6 +417,10 @@ type IncidentResponse struct {
 	Reporter         *UserResponse           `json:"reporter,omitempty"`
 	ReporterEmail    string                  `json:"reporter_email"`
 	ReporterName     string                  `json:"reporter_name"`
+	Channel          string                  `json:"channel,omitempty"`
+	CreatedByName    string                  `json:"created_by_name,omitempty"`
+	CreatedByMobile  string                  `json:"created_by_mobile,omitempty"`
+	EvaluationCount  int                     `json:"evaluation_count,omitempty"`
 	CustomFields     string                  `json:"custom_fields,omitempty"`
 	CommentsCount    int                     `json:"comments_count"`
 	AttachmentsCount int                     `json:"attachments_count"`
@@ -501,6 +527,10 @@ func ToIncidentResponse(i *Incident) IncidentResponse {
 		SLADeadline:      i.SLADeadline,
 		ReporterEmail:    i.ReporterEmail,
 		ReporterName:     i.ReporterName,
+		Channel:          i.Channel,
+		CreatedByName:    i.CreatedByName,
+		CreatedByMobile:  i.CreatedByMobile,
+		EvaluationCount:  i.EvaluationCount,
 		CustomFields:     i.CustomFields,
 		CommentsCount:    len(i.Comments),
 		AttachmentsCount: len(i.Attachments),
