@@ -11,12 +11,17 @@ import (
 	"gorm.io/gorm"
 )
 
-// Incident represents an actual incident record
+// Incident represents an actual incident or request record
 type Incident struct {
 	ID             uuid.UUID `gorm:"type:uuid;primary_key" json:"id"`
 	IncidentNumber string    `gorm:"size:50;uniqueIndex;not null" json:"incident_number"`
 	Title          string    `gorm:"size:200;not null" json:"title"`
 	Description    string    `gorm:"type:text" json:"description"`
+
+	// Record Type: 'incident' or 'request'
+	RecordType       string     `gorm:"size:20;default:'incident';index" json:"record_type"`
+	SourceIncidentID *uuid.UUID `gorm:"type:uuid;index" json:"source_incident_id"`
+	SourceIncident   *Incident  `gorm:"foreignKey:SourceIncidentID" json:"source_incident,omitempty"`
 
 	// Classification
 	ClassificationID *uuid.UUID      `gorm:"type:uuid;index" json:"classification_id"`
@@ -325,6 +330,26 @@ type IncidentCommentRequest struct {
 	IsInternal bool   `json:"is_internal"`
 }
 
+// ConvertToRequestRequest for converting an incident to a request
+type ConvertToRequestRequest struct {
+	TransitionID      *string                  `json:"transition_id" validate:"omitempty,uuid"`
+	TransitionComment string                   `json:"transition_comment"`
+	ClassificationID  string                   `json:"classification_id" validate:"required,uuid"`
+	WorkflowID        string                   `json:"workflow_id" validate:"required,uuid"`
+	Title             *string                  `json:"title"`
+	Description       *string                  `json:"description"`
+	AssigneeID        *string                  `json:"assignee_id" validate:"omitempty,uuid"`
+	DepartmentID      *string                  `json:"department_id" validate:"omitempty,uuid"`
+	DueDate           *string                  `json:"due_date"`
+	Feedback          *IncidentFeedbackRequest `json:"feedback"`
+}
+
+// ConvertToRequestResponse for the conversion result
+type ConvertToRequestResponse struct {
+	OriginalIncident *IncidentResponse `json:"original_incident"`
+	NewRequest       *IncidentResponse `json:"new_request"`
+}
+
 type IncidentFilter struct {
 	Search           string      `json:"search"`
 	WorkflowID       *uuid.UUID  `json:"workflow_id"`
@@ -335,6 +360,7 @@ type IncidentFilter struct {
 	LocationID       *uuid.UUID  `json:"location_id"`
 	ReporterID       *uuid.UUID  `json:"reporter_id"`
 	SLABreached      *bool       `json:"sla_breached"`
+	RecordType       *string     `json:"record_type"` // 'incident' or 'request'
 	StartDate        *time.Time  `json:"start_date"`
 	EndDate          *time.Time  `json:"end_date"`
 	Page             int         `json:"page"`
@@ -349,6 +375,9 @@ type IncidentResponse struct {
 	IncidentNumber   string                  `json:"incident_number"`
 	Title            string                  `json:"title"`
 	Description      string                  `json:"description"`
+	RecordType       string                  `json:"record_type"`
+	SourceIncidentID *uuid.UUID              `json:"source_incident_id,omitempty"`
+	SourceIncident   *IncidentResponse       `json:"source_incident,omitempty"`
 	Classification   *ClassificationResponse `json:"classification,omitempty"`
 	Workflow         *WorkflowResponse       `json:"workflow,omitempty"`
 	CurrentState     *WorkflowStateResponse  `json:"current_state,omitempty"`
@@ -461,6 +490,8 @@ func ToIncidentResponse(i *Incident) IncidentResponse {
 		IncidentNumber:   i.IncidentNumber,
 		Title:            i.Title,
 		Description:      i.Description,
+		RecordType:       i.RecordType,
+		SourceIncidentID: i.SourceIncidentID,
 		Latitude:         i.Latitude,
 		Longitude:        i.Longitude,
 		DueDate:          i.DueDate,
@@ -475,6 +506,11 @@ func ToIncidentResponse(i *Incident) IncidentResponse {
 		AttachmentsCount: len(i.Attachments),
 		CreatedAt:        i.CreatedAt,
 		UpdatedAt:        i.UpdatedAt,
+	}
+
+	if i.SourceIncident != nil {
+		sourceResp := ToIncidentResponse(i.SourceIncident)
+		resp.SourceIncident = &sourceResp
 	}
 
 	if i.Classification != nil {

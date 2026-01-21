@@ -12,6 +12,7 @@ type Classification struct {
 	ID          uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
 	Name        string         `gorm:"not null;size:100" json:"name"`
 	Description string         `gorm:"size:500" json:"description"`
+	Type        string         `gorm:"size:20;default:'both'" json:"type"` // 'incident', 'request', 'both'
 	ParentID    *uuid.UUID     `gorm:"type:uuid;index" json:"parent_id"`
 	Parent      *Classification `gorm:"foreignKey:ParentID" json:"parent,omitempty"`
 	Children    []Classification `gorm:"foreignKey:ParentID" json:"children,omitempty"`
@@ -35,16 +36,18 @@ func (c *Classification) BeforeCreate(tx *gorm.DB) error {
 type ClassificationCreateRequest struct {
 	Name        string     `json:"name" validate:"required,min=1,max=100"`
 	Description string     `json:"description" validate:"max=500"`
+	Type        string     `json:"type" validate:"omitempty,oneof=incident request both"`
 	ParentID    *uuid.UUID `json:"parent_id"`
 	SortOrder   int        `json:"sort_order"`
 }
 
 // ClassificationUpdateRequest for updating a classification
 type ClassificationUpdateRequest struct {
-	Name        string `json:"name" validate:"min=1,max=100"`
-	Description string `json:"description" validate:"max=500"`
-	IsActive    *bool  `json:"is_active"`
-	SortOrder   *int   `json:"sort_order"`
+	Name        string  `json:"name" validate:"min=1,max=100"`
+	Description string  `json:"description" validate:"max=500"`
+	Type        *string `json:"type" validate:"omitempty,oneof=incident request both"`
+	IsActive    *bool   `json:"is_active"`
+	SortOrder   *int    `json:"sort_order"`
 }
 
 // ClassificationResponse for API responses
@@ -52,6 +55,7 @@ type ClassificationResponse struct {
 	ID          uuid.UUID                `json:"id"`
 	Name        string                   `json:"name"`
 	Description string                   `json:"description"`
+	Type        string                   `json:"type"`
 	ParentID    *uuid.UUID               `json:"parent_id"`
 	Level       int                      `json:"level"`
 	Path        string                   `json:"path"`
@@ -66,6 +70,7 @@ func ToClassificationResponse(c *Classification) ClassificationResponse {
 		ID:          c.ID,
 		Name:        c.Name,
 		Description: c.Description,
+		Type:        c.Type,
 		ParentID:    c.ParentID,
 		Level:       c.Level,
 		Path:        c.Path,

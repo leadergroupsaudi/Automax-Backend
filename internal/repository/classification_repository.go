@@ -15,7 +15,9 @@ type ClassificationRepository interface {
 	Update(ctx context.Context, classification *models.Classification) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context) ([]models.Classification, error)
+	ListByType(ctx context.Context, classType string) ([]models.Classification, error)
 	GetTree(ctx context.Context) ([]models.Classification, error)
+	GetTreeByType(ctx context.Context, classType string) ([]models.Classification, error)
 	GetChildren(ctx context.Context, parentID uuid.UUID) ([]models.Classification, error)
 	GetByParentID(ctx context.Context, parentID *uuid.UUID) ([]models.Classification, error)
 }
@@ -66,6 +68,16 @@ func (r *classificationRepository) List(ctx context.Context) ([]models.Classific
 	return classifications, err
 }
 
+func (r *classificationRepository) ListByType(ctx context.Context, classType string) ([]models.Classification, error) {
+	var classifications []models.Classification
+	query := r.db.WithContext(ctx)
+	if classType != "" {
+		query = query.Where("type = ? OR type = 'both'", classType)
+	}
+	err := query.Order("sort_order, name").Find(&classifications).Error
+	return classifications, err
+}
+
 func (r *classificationRepository) GetTree(ctx context.Context) ([]models.Classification, error) {
 	var roots []models.Classification
 	err := r.db.WithContext(ctx).
@@ -77,6 +89,22 @@ func (r *classificationRepository) GetTree(ctx context.Context) ([]models.Classi
 			return db.Order("sort_order, name")
 		}).
 		Preload("Children.Children.Children").
+		Order("sort_order, name").
+		Find(&roots).Error
+	return roots, err
+}
+
+func (r *classificationRepository) GetTreeByType(ctx context.Context, classType string) ([]models.Classification, error) {
+	var roots []models.Classification
+	typeFilter := func(db *gorm.DB) *gorm.DB {
+		return db.Where("type = ? OR type = 'both'", classType).Order("sort_order, name")
+	}
+	err := r.db.WithContext(ctx).
+		Where("parent_id IS NULL").
+		Where("type = ? OR type = 'both'", classType).
+		Preload("Children", typeFilter).
+		Preload("Children.Children", typeFilter).
+		Preload("Children.Children.Children", typeFilter).
 		Order("sort_order, name").
 		Find(&roots).Error
 	return roots, err

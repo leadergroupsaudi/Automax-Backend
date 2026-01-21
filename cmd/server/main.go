@@ -151,6 +151,7 @@ func main() {
 	incidents.Put("/:id", incidentHandler.UpdateIncident)
 	incidents.Delete("/:id", incidentHandler.DeleteIncident)
 	incidents.Post("/:id/transition", incidentHandler.ExecuteTransition)
+	incidents.Post("/:id/convert-to-request", incidentHandler.ConvertToRequest)
 	incidents.Get("/:id/available-transitions", incidentHandler.GetAvailableTransitions)
 	incidents.Get("/:id/history", incidentHandler.GetTransitionHistory)
 	incidents.Post("/:id/comments", incidentHandler.AddComment)

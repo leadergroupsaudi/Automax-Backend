@@ -23,6 +23,7 @@ type IncidentRepository interface {
 
 	// Incident number generation
 	GenerateIncidentNumber(ctx context.Context) (string, error)
+	GenerateRequestNumber(ctx context.Context) (string, error)
 
 	// State transitions
 	UpdateState(ctx context.Context, incidentID, newStateID uuid.UUID) error
@@ -173,6 +174,9 @@ func (r *incidentRepository) List(ctx context.Context, filter *models.IncidentFi
 	if filter.SLABreached != nil {
 		query = query.Where("sla_breached = ?", *filter.SLABreached)
 	}
+	if filter.RecordType != nil {
+		query = query.Where("record_type = ?", *filter.RecordType)
+	}
 	if filter.StartDate != nil {
 		query = query.Where("created_at >= ?", *filter.StartDate)
 	}
@@ -236,11 +240,25 @@ func (r *incidentRepository) GenerateIncidentNumber(ctx context.Context) (string
 	var count int64
 	err := r.db.WithContext(ctx).Model(&models.Incident{}).
 		Where("EXTRACT(YEAR FROM created_at) = ?", year).
+		Where("record_type = 'incident' OR record_type = '' OR record_type IS NULL").
 		Count(&count).Error
 	if err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("INC-%d-%06d", year, count+1), nil
+}
+
+func (r *incidentRepository) GenerateRequestNumber(ctx context.Context) (string, error) {
+	year := time.Now().Year()
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Incident{}).
+		Where("EXTRACT(YEAR FROM created_at) = ?", year).
+		Where("record_type = 'request'").
+		Count(&count).Error
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("REQ-%d-%06d", year, count+1), nil
 }
 
 // State transitions

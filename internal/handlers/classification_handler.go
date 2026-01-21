@@ -31,9 +31,15 @@ func (h *ClassificationHandler) Create(c *fiber.Ctx) error {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
 	}
 
+	classType := "both"
+	if req.Type != "" {
+		classType = req.Type
+	}
+
 	classification := &models.Classification{
 		Name:        req.Name,
 		Description: req.Description,
+		Type:        classType,
 		ParentID:    req.ParentID,
 		SortOrder:   req.SortOrder,
 		IsActive:    true,
@@ -84,6 +90,9 @@ func (h *ClassificationHandler) Update(c *fiber.Ctx) error {
 	if req.Description != "" {
 		classification.Description = req.Description
 	}
+	if req.Type != nil {
+		classification.Type = *req.Type
+	}
 	if req.IsActive != nil {
 		classification.IsActive = *req.IsActive
 	}
@@ -113,7 +122,15 @@ func (h *ClassificationHandler) Delete(c *fiber.Ctx) error {
 }
 
 func (h *ClassificationHandler) List(c *fiber.Ctx) error {
-	classifications, err := h.repo.List(c.Context())
+	var classifications []models.Classification
+	var err error
+
+	classType := c.Query("type")
+	if classType != "" {
+		classifications, err = h.repo.ListByType(c.Context(), classType)
+	} else {
+		classifications, err = h.repo.List(c.Context())
+	}
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -127,7 +144,15 @@ func (h *ClassificationHandler) List(c *fiber.Ctx) error {
 }
 
 func (h *ClassificationHandler) GetTree(c *fiber.Ctx) error {
-	tree, err := h.repo.GetTree(c.Context())
+	var tree []models.Classification
+	var err error
+
+	classType := c.Query("type")
+	if classType != "" {
+		tree, err = h.repo.GetTreeByType(c.Context(), classType)
+	} else {
+		tree, err = h.repo.GetTree(c.Context())
+	}
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
 	}

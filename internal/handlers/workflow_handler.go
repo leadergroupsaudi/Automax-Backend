@@ -61,8 +61,16 @@ func (h *WorkflowHandler) GetWorkflow(c *fiber.Ctx) error {
 
 func (h *WorkflowHandler) ListWorkflows(c *fiber.Ctx) error {
 	activeOnly := c.Query("active_only") == "true"
+	recordType := c.Query("record_type")
 
-	workflows, err := h.service.ListWorkflows(c.Context(), activeOnly)
+	var workflows []models.WorkflowResponse
+	var err error
+
+	if recordType != "" {
+		workflows, err = h.service.ListWorkflowsByRecordType(c.Context(), recordType, activeOnly)
+	} else {
+		workflows, err = h.service.ListWorkflows(c.Context(), activeOnly)
+	}
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
 	}

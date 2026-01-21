@@ -15,6 +15,7 @@ type WorkflowRepository interface {
 	FindByIDWithRelations(ctx context.Context, id uuid.UUID) (*models.Workflow, error)
 	FindByCode(ctx context.Context, code string) (*models.Workflow, error)
 	List(ctx context.Context, activeOnly bool) ([]models.Workflow, error)
+	ListByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.Workflow, error)
 	Update(ctx context.Context, workflow *models.Workflow) error
 	Delete(ctx context.Context, id uuid.UUID) error
 
@@ -123,6 +124,26 @@ func (r *workflowRepository) List(ctx context.Context, activeOnly bool) ([]model
 		Preload("Transitions").
 		Preload("Classifications").
 		Preload("CreatedBy")
+
+	if activeOnly {
+		query = query.Where("is_active = ?", true)
+	}
+
+	err := query.Order("name").Find(&workflows).Error
+	return workflows, err
+}
+
+func (r *workflowRepository) ListByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.Workflow, error) {
+	var workflows []models.Workflow
+	query := r.db.WithContext(ctx).
+		Preload("States").
+		Preload("Transitions").
+		Preload("Classifications").
+		Preload("CreatedBy")
+
+	if recordType != "" {
+		query = query.Where("record_type = ? OR record_type = 'both'", recordType)
+	}
 
 	if activeOnly {
 		query = query.Where("is_active = ?", true)

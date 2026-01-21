@@ -16,6 +16,7 @@ type WorkflowService interface {
 	CreateWorkflow(ctx context.Context, req *models.WorkflowCreateRequest, createdByID uuid.UUID) (*models.WorkflowResponse, error)
 	GetWorkflow(ctx context.Context, id uuid.UUID) (*models.WorkflowResponse, error)
 	ListWorkflows(ctx context.Context, activeOnly bool) ([]models.WorkflowResponse, error)
+	ListWorkflowsByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.WorkflowResponse, error)
 	UpdateWorkflow(ctx context.Context, id uuid.UUID, req *models.WorkflowUpdateRequest) (*models.WorkflowResponse, error)
 	DeleteWorkflow(ctx context.Context, id uuid.UUID) error
 	DuplicateWorkflow(ctx context.Context, id uuid.UUID, createdByID uuid.UUID) (*models.WorkflowResponse, error)
@@ -69,10 +70,16 @@ func (s *workflowService) CreateWorkflow(ctx context.Context, req *models.Workfl
 		}
 	}
 
+	recordType := "incident"
+	if req.RecordType != "" {
+		recordType = req.RecordType
+	}
+
 	workflow := &models.Workflow{
 		Name:           req.Name,
 		Code:           req.Code,
 		Description:    req.Description,
+		RecordType:     recordType,
 		RequiredFields: requiredFieldsJSON,
 		CreatedByID:    &createdByID,
 		IsActive:       true,
@@ -132,6 +139,20 @@ func (s *workflowService) ListWorkflows(ctx context.Context, activeOnly bool) ([
 	return responses, nil
 }
 
+func (s *workflowService) ListWorkflowsByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.WorkflowResponse, error) {
+	workflows, err := s.repo.ListByRecordType(ctx, recordType, activeOnly)
+	if err != nil {
+		return nil, err
+	}
+
+	responses := make([]models.WorkflowResponse, len(workflows))
+	for i, w := range workflows {
+		responses[i] = models.ToWorkflowResponse(&w)
+	}
+
+	return responses, nil
+}
+
 func (s *workflowService) UpdateWorkflow(ctx context.Context, id uuid.UUID, req *models.WorkflowUpdateRequest) (*models.WorkflowResponse, error) {
 	workflow, err := s.repo.FindByID(ctx, id)
 	if err != nil {
@@ -152,6 +173,9 @@ func (s *workflowService) UpdateWorkflow(ctx context.Context, id uuid.UUID, req 
 	}
 	if req.IsDefault != nil {
 		workflow.IsDefault = *req.IsDefault
+	}
+	if req.RecordType != nil {
+		workflow.RecordType = *req.RecordType
 	}
 	if req.CanvasLayout != "" {
 		workflow.CanvasLayout = req.CanvasLayout

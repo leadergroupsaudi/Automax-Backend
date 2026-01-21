@@ -148,6 +148,10 @@ func (h *IncidentHandler) ListIncidents(c *fiber.Ctx) error {
 		filter.SLABreached = &breached
 	}
 
+	if recordType := c.Query("record_type"); recordType != "" {
+		filter.RecordType = &recordType
+	}
+
 	if startDate := c.Query("start_date"); startDate != "" {
 		if t, err := time.Parse(time.RFC3339, startDate); err == nil {
 			filter.StartDate = &t
@@ -211,6 +215,34 @@ func (h *IncidentHandler) DeleteIncident(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Incident deleted", nil)
+}
+
+// ConvertToRequest converts an incident to a request
+func (h *IncidentHandler) ConvertToRequest(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID")
+	}
+
+	var req models.ConvertToRequestRequest
+	if err := c.BodyParser(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+	}
+
+	if err := h.validator.Struct(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	userID := c.Locals("user_id").(uuid.UUID)
+	roleIDs := h.getUserRoleIDs(c)
+
+	result, err := h.service.ConvertToRequest(c.Context(), id, &req, userID, roleIDs)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusCreated, "Incident converted to request", result)
 }
 
 // State transitions

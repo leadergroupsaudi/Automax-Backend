@@ -21,6 +21,9 @@ type IncidentService interface {
 	UpdateIncident(ctx context.Context, id uuid.UUID, req *models.IncidentUpdateRequest, userID uuid.UUID) (*models.IncidentResponse, error)
 	DeleteIncident(ctx context.Context, id uuid.UUID) error
 
+	// Convert incident to request
+	ConvertToRequest(ctx context.Context, incidentID uuid.UUID, req *models.ConvertToRequestRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.ConvertToRequestResponse, error)
+
 	// State transitions
 	ExecuteTransition(ctx context.Context, incidentID uuid.UUID, req *models.IncidentTransitionRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.IncidentResponse, error)
 	GetAvailableTransitions(ctx context.Context, incidentID uuid.UUID, userRoleIDs []uuid.UUID) ([]models.AvailableTransitionResponse, error)
@@ -361,6 +364,179 @@ func (s *incidentService) UpdateIncident(ctx context.Context, id uuid.UUID, req 
 
 func (s *incidentService) DeleteIncident(ctx context.Context, id uuid.UUID) error {
 	return s.incidentRepo.Delete(ctx, id)
+}
+
+// ConvertToRequest converts an incident to a request
+func (s *incidentService) ConvertToRequest(ctx context.Context, incidentID uuid.UUID, req *models.ConvertToRequestRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.ConvertToRequestResponse, error) {
+	// Get the source incident
+	sourceIncident, err := s.incidentRepo.FindByIDWithRelations(ctx, incidentID)
+	if err != nil {
+		return nil, errors.New("incident not found")
+	}
+
+	// Validate it's not already a request
+	if sourceIncident.RecordType == "request" {
+		return nil, errors.New("cannot convert a request to another request")
+	}
+
+	// Execute transition if provided
+	if req.TransitionID != nil && *req.TransitionID != "" {
+		transitionReq := &models.IncidentTransitionRequest{
+			TransitionID: *req.TransitionID,
+			Comment:      req.TransitionComment,
+			Feedback:     req.Feedback,
+		}
+
+		_, err := s.ExecuteTransition(ctx, incidentID, transitionReq, userID, userRoleIDs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute transition: %w", err)
+		}
+
+		// Reload the incident after transition
+		sourceIncident, err = s.incidentRepo.FindByIDWithRelations(ctx, incidentID)
+		if err != nil {
+			return nil, errors.New("failed to reload incident after transition")
+		}
+	}
+
+	// Parse workflow ID
+	workflowID, err := uuid.Parse(req.WorkflowID)
+	if err != nil {
+		return nil, errors.New("invalid workflow_id")
+	}
+
+	// Get the initial state of the request workflow
+	initialState, err := s.workflowRepo.GetInitialState(ctx, workflowID)
+	if err != nil {
+		return nil, errors.New("workflow has no initial state configured")
+	}
+
+	// Parse classification ID
+	classificationID, err := uuid.Parse(req.ClassificationID)
+	if err != nil {
+		return nil, errors.New("invalid classification_id")
+	}
+
+	// Generate request number
+	requestNumber, err := s.incidentRepo.GenerateRequestNumber(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate request number: %w", err)
+	}
+
+	// Create the new request, copying relevant data from source incident
+	title := sourceIncident.Title
+	if req.Title != nil && *req.Title != "" {
+		title = *req.Title
+	}
+
+	description := sourceIncident.Description
+	if req.Description != nil && *req.Description != "" {
+		description = *req.Description
+	}
+
+	newRequest := &models.Incident{
+		IncidentNumber:   requestNumber,
+		Title:            title,
+		Description:      description,
+		RecordType:       "request",
+		SourceIncidentID: &incidentID,
+		ClassificationID: &classificationID,
+		WorkflowID:       workflowID,
+		CurrentStateID:   initialState.ID,
+		ReporterID:       sourceIncident.ReporterID,
+		ReporterEmail:    sourceIncident.ReporterEmail,
+		ReporterName:     sourceIncident.ReporterName,
+		LocationID:       sourceIncident.LocationID,
+		Latitude:         sourceIncident.Latitude,
+		Longitude:        sourceIncident.Longitude,
+		CustomFields:     sourceIncident.CustomFields,
+	}
+
+	// Handle optional assignee override
+	if req.AssigneeID != nil && *req.AssigneeID != "" {
+		assigneeID, err := uuid.Parse(*req.AssigneeID)
+		if err == nil {
+			newRequest.AssigneeID = &assigneeID
+		}
+	} else {
+		newRequest.AssigneeID = sourceIncident.AssigneeID
+	}
+
+	// Handle optional department override
+	if req.DepartmentID != nil && *req.DepartmentID != "" {
+		deptID, err := uuid.Parse(*req.DepartmentID)
+		if err == nil {
+			newRequest.DepartmentID = &deptID
+		}
+	} else {
+		newRequest.DepartmentID = sourceIncident.DepartmentID
+	}
+
+	// Handle due date
+	if req.DueDate != nil && *req.DueDate != "" {
+		dueDate, err := time.Parse(time.RFC3339, *req.DueDate)
+		if err == nil {
+			newRequest.DueDate = &dueDate
+		}
+	}
+
+	// Calculate SLA deadline based on initial state
+	if initialState.SLAHours != nil && *initialState.SLAHours > 0 {
+		deadline := time.Now().Add(time.Duration(*initialState.SLAHours) * time.Hour)
+		newRequest.SLADeadline = &deadline
+	}
+
+	// Create the request
+	if err := s.incidentRepo.Create(ctx, newRequest); err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Copy lookup values from source incident
+	if len(sourceIncident.LookupValues) > 0 {
+		if err := s.incidentRepo.SetLookupValues(ctx, newRequest.ID, sourceIncident.LookupValues); err != nil {
+			fmt.Printf("Warning: failed to copy lookup values: %v\n", err)
+		}
+	}
+
+	// Fetch the created request with relations
+	createdRequest, err := s.incidentRepo.FindByIDWithRelations(ctx, newRequest.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch created request: %w", err)
+	}
+
+	// Create revision for source incident
+	sourceIncidentNumber := sourceIncident.IncidentNumber
+	changes := []models.IncidentFieldChange{
+		{
+			FieldName:  "converted_to_request",
+			FieldLabel: "Converted to Request",
+			OldValue:   nil,
+			NewValue:   &requestNumber,
+		},
+	}
+	description = fmt.Sprintf("Incident converted to request %s", requestNumber)
+	_ = s.CreateRevision(ctx, incidentID, models.RevisionActionFieldChange, description, changes, userID)
+
+	// Create revision for new request
+	changes = []models.IncidentFieldChange{
+		{
+			FieldName:  "source_incident",
+			FieldLabel: "Created from Incident",
+			OldValue:   nil,
+			NewValue:   &sourceIncidentNumber,
+		},
+	}
+	description = fmt.Sprintf("Request created from incident %s", sourceIncidentNumber)
+	_ = s.CreateRevision(ctx, newRequest.ID, models.RevisionActionCreated, description, changes, userID)
+
+	// Build response
+	originalResp := models.ToIncidentResponse(sourceIncident)
+	newResp := models.ToIncidentResponse(createdRequest)
+
+	return &models.ConvertToRequestResponse{
+		OriginalIncident: &originalResp,
+		NewRequest:       &newResp,
+	}, nil
 }
 
 // State transitions
