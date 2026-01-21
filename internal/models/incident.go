@@ -18,10 +18,14 @@ type Incident struct {
 	Title          string    `gorm:"size:200;not null" json:"title"`
 	Description    string    `gorm:"type:text" json:"description"`
 
-	// Record Type: 'incident', 'request', or 'complaint'
+	// Record Type: 'incident', 'request', 'complaint', or 'query'
 	RecordType       string     `gorm:"size:20;default:'incident';index" json:"record_type"`
 	SourceIncidentID *uuid.UUID `gorm:"type:uuid;index" json:"source_incident_id"`
 	SourceIncident   *Incident  `gorm:"foreignKey:SourceIncidentID" json:"source_incident,omitempty"`
+
+	// Reference to converted request (when incident is converted to request)
+	ConvertedRequestID *uuid.UUID `gorm:"type:uuid;index" json:"converted_request_id"`
+	ConvertedRequest   *Incident  `gorm:"foreignKey:ConvertedRequestID" json:"converted_request,omitempty"`
 
 	// Classification
 	ClassificationID *uuid.UUID      `gorm:"type:uuid;index" json:"classification_id"`
@@ -351,6 +355,20 @@ type CreateComplaintRequest struct {
 	LookupValueIDs   []string `json:"lookup_value_ids" validate:"omitempty,dive,uuid"`
 }
 
+// CreateQueryRequest for creating a new query
+type CreateQueryRequest struct {
+	Title            string   `json:"title" validate:"required,min=5,max=200"`
+	Description      string   `json:"description"`
+	ClassificationID string   `json:"classification_id" validate:"required,uuid"`
+	WorkflowID       string   `json:"workflow_id" validate:"required,uuid"`
+	SourceIncidentID *string  `json:"source_incident_id" validate:"omitempty,uuid"` // optional reference to source incident
+	Channel          string   `json:"channel"`
+	DepartmentID     *string  `json:"department_id" validate:"omitempty,uuid"`
+	AssigneeID       *string  `json:"assignee_id" validate:"omitempty,uuid"`
+	LocationID       *string  `json:"location_id" validate:"omitempty,uuid"`
+	LookupValueIDs   []string `json:"lookup_value_ids" validate:"omitempty,dive,uuid"`
+}
+
 // ConvertToRequestRequest for converting an incident to a request
 type ConvertToRequestRequest struct {
 	TransitionID      *string                  `json:"transition_id" validate:"omitempty,uuid"`
@@ -381,7 +399,7 @@ type IncidentFilter struct {
 	LocationID       *uuid.UUID  `json:"location_id"`
 	ReporterID       *uuid.UUID  `json:"reporter_id"`
 	SLABreached      *bool       `json:"sla_breached"`
-	RecordType       *string     `json:"record_type"` // 'incident', 'request', or 'complaint'
+	RecordType       *string     `json:"record_type"` // 'incident', 'request', 'complaint', or 'query'
 	Channel          *string     `json:"channel"`     // for complaints
 	StartDate        *time.Time  `json:"start_date"`
 	EndDate          *time.Time  `json:"end_date"`
@@ -396,11 +414,13 @@ type IncidentResponse struct {
 	ID               uuid.UUID               `json:"id"`
 	IncidentNumber   string                  `json:"incident_number"`
 	Title            string                  `json:"title"`
-	Description      string                  `json:"description"`
-	RecordType       string                  `json:"record_type"`
-	SourceIncidentID *uuid.UUID              `json:"source_incident_id,omitempty"`
-	SourceIncident   *IncidentResponse       `json:"source_incident,omitempty"`
-	Classification   *ClassificationResponse `json:"classification,omitempty"`
+	Description        string                  `json:"description"`
+	RecordType         string                  `json:"record_type"`
+	SourceIncidentID   *uuid.UUID              `json:"source_incident_id,omitempty"`
+	SourceIncident     *IncidentResponse       `json:"source_incident,omitempty"`
+	ConvertedRequestID *uuid.UUID              `json:"converted_request_id,omitempty"`
+	ConvertedRequest   *IncidentResponse       `json:"converted_request,omitempty"`
+	Classification     *ClassificationResponse `json:"classification,omitempty"`
 	Workflow         *WorkflowResponse       `json:"workflow,omitempty"`
 	CurrentState     *WorkflowStateResponse  `json:"current_state,omitempty"`
 	Assignee         *UserResponse           `json:"assignee,omitempty"`
@@ -512,13 +532,14 @@ type IncidentStatsResponse struct {
 
 func ToIncidentResponse(i *Incident) IncidentResponse {
 	resp := IncidentResponse{
-		ID:               i.ID,
-		IncidentNumber:   i.IncidentNumber,
-		Title:            i.Title,
-		Description:      i.Description,
-		RecordType:       i.RecordType,
-		SourceIncidentID: i.SourceIncidentID,
-		Latitude:         i.Latitude,
+		ID:                 i.ID,
+		IncidentNumber:     i.IncidentNumber,
+		Title:              i.Title,
+		Description:        i.Description,
+		RecordType:         i.RecordType,
+		SourceIncidentID:   i.SourceIncidentID,
+		ConvertedRequestID: i.ConvertedRequestID,
+		Latitude:           i.Latitude,
 		Longitude:        i.Longitude,
 		DueDate:          i.DueDate,
 		ResolvedAt:       i.ResolvedAt,
@@ -541,6 +562,11 @@ func ToIncidentResponse(i *Incident) IncidentResponse {
 	if i.SourceIncident != nil {
 		sourceResp := ToIncidentResponse(i.SourceIncident)
 		resp.SourceIncident = &sourceResp
+	}
+
+	if i.ConvertedRequest != nil {
+		convertedResp := ToIncidentResponse(i.ConvertedRequest)
+		resp.ConvertedRequest = &convertedResp
 	}
 
 	if i.Classification != nil {

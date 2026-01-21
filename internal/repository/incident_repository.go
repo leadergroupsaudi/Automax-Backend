@@ -25,6 +25,7 @@ type IncidentRepository interface {
 	GenerateIncidentNumber(ctx context.Context) (string, error)
 	GenerateRequestNumber(ctx context.Context) (string, error)
 	GenerateComplaintNumber(ctx context.Context) (string, error)
+	GenerateQueryNumber(ctx context.Context) (string, error)
 
 	// State transitions
 	UpdateState(ctx context.Context, incidentID, newStateID uuid.UUID) error
@@ -119,6 +120,7 @@ func (r *incidentRepository) FindByIDWithRelations(ctx context.Context, id uuid.
 		Preload("LookupValues.Category").
 		Preload("Reporter").
 		Preload("SourceIncident").
+		Preload("ConvertedRequest").
 		Preload("Comments", func(db *gorm.DB) *gorm.DB {
 			return db.Order("created_at DESC")
 		}).
@@ -284,6 +286,19 @@ func (r *incidentRepository) GenerateComplaintNumber(ctx context.Context) (strin
 		return "", err
 	}
 	return fmt.Sprintf("COMP-%d-%06d", year, count+1), nil
+}
+
+func (r *incidentRepository) GenerateQueryNumber(ctx context.Context) (string, error) {
+	year := time.Now().Year()
+	var count int64
+	err := r.db.WithContext(ctx).Model(&models.Incident{}).
+		Where("EXTRACT(YEAR FROM created_at) = ?", year).
+		Where("record_type = 'query'").
+		Count(&count).Error
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("QRY-%d-%06d", year, count+1), nil
 }
 
 // State transitions

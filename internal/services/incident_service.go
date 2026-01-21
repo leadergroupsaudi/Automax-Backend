@@ -28,6 +28,9 @@ type IncidentService interface {
 	CreateComplaint(ctx context.Context, req *models.CreateComplaintRequest, creatorID uuid.UUID) (*models.IncidentResponse, error)
 	IncrementEvaluationCount(ctx context.Context, id uuid.UUID) error
 
+	// Query operations
+	CreateQuery(ctx context.Context, req *models.CreateQueryRequest, creatorID uuid.UUID) (*models.IncidentResponse, error)
+
 	// State transitions
 	ExecuteTransition(ctx context.Context, incidentID uuid.UUID, req *models.IncidentTransitionRequest, userID uuid.UUID, userRoleIDs []uuid.UUID) (*models.IncidentResponse, error)
 	GetAvailableTransitions(ctx context.Context, incidentID uuid.UUID, userRoleIDs []uuid.UUID) ([]models.AvailableTransitionResponse, error)
@@ -500,6 +503,13 @@ func (s *incidentService) ConvertToRequest(ctx context.Context, incidentID uuid.
 		if err := s.incidentRepo.SetLookupValues(ctx, newRequest.ID, sourceIncident.LookupValues); err != nil {
 			fmt.Printf("Warning: failed to copy lookup values: %v\n", err)
 		}
+	}
+
+	// Update source incident with reference to the converted request
+	if err := s.incidentRepo.UpdateFields(ctx, incidentID, map[string]interface{}{
+		"converted_request_id": newRequest.ID,
+	}); err != nil {
+		fmt.Printf("Warning: failed to update converted_request_id on source incident: %v\n", err)
 	}
 
 	// Fetch the created request with relations
@@ -1421,6 +1431,116 @@ func (s *incidentService) IncrementEvaluationCount(ctx context.Context, id uuid.
 	}
 
 	return s.incidentRepo.IncrementEvaluationCount(ctx, id)
+}
+
+func (s *incidentService) CreateQuery(ctx context.Context, req *models.CreateQueryRequest, creatorID uuid.UUID) (*models.IncidentResponse, error) {
+	// Parse workflow ID
+	workflowID, err := uuid.Parse(req.WorkflowID)
+	if err != nil {
+		return nil, errors.New("invalid workflow_id")
+	}
+
+	// Get the initial state of the workflow
+	initialState, err := s.workflowRepo.GetInitialState(ctx, workflowID)
+	if err != nil {
+		return nil, errors.New("workflow has no initial state configured")
+	}
+
+	// Generate query number
+	queryNumber, err := s.incidentRepo.GenerateQueryNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse classification ID
+	classificationID, err := uuid.Parse(req.ClassificationID)
+	if err != nil {
+		return nil, errors.New("invalid classification_id")
+	}
+
+	query := &models.Incident{
+		IncidentNumber:   queryNumber,
+		Title:            req.Title,
+		Description:      req.Description,
+		RecordType:       "query",
+		ClassificationID: &classificationID,
+		WorkflowID:       workflowID,
+		CurrentStateID:   initialState.ID,
+		Channel:          req.Channel,
+		ReporterID:       &creatorID,
+	}
+
+	// Parse optional source incident ID
+	if req.SourceIncidentID != nil && *req.SourceIncidentID != "" {
+		sourceID, err := uuid.Parse(*req.SourceIncidentID)
+		if err == nil {
+			// Validate source incident exists
+			_, err := s.incidentRepo.FindByID(ctx, sourceID)
+			if err != nil {
+				return nil, errors.New("source incident not found")
+			}
+			query.SourceIncidentID = &sourceID
+		}
+	}
+
+	// Parse optional UUIDs
+	if req.AssigneeID != nil && *req.AssigneeID != "" {
+		assigneeID, err := uuid.Parse(*req.AssigneeID)
+		if err == nil {
+			query.AssigneeID = &assigneeID
+		}
+	}
+
+	if req.DepartmentID != nil && *req.DepartmentID != "" {
+		deptID, err := uuid.Parse(*req.DepartmentID)
+		if err == nil {
+			query.DepartmentID = &deptID
+		}
+	}
+
+	if req.LocationID != nil && *req.LocationID != "" {
+		locID, err := uuid.Parse(*req.LocationID)
+		if err == nil {
+			query.LocationID = &locID
+		}
+	}
+
+	// Calculate SLA deadline based on initial state
+	if initialState.SLAHours != nil && *initialState.SLAHours > 0 {
+		deadline := time.Now().Add(time.Duration(*initialState.SLAHours) * time.Hour)
+		query.SLADeadline = &deadline
+	}
+
+	if err := s.incidentRepo.Create(ctx, query); err != nil {
+		return nil, err
+	}
+
+	// Set lookup values if provided
+	if len(req.LookupValueIDs) > 0 {
+		var lookupValues []models.LookupValue
+		for _, idStr := range req.LookupValueIDs {
+			id, err := uuid.Parse(idStr)
+			if err == nil {
+				lookupValues = append(lookupValues, models.LookupValue{ID: id})
+			}
+		}
+		if err := s.incidentRepo.SetLookupValues(ctx, query.ID, lookupValues); err != nil {
+			fmt.Printf("Warning: failed to set lookup values: %v\n", err)
+		}
+	}
+
+	// Fetch with relations
+	created, err := s.incidentRepo.FindByIDWithRelations(ctx, query.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create initial revision
+	description := fmt.Sprintf("Query %s created", queryNumber)
+	_ = s.CreateRevision(ctx, query.ID, models.RevisionActionCreated, description, nil, creatorID)
+
+	resp := models.ToIncidentResponse(created)
+	return &resp, nil
 }
 
 // Helper function to truncate string for descriptions

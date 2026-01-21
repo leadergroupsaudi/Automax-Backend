@@ -823,3 +823,136 @@ func (h *IncidentHandler) IncrementEvaluation(c *fiber.Ctx) error {
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Evaluation count incremented", complaint)
 }
+
+// Query handlers
+
+func (h *IncidentHandler) CreateQuery(c *fiber.Ctx) error {
+	var req models.CreateQueryRequest
+	if err := c.BodyParser(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+	}
+
+	if err := h.validator.Struct(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	userID := c.Locals("user_id").(uuid.UUID)
+
+	query, err := h.service.CreateQuery(c.Context(), &req, userID)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusCreated, "Query created", query)
+}
+
+func (h *IncidentHandler) ListQueries(c *fiber.Ctx) error {
+	filter := &models.IncidentFilter{}
+
+	// Force record_type to query
+	recordType := "query"
+	filter.RecordType = &recordType
+
+	// Parse query parameters
+	if page := c.Query("page"); page != "" {
+		if p, err := strconv.Atoi(page); err == nil {
+			filter.Page = p
+		}
+	}
+	if filter.Page < 1 {
+		filter.Page = 1
+	}
+
+	if limit := c.Query("limit"); limit != "" {
+		if l, err := strconv.Atoi(limit); err == nil {
+			filter.Limit = l
+		}
+	}
+	if filter.Limit < 1 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+
+	filter.Search = c.Query("search")
+
+	if workflowID := c.Query("workflow_id"); workflowID != "" {
+		if id, err := uuid.Parse(workflowID); err == nil {
+			filter.WorkflowID = &id
+		}
+	}
+
+	if stateID := c.Query("current_state_id"); stateID != "" {
+		if id, err := uuid.Parse(stateID); err == nil {
+			filter.CurrentStateID = &id
+		}
+	}
+
+	if classID := c.Query("classification_id"); classID != "" {
+		if id, err := uuid.Parse(classID); err == nil {
+			filter.ClassificationID = &id
+		}
+	}
+
+	if assigneeID := c.Query("assignee_id"); assigneeID != "" {
+		if id, err := uuid.Parse(assigneeID); err == nil {
+			filter.AssigneeID = &id
+		}
+	}
+
+	if deptID := c.Query("department_id"); deptID != "" {
+		if id, err := uuid.Parse(deptID); err == nil {
+			filter.DepartmentID = &id
+		}
+	}
+
+	if channel := c.Query("channel"); channel != "" {
+		filter.Channel = &channel
+	}
+
+	if startDate := c.Query("start_date"); startDate != "" {
+		if t, err := time.Parse(time.RFC3339, startDate); err == nil {
+			filter.StartDate = &t
+		}
+	}
+
+	if endDate := c.Query("end_date"); endDate != "" {
+		if t, err := time.Parse(time.RFC3339, endDate); err == nil {
+			filter.EndDate = &t
+		}
+	}
+
+	queries, total, err := h.service.ListIncidents(c.Context(), filter)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	totalPages := (int(total) + filter.Limit - 1) / filter.Limit
+
+	return c.JSON(fiber.Map{
+		"success":     true,
+		"data":        queries,
+		"page":        filter.Page,
+		"limit":       filter.Limit,
+		"total_items": total,
+		"total_pages": totalPages,
+	})
+}
+
+func (h *IncidentHandler) GetQuery(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID")
+	}
+
+	query, err := h.service.GetIncident(c.Context(), id)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusNotFound, "Query not found")
+	}
+
+	// Verify it's a query
+	if query.RecordType != "query" {
+		return utils.ErrorResponse(c, fiber.StatusNotFound, "Query not found")
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Query retrieved", query)
+}

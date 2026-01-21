@@ -187,6 +187,24 @@ func main() {
 	complaints.Post("/:id/evaluate", incidentHandler.IncrementEvaluation)
 	complaints.Get("/:id/revisions", incidentHandler.ListRevisions)
 
+	// Query routes (authenticated users)
+	queries := v1.Group("/queries", authMiddleware.Authenticate())
+	queries.Post("/", incidentHandler.CreateQuery)
+	queries.Get("/", incidentHandler.ListQueries)
+	queries.Get("/:id", incidentHandler.GetQuery)
+	queries.Put("/:id", incidentHandler.UpdateIncident)
+	queries.Post("/:id/transition", incidentHandler.ExecuteTransition)
+	queries.Get("/:id/available-transitions", incidentHandler.GetAvailableTransitions)
+	queries.Get("/:id/history", incidentHandler.GetTransitionHistory)
+	queries.Post("/:id/comments", incidentHandler.AddComment)
+	queries.Get("/:id/comments", incidentHandler.ListComments)
+	queries.Put("/:id/comments/:comment_id", incidentHandler.UpdateComment)
+	queries.Delete("/:id/comments/:comment_id", incidentHandler.DeleteComment)
+	queries.Post("/:id/attachments", incidentHandler.UploadAttachment)
+	queries.Get("/:id/attachments", incidentHandler.ListAttachments)
+	queries.Delete("/:id/attachments/:attachment_id", incidentHandler.DeleteAttachment)
+	queries.Get("/:id/revisions", incidentHandler.ListRevisions)
+
 	// Admin routes
 	admin := v1.Group("/admin", authMiddleware.Authenticate())
 
