@@ -92,29 +92,27 @@ type ReportScheduleConfig struct {
 	Recipients []string `json:"recipients"` // Email addresses
 }
 
+// ReportCreateRequestConfig for nested config in create request
+type ReportCreateRequestConfig struct {
+	Columns []ReportColumnConfig `json:"columns" validate:"required,min=1"`
+	Filters []ReportFilterConfig `json:"filters"`
+	Sorting []ReportSortConfig   `json:"sorting"`
+	Options *ReportConfigOptions `json:"options,omitempty"`
+}
+
 type ReportCreateRequest struct {
-	Name         string               `json:"name" validate:"required,max=255"`
-	Description  string               `json:"description"`
-	DataSource   string               `json:"data_source" validate:"required,oneof=incidents users workflows departments locations classifications"`
-	Columns      []ReportColumnConfig `json:"columns" validate:"required,min=1"`
-	Filters      []ReportFilterConfig `json:"filters"`
-	Sorting      *ReportSortConfig    `json:"sorting"`
-	Grouping     *ReportGroupConfig   `json:"grouping"`
-	OutputFormat string               `json:"output_format" validate:"omitempty,oneof=table chart"`
-	IsPublic     bool                 `json:"is_public"`
-	Schedule     *ReportScheduleConfig `json:"schedule"`
+	Name        string                    `json:"name" validate:"required,max=255"`
+	Description string                    `json:"description"`
+	DataSource  string                    `json:"data_source" validate:"required,oneof=incidents action_logs users workflows departments locations classifications"`
+	Config      ReportCreateRequestConfig `json:"config" validate:"required"`
+	IsPublic    bool                      `json:"is_public"`
 }
 
 type ReportUpdateRequest struct {
-	Name         string               `json:"name" validate:"omitempty,max=255"`
-	Description  string               `json:"description"`
-	Columns      []ReportColumnConfig `json:"columns"`
-	Filters      []ReportFilterConfig `json:"filters"`
-	Sorting      *ReportSortConfig    `json:"sorting"`
-	Grouping     *ReportGroupConfig   `json:"grouping"`
-	OutputFormat string               `json:"output_format" validate:"omitempty,oneof=table chart"`
-	IsPublic     *bool                `json:"is_public"`
-	Schedule     *ReportScheduleConfig `json:"schedule"`
+	Name        string                     `json:"name" validate:"omitempty,max=255"`
+	Description string                     `json:"description"`
+	Config      *ReportCreateRequestConfig `json:"config"`
+	IsPublic    *bool                      `json:"is_public"`
 }
 
 type ReportExecuteRequest struct {
@@ -122,6 +120,38 @@ type ReportExecuteRequest struct {
 	ExportFormat string               `json:"export_format"` // csv, xlsx, pdf, or empty for preview
 	Limit        int                  `json:"limit"`
 	Page         int                  `json:"page"`
+}
+
+// ReportExportRequest is used for exporting reports
+type ReportExportRequest struct {
+	DataSource string               `json:"data_source" validate:"required"`
+	Columns    []string             `json:"columns" validate:"required,min=1"`
+	Filters    []ReportFilterConfig `json:"filters"`
+	Sorting    []ReportSortConfig   `json:"sorting"`
+	Format     string               `json:"format" validate:"required,oneof=xlsx pdf"`
+	Options    *ReportExportOptions `json:"options"`
+}
+
+type ReportExportOptions struct {
+	Title            string `json:"title"`
+	IncludeFilters   bool   `json:"includeFilters"`
+	IncludeTimestamp bool   `json:"includeTimestamp"`
+}
+
+// ReportQueryRequest is used for ad-hoc report queries without saving
+type ReportQueryRequest struct {
+	DataSource string               `json:"data_source" validate:"required"`
+	Columns    []string             `json:"columns" validate:"required,min=1"`
+	Filters    []ReportFilterConfig `json:"filters"`
+	Sorting    []ReportSortConfig   `json:"sorting"`
+	Page       int                  `json:"page"`
+	Limit      int                  `json:"limit"`
+	Options    *ReportQueryOptions  `json:"options"`
+}
+
+type ReportQueryOptions struct {
+	IncludeSubDepartments bool `json:"includeSubDepartments"`
+	IncludeSubLocations   bool `json:"includeSubLocations"`
 }
 
 type ReportFilter struct {
@@ -135,22 +165,39 @@ type ReportFilter struct {
 
 // Response types
 
+// ReportTemplateConfig is the nested config structure matching frontend expectations
+type ReportTemplateConfig struct {
+	Columns []ReportColumnConfig `json:"columns"`
+	Filters []ReportFilterConfig `json:"filters"`
+	Sorting []ReportSortConfig   `json:"sorting"`
+	Options *ReportConfigOptions `json:"options,omitempty"`
+}
+
+type ReportConfigOptions struct {
+	IncludeSubDepartments bool `json:"includeSubDepartments,omitempty"`
+	IncludeSubLocations   bool `json:"includeSubLocations,omitempty"`
+	Limit                 int  `json:"limit,omitempty"`
+}
+
 type ReportResponse struct {
-	ID           string                `json:"id"`
-	Name         string                `json:"name"`
-	Description  string                `json:"description"`
-	DataSource   string                `json:"data_source"`
-	Columns      []ReportColumnConfig  `json:"columns"`
-	Filters      []ReportFilterConfig  `json:"filters"`
-	Sorting      *ReportSortConfig     `json:"sorting"`
-	Grouping     *ReportGroupConfig    `json:"grouping"`
-	OutputFormat string                `json:"output_format"`
-	IsPublic     bool                  `json:"is_public"`
-	IsScheduled  bool                  `json:"is_scheduled"`
-	Schedule     *ReportScheduleConfig `json:"schedule"`
-	CreatedBy    *UserBasicResponse    `json:"created_by,omitempty"`
-	CreatedAt    string                `json:"created_at"`
-	UpdatedAt    string                `json:"updated_at"`
+	ID          string                `json:"id"`
+	Name        string                `json:"name"`
+	Description string                `json:"description"`
+	DataSource  string                `json:"data_source"`
+	Config      ReportTemplateConfig  `json:"config"`
+	IsPublic    bool                  `json:"is_public"`
+	IsSystem    bool                  `json:"is_system"`
+	CreatedBy   *UserBasicResponse    `json:"created_by,omitempty"`
+	SharedWith  []SharedUserResponse  `json:"shared_with,omitempty"`
+	CanEdit     bool                  `json:"can_edit"`
+	CreatedAt   string                `json:"created_at"`
+	UpdatedAt   string                `json:"updated_at"`
+}
+
+type SharedUserResponse struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	CanEdit  bool   `json:"can_edit"`
 }
 
 type ReportExecutionResponse struct {
@@ -172,6 +219,17 @@ type ReportResultResponse struct {
 	Total   int64                `json:"total"`
 	Page    int                  `json:"page"`
 	Limit   int                  `json:"limit"`
+}
+
+// ReportQueryResponse is the response for ad-hoc report queries
+type ReportQueryResponse struct {
+	Success    bool                     `json:"success"`
+	Data       []map[string]interface{} `json:"data"`
+	Columns    []string                 `json:"columns"`
+	TotalItems int64                    `json:"total_items"`
+	TotalPages int                      `json:"total_pages"`
+	Page       int                      `json:"page"`
+	Limit      int                      `json:"limit"`
 }
 
 type UserBasicResponse struct {

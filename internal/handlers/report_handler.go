@@ -214,6 +214,64 @@ func (h *ReportHandler) PreviewReport(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, "Preview generated successfully", result)
 }
 
+func (h *ReportHandler) QueryReport(c *fiber.Ctx) error {
+	var req models.ReportQueryRequest
+	if err := c.BodyParser(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+	}
+
+	if req.DataSource == "" {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "data_source is required")
+	}
+
+	if len(req.Columns) == 0 {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "columns are required")
+	}
+
+	// Set defaults
+	if req.Page < 1 {
+		req.Page = 1
+	}
+	if req.Limit < 1 || req.Limit > 1000 {
+		req.Limit = 50
+	}
+
+	result, err := h.service.QueryReport(c.Context(), &req)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(result)
+}
+
+func (h *ReportHandler) ExportReport(c *fiber.Ctx) error {
+	var req models.ReportExportRequest
+	if err := c.BodyParser(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+	}
+
+	if req.DataSource == "" {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "data_source is required")
+	}
+
+	if len(req.Columns) == 0 {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "columns are required")
+	}
+
+	if req.Format != "xlsx" && req.Format != "pdf" {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "format must be xlsx or pdf")
+	}
+
+	data, filename, contentType, err := h.service.ExportReport(c.Context(), &req)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	c.Set("Content-Type", contentType)
+	c.Set("Content-Disposition", "attachment; filename="+filename)
+	return c.Send(data)
+}
+
 func (h *ReportHandler) GetExecutionHistory(c *fiber.Ctx) error {
 	idStr := c.Params("id")
 	id, err := uuid.Parse(idStr)

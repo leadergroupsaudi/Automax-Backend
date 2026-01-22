@@ -206,24 +206,28 @@ func (r *reportRepository) ExecuteIncidentQuery(ctx context.Context, filters []m
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("created_at DESC")
+		query = query.Order("incidents.created_at DESC")
 	}
 
 	offset := (page - 1) * limit
 	rows, err := query.
 		Select("incidents.*, "+
 			"reporters.email as reporter_email, reporters.first_name as reporter_first_name, reporters.last_name as reporter_last_name, "+
+			"reporters.username as reporter_username, "+
 			"assignees.email as assignee_email, assignees.first_name as assignee_first_name, assignees.last_name as assignee_last_name, "+
-			"workflow_states.name as current_state_name, "+
+			"assignees.username as assignee_username, "+
+			"workflow_states.name as current_state_name, workflow_states.state_type as current_state_state_type, "+
 			"classifications.name as classification_name, "+
 			"departments.name as department_name, "+
-			"locations.name as location_name").
+			"locations.name as location_name, "+
+			"workflows.name as workflow_name").
 		Joins("LEFT JOIN users as reporters ON incidents.reporter_id = reporters.id").
 		Joins("LEFT JOIN users as assignees ON incidents.assignee_id = assignees.id").
 		Joins("LEFT JOIN workflow_states ON incidents.current_state_id = workflow_states.id").
 		Joins("LEFT JOIN classifications ON incidents.classification_id = classifications.id").
 		Joins("LEFT JOIN departments ON incidents.department_id = departments.id").
 		Joins("LEFT JOIN locations ON incidents.location_id = locations.id").
+		Joins("LEFT JOIN workflows ON incidents.workflow_id = workflows.id").
 		Offset(offset).
 		Limit(limit).
 		Rows()
@@ -245,15 +249,87 @@ func (r *reportRepository) ExecuteIncidentQuery(ctx context.Context, filters []m
 			continue
 		}
 
-		row := make(map[string]interface{})
+		// Build raw row data
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure matching frontend field names
+		row := make(map[string]interface{})
+
+		// Copy base incident fields
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to nested dot-notation keys for frontend compatibility
+		// current_state.name and current_state.state_type
+		if v, ok := rawRow["current_state_name"]; ok {
+			row["current_state.name"] = v
+		}
+		if v, ok := rawRow["current_state_state_type"]; ok {
+			row["current_state.state_type"] = v
+		}
+
+		// assignee.username, assignee.full_name
+		if v, ok := rawRow["assignee_username"]; ok {
+			row["assignee.username"] = v
+		}
+		firstName, _ := rawRow["assignee_first_name"].(string)
+		lastName, _ := rawRow["assignee_last_name"].(string)
+		fullName := ""
+		if firstName != "" || lastName != "" {
+			fullName = firstName
+			if lastName != "" {
+				if fullName != "" {
+					fullName += " "
+				}
+				fullName += lastName
+			}
+		}
+		row["assignee.full_name"] = fullName
+
+		// department.name
+		if v, ok := rawRow["department_name"]; ok {
+			row["department.name"] = v
+		}
+
+		// location.name
+		if v, ok := rawRow["location_name"]; ok {
+			row["location.name"] = v
+		}
+
+		// classification.name
+		if v, ok := rawRow["classification_name"]; ok {
+			row["classification.name"] = v
+		}
+
+		// workflow.name
+		if v, ok := rawRow["workflow_name"]; ok {
+			row["workflow.name"] = v
+		}
+
+		// reporter_name (combined)
+		reporterFirst, _ := rawRow["reporter_first_name"].(string)
+		reporterLast, _ := rawRow["reporter_last_name"].(string)
+		reporterName := ""
+		if reporterFirst != "" || reporterLast != "" {
+			reporterName = reporterFirst
+			if reporterLast != "" {
+				if reporterName != "" {
+					reporterName += " "
+				}
+				reporterName += reporterLast
+			}
+		}
+		row["reporter_name"] = reporterName
+
 		results = append(results, row)
 	}
 
@@ -273,12 +349,12 @@ func (r *reportRepository) ExecuteUserQuery(ctx context.Context, filters []model
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("created_at DESC")
+		query = query.Order("users.created_at DESC")
 	}
 
 	offset := (page - 1) * limit
 	rows, err := query.
-		Select("users.id, users.email, users.username, users.first_name, users.last_name, users.phone, users.avatar, users.is_active, users.is_super_admin, users.created_at, users.updated_at, "+
+		Select("users.id, users.email, users.username, users.first_name, users.last_name, users.phone, users.avatar, users.is_active, users.is_super_admin, users.created_at, users.updated_at, users.last_login_at, "+
 			"departments.name as department_name, locations.name as location_name").
 		Joins("LEFT JOIN departments ON users.department_id = departments.id").
 		Joins("LEFT JOIN locations ON users.location_id = locations.id").
@@ -303,15 +379,30 @@ func (r *reportRepository) ExecuteUserQuery(ctx context.Context, filters []model
 			continue
 		}
 
-		row := make(map[string]interface{})
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure
+		row := make(map[string]interface{})
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to dot-notation for frontend
+		if v, ok := rawRow["department_name"]; ok {
+			row["department.name"] = v
+		}
+		if v, ok := rawRow["location_name"]; ok {
+			row["location.name"] = v
+		}
+
 		results = append(results, row)
 	}
 
@@ -331,12 +422,13 @@ func (r *reportRepository) ExecuteWorkflowQuery(ctx context.Context, filters []m
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("created_at DESC")
+		query = query.Order("workflows.created_at DESC")
 	}
 
 	offset := (page - 1) * limit
 	rows, err := query.
-		Select("workflows.*").
+		Select("workflows.*, creators.username as created_by_username").
+		Joins("LEFT JOIN users as creators ON workflows.created_by_id = creators.id").
 		Offset(offset).
 		Limit(limit).
 		Rows()
@@ -358,15 +450,27 @@ func (r *reportRepository) ExecuteWorkflowQuery(ctx context.Context, filters []m
 			continue
 		}
 
-		row := make(map[string]interface{})
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure
+		row := make(map[string]interface{})
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to dot-notation for frontend
+		if v, ok := rawRow["created_by_username"]; ok {
+			row["created_by.username"] = v
+		}
+
 		results = append(results, row)
 	}
 
@@ -386,13 +490,15 @@ func (r *reportRepository) ExecuteDepartmentQuery(ctx context.Context, filters [
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("name ASC")
+		query = query.Order("departments.name ASC")
 	}
 
 	offset := (page - 1) * limit
 	rows, err := query.
-		Select("departments.*, parents.name as parent_name").
+		Select("departments.*, parents.name as parent_name, "+
+			"managers.username as manager_username, managers.first_name as manager_first_name, managers.last_name as manager_last_name").
 		Joins("LEFT JOIN departments as parents ON departments.parent_id = parents.id").
+		Joins("LEFT JOIN users as managers ON departments.manager_id = managers.id").
 		Offset(offset).
 		Limit(limit).
 		Rows()
@@ -414,15 +520,44 @@ func (r *reportRepository) ExecuteDepartmentQuery(ctx context.Context, filters [
 			continue
 		}
 
-		row := make(map[string]interface{})
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure
+		row := make(map[string]interface{})
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to dot-notation for frontend
+		if v, ok := rawRow["parent_name"]; ok {
+			row["parent.name"] = v
+		}
+		if v, ok := rawRow["manager_username"]; ok {
+			row["manager.username"] = v
+		}
+		// manager.full_name
+		mgrFirst, _ := rawRow["manager_first_name"].(string)
+		mgrLast, _ := rawRow["manager_last_name"].(string)
+		mgrFullName := ""
+		if mgrFirst != "" || mgrLast != "" {
+			mgrFullName = mgrFirst
+			if mgrLast != "" {
+				if mgrFullName != "" {
+					mgrFullName += " "
+				}
+				mgrFullName += mgrLast
+			}
+		}
+		row["manager.full_name"] = mgrFullName
+
 		results = append(results, row)
 	}
 
@@ -442,7 +577,7 @@ func (r *reportRepository) ExecuteLocationQuery(ctx context.Context, filters []m
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("name ASC")
+		query = query.Order("locations.name ASC")
 	}
 
 	offset := (page - 1) * limit
@@ -470,15 +605,27 @@ func (r *reportRepository) ExecuteLocationQuery(ctx context.Context, filters []m
 			continue
 		}
 
-		row := make(map[string]interface{})
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure
+		row := make(map[string]interface{})
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to dot-notation for frontend
+		if v, ok := rawRow["parent_name"]; ok {
+			row["parent.name"] = v
+		}
+
 		results = append(results, row)
 	}
 
@@ -498,7 +645,7 @@ func (r *reportRepository) ExecuteClassificationQuery(ctx context.Context, filte
 
 	query = r.applySorting(query, sorting)
 	if sorting == nil {
-		query = query.Order("name ASC")
+		query = query.Order("classifications.name ASC")
 	}
 
 	offset := (page - 1) * limit
@@ -526,15 +673,27 @@ func (r *reportRepository) ExecuteClassificationQuery(ctx context.Context, filte
 			continue
 		}
 
-		row := make(map[string]interface{})
+		rawRow := make(map[string]interface{})
 		for i, colName := range cols {
 			val := columns[i]
 			if b, ok := val.([]byte); ok {
-				row[colName] = string(b)
+				rawRow[colName] = string(b)
 			} else {
-				row[colName] = val
+				rawRow[colName] = val
 			}
 		}
+
+		// Transform to nested structure
+		row := make(map[string]interface{})
+		for k, v := range rawRow {
+			row[k] = v
+		}
+
+		// Map to dot-notation for frontend
+		if v, ok := rawRow["parent_name"]; ok {
+			row["parent.name"] = v
+		}
+
 		results = append(results, row)
 	}
 

@@ -67,6 +67,7 @@ func main() {
 	workflowRepo := repository.NewWorkflowRepository(db)
 	incidentRepo := repository.NewIncidentRepository(db)
 	reportRepo := repository.NewReportRepository(db)
+	reportTemplateRepo := repository.NewReportTemplateRepository(db)
 	lookupRepo := repository.NewLookupRepository(db)
 
 	// Initialize services
@@ -75,6 +76,7 @@ func main() {
 	workflowService := services.NewWorkflowService(workflowRepo)
 	incidentService := services.NewIncidentService(incidentRepo, workflowRepo, userRepo, minioStorage)
 	reportService := services.NewReportService(reportRepo)
+	reportTemplateService := services.NewReportTemplateService(reportTemplateRepo, reportRepo)
 
 	// Initialize and start SLA Monitor (checks every 5 minutes)
 	slaMonitor := services.NewSLAMonitor(incidentRepo, 5*time.Minute)
@@ -96,6 +98,7 @@ func main() {
 	workflowHandler := handlers.NewWorkflowHandler(workflowService)
 	incidentHandler := handlers.NewIncidentHandler(incidentService, userRepo, minioStorage)
 	reportHandler := handlers.NewReportHandler(reportService)
+	reportTemplateHandler := handlers.NewReportTemplateHandler(reportTemplateService)
 	lookupHandler := handlers.NewLookupHandler(lookupRepo)
 
 	// Initialize middleware
@@ -315,12 +318,27 @@ func main() {
 	reports.Get("/", authMiddleware.RequirePermission("reports:view"), reportHandler.ListReports)
 	reports.Get("/data-sources", authMiddleware.RequirePermission("reports:view"), reportHandler.GetDataSources)
 	reports.Post("/preview", authMiddleware.RequirePermission("reports:view"), reportHandler.PreviewReport)
+	reports.Post("/query", authMiddleware.RequirePermission("reports:view"), reportHandler.QueryReport)
+	reports.Post("/export", authMiddleware.RequirePermission("reports:view"), reportHandler.ExportReport)
 	reports.Get("/:id", authMiddleware.RequirePermission("reports:view"), reportHandler.GetReport)
 	reports.Put("/:id", authMiddleware.RequirePermission("reports:update"), reportHandler.UpdateReport)
 	reports.Delete("/:id", authMiddleware.RequirePermission("reports:delete"), reportHandler.DeleteReport)
 	reports.Post("/:id/duplicate", authMiddleware.RequirePermission("reports:create"), reportHandler.DuplicateReport)
 	reports.Post("/:id/execute", authMiddleware.RequirePermission("reports:view"), reportHandler.ExecuteReport)
 	reports.Get("/:id/executions", authMiddleware.RequirePermission("reports:view"), reportHandler.GetExecutionHistory)
+
+	// Report Template routes
+	reportTemplates := admin.Group("/report-templates")
+	reportTemplates.Post("/", authMiddleware.RequirePermission("reports:create"), reportTemplateHandler.CreateTemplate)
+	reportTemplates.Get("/", authMiddleware.RequirePermission("reports:view"), reportTemplateHandler.ListTemplates)
+	reportTemplates.Get("/default", authMiddleware.RequirePermission("reports:view"), reportTemplateHandler.GetDefaultTemplate)
+	reportTemplates.Post("/preview", authMiddleware.RequirePermission("reports:view"), reportTemplateHandler.PreviewTemplate)
+	reportTemplates.Post("/generate", authMiddleware.RequirePermission("reports:view"), reportTemplateHandler.GenerateReport)
+	reportTemplates.Get("/:id", authMiddleware.RequirePermission("reports:view"), reportTemplateHandler.GetTemplate)
+	reportTemplates.Put("/:id", authMiddleware.RequirePermission("reports:update"), reportTemplateHandler.UpdateTemplate)
+	reportTemplates.Delete("/:id", authMiddleware.RequirePermission("reports:delete"), reportTemplateHandler.DeleteTemplate)
+	reportTemplates.Post("/:id/duplicate", authMiddleware.RequirePermission("reports:create"), reportTemplateHandler.DuplicateTemplate)
+	reportTemplates.Post("/:id/set-default", authMiddleware.RequirePermission("reports:update"), reportTemplateHandler.SetDefaultTemplate)
 
 	// Lookup routes (admin)
 	lookups := admin.Group("/lookups")
