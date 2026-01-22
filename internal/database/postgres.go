@@ -129,6 +129,60 @@ func Seed(db *gorm.DB) error {
 		{Name: "Comment on Incidents", Code: "incidents:comment", Module: "incidents", Action: "comment", Description: "Add comments to incidents"},
 		{Name: "View All Incidents", Code: "incidents:view_all", Module: "incidents", Action: "view_all", Description: "View all incidents regardless of assignment"},
 		{Name: "Manage SLA", Code: "incidents:manage_sla", Module: "incidents", Action: "manage_sla", Description: "Override SLA settings"},
+
+		// Request permissions
+		{Name: "View Requests", Code: "requests:view", Module: "requests", Action: "view", Description: "View requests"},
+		{Name: "Create Requests", Code: "requests:create", Module: "requests", Action: "create", Description: "Create new requests"},
+		{Name: "Update Requests", Code: "requests:update", Module: "requests", Action: "update", Description: "Update request fields"},
+		{Name: "Delete Requests", Code: "requests:delete", Module: "requests", Action: "delete", Description: "Delete requests"},
+		{Name: "Transition Requests", Code: "requests:transition", Module: "requests", Action: "transition", Description: "Execute request state transitions"},
+		{Name: "Assign Requests", Code: "requests:assign", Module: "requests", Action: "assign", Description: "Assign/reassign requests"},
+		{Name: "Comment on Requests", Code: "requests:comment", Module: "requests", Action: "comment", Description: "Add comments to requests"},
+		{Name: "View All Requests", Code: "requests:view_all", Module: "requests", Action: "view_all", Description: "View all requests regardless of assignment"},
+
+		// Complaint permissions
+		{Name: "View Complaints", Code: "complaints:view", Module: "complaints", Action: "view", Description: "View complaints"},
+		{Name: "Create Complaints", Code: "complaints:create", Module: "complaints", Action: "create", Description: "Create new complaints"},
+		{Name: "Update Complaints", Code: "complaints:update", Module: "complaints", Action: "update", Description: "Update complaint fields"},
+		{Name: "Delete Complaints", Code: "complaints:delete", Module: "complaints", Action: "delete", Description: "Delete complaints"},
+		{Name: "Transition Complaints", Code: "complaints:transition", Module: "complaints", Action: "transition", Description: "Execute complaint state transitions"},
+		{Name: "Assign Complaints", Code: "complaints:assign", Module: "complaints", Action: "assign", Description: "Assign/reassign complaints"},
+		{Name: "Comment on Complaints", Code: "complaints:comment", Module: "complaints", Action: "comment", Description: "Add comments to complaints"},
+		{Name: "View All Complaints", Code: "complaints:view_all", Module: "complaints", Action: "view_all", Description: "View all complaints regardless of assignment"},
+
+		// Query permissions
+		{Name: "View Queries", Code: "queries:view", Module: "queries", Action: "view", Description: "View queries"},
+		{Name: "Create Queries", Code: "queries:create", Module: "queries", Action: "create", Description: "Create new queries"},
+		{Name: "Update Queries", Code: "queries:update", Module: "queries", Action: "update", Description: "Update query fields"},
+		{Name: "Delete Queries", Code: "queries:delete", Module: "queries", Action: "delete", Description: "Delete queries"},
+		{Name: "Transition Queries", Code: "queries:transition", Module: "queries", Action: "transition", Description: "Execute query state transitions"},
+		{Name: "Assign Queries", Code: "queries:assign", Module: "queries", Action: "assign", Description: "Assign/reassign queries"},
+		{Name: "Comment on Queries", Code: "queries:comment", Module: "queries", Action: "comment", Description: "Add comments to queries"},
+		{Name: "View All Queries", Code: "queries:view_all", Module: "queries", Action: "view_all", Description: "View all queries regardless of assignment"},
+
+		// Report permissions
+		{Name: "View Reports", Code: "reports:view", Module: "reports", Action: "view", Description: "View reports"},
+		{Name: "Create Reports", Code: "reports:create", Module: "reports", Action: "create", Description: "Create new reports"},
+		{Name: "Update Reports", Code: "reports:update", Module: "reports", Action: "update", Description: "Update reports"},
+		{Name: "Delete Reports", Code: "reports:delete", Module: "reports", Action: "delete", Description: "Delete reports"},
+
+		// Action Log permissions
+		{Name: "View Action Logs", Code: "action-logs:view", Module: "action-logs", Action: "view", Description: "View action logs"},
+		{Name: "Delete Action Logs", Code: "action-logs:delete", Module: "action-logs", Action: "delete", Description: "Delete/cleanup action logs"},
+
+		// Lookup permissions
+		{Name: "View Lookups", Code: "lookups:view", Module: "lookups", Action: "view", Description: "View lookup categories and values"},
+		{Name: "Create Lookups", Code: "lookups:create", Module: "lookups", Action: "create", Description: "Create lookup categories and values"},
+		{Name: "Update Lookups", Code: "lookups:update", Module: "lookups", Action: "update", Description: "Update lookup categories and values"},
+		{Name: "Delete Lookups", Code: "lookups:delete", Module: "lookups", Action: "delete", Description: "Delete lookup categories and values"},
+
+		// Dashboard permissions
+		{Name: "Admin Dashboard", Code: "dashboard:admin", Module: "dashboard", Action: "admin", Description: "Access admin section cards on dashboard"},
+		{Name: "Incidents Dashboard", Code: "dashboard:incidents", Module: "dashboard", Action: "incidents", Description: "Access incident cards on dashboard"},
+		{Name: "Requests Dashboard", Code: "dashboard:requests", Module: "dashboard", Action: "requests", Description: "Access request cards on dashboard"},
+		{Name: "Complaints Dashboard", Code: "dashboard:complaints", Module: "dashboard", Action: "complaints", Description: "Access complaint cards on dashboard"},
+		{Name: "Queries Dashboard", Code: "dashboard:queries", Module: "dashboard", Action: "queries", Description: "Access query cards on dashboard"},
+		{Name: "Workflows Dashboard", Code: "dashboard:workflows", Module: "dashboard", Action: "workflows", Description: "Access workflow cards on dashboard"},
 	}
 
 	for _, perm := range permissions {

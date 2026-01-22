@@ -12,6 +12,7 @@ type UserRepository interface {
 	Create(ctx context.Context, user *models.User) error
 	FindByID(ctx context.Context, id uuid.UUID) (*models.User, error)
 	FindByIDWithRelations(ctx context.Context, id uuid.UUID) (*models.User, error)
+	FindByIDWithPermissions(ctx context.Context, id uuid.UUID) (*models.User, error)
 	FindByEmail(ctx context.Context, email string) (*models.User, error)
 	FindByEmailWithRelations(ctx context.Context, email string) (*models.User, error)
 	FindByUsername(ctx context.Context, username string) (*models.User, error)
@@ -61,6 +62,19 @@ func (r *userRepository) FindByIDWithRelations(ctx context.Context, id uuid.UUID
 		Preload("Classifications").
 		Preload("Roles").
 		Preload("Roles.Permissions").
+		First(&user, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+// FindByIDWithPermissions loads only roles and permissions for permission checking
+func (r *userRepository) FindByIDWithPermissions(ctx context.Context, id uuid.UUID) (*models.User, error) {
+	var user models.User
+	err := r.db.WithContext(ctx).
+		Preload("Roles", "is_active = ?", true).
+		Preload("Roles.Permissions", "is_active = ?", true).
 		First(&user, "id = ?", id).Error
 	if err != nil {
 		return nil, err

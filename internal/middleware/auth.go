@@ -5,19 +5,23 @@ import (
 	"strings"
 
 	"github.com/automax/backend/internal/database"
+	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
 
 type AuthMiddleware struct {
 	jwtManager   *utils.JWTManager
 	sessionStore *database.SessionStore
+	userRepo     repository.UserRepository
 }
 
-func NewAuthMiddleware(jwtManager *utils.JWTManager, sessionStore *database.SessionStore) *AuthMiddleware {
+func NewAuthMiddleware(jwtManager *utils.JWTManager, sessionStore *database.SessionStore, userRepo repository.UserRepository) *AuthMiddleware {
 	return &AuthMiddleware{
 		jwtManager:   jwtManager,
 		sessionStore: sessionStore,
+		userRepo:     userRepo,
 	}
 }
 
@@ -71,6 +75,37 @@ func (m *AuthMiddleware) RequireRole(roles ...string) fiber.Handler {
 
 		for _, role := range roles {
 			if userRole == role {
+				return c.Next()
+			}
+		}
+
+		return utils.ErrorResponse(c, fiber.StatusForbidden, "Insufficient permissions")
+	}
+}
+
+// RequirePermission checks if the authenticated user has any of the specified permissions
+func (m *AuthMiddleware) RequirePermission(permissions ...string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		userID, ok := c.Locals("user_id").(uuid.UUID)
+		if !ok {
+			return utils.ErrorResponse(c, fiber.StatusUnauthorized, "User not authenticated")
+		}
+
+		user, err := m.userRepo.FindByIDWithPermissions(c.Context(), userID)
+		if err != nil {
+			return utils.ErrorResponse(c, fiber.StatusForbidden, "User not found")
+		}
+
+		// Super admin has all permissions
+		if user.IsSuperAdmin {
+			c.Locals("user", user)
+			return c.Next()
+		}
+
+		// Check if user has any of the required permissions
+		for _, perm := range permissions {
+			if user.HasPermission(perm) {
+				c.Locals("user", user)
 				return c.Next()
 			}
 		}
