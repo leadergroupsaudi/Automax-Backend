@@ -12,6 +12,7 @@ import (
 type ClassificationRepository interface {
 	Create(ctx context.Context, classification *models.Classification) error
 	FindByID(ctx context.Context, id uuid.UUID) (*models.Classification, error)
+	FindByNameAndParent(ctx context.Context, name string, parentID *uuid.UUID) (*models.Classification, error)
 	Update(ctx context.Context, classification *models.Classification) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context) ([]models.Classification, error)
@@ -48,6 +49,21 @@ func (r *classificationRepository) Create(ctx context.Context, classification *m
 func (r *classificationRepository) FindByID(ctx context.Context, id uuid.UUID) (*models.Classification, error) {
 	var classification models.Classification
 	err := r.db.WithContext(ctx).Preload("Children").First(&classification, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &classification, nil
+}
+
+func (r *classificationRepository) FindByNameAndParent(ctx context.Context, name string, parentID *uuid.UUID) (*models.Classification, error) {
+	var classification models.Classification
+	query := r.db.WithContext(ctx).Where("name = ?", name)
+	if parentID == nil {
+		query = query.Where("parent_id IS NULL")
+	} else {
+		query = query.Where("parent_id = ?", parentID)
+	}
+	err := query.First(&classification).Error
 	if err != nil {
 		return nil, err
 	}

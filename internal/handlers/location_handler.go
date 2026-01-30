@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
+	"sort"
+
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
@@ -205,4 +209,133 @@ func (h *LocationHandler) GetByType(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Locations retrieved", responses)
+}
+
+// Export exports all locations as JSON
+func (h *LocationHandler) Export(c *fiber.Ctx) error {
+	locations, err := h.repo.List(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Convert to export format - NO FILTERING to match classification behavior
+	exportData := make([]map[string]interface{}, len(locations))
+	for i, loc := range locations {
+		exportData[i] = map[string]interface{}{
+			"id":          loc.ID,
+			"name":        loc.Name,
+			"code":        loc.Code,
+			"description": loc.Description,
+			"type":        loc.Type,
+			"parent_id":   loc.ParentID,
+			"level":       loc.Level,
+			"path":        loc.Path,
+			"address":     loc.Address,
+			"latitude":    loc.Latitude,
+			"longitude":   loc.Longitude,
+			"is_active":   loc.IsActive,
+			"sort_order":  loc.SortOrder,
+		}
+	}
+
+	c.Set("Content-Type", "application/json")
+	c.Set("Content-Disposition", "attachment; filename=locations_export.json")
+	return c.JSON(exportData)
+}
+
+// Import imports locations from JSON
+func (h *LocationHandler) Import(c *fiber.Ctx) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "No file uploaded")
+	}
+
+	// Open and read file
+	fileContent, err := file.Open()
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to read file")
+	}
+	defer fileContent.Close()
+
+	// Read file content
+	var importData []struct {
+		ID          uuid.UUID  `json:"id"`
+		Name        string     `json:"name"`
+		Code        string     `json:"code"`
+		Description string     `json:"description"`
+		Type        string     `json:"type"`
+		ParentID    *uuid.UUID `json:"parent_id"`
+		Level       int        `json:"level"`
+		Path        string     `json:"path"`
+		Address     string     `json:"address"`
+		Latitude    *float64   `json:"latitude"`
+		Longitude   *float64   `json:"longitude"`
+		IsActive    bool       `json:"is_active"`
+		SortOrder   int        `json:"sort_order"`
+	}
+
+	// Parse JSON from file
+	decoder := json.NewDecoder(fileContent)
+	if err := decoder.Decode(&importData); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid JSON format: "+err.Error())
+	}
+
+	// Sort by level to ensure parents are imported before children
+	sort.Slice(importData, func(i, j int) bool {
+		return importData[i].Level < importData[j].Level
+	})
+
+	// Create a map from old IDs to new IDs for maintaining parent-child relationships
+	idMapping := make(map[uuid.UUID]uuid.UUID)
+	imported := 0
+	skipped := 0
+	errors := []string{}
+
+	// Import all locations in level order
+	for _, data := range importData {
+		var newParentID *uuid.UUID
+
+		// If has parent, get the new parent ID from mapping
+		if data.ParentID != nil {
+			mappedParentID, exists := idMapping[*data.ParentID]
+			if exists {
+				newParentID = &mappedParentID
+			} else {
+				// Parent not found in import data, import as root node
+				newParentID = nil
+			}
+		}
+
+		// Create new location (no duplicate check)
+		newID := uuid.New()
+		location := &models.Location{
+			ID:          newID,
+			Name:        data.Name,
+			Code:        data.Code,
+			Description: data.Description,
+			Type:        data.Type,
+			ParentID:    newParentID,
+			Address:     data.Address,
+			Latitude:    data.Latitude,
+			Longitude:   data.Longitude,
+			IsActive:    data.IsActive,
+			SortOrder:   data.SortOrder,
+		}
+
+		if err := h.repo.Create(c.Context(), location); err != nil {
+			skipped++
+			errors = append(errors, data.Name+" (Level "+fmt.Sprintf("%d", data.Level)+") - "+err.Error())
+		} else {
+			imported++
+			idMapping[data.ID] = newID
+		}
+	}
+
+	result := map[string]interface{}{
+		"imported": imported,
+		"skipped":  skipped,
+		"errors":   errors,
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Import completed", result)
 }

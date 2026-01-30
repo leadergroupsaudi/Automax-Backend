@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"encoding/json"
+
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
@@ -296,4 +298,121 @@ func (h *RoleHandler) GetModules(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Modules retrieved", modules)
+}
+
+// Export roles to JSON
+func (h *RoleHandler) Export(c *fiber.Ctx) error {
+	roles, err := h.roleRepo.List(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	type ExportRole struct {
+		ID            uuid.UUID   `json:"id"`
+		Name          string      `json:"name"`
+		Code          string      `json:"code"`
+		Description   string      `json:"description"`
+		IsSystem      bool        `json:"is_system"`
+		IsActive      bool        `json:"is_active"`
+		PermissionIDs []uuid.UUID `json:"permission_ids"`
+	}
+
+	exportData := make([]ExportRole, len(roles))
+	for i, role := range roles {
+		permissionIDs := make([]uuid.UUID, len(role.Permissions))
+		for j, perm := range role.Permissions {
+			permissionIDs[j] = perm.ID
+		}
+
+		exportData[i] = ExportRole{
+			ID:            role.ID,
+			Name:          role.Name,
+			Code:          role.Code,
+			Description:   role.Description,
+			IsSystem:      role.IsSystem,
+			IsActive:      role.IsActive,
+			PermissionIDs: permissionIDs,
+		}
+	}
+
+	jsonData, err := json.MarshalIndent(exportData, "", "  ")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to create export file")
+	}
+
+	c.Set("Content-Type", "application/json")
+	c.Set("Content-Disposition", "attachment; filename=roles_export.json")
+	return c.Send(jsonData)
+}
+
+// Import roles from JSON
+func (h *RoleHandler) Import(c *fiber.Ctx) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "No file provided")
+	}
+
+	fileContent, err := file.Open()
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to open file")
+	}
+	defer fileContent.Close()
+
+	type ImportRole struct {
+		ID            uuid.UUID   `json:"id"`
+		Name          string      `json:"name"`
+		Code          string      `json:"code"`
+		Description   string      `json:"description"`
+		IsSystem      bool        `json:"is_system"`
+		IsActive      bool        `json:"is_active"`
+		PermissionIDs []uuid.UUID `json:"permission_ids"`
+	}
+
+	var importData []ImportRole
+	if err := json.NewDecoder(fileContent).Decode(&importData); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid JSON format")
+	}
+
+	imported := 0
+	skipped := 0
+	var errors []string
+
+	for _, data := range importData {
+		// Check if role with same code already exists
+		existingRole, err := h.roleRepo.FindByCode(c.Context(), data.Code)
+		if err == nil && existingRole != nil {
+			skipped++
+			errors = append(errors, data.Name+" - Role with code "+data.Code+" already exists, skipped")
+			continue
+		}
+
+		// Create new role
+		role := &models.Role{
+			Name:        data.Name,
+			Code:        data.Code,
+			Description: data.Description,
+			IsActive:    data.IsActive,
+			IsSystem:    false, // Always set imported roles as non-system
+		}
+
+		if err := h.roleRepo.Create(c.Context(), role); err != nil {
+			errors = append(errors, data.Name+" - Failed to create: "+err.Error())
+			continue
+		}
+
+		// Assign permissions if provided
+		if len(data.PermissionIDs) > 0 {
+			if err := h.roleRepo.AssignPermissions(c.Context(), role.ID, data.PermissionIDs); err != nil {
+				errors = append(errors, data.Name+" - Role created but failed to assign permissions: "+err.Error())
+			}
+		}
+
+		imported++
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Import completed", map[string]interface{}{
+		"imported": imported,
+		"skipped":  skipped,
+		"errors":   errors,
+	})
 }

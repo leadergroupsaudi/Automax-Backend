@@ -28,6 +28,8 @@ type UserService interface {
 	DeleteUser(ctx context.Context, userID uuid.UUID) error
 	ListUsers(ctx context.Context, page, limit int) ([]models.UserResponse, int64, error)
 	GetUserByID(ctx context.Context, userID uuid.UUID) (*models.UserResponse, error)
+	GetUserByEmail(ctx context.Context, email string) (*models.User, error)
+	GetUserByUsername(ctx context.Context, username string) (*models.User, error)
 	FindMatchingUsers(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.UserResponse, error)
 }
 
@@ -420,4 +422,12 @@ func (s *userService) FindMatchingUsers(ctx context.Context, roleID, classificat
 	}
 
 	return responses, nil
+}
+
+func (s *userService) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	return s.userRepo.FindByEmail(ctx, email)
+}
+
+func (s *userService) GetUserByUsername(ctx context.Context, username string) (*models.User, error) {
+	return s.userRepo.FindByUsername(ctx, username)
 }

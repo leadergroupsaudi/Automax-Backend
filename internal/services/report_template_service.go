@@ -616,7 +616,9 @@ func (s *reportTemplateService) renderTableElement(pdf *gofpdf.Fpdf, element *mo
 	}
 
 	if len(content.Columns) == 0 {
-		fmt.Printf("[renderTableElement] WARNING: No columns defined!\n")
+		fmt.Printf("[renderTableElement] ERROR: No columns defined! This will result in an empty table.\n")
+		fmt.Printf("[renderTableElement] Template content: %+v\n", content)
+		// Still return early to avoid rendering empty table
 		return
 	}
 
