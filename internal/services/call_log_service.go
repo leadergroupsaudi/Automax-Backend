@@ -19,6 +19,7 @@ type CallLogService interface {
 	StartCall(ctx context.Context, callUUID string, createdBy uuid.UUID, participants []uuid.UUID) (*models.CallLogResponse, error)
 	EndCall(ctx context.Context, callUUID string, endAt *time.Time) (*models.CallLogResponse, error)
 	JoinCall(ctx context.Context, callUUID string, userID uuid.UUID) error
+	GetCallLogsByUserID(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.CallLogResponse, int64, error)
 }
 
 type callLogService struct {
@@ -198,4 +199,27 @@ func (s *callLogService) getCallLogResponse(ctx context.Context, id uuid.UUID) (
 
 	response := models.ToCallLogResponse(callLog, nil) // TODO: Pass user repo for participants
 	return &response, nil
+}
+
+func (s *callLogService) GetCallLogsByUserID(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.CallLogResponse, int64, error) {
+	// Set defaults
+	if page <= 0 {
+		page = 1
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+
+	callLogs, total, err := s.repo.FindByUserID(ctx, userID, page, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	responses := make([]models.CallLogResponse, len(callLogs))
+	for i, callLog := range callLogs {
+		// Use ToCallLogResponseWithoutCreator to exclude creator data
+		responses[i] = models.ToCallLogResponseWithoutCreator(&callLog)
+	}
+
+	return responses, total, nil
 }

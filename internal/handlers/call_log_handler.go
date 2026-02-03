@@ -293,3 +293,45 @@ func (h *CallLogHandler) JoinCall(c *fiber.Ctx) error {
 		"message": "Successfully joined the call",
 	})
 }
+
+// GetCallLogsByExtension handles GET /api/v1/call-logs/extension/:extension
+func (h *CallLogHandler) GetCallLogsByExtension(c *fiber.Ctx) error {
+	extension := c.Params("extension")
+	if extension == "" {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Extension is required")
+	}
+
+	// Parse pagination parameters
+	page, _ := strconv.Atoi(c.Query("page", "1"))
+	limit, _ := strconv.Atoi(c.Query("limit", "10"))
+
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
+
+	// Find user by extension
+	user, err := h.userSvc.FindByExtension(c.Context(), extension)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusNotFound, "User with extension not found")
+	}
+
+	// Get call logs for the user
+	callLogs, total, err := h.service.GetCallLogsByUserID(c.Context(), user.ID, page, limit)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	totalPages := (int(total) + limit - 1) / limit
+
+	return c.JSON(fiber.Map{
+		"success":     true,
+		"data":        callLogs,
+		"total_items": total,
+		"total_pages": totalPages,
+		"page":        page,
+		"limit":       limit,
+	})
+}

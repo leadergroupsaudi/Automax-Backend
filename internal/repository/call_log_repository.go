@@ -17,6 +17,7 @@ type CallLogRepository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, filter *models.CallLogFilter) ([]models.CallLog, int64, error)
 	GetStats(ctx context.Context) (*models.CallLogStats, error)
+	FindByUserID(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.CallLog, int64, error)
 }
 
 type callLogRepository struct {
@@ -133,4 +134,36 @@ func (r *callLogRepository) GetStats(ctx context.Context) (*models.CallLogStats,
 		Count(&stats.RecentCalls)
 
 	return stats, nil
+}
+
+func (r *callLogRepository) FindByUserID(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.CallLog, int64, error) {
+	var callLogs []models.CallLog
+	var total int64
+
+	// Convert UUID to JSON format for comparison
+	userIDJSON := `"` + userID.String() + `"`
+
+	// Build query to find calls where user is creator or participant
+	// Using JSON contains operator (@>) since participants/joined_users/invited_users are stored as JSON text
+	query := r.db.WithContext(ctx).Model(&models.CallLog{}).
+		Where("created_by = ? OR participants::jsonb @> ?::jsonb OR joined_users::jsonb @> ?::jsonb OR invited_users::jsonb @> ?::jsonb",
+			userID, "["+userIDJSON+"]", "["+userIDJSON+"]", "["+userIDJSON+"]")
+
+	// Count total
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	// Apply pagination
+	offset := (page - 1) * limit
+	err := query.
+		Order("created_at DESC").
+		Offset(offset).
+		Limit(limit).
+		Find(&callLogs).Error
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return callLogs, total, nil
 }

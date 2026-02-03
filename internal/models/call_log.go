@@ -173,3 +173,19 @@ func ToCallLogResponse(callLog *CallLog, userRepo interface{}) CallLogResponse {
 
 	return resp
 }
+
+// ToCallLogResponseWithoutCreator creates a response without creator details
+func ToCallLogResponseWithoutCreator(callLog *CallLog) CallLogResponse {
+	return CallLogResponse{
+		ID:           callLog.ID,
+		CallUuid:     callLog.CallUuid,
+		CreatedBy:    callLog.CreatedBy,
+		StartAt:      callLog.StartAt,
+		EndAt:        callLog.EndAt,
+		Status:       callLog.Status,
+		RecordingUrl: callLog.RecordingUrl,
+		Meta:         callLog.Meta,
+		CreatedAt:    callLog.CreatedAt,
+		UpdatedAt:    callLog.UpdatedAt,
+	}
+}

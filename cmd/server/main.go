@@ -376,6 +376,10 @@ func main() {
 	calls.Post("/:call_uuid/end", callLogHandler.EndCall)
 	calls.Post("/:call_uuid/join", callLogHandler.JoinCall)
 
+	// Call logs routes
+	callLogsPublic := v1.Group("/call-logs", authMiddleware.Authenticate())
+	callLogsPublic.Get("/extension/:extension", callLogHandler.GetCallLogsByExtension)
+
 	go func() {
 		addr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)
 		log.Printf("Server starting on %s", addr)
