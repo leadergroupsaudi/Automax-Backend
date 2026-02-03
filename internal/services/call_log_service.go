@@ -34,7 +34,7 @@ func (s *callLogService) CreateCallLog(ctx context.Context, req *models.CallLogC
 	if meta == "" {
 		meta = "{}"
 	}
-	
+
 	callLog := &models.CallLog{
 		CallUuid:     req.CallUuid,
 		CreatedBy:    createdBy,

@@ -24,7 +24,7 @@ func (u *UUIDArray) Scan(value interface{}) error {
 		*u = nil
 		return nil
 	}
-	
+
 	var bytes []byte
 	switch v := value.(type) {
 	case []byte:
@@ -34,7 +34,7 @@ func (u *UUIDArray) Scan(value interface{}) error {
 	default:
 		return fmt.Errorf("unsupported type: %T", value)
 	}
-	
+
 	return json.Unmarshal(bytes, u)
 }
 
@@ -89,26 +89,26 @@ type CallLogMeta struct {
 
 // CallLogCreateRequest for creating a new call log
 type CallLogCreateRequest struct {
-	CallUuid     string      `json:"call_uuid,omitempty" validate:"omitempty,max=36"`
-	StartAt      *time.Time  `json:"start_at,omitempty"`
-	EndAt        *time.Time  `json:"end_at,omitempty"`
-	Status       string      `json:"status" validate:"required,max=20"`
-	Participants UUIDArray   `json:"participants,omitempty"`
-	InvitedUsers UUIDArray   `json:"invited_users,omitempty"`
-	RecordingUrl string      `json:"recording_url,omitempty" validate:"omitempty,max=500"`
-	Meta         string      `json:"meta,omitempty"`
+	CallUuid     string     `json:"call_uuid,omitempty" validate:"omitempty,max=36"`
+	StartAt      *time.Time `json:"start_at,omitempty"`
+	EndAt        *time.Time `json:"end_at,omitempty"`
+	Status       string     `json:"status" validate:"required,max=20"`
+	Participants UUIDArray  `json:"participants,omitempty"`
+	InvitedUsers UUIDArray  `json:"invited_users,omitempty"`
+	RecordingUrl string     `json:"recording_url,omitempty" validate:"omitempty,max=500"`
+	Meta         string     `json:"meta,omitempty"`
 }
 
 // CallLogUpdateRequest for updating a call log
 type CallLogUpdateRequest struct {
-	StartAt      *time.Time  `json:"start_at,omitempty"`
-	EndAt        *time.Time  `json:"end_at,omitempty"`
-	Status       string      `json:"status,omitempty" validate:"omitempty,max=20"`
-	Participants UUIDArray   `json:"participants,omitempty"`
-	JoinedUsers  UUIDArray   `json:"joined_users,omitempty"`
-	InvitedUsers UUIDArray   `json:"invited_users,omitempty"`
-	RecordingUrl string      `json:"recording_url,omitempty" validate:"omitempty,max=500"`
-	Meta         string      `json:"meta,omitempty"`
+	StartAt      *time.Time `json:"start_at,omitempty"`
+	EndAt        *time.Time `json:"end_at,omitempty"`
+	Status       string     `json:"status,omitempty" validate:"omitempty,max=20"`
+	Participants UUIDArray  `json:"participants,omitempty"`
+	JoinedUsers  UUIDArray  `json:"joined_users,omitempty"`
+	InvitedUsers UUIDArray  `json:"invited_users,omitempty"`
+	RecordingUrl string     `json:"recording_url,omitempty" validate:"omitempty,max=500"`
+	Meta         string     `json:"meta,omitempty"`
 }
 
 // CallLogResponse for API responses
