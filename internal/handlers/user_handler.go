@@ -420,3 +420,30 @@ func (h *UserHandler) MatchUsers(c *fiber.Ctx) error {
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Users matched", matchResponse)
 }
+
+func (h *UserHandler) UpdateUserCallStatus(c *fiber.Ctx) error {
+	// Get Extension from Params
+	userExt := c.Params("userExtID")
+	var req struct {
+		Status string `json:"call_status"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+	}
+	validStatuses := map[string]bool{
+		"available": true,
+		"in_call":   true,
+		"offline":   true,
+	}
+	if !validStatuses[req.Status] {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid status: "+req.Status)
+	}
+
+	// Call Service
+	resp, err := h.userService.UpdateUserCallStatus(c.Context(), userExt, req.Status)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "User call status updated successfully", resp)
+}

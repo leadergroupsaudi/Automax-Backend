@@ -34,6 +34,19 @@ func Connect(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 
 func Migrate(db *gorm.DB) error {
 	log.Println("Running database migrations...")
+	// Manually create the ENUM type for call_status if it doesn't exist
+	createEnumQuery := `
+        DO $$ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_call_status') THEN 
+                CREATE TYPE user_call_status AS ENUM ('offline', 'online', 'busy', 'in_call', 'available'); 
+            END IF; 
+        END $$;`
+
+	if err := db.Exec(createEnumQuery).Error; err != nil {
+		return fmt.Errorf("failed to create enum type: %w", err)
+	}
+
 	err := db.AutoMigrate(
 		&models.Permission{},
 		&models.Role{},

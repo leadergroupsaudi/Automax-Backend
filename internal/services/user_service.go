@@ -2,8 +2,11 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"mime/multipart"
+	"time"
 
 	"github.com/automax/backend/internal/config"
 	"github.com/automax/backend/internal/database"
@@ -29,6 +32,7 @@ type UserService interface {
 	ListUsers(ctx context.Context, page, limit int) ([]models.UserResponse, int64, error)
 	GetUserByID(ctx context.Context, userID uuid.UUID) (*models.UserResponse, error)
 	FindMatchingUsers(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.UserResponse, error)
+	UpdateUserCallStatus(ctx context.Context, extension string, status string) (interface{}, error)
 }
 
 type userService struct {
@@ -420,4 +424,54 @@ func (s *userService) FindMatchingUsers(ctx context.Context, roleID, classificat
 	}
 
 	return responses, nil
+}
+
+func (s *userService) UpdateUserCallStatus(ctx context.Context, extension string, status string) (interface{}, error) {
+	//Setup cache key
+	cacheKey := fmt.Sprintf("USER_CALL_STATUS:%s", extension)
+	var cachedStatus map[string]interface{}
+
+	err := s.sessionStore.Get(ctx, cacheKey, &cachedStatus)
+	if err == nil {
+		if st, ok := cachedStatus["call_status"].(string); ok && st == status {
+			return cachedStatus, nil
+		}
+	}
+
+	// Fetch User from DB
+	user, err := s.userRepo.FindByExtension(ctx, extension)
+	if err != nil {
+		return nil, fmt.Errorf("user with extension %s not found: %w", extension, err)
+	}
+
+	// Update DB if status is different
+	if string(user.CallStatus) != status {
+		user.CallStatus = models.CallStatus(status)
+		if err := s.userRepo.Update(ctx, user); err != nil {
+			return nil, err
+		}
+	}
+
+	// Prepare Response
+	result := map[string]interface{}{
+		"id":          user.ID,
+		"extension":   user.Extension,
+		"call_status": user.CallStatus,
+		"updated_at":  user.UpdatedAt,
+	}
+
+	//  Update Cache
+	err = s.sessionStore.Set(ctx, cacheKey, result, 15*time.Minute)
+	if err != nil {
+		fmt.Printf("Failed to update cache: %v\n", err)
+	}
+
+	return result, nil
+}
+
+// Helper to keep code clean
+func (s *userService) updateStatusCache(ctx context.Context, key string, data interface{}) {
+	if bytes, err := json.Marshal(data); err == nil {
+		_ = s.sessionStore.Set(ctx, key, string(bytes), 15*time.Minute)
+	}
 }

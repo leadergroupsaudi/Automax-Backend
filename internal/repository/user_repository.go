@@ -29,6 +29,8 @@ type UserRepository interface {
 	GetUserRoles(ctx context.Context, userID uuid.UUID) ([]models.Role, error)
 	GetUserPermissions(ctx context.Context, userID uuid.UUID) ([]string, error)
 	FindMatching(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.User, error)
+
+	FindByExtension(ctx context.Context, extension string) (*models.User, error)
 }
 
 type userRepository struct {
@@ -321,4 +323,10 @@ func (r *userRepository) FindMatching(ctx context.Context, roleID, classificatio
 
 	err := query.Distinct().Order("first_name, last_name").Find(&users).Error
 	return users, err
+}
+
+func (r *userRepository) FindByExtension(ctx context.Context, extension string) (*models.User, error) {
+	var user models.User
+	err := r.db.WithContext(ctx).Where("extension = ?", extension).First(&user).Error
+	return &user, err
 }
