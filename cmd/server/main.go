@@ -141,6 +141,7 @@ func main() {
 	users.Post("/me/avatar", authMiddleware.Authenticate(), userHandler.UploadAvatar)
 	users.Put("/me/password", authMiddleware.Authenticate(), userHandler.ChangePassword)
 	users.Delete("/me", authMiddleware.Authenticate(), userHandler.DeleteAccount)
+	users.Put("/:userExtID/status", userHandler.UpdateUserCallStatus)
 
 	// Incident routes (authenticated users)
 	incidents := v1.Group("/incidents", authMiddleware.Authenticate())

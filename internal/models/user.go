@@ -7,6 +7,14 @@ import (
 	"gorm.io/gorm"
 )
 
+type CallStatus string
+
+const (
+	CallStatusOffline CallStatus = "offline"
+	CallStatusOnline  CallStatus = "online"
+	CallStatusBusy    CallStatus = "busy"
+)
+
 type User struct {
 	ID              uuid.UUID        `gorm:"type:uuid;primary_key" json:"id"`
 	Email           string           `gorm:"uniqueIndex;not null" json:"email"`
@@ -26,6 +34,8 @@ type User struct {
 	Roles           []Role           `gorm:"many2many:user_roles;" json:"roles,omitempty"`
 	IsActive        bool             `gorm:"default:true" json:"is_active"`
 	IsSuperAdmin    bool             `gorm:"default:false" json:"is_super_admin"`
+	Extension       string           `gorm:"size:20" json:"extension"`
+	CallStatus      CallStatus       `gorm:"type:user_call_status;default:offline" json:"call_status"`
 	LastLoginAt     *time.Time       `json:"last_login_at"`
 	CreatedAt       time.Time        `json:"created_at"`
 	UpdatedAt       time.Time        `json:"updated_at"`
@@ -145,6 +155,8 @@ type UserResponse struct {
 	Permissions     []string                 `json:"permissions,omitempty"`
 	IsActive        bool                     `json:"is_active"`
 	IsSuperAdmin    bool                     `json:"is_super_admin"`
+	Extension       string                   `json:"extension"`
+	CallStatus      string                   `json:"call_status"`
 	LastLoginAt     *time.Time               `json:"last_login_at"`
 	CreatedAt       time.Time                `json:"created_at"`
 }
@@ -194,6 +206,8 @@ func ToUserResponse(user *User) UserResponse {
 		LocationID:   user.LocationID,
 		IsActive:     user.IsActive,
 		IsSuperAdmin: user.IsSuperAdmin,
+		Extension:    user.Extension,
+		CallStatus:   string(user.CallStatus),
 		LastLoginAt:  user.LastLoginAt,
 		CreatedAt:    user.CreatedAt,
 		Permissions:  user.GetPermissions(),
