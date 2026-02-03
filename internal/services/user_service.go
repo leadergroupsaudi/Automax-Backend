@@ -33,6 +33,7 @@ type UserService interface {
 	GetUserByID(ctx context.Context, userID uuid.UUID) (*models.UserResponse, error)
 	FindMatchingUsers(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.UserResponse, error)
 	UpdateUserCallStatus(ctx context.Context, extension string, status string) (interface{}, error)
+	FindByExtension(ctx context.Context, extension string) (*models.User, error)
 }
 
 type userService struct {
@@ -289,6 +290,10 @@ func (s *userService) UpdateProfile(ctx context.Context, userID uuid.UUID, req *
 		user.IsActive = *req.IsActive
 	}
 
+	if req.Extension != "" {
+		user.Extension = req.Extension
+	}
+
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return nil, err
 	}
@@ -474,4 +479,12 @@ func (s *userService) updateStatusCache(ctx context.Context, key string, data in
 	if bytes, err := json.Marshal(data); err == nil {
 		_ = s.sessionStore.Set(ctx, key, string(bytes), 15*time.Minute)
 	}
+}
+
+func (s *userService) FindByExtension(ctx context.Context, extension string) (*models.User, error) {
+	user, err := s.userRepo.FindByExtension(ctx, extension)
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
 }

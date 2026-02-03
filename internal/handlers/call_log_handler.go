@@ -15,12 +15,14 @@ import (
 type CallLogHandler struct {
 	service   services.CallLogService
 	validator *validator.Validate
+	userSvc   services.UserService
 }
 
-func NewCallLogHandler(service services.CallLogService, validator *validator.Validate) *CallLogHandler {
+func NewCallLogHandler(service services.CallLogService, validator *validator.Validate, userSvc services.UserService) *CallLogHandler {
 	return &CallLogHandler{
 		service:   service,
 		validator: validator,
+		userSvc:   userSvc,
 	}
 }
 
@@ -192,8 +194,8 @@ func (h *CallLogHandler) GetStats(c *fiber.Ctx) error {
 // StartCall handles POST /api/v1/calls/start
 func (h *CallLogHandler) StartCall(c *fiber.Ctx) error {
 	var req struct {
-		CallUUID     string      `json:"call_uuid" validate:"required"`
-		Participants []uuid.UUID `json:"participants,omitempty"`
+		CallUUID     string        `json:"call_uuid" validate:"required"`
+		Participants []interface{} `json:"participants,omitempty"`
 	}
 
 	if err := c.BodyParser(&req); err != nil {
@@ -209,7 +211,31 @@ func (h *CallLogHandler) StartCall(c *fiber.Ctx) error {
 		return utils.ErrorResponse(c, fiber.StatusUnauthorized, "User not authenticated")
 	}
 
-	callLog, err := h.service.StartCall(c.Context(), req.CallUUID, userID, req.Participants)
+	// Resolve participant IDs from user IDs or extension IDs
+	var participantIDs []uuid.UUID
+	for _, p := range req.Participants {
+		var id uuid.UUID
+		var err error
+
+		switch v := p.(type) {
+		case string:
+			id, err = uuid.Parse(v)
+			if err != nil {
+				// Try to resolve by extension ID
+				usr, err := h.userSvc.FindByExtension(c.Context(), v)
+				if err != nil {
+					return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid participant: "+v)
+				}
+				id = usr.ID
+			}
+		default:
+			return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid participant format")
+		}
+
+		participantIDs = append(participantIDs, id)
+	}
+
+	callLog, err := h.service.StartCall(c.Context(), req.CallUUID, userID, participantIDs)
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
 	}

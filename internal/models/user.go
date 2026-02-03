@@ -127,6 +127,7 @@ type UserUpdateRequest struct {
 	LastName          string      `json:"last_name" validate:"max=100"`
 	Username          string      `json:"username" validate:"min=3,max=50"`
 	Phone             string      `json:"phone" validate:"max=20"`
+	Extension         string      `json:"extension" validate:"max=20"`
 	DepartmentID      *uuid.UUID  `json:"department_id"`
 	LocationID        *uuid.UUID  `json:"location_id"`
 	DepartmentIDs     []uuid.UUID `json:"department_ids"`

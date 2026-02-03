@@ -97,7 +97,7 @@ func main() {
 	departmentHandler := handlers.NewDepartmentHandler(departmentRepo)
 	roleHandler := handlers.NewRoleHandler(roleRepo, permissionRepo)
 	actionLogHandler := handlers.NewActionLogHandler(actionLogService, validate)
-	callLogHandler := handlers.NewCallLogHandler(callLogService, validate)
+	callLogHandler := handlers.NewCallLogHandler(callLogService, validate, userService)
 	workflowHandler := handlers.NewWorkflowHandler(workflowService)
 	incidentHandler := handlers.NewIncidentHandler(incidentService, userRepo, minioStorage)
 	reportHandler := handlers.NewReportHandler(reportService)
