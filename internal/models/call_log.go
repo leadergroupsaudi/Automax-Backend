@@ -1,11 +1,57 @@
 package models
 
 import (
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// UUIDArray represents an array of UUIDs for PostgreSQL
+type UUIDArray []uuid.UUID
+
+// Value implements the driver.Valuer interface
+func (u UUIDArray) Value() (driver.Value, error) {
+	return json.Marshal(u)
+}
+
+// Scan implements the sql.Scanner interface
+func (u *UUIDArray) Scan(value interface{}) error {
+	if value == nil {
+		*u = nil
+		return nil
+	}
+	
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported type: %T", value)
+	}
+	
+	return json.Unmarshal(bytes, u)
+}
+
+// MarshalJSON implements json.Marshaler
+func (u UUIDArray) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]uuid.UUID(u))
+}
+
+// UnmarshalJSON implements json.Unmarshaler
+func (u *UUIDArray) UnmarshalJSON(data []byte) error {
+	var uuids []uuid.UUID
+	if err := json.Unmarshal(data, &uuids); err != nil {
+		return err
+	}
+	*u = UUIDArray(uuids)
+	return nil
+}
 
 type CallLog struct {
 	ID           uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
@@ -15,9 +61,9 @@ type CallLog struct {
 	StartAt      *time.Time     `json:"start_at,omitempty"`
 	EndAt        *time.Time     `json:"end_at,omitempty"`
 	Status       string         `gorm:"size:20;not null" json:"status"`
-	Participants []uuid.UUID    `gorm:"type:uuid[]" json:"participants,omitempty"`
-	JoinedUsers  []uuid.UUID    `gorm:"type:uuid[]" json:"joined_users,omitempty"`
-	InvitedUsers []uuid.UUID    `gorm:"type:uuid[]" json:"invited_users,omitempty"`
+	Participants UUIDArray      `gorm:"type:text" json:"participants,omitempty"`
+	JoinedUsers  UUIDArray      `gorm:"type:text" json:"joined_users,omitempty"`
+	InvitedUsers UUIDArray      `gorm:"type:text" json:"invited_users,omitempty"`
 	RecordingUrl string         `gorm:"size:500" json:"recording_url,omitempty"`
 	Meta         string         `gorm:"type:json" json:"meta,omitempty"` // JSON string for metadata
 	CreatedAt    time.Time      `json:"created_at"`
@@ -47,8 +93,8 @@ type CallLogCreateRequest struct {
 	StartAt      *time.Time  `json:"start_at,omitempty"`
 	EndAt        *time.Time  `json:"end_at,omitempty"`
 	Status       string      `json:"status" validate:"required,max=20"`
-	Participants []uuid.UUID `json:"participants,omitempty"`
-	InvitedUsers []uuid.UUID `json:"invited_users,omitempty"`
+	Participants UUIDArray   `json:"participants,omitempty"`
+	InvitedUsers UUIDArray   `json:"invited_users,omitempty"`
 	RecordingUrl string      `json:"recording_url,omitempty" validate:"omitempty,max=500"`
 	Meta         string      `json:"meta,omitempty"`
 }
@@ -58,9 +104,9 @@ type CallLogUpdateRequest struct {
 	StartAt      *time.Time  `json:"start_at,omitempty"`
 	EndAt        *time.Time  `json:"end_at,omitempty"`
 	Status       string      `json:"status,omitempty" validate:"omitempty,max=20"`
-	Participants []uuid.UUID `json:"participants,omitempty"`
-	JoinedUsers  []uuid.UUID `json:"joined_users,omitempty"`
-	InvitedUsers []uuid.UUID `json:"invited_users,omitempty"`
+	Participants UUIDArray   `json:"participants,omitempty"`
+	JoinedUsers  UUIDArray   `json:"joined_users,omitempty"`
+	InvitedUsers UUIDArray   `json:"invited_users,omitempty"`
 	RecordingUrl string      `json:"recording_url,omitempty" validate:"omitempty,max=500"`
 	Meta         string      `json:"meta,omitempty"`
 }

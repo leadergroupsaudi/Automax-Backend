@@ -30,6 +30,11 @@ func NewCallLogService(repo repository.CallLogRepository) CallLogService {
 }
 
 func (s *callLogService) CreateCallLog(ctx context.Context, req *models.CallLogCreateRequest, createdBy uuid.UUID) (*models.CallLogResponse, error) {
+	meta := req.Meta
+	if meta == "" {
+		meta = "{}"
+	}
+	
 	callLog := &models.CallLog{
 		CallUuid:     req.CallUuid,
 		CreatedBy:    createdBy,
@@ -39,7 +44,7 @@ func (s *callLogService) CreateCallLog(ctx context.Context, req *models.CallLogC
 		Participants: req.Participants,
 		InvitedUsers: req.InvitedUsers,
 		RecordingUrl: req.RecordingUrl,
-		Meta:         req.Meta,
+		Meta:         meta,
 		CreatedAt:    time.Now(),
 	}
 
@@ -82,7 +87,11 @@ func (s *callLogService) UpdateCallLog(ctx context.Context, id uuid.UUID, req *m
 		callLog.RecordingUrl = req.RecordingUrl
 	}
 	if req.Meta != "" {
-		callLog.Meta = req.Meta
+		if req.Meta == "" {
+			callLog.Meta = "{}"
+		} else {
+			callLog.Meta = req.Meta
+		}
 	}
 
 	callLog.UpdatedAt = &time.Time{}
