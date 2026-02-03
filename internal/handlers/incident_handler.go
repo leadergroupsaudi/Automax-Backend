@@ -16,18 +16,20 @@ import (
 )
 
 type IncidentHandler struct {
-	service   services.IncidentService
-	userRepo  repository.UserRepository
-	storage   *storage.MinIOStorage
-	validator *validator.Validate
+	service      services.IncidentService
+	userRepo     repository.UserRepository
+	incidentRepo repository.IncidentRepository
+	storage      *storage.MinIOStorage
+	validator    *validator.Validate
 }
 
-func NewIncidentHandler(service services.IncidentService, userRepo repository.UserRepository, storage *storage.MinIOStorage) *IncidentHandler {
+func NewIncidentHandler(service services.IncidentService, userRepo repository.UserRepository, incidentRepo repository.IncidentRepository, storage *storage.MinIOStorage) *IncidentHandler {
 	return &IncidentHandler{
-		service:   service,
-		userRepo:  userRepo,
-		storage:   storage,
-		validator: validator.New(),
+		service:      service,
+		userRepo:     userRepo,
+		incidentRepo: incidentRepo,
+		storage:      storage,
+		validator:    validator.New(),
 	}
 }
 
