@@ -42,6 +42,7 @@ func Migrate(db *gorm.DB) error {
 		&models.Department{},
 		&models.User{},
 		&models.ActionLog{},
+		&models.CallLog{},
 		// Lookup models
 		&models.LookupCategory{},
 		&models.LookupValue{},
@@ -170,6 +171,12 @@ func Seed(db *gorm.DB) error {
 		// Action Log permissions
 		{Name: "View Action Logs", Code: "action-logs:view", Module: "action-logs", Action: "view", Description: "View action logs"},
 		{Name: "Delete Action Logs", Code: "action-logs:delete", Module: "action-logs", Action: "delete", Description: "Delete/cleanup action logs"},
+
+		// Call Log permissions
+		{Name: "View Call Logs", Code: "call-logs:view", Module: "call-logs", Action: "view", Description: "View call logs"},
+		{Name: "Create Call Logs", Code: "call-logs:create", Module: "call-logs", Action: "create", Description: "Create call logs"},
+		{Name: "Update Call Logs", Code: "call-logs:update", Module: "call-logs", Action: "update", Description: "Update call logs"},
+		{Name: "Delete Call Logs", Code: "call-logs:delete", Module: "call-logs", Action: "delete", Description: "Delete call logs"},
 
 		// Lookup permissions
 		{Name: "View Lookups", Code: "lookups:view", Module: "lookups", Action: "view", Description: "View lookup categories and values"},
