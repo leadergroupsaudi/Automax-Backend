@@ -8,20 +8,20 @@ import (
 )
 
 type CallLog struct {
-	ID           uuid.UUID     `gorm:"type:uuid;primary_key" json:"id"`
-	CallUuid     string        `gorm:"size:36;uniqueIndex" json:"call_uuid,omitempty"`
-	CreatedBy    uuid.UUID     `gorm:"type:uuid;index;not null" json:"created_by"`
-	Creator      *User         `gorm:"foreignKey:CreatedBy" json:"creator,omitempty"`
-	StartAt      *time.Time    `json:"start_at,omitempty"`
-	EndAt        *time.Time    `json:"end_at,omitempty"`
-	Status       string        `gorm:"size:20;not null" json:"status"`
-	Participants []uuid.UUID   `gorm:"type:uuid[]" json:"participants,omitempty"`
-	JoinedUsers  []uuid.UUID   `gorm:"type:uuid[]" json:"joined_users,omitempty"`
-	InvitedUsers []uuid.UUID   `gorm:"type:uuid[]" json:"invited_users,omitempty"`
-	RecordingUrl string        `gorm:"size:500" json:"recording_url,omitempty"`
-	Meta         string        `gorm:"type:json" json:"meta,omitempty"` // JSON string for metadata
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    *time.Time    `json:"updated_at,omitempty"`
+	ID           uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
+	CallUuid     string         `gorm:"size:36;uniqueIndex" json:"call_uuid,omitempty"`
+	CreatedBy    uuid.UUID      `gorm:"type:uuid;index;not null" json:"created_by"`
+	Creator      *User          `gorm:"foreignKey:CreatedBy" json:"creator,omitempty"`
+	StartAt      *time.Time     `json:"start_at,omitempty"`
+	EndAt        *time.Time     `json:"end_at,omitempty"`
+	Status       string         `gorm:"size:20;not null" json:"status"`
+	Participants []uuid.UUID    `gorm:"type:uuid[]" json:"participants,omitempty"`
+	JoinedUsers  []uuid.UUID    `gorm:"type:uuid[]" json:"joined_users,omitempty"`
+	InvitedUsers []uuid.UUID    `gorm:"type:uuid[]" json:"invited_users,omitempty"`
+	RecordingUrl string         `gorm:"size:500" json:"recording_url,omitempty"`
+	Meta         string         `gorm:"type:json" json:"meta,omitempty"` // JSON string for metadata
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    *time.Time     `json:"updated_at,omitempty"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
@@ -33,12 +33,12 @@ func (c *CallLog) BeforeCreate(tx *gorm.DB) error {
 }
 
 type CallLogMeta struct {
-	Duration    int                    `json:"duration,omitempty"`    // Duration in seconds
-	CallType    string                 `json:"call_type,omitempty"`   // audio, video, etc.
-	Platform    string                 `json:"platform,omitempty"`    // web, mobile, etc.
-	DeviceInfo  map[string]interface{} `json:"device_info,omitempty"`
-	Quality     string                 `json:"quality,omitempty"`     // hd, sd, etc.
-	Notes       string                 `json:"notes,omitempty"`
+	Duration   int                    `json:"duration,omitempty"`  // Duration in seconds
+	CallType   string                 `json:"call_type,omitempty"` // audio, video, etc.
+	Platform   string                 `json:"platform,omitempty"`  // web, mobile, etc.
+	DeviceInfo map[string]interface{} `json:"device_info,omitempty"`
+	Quality    string                 `json:"quality,omitempty"` // hd, sd, etc.
+	Notes      string                 `json:"notes,omitempty"`
 }
 
 // CallLogCreateRequest for creating a new call log
@@ -67,20 +67,20 @@ type CallLogUpdateRequest struct {
 
 // CallLogResponse for API responses
 type CallLogResponse struct {
-	ID           uuid.UUID            `json:"id"`
-	CallUuid     string               `json:"call_uuid,omitempty"`
-	CreatedBy    uuid.UUID            `json:"created_by"`
-	Creator      *UserResponse        `json:"creator,omitempty"`
-	StartAt      *time.Time           `json:"start_at,omitempty"`
-	EndAt        *time.Time           `json:"end_at,omitempty"`
-	Status       string               `json:"status"`
-	Participants []UserResponse       `json:"participants,omitempty"`
-	JoinedUsers  []UserResponse       `json:"joined_users,omitempty"`
-	InvitedUsers []UserResponse       `json:"invited_users,omitempty"`
-	RecordingUrl string               `json:"recording_url,omitempty"`
-	Meta         string               `json:"meta,omitempty"`
-	CreatedAt    time.Time            `json:"created_at"`
-	UpdatedAt    *time.Time           `json:"updated_at,omitempty"`
+	ID           uuid.UUID      `json:"id"`
+	CallUuid     string         `json:"call_uuid,omitempty"`
+	CreatedBy    uuid.UUID      `json:"created_by"`
+	Creator      *UserResponse  `json:"creator,omitempty"`
+	StartAt      *time.Time     `json:"start_at,omitempty"`
+	EndAt        *time.Time     `json:"end_at,omitempty"`
+	Status       string         `json:"status"`
+	Participants []UserResponse `json:"participants,omitempty"`
+	JoinedUsers  []UserResponse `json:"joined_users,omitempty"`
+	InvitedUsers []UserResponse `json:"invited_users,omitempty"`
+	RecordingUrl string         `json:"recording_url,omitempty"`
+	Meta         string         `json:"meta,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    *time.Time     `json:"updated_at,omitempty"`
 }
 
 // CallLogFilter for filtering call logs
@@ -96,9 +96,9 @@ type CallLogFilter struct {
 
 // CallLogStats represents statistics for call logs
 type CallLogStats struct {
-	TotalCalls     int64            `json:"total_calls"`
-	RecentCalls    int64            `json:"recent_calls"`
-	CallsByStatus  map[string]int64 `json:"calls_by_status"`
+	TotalCalls    int64            `json:"total_calls"`
+	RecentCalls   int64            `json:"recent_calls"`
+	CallsByStatus map[string]int64 `json:"calls_by_status"`
 }
 
 func ToCallLogResponse(callLog *CallLog, userRepo interface{}) CallLogResponse {
