@@ -489,6 +489,8 @@ func (s *userService) FindByExtension(ctx context.Context, extension string) (*m
 		return nil, err
 	}
 	return user, nil
+}
+
 func (s *userService) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 	return s.userRepo.FindByEmail(ctx, email)
 }
