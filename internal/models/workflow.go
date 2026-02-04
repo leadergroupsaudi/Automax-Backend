@@ -146,7 +146,7 @@ type TransitionRequirement struct {
 	RequirementType string `gorm:"size:50;not null" json:"requirement_type"` // comment, attachment, field_value
 	FieldName       string `gorm:"size:100" json:"field_name"`               // for field_value type
 	FieldValue      string `gorm:"size:500" json:"field_value"`              // expected value or validation rule
-	IsMandatory     bool   `gorm:"default:true" json:"is_mandatory"`
+	IsMandatory     *bool  `gorm:"default:true" json:"is_mandatory"`
 	ErrorMessage    string `gorm:"size:200" json:"error_message"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -284,7 +284,7 @@ type TransitionRequirementRequest struct {
 	RequirementType string `json:"requirement_type" validate:"required,oneof=comment attachment feedback field_value"`
 	FieldName       string `json:"field_name"`
 	FieldValue      string `json:"field_value"`
-	IsMandatory     bool   `json:"is_mandatory"`
+	IsMandatory     *bool  `json:"is_mandatory"`
 	ErrorMessage    string `json:"error_message"`
 }
 
@@ -406,7 +406,7 @@ type TransitionRequirementResponse struct {
 	RequirementType string    `json:"requirement_type"`
 	FieldName       string    `json:"field_name,omitempty"`
 	FieldValue      string    `json:"field_value,omitempty"`
-	IsMandatory     bool      `json:"is_mandatory"`
+	IsMandatory     *bool     `json:"is_mandatory"`
 	ErrorMessage    string    `json:"error_message,omitempty"`
 }
 
@@ -609,4 +609,94 @@ func ToTransitionActionResponse(a *TransitionAction) TransitionActionResponse {
 		IsAsync:        a.IsAsync,
 		IsActive:       a.IsActive,
 	}
+}
+
+// Export/Import structures
+
+// CodeNamePair represents a portable reference using code and name
+type CodeNamePair struct {
+	Code string `json:"code"`
+	Name string `json:"name"`
+}
+
+// WorkflowExportData is the top-level export structure
+type WorkflowExportData struct {
+	ExportVersion string                 `json:"export_version"`
+	ExportedAt    string                 `json:"exported_at"`
+	Workflow      WorkflowExportContent  `json:"workflow"`
+}
+
+// WorkflowExportContent contains workflow data with codes instead of IDs
+type WorkflowExportContent struct {
+	Name                  string                      `json:"name"`
+	Code                  string                      `json:"code"`
+	Description           string                      `json:"description"`
+	RecordType            string                      `json:"record_type"`
+	RequiredFields        []string                    `json:"required_fields"`
+	States                []WorkflowStateExport       `json:"states"`
+	Transitions           []WorkflowTransitionExport  `json:"transitions"`
+	Classifications       []CodeNamePair              `json:"classifications"`
+	ConvertToRequestRoles []CodeNamePair              `json:"convert_to_request_roles"`
+}
+
+// WorkflowStateExport represents a state with viewable role codes
+type WorkflowStateExport struct {
+	Name          string         `json:"name"`
+	Code          string         `json:"code"`
+	Description   string         `json:"description"`
+	StateType     string         `json:"state_type"`
+	Color         string         `json:"color"`
+	PositionX     int            `json:"position_x"`
+	PositionY     int            `json:"position_y"`
+	SLAHours      *int           `json:"sla_hours,omitempty"`
+	SortOrder     int            `json:"sort_order"`
+	ViewableRoles []CodeNamePair `json:"viewable_roles,omitempty"`
+}
+
+// WorkflowTransitionExport represents a transition with codes and nested requirements/actions
+type WorkflowTransitionExport struct {
+	Name                 string                              `json:"name"`
+	Code                 string                              `json:"code"`
+	Description          string                              `json:"description"`
+	FromStateCode        string                              `json:"from_state_code"`
+	ToStateCode          string                              `json:"to_state_code"`
+	AllowedRoles         []CodeNamePair                      `json:"allowed_roles,omitempty"`
+	AssignDepartment     *CodeNamePair                       `json:"assign_department,omitempty"`
+	AutoDetectDepartment bool                                `json:"auto_detect_department"`
+	AssignUser           *CodeNamePair                       `json:"assign_user,omitempty"`
+	AssignmentRole       *CodeNamePair                       `json:"assignment_role,omitempty"`
+	AutoMatchUser        bool                                `json:"auto_match_user"`
+	ManualSelectUser     bool                                `json:"manual_select_user"`
+	Requirements         []TransitionRequirementExport       `json:"requirements,omitempty"`
+	Actions              []TransitionActionExport            `json:"actions,omitempty"`
+	SortOrder            int                                 `json:"sort_order"`
+}
+
+// TransitionRequirementExport represents a requirement without IDs
+type TransitionRequirementExport struct {
+	RequirementType string `json:"requirement_type"`
+	FieldName       string `json:"field_name,omitempty"`
+	FieldValue      string `json:"field_value,omitempty"`
+	IsMandatory     *bool  `json:"is_mandatory"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+}
+
+// TransitionActionExport represents an action without IDs
+type TransitionActionExport struct {
+	ActionType     string `json:"action_type"`
+	Name           string `json:"name"`
+	Description    string `json:"description,omitempty"`
+	Config         string `json:"config,omitempty"`
+	ExecutionOrder int    `json:"execution_order"`
+	IsAsync        bool   `json:"is_async"`
+	IsActive       bool   `json:"is_active"`
+}
+
+// WorkflowImportData is an alias for import (same structure as export)
+type WorkflowImportData = WorkflowExportData
+
+// WorkflowImportResponse contains the imported workflow and any warnings
+type WorkflowImportResponse struct {
+	Workflow WorkflowResponse `json:"workflow"`
+	Warnings []string         `json:"warnings"`
 }

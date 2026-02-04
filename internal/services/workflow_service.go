@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type WorkflowService interface {
@@ -51,14 +53,28 @@ type WorkflowService interface {
 
 	// Workflow matching - for mobile apps and other clients
 	MatchWorkflow(ctx context.Context, req *models.WorkflowMatchRequest) (*models.WorkflowMatchResponse, error)
+
+	// Import/Export
+	ExportWorkflow(ctx context.Context, id uuid.UUID) ([]byte, string, error)
+	ImportWorkflow(ctx context.Context, data *models.WorkflowImportData, createdByID uuid.UUID) (*models.WorkflowResponse, []string, error)
 }
 
 type workflowService struct {
-	repo repository.WorkflowRepository
+	repo       repository.WorkflowRepository
+	roleRepo   repository.RoleRepository
+	deptRepo   repository.DepartmentRepository
+	classRepo  repository.ClassificationRepository
+	db         *gorm.DB
 }
 
-func NewWorkflowService(repo repository.WorkflowRepository) WorkflowService {
-	return &workflowService{repo: repo}
+func NewWorkflowService(repo repository.WorkflowRepository, roleRepo repository.RoleRepository, deptRepo repository.DepartmentRepository, classRepo repository.ClassificationRepository, db *gorm.DB) WorkflowService {
+	return &workflowService{
+		repo:      repo,
+		roleRepo:  roleRepo,
+		deptRepo:  deptRepo,
+		classRepo: classRepo,
+		db:        db,
+	}
 }
 
 // Workflow CRUD
@@ -945,4 +961,506 @@ func (s *workflowService) MatchWorkflow(ctx context.Context, req *models.Workflo
 	}
 
 	return response, nil
+}
+
+// ExportWorkflow exports a workflow as JSON with all related data
+func (s *workflowService) ExportWorkflow(ctx context.Context, id uuid.UUID) ([]byte, string, error) {
+	// Load workflow with all relations
+	workflow, err := s.repo.FindByIDWithRelations(ctx, id)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Parse required fields
+	var requiredFields []string
+	if workflow.RequiredFields != "" {
+		json.Unmarshal([]byte(workflow.RequiredFields), &requiredFields)
+	}
+	if requiredFields == nil {
+		requiredFields = []string{}
+	}
+
+	// Build state code to ID mapping for transitions
+	stateCodeMap := make(map[uuid.UUID]string)
+	exportStates := make([]models.WorkflowStateExport, len(workflow.States))
+	for i, state := range workflow.States {
+		stateCodeMap[state.ID] = state.Code
+
+		// Convert viewable roles to code/name pairs
+		viewableRoles := make([]models.CodeNamePair, len(state.ViewableRoles))
+		for j, role := range state.ViewableRoles {
+			viewableRoles[j] = models.CodeNamePair{
+				Code: role.Code,
+				Name: role.Name,
+			}
+		}
+
+		exportStates[i] = models.WorkflowStateExport{
+			Name:          state.Name,
+			Code:          state.Code,
+			Description:   state.Description,
+			StateType:     state.StateType,
+			Color:         state.Color,
+			PositionX:     state.PositionX,
+			PositionY:     state.PositionY,
+			SLAHours:      state.SLAHours,
+			SortOrder:     state.SortOrder,
+			ViewableRoles: viewableRoles,
+		}
+	}
+
+	// Build transitions with codes
+	exportTransitions := make([]models.WorkflowTransitionExport, len(workflow.Transitions))
+	for i, trans := range workflow.Transitions {
+		// Convert allowed roles to code/name pairs
+		allowedRoles := make([]models.CodeNamePair, len(trans.AllowedRoles))
+		for j, role := range trans.AllowedRoles {
+			allowedRoles[j] = models.CodeNamePair{
+				Code: role.Code,
+				Name: role.Name,
+			}
+		}
+
+		// Convert department to code/name pair
+		var assignDepartment *models.CodeNamePair
+		if trans.AssignDepartment != nil {
+			assignDepartment = &models.CodeNamePair{
+				Code: trans.AssignDepartment.Code,
+				Name: trans.AssignDepartment.Name,
+			}
+		}
+
+		// Convert assign user to code/name pair (use email as code)
+		var assignUser *models.CodeNamePair
+		if trans.AssignUser != nil {
+			fullName := trans.AssignUser.FirstName
+			if trans.AssignUser.LastName != "" {
+				if fullName != "" {
+					fullName += " "
+				}
+				fullName += trans.AssignUser.LastName
+			}
+			if fullName == "" {
+				fullName = trans.AssignUser.Username
+			}
+			assignUser = &models.CodeNamePair{
+				Code: trans.AssignUser.Email,
+				Name: fullName,
+			}
+		}
+
+		// Convert assignment role to code/name pair
+		var assignmentRole *models.CodeNamePair
+		if trans.AssignmentRole != nil {
+			assignmentRole = &models.CodeNamePair{
+				Code: trans.AssignmentRole.Code,
+				Name: trans.AssignmentRole.Name,
+			}
+		}
+
+		// Convert requirements
+		requirements := make([]models.TransitionRequirementExport, len(trans.Requirements))
+		for j, req := range trans.Requirements {
+			requirements[j] = models.TransitionRequirementExport{
+				RequirementType: req.RequirementType,
+				FieldName:       req.FieldName,
+				FieldValue:      req.FieldValue,
+				IsMandatory:     req.IsMandatory,
+				ErrorMessage:    req.ErrorMessage,
+			}
+		}
+
+		// Convert actions
+		actions := make([]models.TransitionActionExport, len(trans.Actions))
+		for j, action := range trans.Actions {
+			actions[j] = models.TransitionActionExport{
+				ActionType:     action.ActionType,
+				Name:           action.Name,
+				Description:    action.Description,
+				Config:         action.Config,
+				ExecutionOrder: action.ExecutionOrder,
+				IsAsync:        action.IsAsync,
+				IsActive:       action.IsActive,
+			}
+		}
+
+		exportTransitions[i] = models.WorkflowTransitionExport{
+			Name:                 trans.Name,
+			Code:                 trans.Code,
+			Description:          trans.Description,
+			FromStateCode:        stateCodeMap[trans.FromStateID],
+			ToStateCode:          stateCodeMap[trans.ToStateID],
+			AllowedRoles:         allowedRoles,
+			AssignDepartment:     assignDepartment,
+			AutoDetectDepartment: trans.AutoDetectDepartment,
+			AssignUser:           assignUser,
+			AssignmentRole:       assignmentRole,
+			AutoMatchUser:        trans.AutoMatchUser,
+			ManualSelectUser:     trans.ManualSelectUser,
+			Requirements:         requirements,
+			Actions:              actions,
+			SortOrder:            trans.SortOrder,
+		}
+	}
+
+	// Convert classifications to code/name pairs (use name as code since no code field)
+	classifications := make([]models.CodeNamePair, len(workflow.Classifications))
+	for i, class := range workflow.Classifications {
+		classifications[i] = models.CodeNamePair{
+			Code: class.Name,
+			Name: class.Name,
+		}
+	}
+
+	// Convert convert-to-request roles
+	convertRoles := make([]models.CodeNamePair, len(workflow.ConvertToRequestRoles))
+	for i, role := range workflow.ConvertToRequestRoles {
+		convertRoles[i] = models.CodeNamePair{
+			Code: role.Code,
+			Name: role.Name,
+		}
+	}
+
+	// Build export structure
+	exportData := models.WorkflowExportData{
+		ExportVersion: "1.0",
+		ExportedAt:    time.Now().Format(time.RFC3339),
+		Workflow: models.WorkflowExportContent{
+			Name:                  workflow.Name,
+			Code:                  workflow.Code,
+			Description:           workflow.Description,
+			RecordType:            workflow.RecordType,
+			RequiredFields:        requiredFields,
+			States:                exportStates,
+			Transitions:           exportTransitions,
+			Classifications:       classifications,
+			ConvertToRequestRoles: convertRoles,
+		},
+	}
+
+	// Marshal to pretty-printed JSON
+	jsonBytes, err := json.MarshalIndent(exportData, "", "  ")
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Generate filename
+	timestamp := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("workflow_%s_%s.json", workflow.Code, timestamp)
+
+	return jsonBytes, filename, nil
+}
+
+// ImportWorkflow imports a workflow from JSON data
+func (s *workflowService) ImportWorkflow(ctx context.Context, data *models.WorkflowImportData, createdByID uuid.UUID) (*models.WorkflowResponse, []string, error) {
+	warnings := []string{}
+
+	// Validate export version
+	if data.ExportVersion != "1.0" {
+		return nil, nil, fmt.Errorf("unsupported export version: %s", data.ExportVersion)
+	}
+
+	// Validate required fields
+	if data.Workflow.Name == "" || data.Workflow.Code == "" {
+		return nil, nil, errors.New("workflow name and code are required")
+	}
+	if len(data.Workflow.States) == 0 {
+		return nil, nil, errors.New("workflow must have at least one state")
+	}
+
+	// Validate at least one initial state exists
+	hasInitialState := false
+	for _, state := range data.Workflow.States {
+		if state.StateType == "initial" {
+			hasInitialState = true
+			break
+		}
+	}
+	if !hasInitialState {
+		return nil, nil, errors.New("workflow must have at least one initial state")
+	}
+
+	// Check for duplicate workflow code
+	workflowCode := data.Workflow.Code
+	existing, _ := s.repo.FindByCode(ctx, workflowCode)
+	if existing != nil {
+		// Append timestamp to make it unique
+		timestamp := time.Now().Format("20060102_150405")
+		workflowCode = fmt.Sprintf("%s_imported_%s", workflowCode, timestamp)
+		warnings = append(warnings, fmt.Sprintf("Workflow code was modified to '%s' to avoid duplicate", workflowCode))
+	}
+
+	// Start transaction
+	tx := s.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if tx.Error != nil {
+		return nil, nil, tx.Error
+	}
+
+	// Resolve classification codes to IDs
+	classificationIDs := []uuid.UUID{}
+	for _, class := range data.Workflow.Classifications {
+		var classification models.Classification
+		err := tx.Where("name = ?", class.Code).First(&classification).Error
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				warnings = append(warnings, fmt.Sprintf("Classification '%s' not found and will be skipped", class.Name))
+				continue
+			}
+			tx.Rollback()
+			return nil, nil, err
+		}
+		classificationIDs = append(classificationIDs, classification.ID)
+	}
+
+	// Resolve convert-to-request role codes to IDs
+	convertRoleIDs := []uuid.UUID{}
+	for _, role := range data.Workflow.ConvertToRequestRoles {
+		foundRole, err := s.roleRepo.FindByCode(ctx, role.Code)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("Role '%s' not found for convert-to-request permission", role.Name))
+			continue
+		}
+		convertRoleIDs = append(convertRoleIDs, foundRole.ID)
+	}
+
+	// Create workflow
+	requiredFieldsJSON, _ := json.Marshal(data.Workflow.RequiredFields)
+	workflow := &models.Workflow{
+		ID:             uuid.New(),
+		Name:           data.Workflow.Name,
+		Code:           workflowCode,
+		Description:    data.Workflow.Description,
+		RecordType:     data.Workflow.RecordType,
+		RequiredFields: string(requiredFieldsJSON),
+		CreatedByID:    &createdByID,
+		IsActive:       false, // Start as inactive
+		Version:        1,
+	}
+
+	if err := tx.Create(workflow).Error; err != nil {
+		tx.Rollback()
+		return nil, nil, err
+	}
+
+	// Assign classifications
+	if len(classificationIDs) > 0 {
+		if err := tx.Exec("INSERT INTO workflow_classifications (workflow_id, classification_id) VALUES "+
+			buildBulkInsertValues(workflow.ID, classificationIDs)).Error; err != nil {
+			tx.Rollback()
+			return nil, nil, err
+		}
+	}
+
+	// Assign convert-to-request roles
+	if len(convertRoleIDs) > 0 {
+		if err := tx.Exec("INSERT INTO workflow_convert_to_request_roles (workflow_id, role_id) VALUES "+
+			buildBulkInsertValues(workflow.ID, convertRoleIDs)).Error; err != nil {
+			tx.Rollback()
+			return nil, nil, err
+		}
+	}
+
+	// Create states and build code to ID mapping
+	stateCodeToID := make(map[string]uuid.UUID)
+	for _, stateData := range data.Workflow.States {
+		state := &models.WorkflowState{
+			ID:          uuid.New(),
+			WorkflowID:  workflow.ID,
+			Name:        stateData.Name,
+			Code:        stateData.Code,
+			Description: stateData.Description,
+			StateType:   stateData.StateType,
+			Color:       stateData.Color,
+			PositionX:   stateData.PositionX,
+			PositionY:   stateData.PositionY,
+			SLAHours:    stateData.SLAHours,
+			SortOrder:   stateData.SortOrder,
+			IsActive:    true,
+		}
+
+		if err := tx.Create(state).Error; err != nil {
+			tx.Rollback()
+			return nil, nil, err
+		}
+
+		stateCodeToID[stateData.Code] = state.ID
+
+		// Resolve and assign viewable roles
+		if len(stateData.ViewableRoles) > 0 {
+			roleIDs := []uuid.UUID{}
+			for _, roleRef := range stateData.ViewableRoles {
+				role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
+				if err != nil {
+					warnings = append(warnings, fmt.Sprintf("Role '%s' not found for state '%s'", roleRef.Name, stateData.Name))
+					continue
+				}
+				roleIDs = append(roleIDs, role.ID)
+			}
+
+			if len(roleIDs) > 0 {
+				if err := tx.Exec("INSERT INTO state_viewable_roles (workflow_state_id, role_id) VALUES "+
+					buildBulkInsertValues(state.ID, roleIDs)).Error; err != nil {
+					tx.Rollback()
+					return nil, nil, err
+				}
+			}
+		}
+	}
+
+	// Create transitions
+	for _, transData := range data.Workflow.Transitions {
+		fromStateID, ok := stateCodeToID[transData.FromStateCode]
+		if !ok {
+			tx.Rollback()
+			return nil, nil, fmt.Errorf("invalid from_state_code: %s", transData.FromStateCode)
+		}
+
+		toStateID, ok := stateCodeToID[transData.ToStateCode]
+		if !ok {
+			tx.Rollback()
+			return nil, nil, fmt.Errorf("invalid to_state_code: %s", transData.ToStateCode)
+		}
+
+		transition := &models.WorkflowTransition{
+			ID:                   uuid.New(),
+			WorkflowID:           workflow.ID,
+			Name:                 transData.Name,
+			Code:                 transData.Code,
+			Description:          transData.Description,
+			FromStateID:          fromStateID,
+			ToStateID:            toStateID,
+			AutoDetectDepartment: transData.AutoDetectDepartment,
+			AutoMatchUser:        transData.AutoMatchUser,
+			ManualSelectUser:     transData.ManualSelectUser,
+			SortOrder:            transData.SortOrder,
+			IsActive:             true,
+		}
+
+		// Resolve department
+		if transData.AssignDepartment != nil {
+			dept, err := s.deptRepo.FindByCode(ctx, transData.AssignDepartment.Code)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("Department '%s' not found for transition '%s'", transData.AssignDepartment.Name, transData.Name))
+			} else {
+				transition.AssignDepartmentID = &dept.ID
+			}
+		}
+
+		// Resolve user (skip if not found, as users are environment-specific)
+		if transData.AssignUser != nil {
+			var user models.User
+			err := tx.Where("email = ?", transData.AssignUser.Code).First(&user).Error
+			if err == nil {
+				transition.AssignUserID = &user.ID
+			} else {
+				warnings = append(warnings, fmt.Sprintf("User '%s' not found for transition '%s'", transData.AssignUser.Name, transData.Name))
+			}
+		}
+
+		// Resolve assignment role
+		if transData.AssignmentRole != nil {
+			role, err := s.roleRepo.FindByCode(ctx, transData.AssignmentRole.Code)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("Assignment role '%s' not found for transition '%s'", transData.AssignmentRole.Name, transData.Name))
+			} else {
+				transition.AssignmentRoleID = &role.ID
+			}
+		}
+
+		if err := tx.Create(transition).Error; err != nil {
+			tx.Rollback()
+			return nil, nil, err
+		}
+
+		// Assign allowed roles
+		if len(transData.AllowedRoles) > 0 {
+			roleIDs := []uuid.UUID{}
+			for _, roleRef := range transData.AllowedRoles {
+				role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
+				if err != nil {
+					warnings = append(warnings, fmt.Sprintf("Role '%s' not found for transition '%s'", roleRef.Name, transData.Name))
+					continue
+				}
+				roleIDs = append(roleIDs, role.ID)
+			}
+
+			if len(roleIDs) > 0 {
+				if err := tx.Exec("INSERT INTO transition_allowed_roles (workflow_transition_id, role_id) VALUES "+
+					buildBulkInsertValues(transition.ID, roleIDs)).Error; err != nil {
+					tx.Rollback()
+					return nil, nil, err
+				}
+			}
+		}
+
+		// Create requirements
+		for _, reqData := range transData.Requirements {
+			requirement := &models.TransitionRequirement{
+				ID:              uuid.New(),
+				TransitionID:    transition.ID,
+				RequirementType: reqData.RequirementType,
+				FieldName:       reqData.FieldName,
+				FieldValue:      reqData.FieldValue,
+				IsMandatory:     reqData.IsMandatory,
+				ErrorMessage:    reqData.ErrorMessage,
+			}
+
+			if err := tx.Create(requirement).Error; err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+		}
+
+		// Create actions
+		for _, actionData := range transData.Actions {
+			action := &models.TransitionAction{
+				ID:             uuid.New(),
+				TransitionID:   transition.ID,
+				ActionType:     actionData.ActionType,
+				Name:           actionData.Name,
+				Description:    actionData.Description,
+				Config:         actionData.Config,
+				ExecutionOrder: actionData.ExecutionOrder,
+				IsAsync:        actionData.IsAsync,
+				IsActive:       actionData.IsActive,
+			}
+
+			if err := tx.Create(action).Error; err != nil {
+				tx.Rollback()
+				return nil, nil, err
+			}
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit().Error; err != nil {
+		return nil, nil, err
+	}
+
+	// Fetch the created workflow with all relations
+	createdWorkflow, err := s.repo.FindByIDWithRelations(ctx, workflow.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resp := models.ToWorkflowResponse(createdWorkflow)
+	return &resp, warnings, nil
+}
+
+// Helper function to build bulk insert SQL values
+func buildBulkInsertValues(workflowID uuid.UUID, ids []uuid.UUID) string {
+	values := ""
+	for i, id := range ids {
+		if i > 0 {
+			values += ", "
+		}
+		values += fmt.Sprintf("('%s', '%s')", workflowID.String(), id.String())
+	}
+	return values
 }

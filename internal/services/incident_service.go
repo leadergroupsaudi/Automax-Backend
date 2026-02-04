@@ -740,7 +740,7 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 
 	// Validate requirements
 	for _, requirement := range transition.Requirements {
-		if !requirement.IsMandatory {
+		if requirement.IsMandatory == nil || !*requirement.IsMandatory {
 			continue
 		}
 

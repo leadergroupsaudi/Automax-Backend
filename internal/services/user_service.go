@@ -31,6 +31,8 @@ type UserService interface {
 	DeleteUser(ctx context.Context, userID uuid.UUID) error
 	ListUsers(ctx context.Context, page, limit int) ([]models.UserResponse, int64, error)
 	GetUserByID(ctx context.Context, userID uuid.UUID) (*models.UserResponse, error)
+	GetUserByEmail(ctx context.Context, email string) (*models.User, error)
+	GetUserByUsername(ctx context.Context, username string) (*models.User, error)
 	FindMatchingUsers(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.UserResponse, error)
 	UpdateUserCallStatus(ctx context.Context, extension string, status string) (interface{}, error)
 }
@@ -474,4 +476,10 @@ func (s *userService) updateStatusCache(ctx context.Context, key string, data in
 	if bytes, err := json.Marshal(data); err == nil {
 		_ = s.sessionStore.Set(ctx, key, string(bytes), 15*time.Minute)
 	}
+func (s *userService) GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	return s.userRepo.FindByEmail(ctx, email)
+}
+
+func (s *userService) GetUserByUsername(ctx context.Context, username string) (*models.User, error) {
+	return s.userRepo.FindByUsername(ctx, username)
 }

@@ -1,6 +1,11 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
@@ -251,4 +256,147 @@ func (h *DepartmentHandler) MatchDepartment(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Departments matched", matchResponse)
+}
+
+// Export exports all departments as JSON
+func (h *DepartmentHandler) Export(c *fiber.Ctx) error {
+	departments, err := h.repo.List(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Filter out invalid records (with corrupted paths or invalid UUIDs)
+	validDepartments := make([]models.Department, 0)
+	invalidUUID := "00000000-0000-0000-0000-000000000000"
+
+	for _, dept := range departments {
+		// Skip records with invalid paths or IDs
+		if dept.ID.String() == invalidUUID ||
+		   strings.Contains(dept.Path, invalidUUID) {
+			continue
+		}
+		validDepartments = append(validDepartments, dept)
+	}
+
+	// Convert to export format
+	exportData := make([]map[string]interface{}, len(validDepartments))
+	for i, dept := range validDepartments {
+		exportData[i] = map[string]interface{}{
+			"id":          dept.ID,
+			"name":        dept.Name,
+			"code":        dept.Code,
+			"description": dept.Description,
+			"parent_id":   dept.ParentID,
+			"level":       dept.Level,
+			"path":        dept.Path,
+			"manager_id":  dept.ManagerID,
+			"is_active":   dept.IsActive,
+			"sort_order":  dept.SortOrder,
+		}
+	}
+
+	c.Set("Content-Type", "application/json")
+	c.Set("Content-Disposition", "attachment; filename=departments_export.json")
+	return c.JSON(exportData)
+}
+
+// Import imports departments from JSON
+func (h *DepartmentHandler) Import(c *fiber.Ctx) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "No file uploaded")
+	}
+
+	// Open and read file
+	fileContent, err := file.Open()
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to read file")
+	}
+	defer fileContent.Close()
+
+	// Read file content
+	var importData []struct {
+		ID          uuid.UUID  `json:"id"`
+		Name        string     `json:"name"`
+		Code        string     `json:"code"`
+		Description string     `json:"description"`
+		ParentID    *uuid.UUID `json:"parent_id"`
+		Level       int        `json:"level"`
+		Path        string     `json:"path"`
+		ManagerID   *uuid.UUID `json:"manager_id"`
+		IsActive    bool       `json:"is_active"`
+		SortOrder   int        `json:"sort_order"`
+	}
+
+	// Parse JSON from file
+	decoder := json.NewDecoder(fileContent)
+	if err := decoder.Decode(&importData); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid JSON format: "+err.Error())
+	}
+
+	// Sort by level to ensure parents are imported before children
+	sort.Slice(importData, func(i, j int) bool {
+		return importData[i].Level < importData[j].Level
+	})
+
+	// Create a map from old IDs to new IDs for maintaining parent-child relationships
+	idMapping := make(map[uuid.UUID]uuid.UUID)
+	imported := 0
+	skipped := 0
+	errors := []string{}
+
+	// Import all departments in level order
+	for _, data := range importData {
+		var newParentID *uuid.UUID
+
+		// If has parent, get the new parent ID from mapping
+		if data.ParentID != nil {
+			mappedParentID, exists := idMapping[*data.ParentID]
+			if exists {
+				newParentID = &mappedParentID
+			} else {
+				// Parent not found in import data, import as root node
+				newParentID = nil
+			}
+		}
+
+		// Check if department already exists with same name and parent
+		existingDepartment, err := h.repo.FindByNameAndParent(c.Context(), data.Name, newParentID)
+		if err == nil && existingDepartment != nil {
+			// Department already exists, use existing ID
+			skipped++
+			errors = append(errors, data.Name+" (Level "+fmt.Sprintf("%d", data.Level)+") - Already exists, skipped")
+			idMapping[data.ID] = existingDepartment.ID
+			continue
+		}
+
+		// Create new department
+		newID := uuid.New()
+		department := &models.Department{
+			ID:          newID,
+			Name:        data.Name,
+			Code:        data.Code,
+			Description: data.Description,
+			ParentID:    newParentID,
+			ManagerID:   data.ManagerID,
+			IsActive:    data.IsActive,
+			SortOrder:   data.SortOrder,
+		}
+
+		if err := h.repo.Create(c.Context(), department); err != nil {
+			skipped++
+			errors = append(errors, data.Name+" (Level "+fmt.Sprintf("%d", data.Level)+") - "+err.Error())
+		} else {
+			imported++
+			idMapping[data.ID] = newID
+		}
+	}
+
+	result := map[string]interface{}{
+		"imported": imported,
+		"skipped":  skipped,
+		"errors":   errors,
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Import completed", result)
 }
