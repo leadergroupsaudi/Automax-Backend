@@ -69,10 +69,12 @@ func main() {
 	reportRepo := repository.NewReportRepository(db)
 	reportTemplateRepo := repository.NewReportTemplateRepository(db)
 	lookupRepo := repository.NewLookupRepository(db)
+	callLogRepo := repository.NewCallLogRepository(db)
 
 	// Initialize services
 	userService := services.NewUserService(userRepo, jwtManager, sessionStore, minioStorage, cfg)
 	actionLogService := services.NewActionLogService(actionLogRepo)
+	callLogService := services.NewCallLogService(callLogRepo)
 	workflowService := services.NewWorkflowService(workflowRepo, roleRepo, departmentRepo, classificationRepo, db)
 	incidentService := services.NewIncidentService(incidentRepo, workflowRepo, userRepo, minioStorage)
 	reportService := services.NewReportService(reportRepo)
@@ -95,6 +97,7 @@ func main() {
 	departmentHandler := handlers.NewDepartmentHandler(departmentRepo)
 	roleHandler := handlers.NewRoleHandler(roleRepo, permissionRepo)
 	actionLogHandler := handlers.NewActionLogHandler(actionLogService, validate)
+	callLogHandler := handlers.NewCallLogHandler(callLogService, validate, userService)
 	workflowHandler := handlers.NewWorkflowHandler(workflowService)
 	incidentHandler := handlers.NewIncidentHandler(incidentService, userRepo, incidentRepo, minioStorage)
 	reportHandler := handlers.NewReportHandler(reportService)
@@ -292,6 +295,15 @@ func main() {
 	actionLogs.Get("/:id", authMiddleware.RequirePermission("action-logs:view"), actionLogHandler.GetActionLog)
 	actionLogs.Delete("/cleanup", authMiddleware.RequirePermission("action-logs:delete"), actionLogHandler.CleanupOldLogs)
 
+	// Call Log routes
+	callLogs := admin.Group("/call-logs")
+	callLogs.Post("/", authMiddleware.RequirePermission("call-logs:create"), callLogHandler.CreateCallLog)
+	callLogs.Get("/", authMiddleware.RequirePermission("call-logs:view"), callLogHandler.ListCallLogs)
+	callLogs.Get("/stats", authMiddleware.RequirePermission("call-logs:view"), callLogHandler.GetStats)
+	callLogs.Get("/:id", authMiddleware.RequirePermission("call-logs:view"), callLogHandler.GetCallLog)
+	callLogs.Put("/:id", authMiddleware.RequirePermission("call-logs:update"), callLogHandler.UpdateCallLog)
+	callLogs.Delete("/:id", authMiddleware.RequirePermission("call-logs:delete"), callLogHandler.DeleteCallLog)
+
 	// Workflow routes
 	workflows := admin.Group("/workflows")
 	workflows.Post("/", authMiddleware.RequirePermission("workflows:create"), workflowHandler.CreateWorkflow)
@@ -372,6 +384,17 @@ func main() {
 
 	// Public lookup endpoint (by category code) - accessible to authenticated users
 	v1.Get("/lookups/:code", authMiddleware.Authenticate(), lookupHandler.GetValuesByCategoryCode)
+
+	// Call routes (authenticated users)
+	calls := v1.Group("/calls", authMiddleware.Authenticate())
+	calls.Post("/start", callLogHandler.StartCall)
+	calls.Post("/:call_uuid/end", callLogHandler.EndCall)
+	calls.Post("/:call_uuid/join", callLogHandler.JoinCall)
+
+	// Call logs routes
+	callLogsPublic := v1.Group("/call-logs", authMiddleware.Authenticate())
+	callLogsPublic.Get("/sip-info", callLogHandler.GetSipInfo)
+	callLogsPublic.Get("/extension/:extension", callLogHandler.GetCallLogsByExtension)
 
 	go func() {
 		addr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)
