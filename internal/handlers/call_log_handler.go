@@ -335,3 +335,16 @@ func (h *CallLogHandler) GetCallLogsByExtension(c *fiber.Ctx) error {
 		"limit":       limit,
 	})
 }
+
+func (h *CallLogHandler) GetSipInfo(c *fiber.Ctx) error {
+	sipInfo, err := h.service.GetSipInfo(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    sipInfo,
+	})
+}
+

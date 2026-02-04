@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/automax/backend/internal/models"
@@ -20,6 +21,7 @@ type CallLogService interface {
 	EndCall(ctx context.Context, callUUID string, endAt *time.Time) (*models.CallLogResponse, error)
 	JoinCall(ctx context.Context, callUUID string, userID uuid.UUID) error
 	GetCallLogsByUserID(ctx context.Context, userID uuid.UUID, page, limit int) ([]models.CallLogResponse, int64, error)
+	GetSipInfo(ctx context.Context) (map[string]interface{}, error)
 }
 
 type callLogService struct {
@@ -222,4 +224,24 @@ func (s *callLogService) GetCallLogsByUserID(ctx context.Context, userID uuid.UU
 	}
 
 	return responses, total, nil
+}
+
+func (s *callLogService) GetSipInfo(ctx context.Context) (map[string]interface{}, error) {
+	domain := os.Getenv("SIP_DOMAIN")
+	socketURL := os.Getenv("SIP_SOCKET_URL")
+	if os.Getenv("SIP_INTEGRATION_ENABLED") != "true" || domain == "" || socketURL == "" {
+		return map[string]interface{}{
+			"enabled":   false,
+			"socketURL": "",
+			"domain":    "",
+		}, nil
+	}
+
+	sipInfo := map[string]interface{}{
+		"enabled":   true,
+		"socketURL": socketURL,
+		"domain":    domain,
+	}
+
+	return sipInfo, nil
 }

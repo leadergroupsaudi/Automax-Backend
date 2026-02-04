@@ -378,6 +378,7 @@ func main() {
 
 	// Call logs routes
 	callLogsPublic := v1.Group("/call-logs", authMiddleware.Authenticate())
+	callLogsPublic.Get("/sip-info", callLogHandler.GetSipInfo)
 	callLogsPublic.Get("/extension/:extension", callLogHandler.GetCallLogsByExtension)
 
 	go func() {
