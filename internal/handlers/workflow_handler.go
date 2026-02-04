@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"encoding/json"
+	"io"
+
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/services"
 	"github.com/automax/backend/pkg/utils"
@@ -493,4 +496,75 @@ func (h *WorkflowHandler) MatchWorkflow(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Workflow matched", result)
+}
+
+// ExportWorkflow exports a workflow as a JSON file
+func (h *WorkflowHandler) ExportWorkflow(c *fiber.Ctx) error {
+	idStr := c.Params("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID")
+	}
+
+	jsonBytes, filename, err := h.service.ExportWorkflow(c.Context(), id)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Set headers for file download
+	c.Set("Content-Type", "application/json")
+	c.Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+
+	return c.Send(jsonBytes)
+}
+
+// ImportWorkflow imports a workflow from a JSON file
+func (h *WorkflowHandler) ImportWorkflow(c *fiber.Ctx) error {
+	// Get file from multipart form
+	file, err := c.FormFile("file")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "No file uploaded")
+	}
+
+	// Validate file size (10MB limit)
+	const maxFileSize = 10 * 1024 * 1024 // 10MB
+	if file.Size > maxFileSize {
+		return utils.ErrorResponse(c, fiber.StatusRequestEntityTooLarge, "File size exceeds 10MB limit")
+	}
+
+	// Open and read file
+	fileContent, err := file.Open()
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to read file")
+	}
+	defer fileContent.Close()
+
+	// Read file content
+	buf, err := io.ReadAll(fileContent)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to read file content")
+	}
+
+	// Parse JSON
+	var importData models.WorkflowImportData
+	if err := json.Unmarshal(buf, &importData); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid JSON format: "+err.Error())
+	}
+
+	// Get user ID from context
+	userID := c.Locals("user_id").(uuid.UUID)
+
+	// Import workflow
+	workflow, warnings, err := h.service.ImportWorkflow(c.Context(), &importData, userID)
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Build response
+	response := models.WorkflowImportResponse{
+		Workflow: *workflow,
+		Warnings: warnings,
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusCreated, "Workflow imported successfully", response)
 }

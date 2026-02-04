@@ -13,6 +13,7 @@ type DepartmentRepository interface {
 	Create(ctx context.Context, department *models.Department) error
 	FindByID(ctx context.Context, id uuid.UUID) (*models.Department, error)
 	FindByCode(ctx context.Context, code string) (*models.Department, error)
+	FindByNameAndParent(ctx context.Context, name string, parentID *uuid.UUID) (*models.Department, error)
 	Update(ctx context.Context, department *models.Department) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context) ([]models.Department, error)
@@ -65,6 +66,21 @@ func (r *departmentRepository) FindByID(ctx context.Context, id uuid.UUID) (*mod
 func (r *departmentRepository) FindByCode(ctx context.Context, code string) (*models.Department, error) {
 	var department models.Department
 	err := r.db.WithContext(ctx).First(&department, "code = ?", code).Error
+	if err != nil {
+		return nil, err
+	}
+	return &department, nil
+}
+
+func (r *departmentRepository) FindByNameAndParent(ctx context.Context, name string, parentID *uuid.UUID) (*models.Department, error) {
+	var department models.Department
+	query := r.db.WithContext(ctx).Where("name = ?", name)
+	if parentID == nil {
+		query = query.Where("parent_id IS NULL")
+	} else {
+		query = query.Where("parent_id = ?", parentID)
+	}
+	err := query.First(&department).Error
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,11 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
@@ -191,4 +196,134 @@ func (h *ClassificationHandler) GetChildren(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "Children retrieved", responses)
+}
+
+// Export exports all classifications as JSON
+func (h *ClassificationHandler) Export(c *fiber.Ctx) error {
+	classifications, err := h.repo.List(c.Context())
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	// Filter out invalid records (with corrupted paths or invalid UUIDs)
+	validClassifications := make([]models.Classification, 0)
+	invalidUUID := "00000000-0000-0000-0000-000000000000"
+
+	for _, cls := range classifications {
+		// Skip records with invalid paths or IDs
+		if cls.ID.String() == invalidUUID ||
+		   strings.Contains(cls.Path, invalidUUID) {
+			continue
+		}
+		validClassifications = append(validClassifications, cls)
+	}
+
+	// Convert to export format
+	exportData := make([]map[string]interface{}, len(validClassifications))
+	for i, cls := range validClassifications {
+		exportData[i] = map[string]interface{}{
+			"id":          cls.ID,
+			"name":        cls.Name,
+			"description": cls.Description,
+			"type":        cls.Type,
+			"parent_id":   cls.ParentID,
+			"level":       cls.Level,
+			"path":        cls.Path,
+			"is_active":   cls.IsActive,
+			"sort_order":  cls.SortOrder,
+		}
+	}
+
+	c.Set("Content-Type", "application/json")
+	c.Set("Content-Disposition", "attachment; filename=classifications_export.json")
+	return c.JSON(exportData)
+}
+
+// Import imports classifications from JSON
+func (h *ClassificationHandler) Import(c *fiber.Ctx) error {
+	file, err := c.FormFile("file")
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "No file uploaded")
+	}
+
+	// Open and read file
+	fileContent, err := file.Open()
+	if err != nil {
+		return utils.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to read file")
+	}
+	defer fileContent.Close()
+
+	// Read file content
+	var importData []struct {
+		ID          uuid.UUID  `json:"id"`
+		Name        string     `json:"name"`
+		Description string     `json:"description"`
+		Type        string     `json:"type"`
+		ParentID    *uuid.UUID `json:"parent_id"`
+		Level       int        `json:"level"`
+		Path        string     `json:"path"`
+		IsActive    bool       `json:"is_active"`
+		SortOrder   int        `json:"sort_order"`
+	}
+
+	// Parse JSON from file
+	decoder := json.NewDecoder(fileContent)
+	if err := decoder.Decode(&importData); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Invalid JSON format: "+err.Error())
+	}
+
+	// Sort by level to ensure parents are imported before children
+	sort.Slice(importData, func(i, j int) bool {
+		return importData[i].Level < importData[j].Level
+	})
+
+	// Create a map from old IDs to new IDs for maintaining parent-child relationships
+	idMapping := make(map[uuid.UUID]uuid.UUID)
+	imported := 0
+	skipped := 0
+	errors := []string{}
+
+	// Import all classifications in level order
+	for _, data := range importData {
+		var newParentID *uuid.UUID
+
+		// If has parent, get the new parent ID from mapping
+		if data.ParentID != nil {
+			mappedParentID, exists := idMapping[*data.ParentID]
+			if exists {
+				newParentID = &mappedParentID
+			} else {
+				// Parent not found in import data, import as root node
+				newParentID = nil
+			}
+		}
+
+		// Create new classification (no duplicate check)
+		newID := uuid.New()
+		classification := &models.Classification{
+			ID:          newID,
+			Name:        data.Name,
+			Description: data.Description,
+			Type:        data.Type,
+			ParentID:    newParentID,
+			IsActive:    data.IsActive,
+			SortOrder:   data.SortOrder,
+		}
+
+		if err := h.repo.Create(c.Context(), classification); err != nil {
+			skipped++
+			errors = append(errors, data.Name+" (Level "+fmt.Sprintf("%d", data.Level)+") - "+err.Error())
+		} else {
+			imported++
+			idMapping[data.ID] = newID
+		}
+	}
+
+	result := map[string]interface{}{
+		"imported": imported,
+		"skipped":  skipped,
+		"errors":   errors,
+	}
+
+	return utils.SuccessResponse(c, fiber.StatusOK, "Import completed", result)
 }
