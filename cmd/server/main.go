@@ -22,10 +22,12 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/joho/godotenv"
 )
 
 func main() {
 	cfg := config.Load()
+	godotenv.Load()
 
 	db, err := database.Connect(&cfg.Database)
 	if err != nil {
@@ -70,6 +72,8 @@ func main() {
 	reportTemplateRepo := repository.NewReportTemplateRepository(db)
 	lookupRepo := repository.NewLookupRepository(db)
 	callLogRepo := repository.NewCallLogRepository(db)
+	notificationTemplateRepo := repository.NewNotificationTemplateRepository(db)
+	notificationLogRepo := repository.NewNotificationLogRepository(db)
 
 	// Initialize services
 	userService := services.NewUserService(userRepo, jwtManager, sessionStore, minioStorage, cfg)
@@ -79,6 +83,7 @@ func main() {
 	incidentService := services.NewIncidentService(incidentRepo, workflowRepo, userRepo, minioStorage)
 	reportService := services.NewReportService(reportRepo)
 	reportTemplateService := services.NewReportTemplateService(reportTemplateRepo, reportRepo)
+	notificationService := services.NewNotificationService(notificationTemplateRepo, notificationLogRepo)
 
 	// Initialize and start SLA Monitor (checks every 5 minutes)
 	slaMonitor := services.NewSLAMonitor(incidentRepo, 5*time.Minute)
@@ -103,6 +108,10 @@ func main() {
 	reportHandler := handlers.NewReportHandler(reportService)
 	reportTemplateHandler := handlers.NewReportTemplateHandler(reportTemplateService)
 	lookupHandler := handlers.NewLookupHandler(lookupRepo)
+	// notificationHandler := handlers.NewNotificationHandler(notificationService)
+	// templateHandler := handlers.NewMessageTemplateHandler(messageTemplateRepo)
+	notificationHandler := handlers.NewNotificationHandler(notificationService)
+	templateHandler := handlers.NewNotificationTemplateHandler(notificationTemplateRepo)
 
 	// Initialize middleware
 	authMiddleware := middleware.NewAuthMiddleware(jwtManager, sessionStore, userRepo)
@@ -395,6 +404,56 @@ func main() {
 	callLogsPublic := v1.Group("/call-logs", authMiddleware.Authenticate())
 	callLogsPublic.Get("/sip-info", callLogHandler.GetSipInfo)
 	callLogsPublic.Get("/extension/:extension", callLogHandler.GetCallLogsByExtension)
+
+	// ---- TEMPLATE ROUTES ----
+	templates := v1.Group("/templates", authMiddleware.Authenticate())
+
+	templates.Post(
+		"/",
+		authMiddleware.RequirePermission("templates:create"),
+		templateHandler.Create,
+	)
+
+	templates.Get(
+		"/",
+		authMiddleware.RequirePermission("templates:read"),
+		templateHandler.List,
+	)
+
+	templates.Get(
+		"/:id",
+		authMiddleware.RequirePermission("templates:read"),
+		templateHandler.GetByID,
+	)
+
+	templates.Put(
+		"/:id",
+		authMiddleware.RequirePermission("templates:update"),
+		templateHandler.Update,
+	)
+
+	templates.Delete(
+		"/:id",
+		authMiddleware.RequirePermission("templates:delete"),
+		templateHandler.Delete,
+	)
+
+	// ---- NOTIFICATION ROUTES ----
+	notifications := v1.Group("/notifications", authMiddleware.Authenticate())
+
+	notifications.Post(
+		"/send",
+		authMiddleware.RequirePermission("notifications:send"),
+		notificationHandler.Send,
+	)
+
+	// Notification routes
+
+	// Notification & Template routes
+
+	// notifications := v1.Group("/notifications", authMiddleware.Authenticate())
+	// notifications.Post("/send", authMiddleware.RequirePermission("notifications:send"), notificationHandler.Send)
+	//api.Post("/notifications/send", notificationHandler.Send)
 
 	go func() {
 		addr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)

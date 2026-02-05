@@ -56,6 +56,8 @@ func Migrate(db *gorm.DB) error {
 		&models.User{},
 		&models.ActionLog{},
 		&models.CallLog{},
+		&models.NotificationTemplate{},
+		&models.NotificationLog{},
 		// Lookup models
 		&models.LookupCategory{},
 		&models.LookupValue{},
