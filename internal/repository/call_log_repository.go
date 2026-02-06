@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/automax/backend/internal/models"
@@ -166,6 +165,6 @@ func (r *callLogRepository) FindByUserID(ctx context.Context, userID uuid.UUID, 
 	if err != nil {
 		return nil, 0, err
 	}
-	fmt.Println("callLogs QUWRY ", callLogs)
+
 	return callLogs, total, nil
 }
