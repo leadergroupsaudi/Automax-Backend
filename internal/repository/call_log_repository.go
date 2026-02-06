@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/automax/backend/internal/models"
@@ -157,6 +158,7 @@ func (r *callLogRepository) FindByUserID(ctx context.Context, userID uuid.UUID, 
 	// Apply pagination
 	offset := (page - 1) * limit
 	err := query.
+		Preload("Creator").
 		Order("created_at DESC").
 		Offset(offset).
 		Limit(limit).
@@ -164,6 +166,6 @@ func (r *callLogRepository) FindByUserID(ctx context.Context, userID uuid.UUID, 
 	if err != nil {
 		return nil, 0, err
 	}
-
+	fmt.Println("callLogs QUWRY ", callLogs)
 	return callLogs, total, nil
 }

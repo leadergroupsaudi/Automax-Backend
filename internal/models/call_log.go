@@ -111,22 +111,28 @@ type CallLogUpdateRequest struct {
 	Meta         string     `json:"meta,omitempty"`
 }
 
+// UserMinimalResponse for minimal user info in call logs
+type UserMinimalResponse struct {
+	ID        uuid.UUID `json:"user_id"`
+	Extension string    `json:"extension"`
+}
+
 // CallLogResponse for API responses
 type CallLogResponse struct {
-	ID           uuid.UUID      `json:"id"`
-	CallUuid     string         `json:"call_uuid,omitempty"`
-	CreatedBy    uuid.UUID      `json:"created_by"`
-	Creator      *UserResponse  `json:"creator,omitempty"`
-	StartAt      *time.Time     `json:"start_at,omitempty"`
-	EndAt        *time.Time     `json:"end_at,omitempty"`
-	Status       string         `json:"status"`
-	Participants []UserResponse `json:"participants,omitempty"`
-	JoinedUsers  []UserResponse `json:"joined_users,omitempty"`
-	InvitedUsers []UserResponse `json:"invited_users,omitempty"`
-	RecordingUrl string         `json:"recording_url,omitempty"`
-	Meta         string         `json:"meta,omitempty"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    *time.Time     `json:"updated_at,omitempty"`
+	ID           uuid.UUID              `json:"id"`
+	CallUuid     string                 `json:"call_uuid,omitempty"`
+	CreatedBy    uuid.UUID              `json:"created_by"`
+	Creator      *UserResponse          `json:"creator,omitempty"`
+	StartAt      *time.Time             `json:"start_at,omitempty"`
+	EndAt        *time.Time             `json:"end_at,omitempty"`
+	Status       string                 `json:"status"`
+	Participants []UserMinimalResponse  `json:"participants,omitempty"`
+	JoinedUsers  []UserMinimalResponse  `json:"joined_users,omitempty"`
+	InvitedUsers []UserMinimalResponse  `json:"invited_users,omitempty"`
+	RecordingUrl string                 `json:"recording_url,omitempty"`
+	Meta         string                 `json:"meta,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    *time.Time             `json:"updated_at,omitempty"`
 }
 
 // CallLogFilter for filtering call logs
@@ -180,9 +186,13 @@ func ToCallLogResponseWithoutCreator(callLog *CallLog) CallLogResponse {
 		ID:           callLog.ID,
 		CallUuid:     callLog.CallUuid,
 		CreatedBy:    callLog.CreatedBy,
+		Status:       callLog.Status,
+		Participants: []UserMinimalResponse{},
+		JoinedUsers:  []UserMinimalResponse{},
+		InvitedUsers: []UserMinimalResponse{},
 		StartAt:      callLog.StartAt,
 		EndAt:        callLog.EndAt,
-		Status:       callLog.Status,
+
 		RecordingUrl: callLog.RecordingUrl,
 		Meta:         callLog.Meta,
 		CreatedAt:    callLog.CreatedAt,

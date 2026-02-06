@@ -31,6 +31,7 @@ type UserRepository interface {
 	FindMatching(ctx context.Context, roleID, classificationID, locationID, departmentID, excludeUserID *uuid.UUID) ([]models.User, error)
 
 	FindByExtension(ctx context.Context, extension string) (*models.User, error)
+	FindByIDs(ctx context.Context, ids []uuid.UUID) ([]models.User, error)
 }
 
 type userRepository struct {
@@ -329,4 +330,14 @@ func (r *userRepository) FindByExtension(ctx context.Context, extension string) 
 	var user models.User
 	err := r.db.WithContext(ctx).Where("extension = ?", extension).First(&user).Error
 	return &user, err
+}
+
+func (r *userRepository) FindByIDs(ctx context.Context, ids []uuid.UUID) ([]models.User, error) {
+	if len(ids) == 0 {
+		return []models.User{}, nil
+	}
+
+	var users []models.User
+	err := r.db.WithContext(ctx).Where("id IN ?", ids).Find(&users).Error
+	return users, err
 }

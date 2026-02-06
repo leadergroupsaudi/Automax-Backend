@@ -25,11 +25,15 @@ type CallLogService interface {
 }
 
 type callLogService struct {
-	repo repository.CallLogRepository
+	repo     repository.CallLogRepository
+	userRepo repository.UserRepository
 }
 
-func NewCallLogService(repo repository.CallLogRepository) CallLogService {
-	return &callLogService{repo: repo}
+func NewCallLogService(repo repository.CallLogRepository, userRepo repository.UserRepository) CallLogService {
+	return &callLogService{
+		repo:     repo,
+		userRepo: userRepo,
+	}
 }
 
 func (s *callLogService) CreateCallLog(ctx context.Context, req *models.CallLogCreateRequest, createdBy uuid.UUID) (*models.CallLogResponse, error) {
@@ -127,7 +131,12 @@ func (s *callLogService) ListCallLogs(ctx context.Context, filter *models.CallLo
 
 	responses := make([]models.CallLogResponse, len(callLogs))
 	for i, callLog := range callLogs {
-		responses[i] = models.ToCallLogResponse(&callLog, nil) // TODO: Pass user repo for participants
+		// Populate user details for participants, joined users, and invited users
+		resp, err := s.toCallLogResponseWithUsers(ctx, &callLog)
+		if err != nil {
+			return nil, 0, err
+		}
+		responses[i] = resp
 	}
 
 	return responses, total, nil
@@ -199,7 +208,11 @@ func (s *callLogService) getCallLogResponse(ctx context.Context, id uuid.UUID) (
 		return nil, err
 	}
 
-	response := models.ToCallLogResponse(callLog, nil) // TODO: Pass user repo for participants
+	// Populate user details for participants, joined users, and invited users
+	response, err := s.toCallLogResponseWithUsers(ctx, callLog)
+	if err != nil {
+		return nil, err
+	}
 	return &response, nil
 }
 
@@ -219,8 +232,12 @@ func (s *callLogService) GetCallLogsByUserID(ctx context.Context, userID uuid.UU
 
 	responses := make([]models.CallLogResponse, len(callLogs))
 	for i, callLog := range callLogs {
-		// Use ToCallLogResponseWithoutCreator to exclude creator data
-		responses[i] = models.ToCallLogResponseWithoutCreator(&callLog)
+		// Populate user details for participants, joined users, and invited users
+		resp, err := s.toCallLogResponseWithUsers(ctx, &callLog)
+		if err != nil {
+			return nil, 0, err
+		}
+		responses[i] = resp
 	}
 
 	return responses, total, nil
@@ -244,4 +261,84 @@ func (s *callLogService) GetSipInfo(ctx context.Context) (map[string]interface{}
 	}
 
 	return sipInfo, nil
+}
+
+// populateUserDetails fetches user details for given UUIDs and returns UserMinimalResponse array
+func (s *callLogService) populateUserDetails(ctx context.Context, userIDs models.UUIDArray) ([]models.UserMinimalResponse, error) {
+	if len(userIDs) == 0 {
+		return []models.UserMinimalResponse{}, nil
+	}
+
+	users, err := s.userRepo.FindByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to UserMinimalResponse with only ID and Extension
+	userResponses := make([]models.UserMinimalResponse, len(users))
+	for i, user := range users {
+		userResponses[i] = models.UserMinimalResponse{
+			ID:        user.ID,
+			Extension: user.Extension,
+		}
+	}
+
+	return userResponses, nil
+}
+
+// toCallLogResponseWithUsers converts CallLog to CallLogResponse and populates user details
+func (s *callLogService) toCallLogResponseWithUsers(ctx context.Context, callLog *models.CallLog) (models.CallLogResponse, error) {
+	resp := models.CallLogResponse{
+		ID:           callLog.ID,
+		CallUuid:     callLog.CallUuid,
+		CreatedBy:    callLog.CreatedBy,
+		StartAt:      callLog.StartAt,
+		EndAt:        callLog.EndAt,
+		Status:       callLog.Status,
+		RecordingUrl: callLog.RecordingUrl,
+		Meta:         callLog.Meta,
+		CreatedAt:    callLog.CreatedAt,
+		UpdatedAt:    callLog.UpdatedAt,
+	}
+
+	// Populate creator if available
+	if callLog.Creator != nil {
+		creatorResp := models.ToUserResponse(callLog.Creator)
+		resp.Creator = &creatorResp
+	}
+
+	// Populate participants
+	if len(callLog.Participants) > 0 {
+		participants, err := s.populateUserDetails(ctx, callLog.Participants)
+		if err != nil {
+			return resp, err
+		}
+		resp.Participants = participants
+	} else {
+		resp.Participants = []models.UserMinimalResponse{}
+	}
+
+	// Populate joined users
+	if len(callLog.JoinedUsers) > 0 {
+		joinedUsers, err := s.populateUserDetails(ctx, callLog.JoinedUsers)
+		if err != nil {
+			return resp, err
+		}
+		resp.JoinedUsers = joinedUsers
+	} else {
+		resp.JoinedUsers = []models.UserMinimalResponse{}
+	}
+
+	// Populate invited users
+	if len(callLog.InvitedUsers) > 0 {
+		invitedUsers, err := s.populateUserDetails(ctx, callLog.InvitedUsers)
+		if err != nil {
+			return resp, err
+		}
+		resp.InvitedUsers = invitedUsers
+	} else {
+		resp.InvitedUsers = []models.UserMinimalResponse{}
+	}
+
+	return resp, nil
 }

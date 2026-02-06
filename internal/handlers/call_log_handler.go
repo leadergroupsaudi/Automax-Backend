@@ -294,45 +294,51 @@ func (h *CallLogHandler) JoinCall(c *fiber.Ctx) error {
 	})
 }
 
-// GetCallLogsByExtension handles GET /api/v1/call-logs/extension/:extension
 func (h *CallLogHandler) GetCallLogsByExtension(c *fiber.Ctx) error {
 	extension := c.Params("extension")
 	if extension == "" {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, "Extension is required")
 	}
 
-	// Parse pagination parameters
 	page, _ := strconv.Atoi(c.Query("page", "1"))
 	limit, _ := strconv.Atoi(c.Query("limit", "10"))
 
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > 100 {
-		limit = 10
-	}
-
-	// Find user by extension
+	// Find the user
 	user, err := h.userSvc.FindByExtension(c.Context(), extension)
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusNotFound, "User with extension not found")
 	}
 
-	// Get call logs for the user
+	// Get call logs (Note: these are already models.CallLogResponse)
 	callLogs, total, err := h.service.GetCallLogsByUserID(c.Context(), user.ID, page, limit)
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusInternalServerError, err.Error())
 	}
 
+	// Ensure slices are not nil (so JSON returns [] instead of null)
+	for i := range callLogs {
+		if callLogs[i].Participants == nil {
+			callLogs[i].Participants = []models.UserMinimalResponse{}
+		}
+		if callLogs[i].JoinedUsers == nil {
+			callLogs[i].JoinedUsers = []models.UserMinimalResponse{}
+		}
+		if callLogs[i].InvitedUsers == nil {
+			callLogs[i].InvitedUsers = []models.UserMinimalResponse{}
+		}
+	}
+
 	totalPages := (int(total) + limit - 1) / limit
 
 	return c.JSON(fiber.Map{
-		"success":     true,
-		"data":        callLogs,
-		"total_items": total,
-		"total_pages": totalPages,
-		"page":        page,
-		"limit":       limit,
+		"success":      true,
+		"extension_id": extension, // The extension ID from Params
+		"user_id":      user.ID,   // The internal ID found via extension
+		"data":         callLogs,
+		"total_items":  total,
+		"total_pages":  totalPages,
+		"page":         page,
+		"limit":        limit,
 	})
 }
 
@@ -347,4 +353,3 @@ func (h *CallLogHandler) GetSipInfo(c *fiber.Ctx) error {
 		"data":    sipInfo,
 	})
 }
-

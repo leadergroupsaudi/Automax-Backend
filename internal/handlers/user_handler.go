@@ -446,6 +446,8 @@ func (h *UserHandler) UpdateUserCallStatus(c *fiber.Ctx) error {
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusOK, "User call status updated successfully", resp)
+}
+
 // Export exports all users as JSON
 func (h *UserHandler) Export(c *fiber.Ctx) error {
 	// Get all users without pagination
@@ -482,20 +484,20 @@ func (h *UserHandler) Export(c *fiber.Ctx) error {
 		}
 
 		exportData[i] = map[string]interface{}{
-			"id":                  user.ID,
-			"username":            user.Username,
-			"email":               user.Email,
-			"first_name":          user.FirstName,
-			"last_name":           user.LastName,
-			"phone":               user.Phone,
-			"department_id":       user.DepartmentID,
-			"location_id":         user.LocationID,
-			"role_ids":            roleIDs,
-			"department_ids":      departmentIDs,
-			"location_ids":        locationIDs,
-			"classification_ids":  classificationIDs,
-			"is_active":           user.IsActive,
-			"is_super_admin":      user.IsSuperAdmin,
+			"id":                 user.ID,
+			"username":           user.Username,
+			"email":              user.Email,
+			"first_name":         user.FirstName,
+			"last_name":          user.LastName,
+			"phone":              user.Phone,
+			"department_id":      user.DepartmentID,
+			"location_id":        user.LocationID,
+			"role_ids":           roleIDs,
+			"department_ids":     departmentIDs,
+			"location_ids":       locationIDs,
+			"classification_ids": classificationIDs,
+			"is_active":          user.IsActive,
+			"is_super_admin":     user.IsSuperAdmin,
 		}
 	}
 
@@ -520,20 +522,20 @@ func (h *UserHandler) Import(c *fiber.Ctx) error {
 
 	// Read file content
 	var importData []struct {
-		ID                uuid.UUID   `json:"id"`
-		Username          string      `json:"username"`
-		Email             string      `json:"email"`
-		FirstName         string      `json:"first_name"`
-		LastName          string      `json:"last_name"`
-		Phone             string      `json:"phone"`
-		DepartmentID      *uuid.UUID  `json:"department_id"`
-		LocationID        *uuid.UUID  `json:"location_id"`
-		RoleIDs           []string    `json:"role_ids"`
-		DepartmentIDs     []string    `json:"department_ids"`
-		LocationIDs       []string    `json:"location_ids"`
-		ClassificationIDs []string    `json:"classification_ids"`
-		IsActive          bool        `json:"is_active"`
-		IsSuperAdmin      bool        `json:"is_super_admin"`
+		ID                uuid.UUID  `json:"id"`
+		Username          string     `json:"username"`
+		Email             string     `json:"email"`
+		FirstName         string     `json:"first_name"`
+		LastName          string     `json:"last_name"`
+		Phone             string     `json:"phone"`
+		DepartmentID      *uuid.UUID `json:"department_id"`
+		LocationID        *uuid.UUID `json:"location_id"`
+		RoleIDs           []string   `json:"role_ids"`
+		DepartmentIDs     []string   `json:"department_ids"`
+		LocationIDs       []string   `json:"location_ids"`
+		ClassificationIDs []string   `json:"classification_ids"`
+		IsActive          bool       `json:"is_active"`
+		IsSuperAdmin      bool       `json:"is_super_admin"`
 	}
 
 	// Parse JSON from file
@@ -599,7 +601,7 @@ func (h *UserHandler) Import(c *fiber.Ctx) error {
 		req := &models.UserRegisterRequest{
 			Username:          data.Username,
 			Email:             data.Email,
-			Password:          "ChangeMe123!",  // Default password, user should change
+			Password:          "ChangeMe123!", // Default password, user should change
 			FirstName:         data.FirstName,
 			LastName:          data.LastName,
 			Phone:             data.Phone,
