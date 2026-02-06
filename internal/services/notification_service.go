@@ -11,6 +11,9 @@ import (
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/google/uuid"
+
+	twilio "github.com/twilio/twilio-go"
+	openapi "github.com/twilio/twilio-go/rest/api/v2010"
 )
 
 type NotificationService struct {
@@ -28,11 +31,7 @@ func NewNotificationService(
 	}
 }
 
-func (s *NotificationService) SendNotification(
-	ctx context.Context,
-	channel, templateCode, language, recipient string,
-	variables map[string]string,
-) (*models.NotificationLog, error) {
+func (s *NotificationService) SendNotification(ctx context.Context, channel, templateCode, language, recipient string, variables map[string]string) (*models.NotificationLog, error) {
 
 	tpl, err := s.templateRepo.FindByCodeChannelLanguage(
 		ctx, templateCode, channel, language,
@@ -51,16 +50,44 @@ func (s *NotificationService) SendNotification(
 		subject, _ = RenderTemplate(subject, variables)
 	}
 
+	// status := "sent"
+	// provider := channel //"email" or "sms" as provider name
+	// if os.Getenv("ENV") == "local" {
+	// 	status = "mock-sent"
+	// 	provider = "mock"
+	// } else if channel == "email" {
+	// 	err := SendSMTP(recipient, subject, body)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// }
+
+	// Set default status and provider
 	status := "sent"
-	provider := "smtp"
-	if os.Getenv("ENV") == "local" {
+	provider := channel // "email" or "sms" as provider name
+
+	// Send the notification
+	if os.Getenv("ENV") != "local" {
+		switch channel {
+		case "email":
+			err := SendSMTP(recipient, subject, body)
+			if err != nil {
+				return nil, err
+			}
+			provider = "smtp"
+		case "sms":
+			err := SendSMS(recipient, body)
+			if err != nil {
+				return nil, err
+			}
+			provider = "twilio"
+		default:
+			return nil, fmt.Errorf("unsupported channel: %s", channel)
+		}
+	} else {
+		// local/dev: mock send
 		status = "mock-sent"
 		provider = "mock"
-	} else if channel == "email" {
-		err := sendSMTP(recipient, subject, body)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	log := &models.NotificationLog{
@@ -79,7 +106,7 @@ func (s *NotificationService) SendNotification(
 		return nil, err
 	}
 
-	// ✅ Return the log so handler can send it back in the API response
+	//  Return the log so handler can send it back in the API response
 	return log, nil
 }
 
@@ -207,7 +234,7 @@ func RenderTemplate(tpl string, vars map[string]string) (string, error) {
 	return buf.String(), err
 }
 
-func sendSMTP(to, subject, body string) error {
+func SendSMTP(to, subject, body string) error {
 	host := os.Getenv("SMTP_HOST")
 	port := os.Getenv("SMTP_PORT")
 	user := os.Getenv("SMTP_USER")
@@ -221,4 +248,28 @@ func sendSMTP(to, subject, body string) error {
 		from, to, subject, body))
 
 	return smtp.SendMail(addr, auth, from, []string{to}, msg)
+}
+
+func SendSMS(to, message string) error {
+	// Load Twilio credentials
+	accountSID := os.Getenv("TWILIO_ACCOUNT_SID")
+	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
+
+	client := twilio.NewRestClientWithParams(twilio.ClientParams{
+		Username: accountSID,
+		Password: authToken,
+	})
+
+	params := &openapi.CreateMessageParams{}
+	params.SetTo(to)                                 // recipient
+	params.SetFrom(os.Getenv("TWILIO_PHONE_NUMBER")) // Twilio from number
+	params.SetBody(message)                          // SMS body
+
+	_, err := client.Api.CreateMessage(params) // correct method
+	if err != nil {
+		return fmt.Errorf("twilio send sms error: %w", err)
+	}
+
+	fmt.Println("SMS sent successfully")
+	return nil
 }
