@@ -2600,14 +2600,6 @@ func (s *incidentService) AddAttachment(ctx context.Context, incidentID uuid.UUI
 	description := fmt.Sprintf("Attachment added - %s", attachment.FileName)
 	_ = s.CreateRevision(ctx, incidentID, models.RevisionActionAttachmentAdded, description, nil, attachment.UploadedByID)
 
-	// Sync attachment to merged child incidents if this is a master incident
-	if s.incidentMergeRepo != nil {
-		hasMerged, _ := s.incidentMergeRepo.HasMergedIncidents(ctx, incidentID)
-		if hasMerged {
-			_ = s.syncAttachmentToMergedIncidents(ctx, incidentID, created, attachment.UploadedByID)
-		}
-	}
-
 	url, err := s.storage.GetFileURL(ctx, created.FilePath)
 	if err != nil {
 		// Log the error but don't fail the operation
@@ -2616,56 +2608,6 @@ func (s *incidentService) AddAttachment(ctx context.Context, incidentID uuid.UUI
 
 	resp := models.ToIncidentAttachmentResponse(created, url)
 	return &resp, nil
-}
-
-// syncAttachmentToMergedIncidents syncs attachment to all merged child incidents
-func (s *incidentService) syncAttachmentToMergedIncidents(ctx context.Context, masterIncidentID uuid.UUID, masterAttachment *models.IncidentAttachment, uploadedBy uuid.UUID) error {
-	// Get merged incidents
-	mergedIncidents, err := s.incidentMergeRepo.GetMergedIncidents(ctx, masterIncidentID)
-	if err != nil {
-		return err
-	}
-	if len(mergedIncidents) == 0 {
-		return nil
-	}
-
-	// Get master incident for revision description
-	masterIncident, err := s.incidentRepo.FindByID(ctx, masterIncidentID)
-	if err != nil {
-		return err
-	}
-
-	// Process each merged incident
-	for _, merged := range mergedIncidents {
-		// Create attachment record for child (same file path, different incident ID)
-		childAttachment := &models.IncidentAttachment{
-			IncidentID:          merged.ID,
-			FileName:            masterAttachment.FileName,
-			FileSize:            masterAttachment.FileSize,
-			MimeType:            masterAttachment.MimeType,
-			FilePath:            masterAttachment.FilePath,
-			UploadedByID:        uploadedBy,
-			TransitionHistoryID: masterAttachment.TransitionHistoryID,
-		}
-
-		if attErr := s.incidentRepo.CreateAttachment(ctx, childAttachment); attErr != nil {
-			fmt.Printf("[DEBUG] Failed to create attachment for child %s: %v\n", merged.IncidentNumber, attErr)
-			continue
-		}
-
-		// Create revision for child
-		description := fmt.Sprintf(
-			"Attachment added to parent incident %s - %s",
-			masterIncident.IncidentNumber,
-			masterAttachment.FileName,
-		)
-
-		if revErr := s.CreateRevision(ctx, merged.ID, models.RevisionActionAttachmentAdded, description, nil, uploadedBy); revErr != nil {
-			fmt.Printf("[DEBUG] Failed to create revision for child %s: %v\n", merged.IncidentNumber, revErr)
-		}
-	}
-
-	return nil
 }
 
 func (s *incidentService) ListAttachments(ctx context.Context, incidentID uuid.UUID) ([]models.IncidentAttachmentResponse, error) {
@@ -2702,19 +2644,40 @@ func (s *incidentService) ListAttachments(ctx context.Context, incidentID uuid.U
 		}
 	} else {
 		// This is a child incident - get its own attachments AND master's attachments
+		// BUT exclude attachments that came from sibling incidents
 		attachments, err = s.incidentRepo.ListAttachments(ctx, incidentID)
 		if err != nil {
 			return nil, err
 		}
 
-		// Also get attachments from master incident
+		// Get master's attachments, but filter out those that came from siblings
 		masterAttachments, err := s.incidentRepo.ListAttachments(ctx, *incident.MasterIncidentID)
 		if err == nil && len(masterAttachments) > 0 {
-			attachments = append(attachments, masterAttachments...)
-			// Sort by created_at DESC
-			sort.Slice(attachments, func(i, j int) bool {
-				return attachments[i].CreatedAt.After(attachments[j].CreatedAt)
-			})
+			// Get all sibling incidents (other children of the same master)
+			mergedIncidents, err := s.incidentMergeRepo.GetMergedIncidents(ctx, *incident.MasterIncidentID)
+			if err == nil {
+				siblingIDs := make(map[uuid.UUID]bool)
+				for _, sibling := range mergedIncidents {
+					if sibling.ID != incidentID {
+						siblingIDs[sibling.ID] = true
+					}
+				}
+
+				// Filter master attachments to exclude those from siblings
+				for _, masterAtt := range masterAttachments {
+					// Check if this attachment was originally from a sibling
+					// An attachment is from a sibling if its incident_id matches a sibling
+					if !siblingIDs[masterAtt.IncidentID] {
+						// This attachment belongs to master itself (not from a sibling)
+						attachments = append(attachments, masterAtt)
+					}
+				}
+
+				// Sort by created_at DESC
+				sort.Slice(attachments, func(i, j int) bool {
+					return attachments[i].CreatedAt.After(attachments[j].CreatedAt)
+				})
+			}
 		}
 	}
 
