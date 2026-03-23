@@ -48,6 +48,18 @@ func Migrate(db *gorm.DB) error {
 		return fmt.Errorf("failed to create enum type: %w", err)
 	}
 
+	// Pre-AutoMigrate: convert classifications.type varchar → text[] so AutoMigrate
+	// sees the column already in its final form and makes no conflicting changes.
+	// Both functions are guarded by IF EXISTS checks — safe to run on fresh installs.
+	if err := migrations.MigrateClassificationTypesArray(db); err != nil {
+		return fmt.Errorf("failed to run classification types phase 1: %w", err)
+	}
+	// Phase 2: drop the orphan 'types text[]' column left by Phase 1 (the canonical
+	// column is 'type' which AutoMigrate already manages as text[]).
+	if err := db.Exec("ALTER TABLE classifications DROP COLUMN IF EXISTS types").Error; err != nil {
+		return fmt.Errorf("failed to drop orphan types column: %w", err)
+	}
+
 	// Use session that disables FK constraints during migration to prevent auto-FK issues
 	migrationDB := db.Session(&gorm.Session{})
 	migrationDB.Config.DisableForeignKeyConstraintWhenMigrating = true

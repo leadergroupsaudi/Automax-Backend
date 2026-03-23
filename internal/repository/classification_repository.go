@@ -104,12 +104,9 @@ func (r *classificationRepository) ListByType(ctx context.Context, classType str
 	var classifications []models.Classification
 	query := r.db.WithContext(ctx)
 	if classType != "" {
-		// Support 'all' type which matches any type, 'both' matches incident/request
-		query = query.Where("type = ? OR type = 'both' OR type = 'all'", classType)
+		query = query.Where("? = ANY(type)", strings.ToLower(classType))
 	}
-	types := []string{strings.ToLower(classType)}
-
-	err := query.Where("LOWER(type) IN ?", types).Order("sort_order, name").Find(&classifications).Error
+	err := query.Order("sort_order, name").Find(&classifications).Error
 	return classifications, err
 }
 
@@ -135,11 +132,11 @@ func (r *classificationRepository) GetTree(ctx context.Context) ([]models.Classi
 func (r *classificationRepository) GetTreeByType(ctx context.Context, classType string) ([]models.Classification, error) {
 	var roots []models.Classification
 	typeFilter := func(db *gorm.DB) *gorm.DB {
-		return db.Where("type = ? OR type = 'both' OR type = 'all'", classType).Order("sort_order, name")
+		return db.Where("? = ANY(type)", classType).Order("sort_order, name")
 	}
 	err := r.db.WithContext(ctx).
 		Where("parent_id IS NULL").
-		Where("type = ? OR type = 'both' OR type = 'all'", classType).
+		Where("? = ANY(type)", classType).
 		Preload("Criticalities.Criticality").
 		Preload("Children.Criticalities.Criticality").
 		Preload("Children.Children.Criticalities.Criticality").
@@ -178,7 +175,7 @@ func (r *classificationRepository) GetTreeWithStats(ctx context.Context, recordT
 	query := r.db.WithContext(ctx)
 
 	if recordType != "" && recordType != "all" {
-		query = query.Where("type = ? OR type = 'both' OR type = 'all'", recordType)
+		query = query.Where("? = ANY(type)", recordType)
 	}
 
 	if err := query.Order("sort_order, name").Find(&classifications).Error; err != nil {
@@ -221,7 +218,7 @@ func (r *classificationRepository) GetTreeWithStats(ctx context.Context, recordT
 			ID:          cls.ID,
 			Name:        cls.Name,
 			Description: cls.Description,
-			Type:        cls.Type,
+			Types:       cls.Types,
 			ParentID:    cls.ParentID,
 			Level:       cls.Level,
 			Path:        cls.Path,

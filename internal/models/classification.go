@@ -12,7 +12,7 @@ type Classification struct {
 	ID            uuid.UUID                   `gorm:"type:uuid;primary_key" json:"id"`
 	Name          string                      `gorm:"not null;size:100" json:"name"`
 	Description   string                      `gorm:"size:500" json:"description"`
-	Type          string                      `gorm:"size:20;default:'both'" json:"type"` // 'incident', 'request', 'complaint', 'query', 'mobile', 'ivr', 'both', 'all'
+	Types         ClassificationTypes         `gorm:"column:type;type:text[]" json:"types"` // stored as text[] in column "type"
 	ParentID      *uuid.UUID                  `gorm:"type:uuid;index" json:"parent_id"`
 	Parent        *Classification             `gorm:"foreignKey:ParentID" json:"parent,omitempty"`
 	Children      []Classification            `gorm:"foreignKey:ParentID" json:"children,omitempty"`
@@ -55,22 +55,39 @@ func (cc *ClassificationCriticality) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
+// ResolveClassificationTypes returns the canonical ClassificationTypes from a request.
+// Priority: Types array > legacy Type string > default ["incident","request"].
+// Accepts "both" and "all" in Type for backward compatibility with old clients.
+func ResolveClassificationTypes(reqType string, reqTypes []string) ClassificationTypes {
+	if len(reqTypes) > 0 {
+		return ClassificationTypes(reqTypes)
+	}
+	switch reqType {
+	case "both", "":
+		return ClassificationTypes{"incident", "request"}
+	case "all":
+		return ClassificationTypes{"incident", "request", "complaint", "query", "mobile", "ivr"}
+	default:
+		return ClassificationTypes{reqType}
+	}
+}
+
 // ClassificationCreateRequest for creating a new classification
 type ClassificationCreateRequest struct {
-	Name        string     `json:"name" validate:"required,min=1,max=100"`
-	Description string     `json:"description" validate:"max=500"`
-	Type        string     `json:"type" validate:"omitempty,oneof=incident request complaint query mobile ivr both all"`
-	ParentID    *uuid.UUID `json:"parent_id"`
-	SortOrder   int        `json:"sort_order"`
+	Name        string              `json:"name" validate:"required,min=1,max=100"`
+	Description string              `json:"description" validate:"max=500"`
+	Types       ClassificationTypes `json:"types" validate:"omitempty,dive,oneof=incident request complaint query mobile ivr"`
+	ParentID    *uuid.UUID          `json:"parent_id"`
+	SortOrder   int                 `json:"sort_order"`
 }
 
 // ClassificationUpdateRequest for updating a classification
 type ClassificationUpdateRequest struct {
-	Name        string  `json:"name" validate:"min=1,max=100"`
-	Description string  `json:"description" validate:"max=500"`
-	Type        *string `json:"type" validate:"omitempty,oneof=incident request complaint query mobile ivr both all"`
-	IsActive    *bool   `json:"is_active"`
-	SortOrder   *int    `json:"sort_order"`
+	Name        string              `json:"name" validate:"min=1,max=100"`
+	Description string              `json:"description" validate:"max=500"`
+	Types       ClassificationTypes `json:"types" validate:"omitempty,dive,oneof=incident request complaint query mobile ivr"`
+	IsActive    *bool               `json:"is_active"`
+	SortOrder   *int                `json:"sort_order"`
 }
 
 // ClassificationResponse for API responses
@@ -78,7 +95,7 @@ type ClassificationResponse struct {
 	ID            uuid.UUID                           `json:"id"`
 	Name          string                              `json:"name"`
 	Description   string                              `json:"description"`
-	Type          string                              `json:"type"`
+	Types         ClassificationTypes                 `json:"types"`
 	ParentID      *uuid.UUID                          `json:"parent_id"`
 	Level         int                                 `json:"level"`
 	Path          string                              `json:"path"`
@@ -94,7 +111,7 @@ func ToClassificationResponse(c *Classification) ClassificationResponse {
 		ID:          c.ID,
 		Name:        c.Name,
 		Description: c.Description,
-		Type:        c.Type,
+		Types:       c.Types,
 		ParentID:    c.ParentID,
 		Level:       c.Level,
 		Path:        c.Path,
@@ -125,7 +142,7 @@ type ClassificationWithStats struct {
 	ID          uuid.UUID                 `json:"id"`
 	Name        string                    `json:"name"`
 	Description string                    `json:"description"`
-	Type        string                    `json:"type"`
+	Types       ClassificationTypes       `json:"types"`
 	ParentID    *uuid.UUID                `json:"parent_id"`
 	Level       int                       `json:"level"`
 	Path        string                    `json:"path"`
@@ -200,7 +217,8 @@ func ToClassificationCriticalityResponse(cc *ClassificationCriticality) Classifi
 type ClassificationCreateRequestWithCriticalities struct {
 	Name          string                                   `json:"name" validate:"required,min=1,max=100"`
 	Description   string                                   `json:"description" validate:"max=500"`
-	Type          string                                   `json:"type" validate:"omitempty,oneof=incident request complaint query mobile ivr both all"`
+	Type          string                                   `json:"type"`  // legacy singular field accepted for compatibility
+	Types         ClassificationTypes                      `json:"types" validate:"omitempty,dive,oneof=incident request complaint query mobile ivr"`
 	ParentID      *uuid.UUID                               `json:"parent_id"`
 	SortOrder     int                                      `json:"sort_order"`
 	Criticalities []ClassificationCriticalityCreateRequest `json:"criticalities,omitempty"`

@@ -40,15 +40,12 @@ func (h *ClassificationHandler) Create(c *fiber.Ctx) error {
 		})
 	}
 
-	classType := "both"
-	if req.Type != "" {
-		classType = req.Type
-	}
+	classTypes := models.ResolveClassificationTypes(req.Type, req.Types)
 
 	classification := &models.Classification{
 		Name:        req.Name,
 		Description: req.Description,
-		Type:        classType,
+		Types:       classTypes,
 		ParentID:    req.ParentID,
 		SortOrder:   req.SortOrder,
 		IsActive:    true,
@@ -125,8 +122,8 @@ func (h *ClassificationHandler) Update(c *fiber.Ctx) error {
 	if req.Description != "" {
 		classification.Description = req.Description
 	}
-	if req.Type != "" {
-		classification.Type = req.Type
+	if len(req.Types) > 0 {
+		classification.Types = req.Types
 	}
 	classification.IsActive = true // Keep active on update
 	if req.SortOrder >= 0 {
@@ -308,7 +305,7 @@ func (h *ClassificationHandler) Export(c *fiber.Ctx) error {
 			"id":          cls.ID,
 			"name":        cls.Name,
 			"description": cls.Description,
-			"type":        cls.Type,
+			"types":       cls.Types,
 			"parent_id":   cls.ParentID,
 			"level":       cls.Level,
 			"path":        cls.Path,
@@ -338,15 +335,16 @@ func (h *ClassificationHandler) Import(c *fiber.Ctx) error {
 
 	// Read file content
 	var importData []struct {
-		ID          uuid.UUID  `json:"id"`
-		Name        string     `json:"name"`
-		Description string     `json:"description"`
-		Type        string     `json:"type"`
-		ParentID    *uuid.UUID `json:"parent_id"`
-		Level       int        `json:"level"`
-		Path        string     `json:"path"`
-		IsActive    bool       `json:"is_active"`
-		SortOrder   int        `json:"sort_order"`
+		ID          uuid.UUID                  `json:"id"`
+		Name        string                     `json:"name"`
+		Description string                     `json:"description"`
+		Type        string                     `json:"type"`  // legacy field — accepted for backward compat with old export files
+		Types       models.ClassificationTypes `json:"types"` // preferred field
+		ParentID    *uuid.UUID                 `json:"parent_id"`
+		Level       int                        `json:"level"`
+		Path        string                     `json:"path"`
+		IsActive    bool                       `json:"is_active"`
+		SortOrder   int                        `json:"sort_order"`
 	}
 
 	// Parse JSON from file
@@ -381,13 +379,15 @@ func (h *ClassificationHandler) Import(c *fiber.Ctx) error {
 			}
 		}
 
-		// Create new classification (no duplicate check)
+		// Create new classification (no duplicate check).
+		// ResolveClassificationTypes handles backward compat: old export files may only have Type string.
+		classTypes := models.ResolveClassificationTypes(data.Type, data.Types)
 		newID := uuid.New()
 		classification := &models.Classification{
 			ID:          newID,
 			Name:        data.Name,
 			Description: data.Description,
-			Type:        data.Type,
+			Types:       classTypes,
 			ParentID:    newParentID,
 			IsActive:    data.IsActive,
 			SortOrder:   data.SortOrder,
