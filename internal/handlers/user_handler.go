@@ -18,9 +18,10 @@ import (
 )
 
 type UserHandler struct {
-	userService services.UserService
-	storage     *storage.MinIOStorage
-	validator   *validator.Validate
+	userService  services.UserService
+	twoFAService *services.TwoFAService
+	storage      *storage.MinIOStorage
+	validator    *validator.Validate
 }
 
 func NewUserHandler(userService services.UserService, storage *storage.MinIOStorage) *UserHandler {
@@ -29,6 +30,10 @@ func NewUserHandler(userService services.UserService, storage *storage.MinIOStor
 		storage:     storage,
 		validator:   validator.New(),
 	}
+}
+
+func (h *UserHandler) SetTwoFAService(twoFAService *services.TwoFAService) {
+	h.twoFAService = twoFAService
 }
 
 func (h *UserHandler) Register(c *fiber.Ctx) error {

@@ -96,6 +96,7 @@ func main() {
 	notificationService := services.NewNotificationService(notificationTemplateRepo, notificationLogRepo, userRepo, minioStorage)
 	userService := services.NewUserService(userRepo, departmentRepo, jwtManager, sessionStore, minioStorage, cfg, actionLogService, nil)
 	otpService := services.NewOTPService(redisClient, notificationService, notificationLogRepo, userRepo, userService)
+	twoFAService := services.NewTwoFAService(redisClient, userRepo, jwtManager, sessionStore, cfg)
 
 	// Initialize LDAP service
 	ldapService, err := services.NewLDAPService(cfg)
@@ -142,6 +143,8 @@ func main() {
 
 	// Initialize handlers
 	userHandler := handlers.NewUserHandler(userService, minioStorage)
+	userHandler.SetTwoFAService(twoFAService)
+	twoFAHandler := handlers.NewTwoFAHandler(twoFAService)
 	healthHandler := handlers.NewHealthHandler()
 
 	// Initialize LDAP handler
@@ -240,6 +243,10 @@ func main() {
 	auth.Post("/login", loginRateLimitMiddleware, userHandler.Login)
 	auth.Post("/refresh", userHandler.RefreshToken)
 	auth.Post("/logout", authMiddleware.Authenticate(), userHandler.Logout)
+	
+	// 2FA routes (for OTP verification)
+	auth.Post("/verify-2fa-otp", twoFAHandler.VerifyOTP)
+	auth.Post("/resend-2fa-otp", twoFAHandler.ResendOTP)
 
 	// LDAP routes (public - for LDAP authentication)
 	ldap := v1.Group("/ldap")

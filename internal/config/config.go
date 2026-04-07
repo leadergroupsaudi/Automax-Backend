@@ -12,8 +12,10 @@ type Config struct {
 	Redis          RedisConfig
 	MinIO          MinIOConfig
 	JWT            JWTConfig
+	SMTP           SMTPConfig
 	LDAP           LDAPConfig
 	LoginRateLimit LoginRateLimitConfig
+	TwoFA          TwoFAConfig
 	SSOPrivateKey  string // env: SSO_RSA_PRIVATE_KEY (PEM, optional — auto-gen if empty)
 	SSOIssuerURL   string // env: SSO_ISSUER_URL (e.g. https://automax.example.com — embedded in iss claim)
 	SSOFrontendURL string // env: SSO_FRONTEND_URL (e.g. https://automax.example.com — where /sso-complete lives)
@@ -82,6 +84,14 @@ type JWTConfig struct {
 	ExpireHour int
 }
 
+type SMTPConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+	From     string
+}
+
 type LDAPConfig struct {
 	Enabled            bool
 	URL                string
@@ -100,6 +110,13 @@ type LoginRateLimitConfig struct {
 	MaxAttempts      int
 	RateLimitWindow  int // in minutes
 	BlockDuration    int // in minutes
+}
+
+type TwoFAConfig struct {
+	Enabled          bool
+	OTPExpiryMinutes int
+	MaxAttempts      int
+	Method           string // "email" or "sms"
 }
 
 func Load() *Config {
@@ -134,6 +151,13 @@ func Load() *Config {
 			Secret:     getEnv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production"),
 			ExpireHour: getEnvAsInt("JWT_EXPIRE_HOUR", 24),
 		},
+		SMTP: SMTPConfig{
+			Host:     getEnv("SMTP_HOST", "smtp.gmail.com"),
+			Port:     getEnvAsInt("SMTP_PORT", 587),
+			User:     getEnv("SMTP_USER", ""),
+			Password: getEnv("SMTP_PASS", ""),
+			From:     getEnv("SMTP_FROM", ""),
+		},
 		LDAP: LDAPConfig{
 			Enabled:            getEnvAsBool("LDAP_ENABLED", false),
 			URL:                getEnv("LDAP_URL", "ldap://localhost:389"),
@@ -151,6 +175,12 @@ func Load() *Config {
 			MaxAttempts:     getEnvAsInt("MAX_LOGIN_ATTEMPTS", 5),
 			RateLimitWindow: getEnvAsInt("RATE_LIMIT_WINDOW", 5),
 			BlockDuration:   getEnvAsInt("BLOCK_DURATION", 15),
+		},
+		TwoFA: TwoFAConfig{
+			Enabled:          getEnvAsBool("ENABLE_2FA", false),
+			OTPExpiryMinutes: getEnvAsInt("TWOFA_OTP_EXPIRY_MINUTES", 5),
+			MaxAttempts:      getEnvAsInt("TWOFA_MAX_ATTEMPTS", 5),
+			Method:           getEnv("TWOFA_METHOD", "email"),
 		},
 		SSOPrivateKey:  getEnv("SSO_RSA_PRIVATE_KEY", ""),
 		SSOIssuerURL:   getEnv("SSO_ISSUER_URL", ""),

@@ -24,6 +24,7 @@ type User struct {
 	LastName        string           `gorm:"size:100" json:"last_name"`
 	Phone           string           `gorm:"size:20" json:"phone"`
 	MobileVerified  bool             `gorm:"default:false" json:"mobile_verified"`
+	TwoFactorEnabled bool            `gorm:"default:false" json:"two_factor_enabled"`
 	Avatar          string           `gorm:"size:500" json:"avatar"`
 	DepartmentID    *uuid.UUID       `gorm:"type:uuid;index" json:"department_id"`
 	Department      *Department      `gorm:"foreignKey:DepartmentID" json:"department,omitempty"`
@@ -169,6 +170,7 @@ type UserResponse struct {
 	LastName        string                   `json:"last_name"`
 	Phone           string                   `json:"phone"`
 	MobileVerified  bool                     `json:"mobile_verified"`
+	TwoFactorEnabled bool                    `json:"two_factor_enabled"`
 	Avatar          string                   `json:"avatar"`
 	DepartmentID    *uuid.UUID               `json:"department_id"`
 	Department      *DepartmentResponse      `json:"department,omitempty"`
@@ -192,6 +194,28 @@ type AuthResponse struct {
 	Token        string       `json:"token"`
 	RefreshToken string       `json:"refresh_token,omitempty"`
 	ExpiresIn    int64        `json:"expires_in,omitempty"` // seconds until access token expires
+}
+
+// TwoFAInitResponse is returned when 2FA is required after successful credential validation
+type TwoFAInitResponse struct {
+	TwoFARequired bool   `json:"two_factor_required"`
+	SessionID     string `json:"session_id"` // Temporary session ID for OTP verification
+	Message       string `json:"message"`
+	OTPMethod     string `json:"otp_method"` // "email" or "sms"
+}
+
+// TwoFAVerifyRequest for verifying 2FA OTP
+type TwoFAVerifyRequest struct {
+	SessionID string `json:"session_id" validate:"required"`
+	OTP       string `json:"otp" validate:"required"`
+}
+
+// TwoFAVerifyResponse after successful 2FA verification
+type TwoFAVerifyResponse struct {
+	User         UserResponse `json:"user"`
+	Token        string       `json:"token"`
+	RefreshToken string       `json:"refresh_token,omitempty"`
+	ExpiresIn    int64        `json:"expires_in,omitempty"`
 }
 
 type RefreshTokenRequest struct {

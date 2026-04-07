@@ -142,6 +142,11 @@ func Migrate(db *gorm.DB) error {
 		log.Printf("Warning: user mobile verified migration failed: %v", err)
 	}
 
+	// Migrate user two factor enabled
+	if err := migrations.MigrateUserTwoFactorEnabled(db); err != nil {
+		log.Printf("Warning: user two factor enabled migration failed: %v", err)
+	}
+
 	log.Println("Database migrations completed")
 	return nil
 }

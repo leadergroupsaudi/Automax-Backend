@@ -429,6 +429,11 @@ func (s *userService) ValidateMobileForLogin(ctx context.Context, phone string) 
 	return &resp, nil
 }
 
+// GetUserFor2FA retrieves user information for 2FA processing
+func (s *userService) GetUserFor2FA(ctx context.Context, email string) (*models.User, error) {
+	return s.userRepo.FindByEmailWithRelations(ctx, email)
+}
+
 func (s *userService) RefreshToken(ctx context.Context, refreshToken string) (*models.AuthResponse, error) {
 	// Validate the refresh token
 	claims, err := s.jwtManager.ValidateRefreshToken(refreshToken)
