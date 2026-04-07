@@ -137,6 +137,7 @@ func main() {
 	// Wire ReadyToCloseService into IncidentService (post-construction to avoid circular deps)
 	incidentService.SetReadyToCloseService(readyToCloseService)
 	incidentService.SetNotificationService(notificationService)
+	incidentService.SetFCMService(fcmService)
 	incidentService.SetUserService(userService)
 
 	// Initialize and start SLA Monitor (checks every 5 minutes)
@@ -182,6 +183,7 @@ func main() {
 	rejectionLogHandler := handlers.NewRejectionLogHandler(rejectionLogRepo)
 	incidentFeedbackHandler := handlers.NewIncidentFeedbackHandler(incidentRepo)
 	fcmHandler := handlers.NewFCMHandler(fcmService)
+	mobileNotificationHandler := handlers.NewMobileNotificationHandler(notificationLogRepo)
 	sentimentHandler := handlers.NewCallerSentimentHandler(callerSentimentService)
 	goalHandler := handlers.NewGoalHandler(goalService)
 	goalAnalyticsService := services.NewGoalAnalyticsService(db)
@@ -703,6 +705,11 @@ func main() {
 	fcm.Post("/push", fcmHandler.PushNotification)
 	fcm.Get("/device-tokens", fcmHandler.GetUserDeviceTokens)
 	fcm.Delete("/remove-device", fcmHandler.RemoveDevice)
+
+	// Mobile notification history and acknowledgement
+	mobile := v1.Group("/mobile", authMiddleware.Authenticate())
+	mobile.Get("/notifications", mobileNotificationHandler.GetMyNotifications)
+	mobile.Post("/notifications/:id/acknowledge", mobileNotificationHandler.AcknowledgeNotification)
 
 	//Caller sentiments
 	callerSentiments := v1.Group("/caller-sentiments", authMiddleware.Authenticate())

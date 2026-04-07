@@ -82,6 +82,8 @@ type IncidentService interface {
 	SetReadyToCloseService(rtcService ReadyToCloseService)
 	// SetNotificationService wires in the NotificationService (called post-construction).
 	SetNotificationService(ns *NotificationService)
+	// SetFCMService wires in the FCMService for push notifications (called post-construction).
+	SetFCMService(fcm *FCMService)
 
 	// Revisions
 	ListRevisions(ctx context.Context, incidentID uuid.UUID, filter *models.IncidentRevisionFilter) ([]models.IncidentRevisionResponse, int64, error)
@@ -107,6 +109,7 @@ type incidentService struct {
 	wsHub               *WSHub
 	readyToCloseService ReadyToCloseService
 	notificationService *NotificationService
+	fcmService          *FCMService
 	userService         UserService
 }
 
@@ -147,6 +150,11 @@ func (s *incidentService) SetReadyToCloseService(rtcService ReadyToCloseService)
 // SetNotificationService wires the NotificationService into the incident service.
 func (s *incidentService) SetNotificationService(ns *NotificationService) {
 	s.notificationService = ns
+}
+
+// SetFCMService wires the FCMService into the incident service for push notifications.
+func (s *incidentService) SetFCMService(fcm *FCMService) {
+	s.fcmService = fcm
 }
 
 // SetUserService wires the UserService into the incident service.
@@ -2492,6 +2500,56 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 		}
 	}
 
+	// Send push notifications to auto-assigned employee(s)
+	if s.fcmService != nil && len(assigneeUserIDs) > 0 {
+		subject := fmt.Sprintf("Incident %s assigned to you", incident.IncidentNumber)
+		body := fmt.Sprintf(
+			"Incident \"%s\" has been assigned to you. Status changed to: %s.",
+			incident.Title, newStateName,
+		)
+		go func() {
+			bgCtx := context.Background()
+			for _, aid := range assigneeUserIDs {
+				_ = s.fcmService.Push(bgCtx, &models.PushRequest{
+					UserID: aid,
+					Title:  subject,
+					Body:   body,
+					Data: map[string]string{
+						"type":            "incident_assigned",
+						"incident_id":     incidentID.String(),
+						"incident_number": incident.IncidentNumber,
+					},
+				})
+			}
+		}()
+	}
+
+	// Send push notification to reporter (citizen) when incident reaches terminal state
+	if s.fcmService != nil && newState.StateType == "terminal" && incident.ReporterID != nil {
+		closedAt := time.Now().Format("January 2, 2006 at 3:04 PM")
+		body := fmt.Sprintf(
+			"Your incident #%s \"%s\" has been resolved and closed on %s.",
+			incident.IncidentNumber, incident.Title, closedAt,
+		)
+		if req.Comment != "" {
+			body += fmt.Sprintf(" Resolution note: %s", req.Comment)
+		}
+		reporterID := *incident.ReporterID
+		go func() {
+			bgCtx := context.Background()
+			_ = s.fcmService.Push(bgCtx, &models.PushRequest{
+				UserID: reporterID,
+				Title:  "Your Incident Has Been Closed",
+				Body:   body,
+				Data: map[string]string{
+					"type":            "incident_closed",
+					"incident_id":     incidentID.String(),
+					"incident_number": incident.IncidentNumber,
+				},
+			})
+		}()
+	}
+
 	// Broadcast state change to WebSocket subscribers
 	if s.wsHub != nil {
 		s.wsHub.BroadcastToIncident(incidentID, "state_changed", map[string]interface{}{
@@ -3132,6 +3190,24 @@ func (s *incidentService) AssignIncident(ctx context.Context, incidentID, assign
 		if hasMerged {
 			_ = s.syncAssigneeToMergedIncidents(ctx, incidentID, assigneeID, userID)
 		}
+	}
+
+	// Send push notification to the new assignee
+	if s.fcmService != nil && assigneeID != uuid.Nil {
+		go func() {
+			bgCtx := context.Background()
+			body := fmt.Sprintf("Incident #%s \"%s\" has been assigned to you.", updated.IncidentNumber, updated.Title)
+			_ = s.fcmService.Push(bgCtx, &models.PushRequest{
+				UserID: assigneeID,
+				Title:  "New Incident Assigned",
+				Body:   body,
+				Data: map[string]string{
+					"type":            "incident_assigned",
+					"incident_id":     updated.ID.String(),
+					"incident_number": updated.IncidentNumber,
+				},
+			})
+		}()
 	}
 
 	resp := models.ToIncidentResponse(updated)

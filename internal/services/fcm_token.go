@@ -65,6 +65,14 @@ func (s *FCMService) RemoveDeviceToken(userID uuid.UUID, token string) error {
 }
 
 func (svc *FCMService) Push(ctx context.Context, req *models.PushRequest) error {
+	now := time.Now()
+
+	// Convert data to JSON for log body
+	dataJSON, _ := json.Marshal(req.Data)
+	bodyWithData := req.Body
+	if len(dataJSON) > 0 {
+		bodyWithData = fmt.Sprintf("%s | %s", req.Body, string(dataJSON))
+	}
 
 	tokens, err := svc.deviceTokenRepo.GetByUserID(req.UserID)
 	if err != nil {
@@ -78,27 +86,17 @@ func (svc *FCMService) Push(ctx context.Context, req *models.PushRequest) error 
 	var pushErr error
 
 	for _, t := range tokens {
-
-		err := svc.SendPushNotification(ctx, t.DeviceToken, req.Title, req.Body, req.Data)
-
-		if err != nil {
+		if err := svc.SendPushNotification(ctx, t.DeviceToken, req.Title, req.Body, req.Data); err != nil {
 			log.Printf("Push failed: %v", err)
 			pushErr = err
 		}
 	}
 
-	now := time.Now()
-
 	status := models.StatusSent
 	if pushErr != nil {
 		status = models.StatusFailed
 	}
-	// Convert data to JSON to store data into notification log body
-	dataJSON, _ := json.Marshal(req.Data)
-	bodyWithData := req.Body
-	if len(dataJSON) > 0 {
-		bodyWithData = fmt.Sprintf("%s | %s", req.Body, string(dataJSON))
-	}
+
 	logEntry := &models.NotificationLog{
 		Channel:      "push-notification",
 		Direction:    models.DirectionOutbound,
@@ -117,8 +115,7 @@ func (svc *FCMService) Push(ctx context.Context, req *models.PushRequest) error 
 		logEntry.ErrorMessage = pushErr.Error()
 	}
 
-	err = svc.notificationRepo.Create(ctx, logEntry)
-	if err != nil {
+	if err := svc.notificationRepo.Create(ctx, logEntry); err != nil {
 		log.Println("failed to save notification log:", err)
 	}
 
