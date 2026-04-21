@@ -33,6 +33,71 @@ func Connect(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 	return db, nil
 }
 
+func ConnectCorteza(cfg *config.DatabaseConfig) (*gorm.DB, error) {
+
+	dsn := fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s",
+		cfg.Host,
+		cfg.User,
+		cfg.Password,
+		cfg.DBName,
+		cfg.Port,
+		cfg.SSLMode,
+	)
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Warn),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Corteza database: %w", err)
+	}
+
+	// optional: extract sql.DB for ping / pooling
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := sqlDB.Ping(); err != nil {
+		return nil, fmt.Errorf("database ping failed: %w", err)
+	}
+
+	DB = db
+
+	log.Println("Corteza database connected successfully")
+	return db, nil
+}
+
+// func ConnectCorteza(cfg *config.DatabaseConfig) (*gorm.DB, error) {
+
+// 	dsn := fmt.Sprintf(
+// 		"host=%s user=%s password=%s dbname=%s port=%d sslmode=disable",
+// 		cfg.Host,
+// 		cfg.User,
+// 		cfg.Password,
+// 		cfg.DBName,
+// 		cfg.Port,
+// 	)
+
+// 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// GORM "ping" equivalent
+// 	sqlDB, err := db.DB()
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	if err := sqlDB.Ping(); err != nil {
+// 		return nil, err
+// 	}
+
+// 	return db, nil
+// }
+
 func Migrate(db *gorm.DB) error {
 	log.Println("Running database migrations...")
 	// Manually create the ENUM type for call_status if it doesn't exist
