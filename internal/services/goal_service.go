@@ -263,10 +263,16 @@ func (s *goalService) canModifyGoal(ctx context.Context, goalID uuid.UUID, userI
 		return true, nil
 	}
 
-	// Collaborators with reviewer_l1 or reviewer_l2 role can modify
+	// Any collaborator on the goal can modify it. We used to gate this on
+	// reviewer_l1/reviewer_l2 only, which forced admins to assign a "fake
+	// reviewer" role to anyone who needed to add metrics or evidence. The
+	// approval workflow now gates visibility (metrics, evidence, value
+	// changes all need reviewer sign-off before non-owners see them), so
+	// allowing any collaborator to author content is safe — published
+	// state is still controlled.
 	collaborators, _ := s.goalRepo.ListCollaborators(ctx, goalID)
 	for _, c := range collaborators {
-		if c.UserID == userID && (c.Role == models.CollaboratorRoleReviewerL1 || c.Role == models.CollaboratorRoleReviewerL2) {
+		if c.UserID == userID {
 			return true, nil
 		}
 	}
