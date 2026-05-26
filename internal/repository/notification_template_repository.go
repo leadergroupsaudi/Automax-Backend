@@ -130,7 +130,7 @@ func (r *notificationTemplateRepository) ListWithFilters(ctx context.Context, fi
 	offset := (page - 1) * limit
 
 	var list []models.NotificationTemplate
-	err := q.Order("code ASC").Offset(offset).Limit(limit).Find(&list).Error
+	err := q.Order("created_at DESC").Offset(offset).Limit(limit).Find(&list).Error
 	return list, total, err
 }
 
