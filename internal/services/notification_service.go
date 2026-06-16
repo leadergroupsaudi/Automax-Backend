@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -184,7 +185,7 @@ func (s *NotificationService) SendNotification(ctx context.Context, channel stri
 			}
 		}
 		for _, phone := range to {
-			err := utils.SendSMS(phone, body)
+			err := utils.DispatchSMS(phone, body)
 			if err != nil {
 				status = "failed"
 				recipientStatuses = append(recipientStatuses, models.RecipientInfo{
@@ -203,7 +204,11 @@ func (s *NotificationService) SendNotification(ctx context.Context, channel stri
 				})
 			}
 		}
-		provider = "twilio"
+		if strings.EqualFold(os.Getenv("SMS_PROVIDER"), "msg91") {
+			provider = "msg91"
+		} else {
+			provider = "twilio"
+		}
 	case "whatsapp":
 		status = "sent"
 		for _, phone := range to {

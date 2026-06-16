@@ -458,6 +458,92 @@ func SendSMS(to, message string) error {
 	return nil
 }
 
+// SendSMSViaMSG91 sends an SMS using the MSG91 REST API.
+// Required env vars: MSG91_AUTH_KEY, MSG91_SENDER_ID
+// Optional env var:  MSG91_ROUTE (default "4" = transactional)
+func SendSMSViaMSG91(to, message string) error {
+	authKey := os.Getenv("MSG91_AUTH_KEY")
+	senderID := os.Getenv("MSG91_SENDER_ID")
+	route := os.Getenv("MSG91_ROUTE")
+
+	if authKey == "" || senderID == "" {
+		fmt.Println("[DEBUG-SMS] ERROR: MSG91 env vars missing")
+		return fmt.Errorf("msg91 env vars missing: MSG91_AUTH_KEY / MSG91_SENDER_ID")
+	}
+	if route == "" {
+		route = "4"
+	}
+
+	if strings.TrimSpace(message) == "" {
+		fmt.Printf("[DEBUG-SMS] ERROR: empty message body for recipient %s — skipping send\n", to)
+		return fmt.Errorf("sms body is empty")
+	}
+
+	// MSG91 expects number without leading '+' but with country code (e.g. 919876543210)
+	normalizedTo := strings.TrimPrefix(to, "+")
+
+	fmt.Printf("[DEBUG-SMS] MSG91 sending to=%s sender=%s body_len=%d\n", to, senderID, len(message))
+
+	payload := map[string]interface{}{
+		"sender": senderID,
+		"route":  route,
+		"sms": []map[string]interface{}{
+			{
+				"message": message,
+				"to":      []string{normalizedTo},
+			},
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("msg91: failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://api.msg91.com/api/v2/sendsms", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("msg91: failed to create request: %w", err)
+	}
+	req.Header.Set("authkey", authKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		fmt.Printf("[DEBUG-SMS] MSG91 API error to=%s: %v\n", to, err)
+		return fmt.Errorf("msg91 send sms error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[DEBUG-SMS] MSG91 response status=%d body=%s to=%s\n", resp.StatusCode, string(respBody), to)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("msg91 send sms failed: status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if jsonErr := json.Unmarshal(respBody, &result); jsonErr == nil {
+		if result.Type == "error" {
+			return fmt.Errorf("msg91 send sms error: %s", result.Message)
+		}
+		fmt.Printf("[DEBUG-SMS] MSG91 success: %s to=%s\n", result.Message, to)
+	}
+	return nil
+}
+
+// DispatchSMS sends an SMS via MSG91 or Twilio based on the SMS_PROVIDER env var.
+// Set SMS_PROVIDER=msg91 to use MSG91; any other value (or unset) uses Twilio.
+func DispatchSMS(to, message string) error {
+	if strings.EqualFold(os.Getenv("SMS_PROVIDER"), "msg91") {
+		return SendSMSViaMSG91(to, message)
+	}
+	return SendSMS(to, message)
+}
+
 // normalizeSMSBody trims each line, drops blank lines, and strips leading/trailing
 // whitespace from the whole message. This reduces UCS-2 segment count when templates
 // contain indentation or extra blank lines.
