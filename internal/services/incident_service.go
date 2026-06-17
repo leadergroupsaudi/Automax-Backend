@@ -2905,6 +2905,15 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 				tx.Rollback()
 				return nil, errors.New(errMsg)
 			}
+		case "rating":
+			if req.Feedback == nil || req.Feedback.Rating < 1 || req.Feedback.Rating > 5 {
+				errMsg := requirement.ErrorMessage
+				if errMsg == "" {
+					errMsg = "Rating (1–5) is required for this transition"
+				}
+				tx.Rollback()
+				return nil, errors.New(errMsg)
+			}
 		}
 	}
 
