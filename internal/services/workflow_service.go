@@ -893,32 +893,46 @@ func (s *workflowService) CreateState(ctx context.Context, workflowID uuid.UUID,
 		return nil, err
 	}
 
-	// Assign viewable roles if provided
-	if len(req.ViewableRoleIDs) > 0 {
-		roleIDs := make([]uuid.UUID, 0, len(req.ViewableRoleIDs))
-		for _, idStr := range req.ViewableRoleIDs {
-			id, err := uuid.Parse(idStr)
-			if err != nil {
-				continue
-			}
-			roleIDs = append(roleIDs, id)
+	// Parse viewable roles
+	viewableRoleIDs := make([]uuid.UUID, 0, len(req.ViewableRoleIDs))
+	for _, idStr := range req.ViewableRoleIDs {
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			continue
 		}
-		if err := s.repo.AssignStateViewableRoles(ctx, state.ID, roleIDs); err != nil {
+		viewableRoleIDs = append(viewableRoleIDs, id)
+	}
+
+	// Parse editable roles
+	editableRoleIDs := make([]uuid.UUID, 0, len(req.EditableRoleIDs))
+	for _, idStr := range req.EditableRoleIDs {
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			continue
+		}
+		editableRoleIDs = append(editableRoleIDs, id)
+	}
+
+	// A role with edit permission must also have view permission
+	viewableSet := make(map[uuid.UUID]bool, len(viewableRoleIDs))
+	for _, id := range viewableRoleIDs {
+		viewableSet[id] = true
+	}
+	for _, id := range editableRoleIDs {
+		if !viewableSet[id] {
+			viewableRoleIDs = append(viewableRoleIDs, id)
+			viewableSet[id] = true
+		}
+	}
+
+	if len(viewableRoleIDs) > 0 {
+		if err := s.repo.AssignStateViewableRoles(ctx, state.ID, viewableRoleIDs); err != nil {
 			return nil, err
 		}
 	}
 
-	// Assign editable roles if provided
-	if len(req.EditableRoleIDs) > 0 {
-		roleIDs := make([]uuid.UUID, 0, len(req.EditableRoleIDs))
-		for _, idStr := range req.EditableRoleIDs {
-			id, err := uuid.Parse(idStr)
-			if err != nil {
-				continue
-			}
-			roleIDs = append(roleIDs, id)
-		}
-		if err := s.repo.AssignStateEditableRoles(ctx, state.ID, roleIDs); err != nil {
+	if len(editableRoleIDs) > 0 {
+		if err := s.repo.AssignStateEditableRoles(ctx, state.ID, editableRoleIDs); err != nil {
 			return nil, err
 		}
 	}
@@ -1073,32 +1087,62 @@ func (s *workflowService) UpdateState(ctx context.Context, stateID uuid.UUID, re
 		return nil, err
 	}
 
-	// Update viewable roles if provided
-	if req.ViewableRoleIDs != nil {
-		roleIDs := make([]uuid.UUID, 0, len(req.ViewableRoleIDs))
+	// Determine viewable roles: use provided list, or fall back to the state's existing roles
+	// so editable-only updates can still be validated/merged against the current viewable set.
+	viewableProvided := req.ViewableRoleIDs != nil
+	var viewableRoleIDs []uuid.UUID
+	if viewableProvided {
+		viewableRoleIDs = make([]uuid.UUID, 0, len(req.ViewableRoleIDs))
 		for _, idStr := range req.ViewableRoleIDs {
 			id, err := uuid.Parse(idStr)
 			if err != nil {
 				continue
 			}
-			roleIDs = append(roleIDs, id)
+			viewableRoleIDs = append(viewableRoleIDs, id)
 		}
-		if err := s.repo.AssignStateViewableRoles(ctx, stateID, roleIDs); err != nil {
-			return nil, err
+	} else {
+		viewableRoleIDs = make([]uuid.UUID, 0, len(state.ViewableRoles))
+		for _, r := range state.ViewableRoles {
+			viewableRoleIDs = append(viewableRoleIDs, r.ID)
 		}
 	}
 
-	// Update editable roles if provided
-	if req.EditableRoleIDs != nil {
-		roleIDs := make([]uuid.UUID, 0, len(req.EditableRoleIDs))
+	editableProvided := req.EditableRoleIDs != nil
+	var editableRoleIDs []uuid.UUID
+	if editableProvided {
+		editableRoleIDs = make([]uuid.UUID, 0, len(req.EditableRoleIDs))
 		for _, idStr := range req.EditableRoleIDs {
 			id, err := uuid.Parse(idStr)
 			if err != nil {
 				continue
 			}
-			roleIDs = append(roleIDs, id)
+			editableRoleIDs = append(editableRoleIDs, id)
 		}
-		if err := s.repo.AssignStateEditableRoles(ctx, stateID, roleIDs); err != nil {
+	}
+
+	// A role with edit permission must also have view permission
+	if editableProvided {
+		viewableSet := make(map[uuid.UUID]bool, len(viewableRoleIDs))
+		for _, id := range viewableRoleIDs {
+			viewableSet[id] = true
+		}
+		for _, id := range editableRoleIDs {
+			if !viewableSet[id] {
+				viewableRoleIDs = append(viewableRoleIDs, id)
+				viewableSet[id] = true
+				viewableProvided = true // editable roles forced an addition; persist the updated viewable set
+			}
+		}
+	}
+
+	if viewableProvided {
+		if err := s.repo.AssignStateViewableRoles(ctx, stateID, viewableRoleIDs); err != nil {
+			return nil, err
+		}
+	}
+
+	if editableProvided {
+		if err := s.repo.AssignStateEditableRoles(ctx, stateID, editableRoleIDs); err != nil {
 			return nil, err
 		}
 	}
@@ -2134,45 +2178,53 @@ func (s *workflowService) ImportWorkflow(ctx context.Context, data *models.Workf
 
 		stateCodeToID[stateData.Code] = state.ID
 
-		// Resolve and assign viewable roles
-		if len(stateData.ViewableRoles) > 0 {
-			roleIDs := []uuid.UUID{}
-			for _, roleRef := range stateData.ViewableRoles {
-				role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
-				if err != nil {
-					warnings = append(warnings, fmt.Sprintf("Role '%s' not found for state '%s'", roleRef.Name, stateData.Name))
-					continue
-				}
-				roleIDs = append(roleIDs, role.ID)
+		// Resolve viewable roles
+		viewableRoleIDs := []uuid.UUID{}
+		for _, roleRef := range stateData.ViewableRoles {
+			role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("Role '%s' not found for state '%s'", roleRef.Name, stateData.Name))
+				continue
 			}
+			viewableRoleIDs = append(viewableRoleIDs, role.ID)
+		}
 
-			if len(roleIDs) > 0 {
-				if err := tx.Exec("INSERT INTO state_viewable_roles (workflow_state_id, role_id) VALUES " +
-					buildBulkInsertValues(state.ID, roleIDs)).Error; err != nil {
-					tx.Rollback()
-					return nil, nil, err
-				}
+		// Resolve editable roles
+		editableRoleIDs := []uuid.UUID{}
+		for _, roleRef := range stateData.EditableRoles {
+			role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("Role '%s' not found for editable_roles in state '%s'", roleRef.Name, stateData.Name))
+				continue
+			}
+			editableRoleIDs = append(editableRoleIDs, role.ID)
+		}
+
+		// A role with edit permission must also have view permission
+		viewableSet := make(map[uuid.UUID]bool, len(viewableRoleIDs))
+		for _, id := range viewableRoleIDs {
+			viewableSet[id] = true
+		}
+		for _, id := range editableRoleIDs {
+			if !viewableSet[id] {
+				viewableRoleIDs = append(viewableRoleIDs, id)
+				viewableSet[id] = true
 			}
 		}
 
-		// Resolve and assign editable roles
-		if len(stateData.EditableRoles) > 0 {
-			roleIDs := []uuid.UUID{}
-			for _, roleRef := range stateData.EditableRoles {
-				role, err := s.roleRepo.FindByCode(ctx, roleRef.Code)
-				if err != nil {
-					warnings = append(warnings, fmt.Sprintf("Role '%s' not found for editable_roles in state '%s'", roleRef.Name, stateData.Name))
-					continue
-				}
-				roleIDs = append(roleIDs, role.ID)
+		if len(viewableRoleIDs) > 0 {
+			if err := tx.Exec("INSERT INTO state_viewable_roles (workflow_state_id, role_id) VALUES " +
+				buildBulkInsertValues(state.ID, viewableRoleIDs)).Error; err != nil {
+				tx.Rollback()
+				return nil, nil, err
 			}
+		}
 
-			if len(roleIDs) > 0 {
-				if err := tx.Exec("INSERT INTO state_editable_roles (workflow_state_id, role_id) VALUES " +
-					buildBulkInsertValues(state.ID, roleIDs)).Error; err != nil {
-					tx.Rollback()
-					return nil, nil, err
-				}
+		if len(editableRoleIDs) > 0 {
+			if err := tx.Exec("INSERT INTO state_editable_roles (workflow_state_id, role_id) VALUES " +
+				buildBulkInsertValues(state.ID, editableRoleIDs)).Error; err != nil {
+				tx.Rollback()
+				return nil, nil, err
 			}
 		}
 	}
