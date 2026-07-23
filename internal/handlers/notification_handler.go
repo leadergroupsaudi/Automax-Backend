@@ -605,6 +605,11 @@ func (h *NotificationHandler) ListMonitoring(c *fiber.Ctx) error {
 		filter.Limit = 20
 	}
 
+	if startDate := c.Query("start_date"); startDate != "" {
+		if t, err := time.Parse("2006-01-02", startDate); err == nil {
+			filter.StartDate = &t
+		}
+	}
 	if endDate := c.Query("end_date"); endDate != "" {
 		if t, err := time.Parse("2006-01-02", endDate); err == nil {
 			t = t.Add(24*time.Hour - time.Second)
