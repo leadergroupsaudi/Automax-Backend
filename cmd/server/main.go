@@ -17,6 +17,7 @@ import (
 	"github.com/automax/backend/internal/licensing"
 	"github.com/automax/backend/internal/licensing/devseed"
 	"github.com/automax/backend/internal/middleware"
+	"github.com/automax/backend/internal/natsclient"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/internal/services"
 	"github.com/automax/backend/internal/storage"
@@ -63,6 +64,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to MinIO: %v", err)
 	}
+
+	natsClient := natsclient.Connect(cfg.NATS.URL)
+	defer natsClient.Close()
 
 	jwtManager := utils.NewJWTManager(cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.JWT.RefreshExpireHour, cfg.JWT.RememberExpireHour)
 	ssoJWTManager := utils.NewSSOJWTManager(cfg.SSOPrivateKey, cfg.SSOIssuerURL)
@@ -181,6 +185,7 @@ func main() {
 	incidentService.SetFCMService(fcmService)
 	incidentService.SetIvrSmsLinkRepo(ivrSmsLinkRepo)
 	incidentService.SetConfig(cfg)
+	incidentService.SetNATSClient(natsClient)
 	smsFeedbackPendingRepo := repository.NewSmsFeedbackPendingRepository(db)
 	incidentService.SetActionExecutor(services.NewActionExecutor(incidentRepo, userRepo, notificationService, smsFeedbackPendingRepo))
 	incidentService.SetPublicFeedbackRepo(publicFeedbackRepo)

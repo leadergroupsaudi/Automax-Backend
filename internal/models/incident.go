@@ -3,6 +3,7 @@ package models
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/automax/backend/pkg/utils"
@@ -149,6 +150,11 @@ type Incident struct {
 	// AI Verification flag — set to true when the incident has been verified by AI
 	IsAIVerified bool `gorm:"default:false;index" json:"is_ai_verified"`
 
+	// WorkflowStack is a JSON-encoded array of WorkflowStackFrame values, oldest
+	// first. Same text-column convention as Settings.FieldSettings. Hidden from
+	// API responses; use PushWorkflowFrame / PopWorkflowFrame.
+	WorkflowStack string `gorm:"column:workflow_stack;type:text;not null;default:'[]'" json:"-"`
+
 	// Related records
 	Comments          []IncidentComment           `gorm:"foreignKey:IncidentID" json:"comments,omitempty"`
 	Attachments       []IncidentAttachment        `gorm:"foreignKey:IncidentID" json:"attachments,omitempty"`
@@ -164,6 +170,9 @@ type Incident struct {
 func (i *Incident) BeforeCreate(tx *gorm.DB) error {
 	if i.ID == uuid.Nil {
 		i.ID = uuid.New()
+	}
+	if strings.TrimSpace(i.WorkflowStack) == "" {
+		i.WorkflowStack = "[]"
 	}
 	return nil
 }

@@ -17,6 +17,12 @@ import (
 	"gorm.io/gorm"
 )
 
+var (
+	ErrInvalidTargetWorkflow   = errors.New("invalid target_workflow_id")
+	ErrTargetWorkflowNotFound  = errors.New("target workflow not found")
+	ErrTransitionPushAndReturn = errors.New("a transition cannot be both a push and a return")
+)
+
 type WorkflowService interface {
 	// Workflow CRUD
 	CreateWorkflow(ctx context.Context, req *models.WorkflowCreateRequest, createdByID uuid.UUID) (*models.WorkflowResponse, error)
@@ -1425,6 +1431,21 @@ func (s *workflowService) CreateTransition(ctx context.Context, workflowID uuid.
 		AutoMatchUser:        req.AutoMatchUser,
 		ManualSelectUser:     req.ManualSelectUser,
 		ViewAssigneUserList:  req.ViewAssigneUserList,
+		IsReturnTransition:   req.IsReturnTransition,
+	}
+
+	if req.TargetWorkflowID != nil && *req.TargetWorkflowID != "" {
+		targetID, err := uuid.Parse(*req.TargetWorkflowID)
+		if err != nil {
+			return nil, ErrInvalidTargetWorkflow
+		}
+		if _, err := s.repo.FindByID(ctx, targetID); err != nil {
+			return nil, ErrTargetWorkflowNotFound
+		}
+		transition.TargetWorkflowID = &targetID
+	}
+	if transition.TargetWorkflowID != nil && transition.IsReturnTransition {
+		return nil, ErrTransitionPushAndReturn
 	}
 
 	// Department Assignment
@@ -1567,6 +1588,26 @@ func (s *workflowService) UpdateTransition(ctx context.Context, transitionID uui
 	}
 	if req.RequireAssignee != nil {
 		transition.RequireAssignee = *req.RequireAssignee
+	}
+	if req.IsReturnTransition != nil {
+		transition.IsReturnTransition = *req.IsReturnTransition
+	}
+	if req.TargetWorkflowID != nil {
+		if *req.TargetWorkflowID == "" {
+			transition.TargetWorkflowID = nil
+		} else {
+			targetID, err := uuid.Parse(*req.TargetWorkflowID)
+			if err != nil {
+				return nil, ErrInvalidTargetWorkflow
+			}
+			if _, err := s.repo.FindByID(ctx, targetID); err != nil {
+				return nil, ErrTargetWorkflowNotFound
+			}
+			transition.TargetWorkflowID = &targetID
+		}
+	}
+	if transition.TargetWorkflowID != nil && transition.IsReturnTransition {
+		return nil, ErrTransitionPushAndReturn
 	}
 	// Department Assignment
 	if req.AutoDetectDepartment != nil {

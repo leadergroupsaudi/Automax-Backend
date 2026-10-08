@@ -897,6 +897,17 @@ func (h *WorkflowHandler) DeleteState(c *fiber.Ctx) error {
 
 // Transition management
 
+func transitionRequestError(err error) (string, bool) {
+	switch {
+	case errors.Is(err, services.ErrTransitionPushAndReturn),
+		errors.Is(err, services.ErrInvalidTargetWorkflow),
+		errors.Is(err, services.ErrTargetWorkflowNotFound):
+		return err.Error(), true
+	default:
+		return "", false
+	}
+}
+
 func (h *WorkflowHandler) CreateTransition(c *fiber.Ctx) error {
 	workflowIDStr := c.Params("id")
 	workflowID, err := uuid.Parse(workflowIDStr)
@@ -930,6 +941,9 @@ func (h *WorkflowHandler) CreateTransition(c *fiber.Ctx) error {
 
 	transition, err := h.service.CreateTransition(c.UserContext(), workflowID, &req)
 	if err != nil {
+		if msg, ok := transitionRequestError(err); ok {
+			return utils.ErrorResponse(c, fiber.StatusBadRequest, msg)
+		}
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 
@@ -1026,6 +1040,9 @@ func (h *WorkflowHandler) UpdateTransition(c *fiber.Ctx) error {
 
 	transition, err := h.service.UpdateTransition(c.UserContext(), transitionID, &req)
 	if err != nil {
+		if msg, ok := transitionRequestError(err); ok {
+			return utils.ErrorResponse(c, fiber.StatusBadRequest, msg)
+		}
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 

@@ -345,6 +345,11 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		log.Printf("Warning: closed incident edit tracking migration failed: %v", err)
 	}
 
+	// Sub-workflow columns: target_workflow_id, is_return_transition, workflow_stack.
+	if err := migrations.MigrateWorkflowSubworkflowSchema(db); err != nil {
+		log.Printf("Warning: workflow sub-workflow schema migration failed: %v", err)
+	}
+
 	// Migrate user mobile verified
 	if err := migrations.MigrateUserMobileVerified(db); err != nil {
 		log.Printf("Warning: user mobile verified migration failed: %v", err)

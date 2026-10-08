@@ -19,7 +19,7 @@ type Workflow struct {
 	Version       int       `gorm:"default:1" json:"version"`
 	IsActive      bool      `gorm:"default:true" json:"is_active"`
 	IsDefault     bool      `gorm:"default:false" json:"is_default"`
-	RecordType    string    `gorm:"size:20;default:'incident'" json:"record_type"` // 'incident', 'request', 'complaint', 'query', 'evidence', 'both', 'all'
+	RecordType    string    `gorm:"size:20;default:'incident'" json:"record_type"` // 'incident', 'request', 'complaint', 'query', 'evidence', 'both', 'all', 'dispatch'
 
 	// Matching criteria - stored as JSON arrays, empty/null means matches any value
 	// Sources: ["email", "phone", "web", "mobile", "emergency_hotline", etc.]
@@ -194,6 +194,13 @@ type WorkflowTransition struct {
 	ToStateID   uuid.UUID      `gorm:"type:uuid;index;not null" json:"to_state_id"`
 	ToState     *WorkflowState `gorm:"foreignKey:ToStateID" json:"to_state,omitempty"`
 
+	// Sub-workflow linking. TargetWorkflowID set means this transition pushes
+	// into that workflow. IsReturnTransition set means this transition pops
+	// back to the calling workflow.
+	TargetWorkflowID   *uuid.UUID `gorm:"type:uuid;index" json:"target_workflow_id,omitempty"`
+	TargetWorkflow     *Workflow  `gorm:"foreignKey:TargetWorkflowID" json:"target_workflow,omitempty"`
+	IsReturnTransition bool       `gorm:"not null;default:false" json:"is_return_transition"`
+
 	// Role-based restrictions (many-to-many)
 	AllowedRoles []Role `gorm:"many2many:transition_allowed_roles;" json:"allowed_roles,omitempty"`
 
@@ -335,7 +342,7 @@ type WorkflowCreateRequest struct {
 	Code              string   `json:"code" validate:"omitempty,min=2,max=50"`
 	Description       string   `json:"description" validate:"max=500"`
 	DescriptionAr     string   `json:"description_ar" validate:"max=500"`
-	RecordType        string   `json:"record_type" validate:"omitempty,oneof=incident request complaint query evidence both all"`
+	RecordType        string   `json:"record_type" validate:"omitempty,oneof=incident request complaint query evidence both all dispatch"`
 	Sources           []string `json:"sources"`    // Array of source strings
 	Priorities        []int    `json:"priorities"` // Array of priority integers
 	ClassificationIDs []string `json:"classification_ids"`
@@ -353,7 +360,7 @@ type WorkflowUpdateRequest struct {
 	Code                    string   `json:"code" validate:"omitempty,min=2,max=100"`
 	Description             string   `json:"description" validate:"max=500"`
 	DescriptionAr           string   `json:"description_ar" validate:"max=500"`
-	RecordType              *string  `json:"record_type" validate:"omitempty,oneof=incident request complaint query evidence both all"`
+	RecordType              *string  `json:"record_type" validate:"omitempty,oneof=incident request complaint query evidence both all dispatch"`
 	Sources                 []string `json:"sources"`    // Array of source strings (nil means not updating)
 	Priorities              []int    `json:"priorities"` // Array of priority integers (nil means not updating)
 	IsActive                *bool    `json:"is_active"`
@@ -441,19 +448,21 @@ type WorkflowTransitionCreateRequest struct {
 	// the code (TRN-######) and ignores whatever is sent here. Kept omitempty at
 	// the struct level so EPM940 callers can omit it — the handler enforces
 	// "required for VD2" manually since that rule is client-specific.
-	Code            string   `json:"code" validate:"omitempty,min=2,max=50"`
-	Description     string   `json:"description" validate:"max=500"`
-	DescriptionAr   string   `json:"description_ar" validate:"max=500"`
-	FromStateID     string   `json:"from_state_id" validate:"required,uuid"`
-	ToStateID       string   `json:"to_state_id" validate:"required,uuid"`
-	RoleIDs         []string `json:"role_ids"`
-	SortOrder       int      `json:"sort_order"`
-	IsRejection     bool     `json:"is_rejection"`
-	IsNotBelong     bool     `json:"is_not_belong"`
-	IsMissingInfo   bool     `json:"is_missing_info"`
-	IsReopen        bool     `json:"is_reopen"`
-	IsFinalClose    bool     `json:"is_final_close"`
-	RequireAssignee bool     `json:"require_assignee"`
+	Code               string   `json:"code" validate:"omitempty,min=2,max=50"`
+	Description        string   `json:"description" validate:"max=500"`
+	DescriptionAr      string   `json:"description_ar" validate:"max=500"`
+	FromStateID        string   `json:"from_state_id" validate:"required,uuid"`
+	ToStateID          string   `json:"to_state_id" validate:"required,uuid"`
+	RoleIDs            []string `json:"role_ids"`
+	SortOrder          int      `json:"sort_order"`
+	IsRejection        bool     `json:"is_rejection"`
+	IsNotBelong        bool     `json:"is_not_belong"`
+	IsMissingInfo      bool     `json:"is_missing_info"`
+	IsReopen           bool     `json:"is_reopen"`
+	IsFinalClose       bool     `json:"is_final_close"`
+	RequireAssignee    bool     `json:"require_assignee"`
+	TargetWorkflowID   *string  `json:"target_workflow_id" validate:"omitempty,uuid"`
+	IsReturnTransition bool     `json:"is_return_transition"`
 
 	// Department Assignment
 	AssignDepartmentID   *string `json:"assign_department_id" validate:"omitempty"`
@@ -469,22 +478,24 @@ type WorkflowTransitionCreateRequest struct {
 }
 
 type WorkflowTransitionUpdateRequest struct {
-	Name            string   `json:"name" validate:"omitempty,min=2,max=100"`
-	NameAr          string   `json:"name_ar" validate:"max=100"`
-	Code            string   `json:"code" validate:"omitempty,min=2,max=50"`
-	Description     string   `json:"description" validate:"max=500"`
-	DescriptionAr   string   `json:"description_ar" validate:"max=500"`
-	FromStateID     string   `json:"from_state_id" validate:"omitempty,uuid"`
-	ToStateID       string   `json:"to_state_id" validate:"omitempty,uuid"`
-	RoleIDs         []string `json:"role_ids"`
-	SortOrder       *int     `json:"sort_order"`
-	IsActive        *bool    `json:"is_active"`
-	IsRejection     *bool    `json:"is_rejection"`
-	IsNotBelong     *bool    `json:"is_not_belong"`
-	IsMissingInfo   *bool    `json:"is_missing_info"`
-	IsReopen        *bool    `json:"is_reopen"`
-	IsFinalClose    *bool    `json:"is_final_close"`
-	RequireAssignee *bool    `json:"require_assignee"`
+	Name               string   `json:"name" validate:"omitempty,min=2,max=100"`
+	NameAr             string   `json:"name_ar" validate:"max=100"`
+	Code               string   `json:"code" validate:"omitempty,min=2,max=50"`
+	Description        string   `json:"description" validate:"max=500"`
+	DescriptionAr      string   `json:"description_ar" validate:"max=500"`
+	FromStateID        string   `json:"from_state_id" validate:"omitempty,uuid"`
+	ToStateID          string   `json:"to_state_id" validate:"omitempty,uuid"`
+	RoleIDs            []string `json:"role_ids"`
+	SortOrder          *int     `json:"sort_order"`
+	IsActive           *bool    `json:"is_active"`
+	IsRejection        *bool    `json:"is_rejection"`
+	IsNotBelong        *bool    `json:"is_not_belong"`
+	IsMissingInfo      *bool    `json:"is_missing_info"`
+	IsReopen           *bool    `json:"is_reopen"`
+	IsFinalClose       *bool    `json:"is_final_close"`
+	RequireAssignee    *bool    `json:"require_assignee"`
+	TargetWorkflowID   *string  `json:"target_workflow_id" validate:"omitempty,uuid"`
+	IsReturnTransition *bool    `json:"is_return_transition"`
 
 	// Department Assignment
 	AssignDepartmentID   *string `json:"assign_department_id" validate:"omitempty,uuid"`
@@ -652,18 +663,20 @@ type WorkflowTransitionResponse struct {
 	ManualSelectUser    bool           `json:"manual_select_user"`
 	ViewAssigneUserList bool           `json:"view_assigne_user_list"`
 
-	Requirements    []TransitionRequirementResponse `json:"requirements,omitempty"`
-	Actions         []TransitionActionResponse      `json:"actions,omitempty"`
-	FieldChanges    []TransitionFieldChangeResponse `json:"field_changes,omitempty"`
-	IsRejection     bool                            `json:"is_rejection"`
-	IsNotBelong     bool                            `json:"is_not_belong"`
-	IsMissingInfo   bool                            `json:"is_missing_info"`
-	IsReopen        bool                            `json:"is_reopen"`
-	IsFinalClose    bool                            `json:"is_final_close"`
-	RequireAssignee bool                            `json:"require_assignee"`
-	IsActive        bool                            `json:"is_active"`
-	SortOrder       int                             `json:"sort_order"`
-	CreatedAt       time.Time                       `json:"created_at"`
+	Requirements       []TransitionRequirementResponse `json:"requirements,omitempty"`
+	Actions            []TransitionActionResponse      `json:"actions,omitempty"`
+	FieldChanges       []TransitionFieldChangeResponse `json:"field_changes,omitempty"`
+	IsRejection        bool                            `json:"is_rejection"`
+	IsNotBelong        bool                            `json:"is_not_belong"`
+	IsMissingInfo      bool                            `json:"is_missing_info"`
+	IsReopen           bool                            `json:"is_reopen"`
+	IsFinalClose       bool                            `json:"is_final_close"`
+	RequireAssignee    bool                            `json:"require_assignee"`
+	TargetWorkflowID   *uuid.UUID                      `json:"target_workflow_id,omitempty"`
+	IsReturnTransition bool                            `json:"is_return_transition"`
+	IsActive           bool                            `json:"is_active"`
+	SortOrder          int                             `json:"sort_order"`
+	CreatedAt          time.Time                       `json:"created_at"`
 }
 
 type TransitionRequirementResponse struct {
@@ -904,6 +917,8 @@ func ToWorkflowTransitionResponse(t *WorkflowTransition) WorkflowTransitionRespo
 		IsReopen:             t.IsReopen,
 		IsFinalClose:         t.IsFinalClose,
 		RequireAssignee:      t.RequireAssignee,
+		TargetWorkflowID:     t.TargetWorkflowID,
+		IsReturnTransition:   t.IsReturnTransition,
 		IsActive:             t.IsActive,
 		SortOrder:            t.SortOrder,
 		CreatedAt:            t.CreatedAt,
@@ -1030,7 +1045,7 @@ type WorkflowExportContent struct {
 	Description string `json:"description" validate:"omitempty,max=500"`
 
 	// FIX: oneof belongs on the string itself, not a []string slice
-	RecordType string   `json:"record_type,omitempty" validate:"omitempty,oneof=incident request complaint query evidence both all"`
+	RecordType string   `json:"record_type,omitempty" validate:"omitempty,oneof=incident request complaint query evidence both all dispatch"`
 	Sources    []string `json:"sources,omitempty"    validate:"omitempty,dive,min=1"`
 
 	// FIX: []int can't use oneof with string values — validate the range differently

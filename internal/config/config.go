@@ -11,6 +11,7 @@ type Config struct {
 	Server                      ServerConfig
 	Database                    DatabaseConfig
 	Redis                       RedisConfig
+	NATS                        NATSConfig
 	MinIO                       MinIOConfig
 	JWT                         JWTConfig
 	LDAP                        LDAPConfig
@@ -267,6 +268,11 @@ type RedisConfig struct {
 	DB       int
 }
 
+// NATSConfig is the NATS connection. URL is env: NATS_URL, same env-var style as the database settings.
+type NATSConfig struct {
+	URL string
+}
+
 type MinIOConfig struct {
 	Endpoint        string
 	AccessKeyID     string
@@ -325,6 +331,9 @@ func Load() *Config {
 			Port:     getEnv("REDIS_PORT", "6379"),
 			Password: getEnv("REDIS_PASSWORD", ""),
 			DB:       getEnvAsInt("REDIS_DB", 0),
+		},
+		NATS: NATSConfig{
+			URL: getEnv("NATS_URL", "nats://localhost:4223"),
 		},
 		MinIO: MinIOConfig{
 			Endpoint:        getEnv("MINIO_ENDPOINT", "localhost:9000"),

@@ -17,6 +17,7 @@ import (
 
 	"github.com/automax/backend/internal/config"
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/natsclient"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/internal/storage"
 	"github.com/automax/backend/internal/utils"
@@ -127,6 +128,8 @@ type IncidentService interface {
 	SetIvrSmsLinkRepo(repo repository.IvrSmsLinkRepository)
 	// SetConfig wires in the app config (called post-construction).
 	SetConfig(cfg *config.Config)
+	// SetNATSClient wires the process NATS client. A nil client skips the state-changed publish.
+	SetNATSClient(client *natsclient.Client)
 
 	// Closed incident editing
 	UpdateClosedIncidentSummary(ctx context.Context, incidentID uuid.UUID, userID uuid.UUID, newDescription string, reason string) (*models.IncidentResponse, error)
@@ -163,6 +166,7 @@ type incidentService struct {
 	rrCounters              map[string]int64
 	rrMu                    sync.Mutex
 	cfg                     *config.Config
+	nats                    *natsclient.Client
 }
 
 func NewIncidentService(
@@ -217,6 +221,10 @@ func (s *incidentService) SetUserService(us UserService) {
 // SetConfig wires the app config into the incident service.
 func (s *incidentService) SetConfig(cfg *config.Config) {
 	s.cfg = cfg
+}
+
+func (s *incidentService) SetNATSClient(client *natsclient.Client) {
+	s.nats = client
 }
 
 // SetIvrSmsLinkRepo wires the IvrSmsLinkRepository into the incident service.
@@ -3277,12 +3285,40 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 		}
 	}
 
+	// Sub-workflow push/pop. A transition that sets neither field keeps the
+	// existing destination (transition.ToStateID) and does not touch the stack.
+	fromStateID := incident.CurrentStateID
+	destStateID := transition.ToStateID
+	subworkflowMove := false
+	if transition.TargetWorkflowID != nil || transition.IsReturnTransition {
+		var initialStates []models.WorkflowState
+		if transition.TargetWorkflowID != nil {
+			states, err := s.workflowRepo.ListStatesByWorkflowID(ctx, *transition.TargetWorkflowID)
+			if err != nil {
+				tx.Rollback()
+				return nil, err
+			}
+			for _, st := range states {
+				if st.StateType == "initial" {
+					initialStates = append(initialStates, st)
+				}
+			}
+		}
+		dest, moved, err := applySubworkflowTransition(incident, transition, initialStates)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		destStateID = dest
+		subworkflowMove = moved
+	}
+
 	// Create transition history record
 	history := &models.IncidentTransitionHistory{
 		IncidentID:     incidentID,
 		TransitionID:   &transitionID,
-		FromStateID:    incident.CurrentStateID,
-		ToStateID:      transition.ToStateID,
+		FromStateID:    fromStateID,
+		ToStateID:      destStateID,
 		PerformedByID:  userID,
 		Comment:        req.Comment,
 		TransitionedAt: time.Now(),
@@ -3334,7 +3370,7 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 	}
 
 	// Get new state for SLA calculation
-	newState, err := s.workflowRepo.FindStateByID(ctx, transition.ToStateID)
+	newState, err := s.workflowRepo.FindStateByID(ctx, destStateID)
 	if err != nil {
 		tx.Rollback()
 		return nil, errors.New(i18n.T(ctx, "target_state_not_found"))
@@ -3356,8 +3392,12 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 
 	// Prepare updates map for all fields that need to change
 	updates := map[string]interface{}{
-		"current_state_id": transition.ToStateID,
+		"current_state_id": destStateID,
 		"updated_at":       time.Now(),
+	}
+	if subworkflowMove {
+		updates["workflow_id"] = incident.WorkflowID
+		updates["workflow_stack"] = incident.WorkflowStack
 	}
 
 	// When leaving a partial_close state, clear partial close fields
@@ -3825,7 +3865,7 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 			// Transition triggers
 			s.integrationExecutor.RunTransitionTriggers(ctx, updatedForExec, transitionID, transition.Name)
 			// State-enter triggers on the destination state
-			s.integrationExecutor.RunStateTriggers(ctx, updatedForExec, transition.ToStateID, newState.Name, "enter")
+			s.integrationExecutor.RunStateTriggers(ctx, updatedForExec, destStateID, newState.Name, "enter")
 			// State-exit triggers on the source state
 			s.integrationExecutor.RunStateTriggers(ctx, updatedForExec, transition.FromStateID, transition.FromState.Name, "exit")
 
@@ -3845,7 +3885,7 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 					operatorID = actor.Username
 				}
 				eeNotesFromMUN := req.Comment
-				go s.momraStatusSyncService.SyncIncidentStatus(context.Background(), updatedForExec, transition.ToStateID, operatorName, operatorID, eeNotesFromMUN)
+				go s.momraStatusSyncService.SyncIncidentStatus(context.Background(), updatedForExec, destStateID, operatorName, operatorID, eeNotesFromMUN)
 			}
 		}
 	}
@@ -3896,7 +3936,7 @@ func (s *incidentService) ExecuteTransition(ctx context.Context, incidentID uuid
 				} else {
 					fmt.Println("[DEBUG] Non-terminal state - syncing status and sending SMS")
 					// Non-terminal state: sync the status and send SMS notifications
-					_ = s.incidentMergeRepo.SyncStatusToMergedIncidents(ctx, incidentID, transition.ToStateID)
+					_ = s.incidentMergeRepo.SyncStatusToMergedIncidents(ctx, incidentID, destStateID)
 
 					// Sync transition data (revision, history, comment) to children
 					_ = s.syncTransitionToMergedIncidents(ctx, incidentID, transition, history, userID)
