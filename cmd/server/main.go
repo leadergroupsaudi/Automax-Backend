@@ -274,7 +274,7 @@ func main() {
 	lookupHandler := handlers.NewLookupHandler(lookupRepo)
 	applicationLinkHandler := handlers.NewApplicationLinkHandler(applicationLinkService, minioStorage)
 	configHandler := handlers.NewConfigHandler(configService, actionLogService)
-	settingsHandler := handlers.NewSettingsHandler(settingsService)
+	settingsHandler := handlers.NewSettingsHandler(settingsService, minioStorage, cfg)
 	jwksHandler := handlers.NewJWKSHandler(ssoJWTManager)
 	ssoHandler := handlers.NewSSOHandler(ssoJWTManager, jwtManager, sessionStore, userRepo, applicationLinkRepo, userService, otpService, cfg.SSOFrontendURL, cfg.NafathAPIBaseURL)
 	notificationTemplateService := services.NewNotificationTemplateService(notificationTemplateRepo, db)
@@ -1012,6 +1012,7 @@ func main() {
 	v1.Get("/settings", settingsHandler.GetSettings)
 	// Admin settings endpoint (requires settings:update permission)
 	admin.Put("/settings", authMiddleware.RequirePermission("settings:update"), settingsHandler.UpdateSettings)
+	admin.Post("/settings/branding-image", authMiddleware.RequirePermission("settings:update"), settingsHandler.UploadBrandingImage)
 
 	// License management routes
 	licenseGroup := admin.Group("/license")
