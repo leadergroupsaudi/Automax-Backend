@@ -65,11 +65,6 @@ type Settings struct {
 	DefaultLanguage    string `gorm:"size:10;default:'en'" json:"default_language"`
 	SupportedLanguages string `gorm:"size:500;default:'[\"en\",\"ar\"]'" json:"supported_languages"`
 
-	// Benchmark Municipality Names (configurable labels for the 3 comparison slots)
-	Municipality1Name string `gorm:"size:100;default:'Municipality 1'" json:"municipality1_name"`
-	Municipality2Name string `gorm:"size:100;default:'Municipality 2'" json:"municipality2_name"`
-	Municipality3Name string `gorm:"size:100;default:'Municipality 3'" json:"municipality3_name"`
-
 	// Feature Toggles
 	ShowEvaluateButton bool `gorm:"default:false" json:"show_evaluate_button"` // Manual feedback trigger button on complaint/query detail pages
 
@@ -166,11 +161,6 @@ type SettingsUpdateRequest struct {
 	DefaultLanguage    *string `json:"default_language" validate:"omitempty,min=2,max=10"`
 	SupportedLanguages *string `json:"supported_languages" validate:"omitempty,max=500"`
 
-	// Benchmark Municipality Names
-	Municipality1Name *string `json:"municipality1_name" validate:"omitempty,max=100"`
-	Municipality2Name *string `json:"municipality2_name" validate:"omitempty,max=100"`
-	Municipality3Name *string `json:"municipality3_name" validate:"omitempty,max=100"`
-
 	// Feature Toggles
 	ShowEvaluateButton *bool `json:"show_evaluate_button"`
 
@@ -219,11 +209,6 @@ type SettingsResponse struct {
 	TimeFormat         string `json:"time_format"`
 	DefaultLanguage    string `json:"default_language"`
 	SupportedLanguages string `json:"supported_languages"`
-
-	// Benchmark Municipality Names
-	Municipality1Name string `json:"municipality1_name"`
-	Municipality2Name string `json:"municipality2_name"`
-	Municipality3Name string `json:"municipality3_name"`
 
 	// Feature Toggles
 	ShowEvaluateButton bool `json:"show_evaluate_button"`
@@ -275,9 +260,6 @@ func (s *Settings) ToSettingsResponse() *SettingsResponse {
 		TimeFormat:          s.TimeFormat,
 		DefaultLanguage:     s.DefaultLanguage,
 		SupportedLanguages:  s.SupportedLanguages,
-		Municipality1Name:   s.Municipality1Name,
-		Municipality2Name:   s.Municipality2Name,
-		Municipality3Name:   s.Municipality3Name,
 		ShowEvaluateButton:  s.ShowEvaluateButton,
 		AuthSetting:         AuthSetting{TotpEnabled: s.TotpEnabled, ShowForgotPassword: s.ShowForgotPassword},
 		FieldSettings:       fieldSettings,

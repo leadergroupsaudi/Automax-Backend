@@ -109,15 +109,6 @@ func (s *settingsService) UpdateSettings(ctx context.Context, req *models.Settin
 	if req.DefaultLanguage != nil {
 		settings.DefaultLanguage = *req.DefaultLanguage
 	}
-	if req.Municipality1Name != nil {
-		settings.Municipality1Name = *req.Municipality1Name
-	}
-	if req.Municipality2Name != nil {
-		settings.Municipality2Name = *req.Municipality2Name
-	}
-	if req.Municipality3Name != nil {
-		settings.Municipality3Name = *req.Municipality3Name
-	}
 	if req.ShowEvaluateButton != nil {
 		settings.ShowEvaluateButton = *req.ShowEvaluateButton
 	}
