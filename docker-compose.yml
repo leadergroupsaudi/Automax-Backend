@@ -79,7 +79,7 @@ services:
         condition: service_started
 
   # frontend:
-  #   image: yashplg/automax31-frontend:v1.8.9.2
+  #   image: yashplg/automax31-frontend:latest
   #   container_name: automax-frontend
   #   restart: always
   #   ports:
