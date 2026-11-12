@@ -35,8 +35,8 @@ RUN apk --no-cache add \
 # Copy binary from builder
 COPY --from=builder /app/main .
 
-# Copy Firebase credentials
-COPY automax3-firebase-adminsdk-fbsvc-99cd353ef1.json .
+# Push notifications read FIREBASE_CREDENTIAL_PATH when a message is sent.
+# Mount that file into the container. It is not copied into the image.
 
 # Expose port
 EXPOSE 8080
