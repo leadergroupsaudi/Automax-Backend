@@ -51,7 +51,8 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
 
   backend:
-    image: yashplg/automax31-backend:latest
+    #image: yashplg/automax31-backend:latest
+    image: yashplg/automax31-backend-zkff:v1
     container_name: automax-backend
     restart: always
     ports:
@@ -79,7 +80,7 @@ services:
         condition: service_started
 
   # frontend:
-  #   image: yashplg/automax31-frontend:latest
+  #   image: yashplg/automax31-frontend:v1.8.9.2
   #   container_name: automax-frontend
   #   restart: always
   #   ports:
