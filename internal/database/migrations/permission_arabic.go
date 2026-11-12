@@ -19,6 +19,7 @@ var permissionModuleArabic = map[string]string{
 	"complaints":             "الشكاوى",
 	"corrective_action":      "الإجراءات التصحيحية",
 	"dashboard":              "لوحة المعلومات",
+	"dispatch":               "التوزيع",
 	"departments":            "الإدارات",
 	"escalation-groups":      "مجموعات التصعيد",
 	"escalation-policies":    "سياسات التصعيد",
@@ -112,6 +113,13 @@ var permissionNameArabic = map[string]struct{ Name, Description string }{
 	"dashboard:queries":    {"لوحة معلومات الاستفسارات", "الوصول إلى بطاقات الاستفسارات في لوحة المعلومات"},
 	"dashboard:requests":   {"لوحة معلومات الطلبات", "الوصول إلى بطاقات الطلبات في لوحة المعلومات"},
 	"dashboard:workflows":  {"لوحة معلومات مسارات العمل", "الوصول إلى بطاقات مسارات العمل في لوحة المعلومات"},
+	"dashboard:dispatch":   {"لوحة معلومات التوزيع", "الوصول إلى بطاقة إدارة التوزيع في لوحة المعلومات"},
+
+	// Dispatch
+	"dispatch:view":   {"عرض التوزيع", "عرض الوحدات وأنواع الوحدات ومحطات الإطفاء"},
+	"dispatch:create": {"إنشاء التوزيع", "إنشاء الوحدات وأنواع الوحدات ومحطات الإطفاء"},
+	"dispatch:update": {"تحديث التوزيع", "تحديث الوحدات وأنواع الوحدات ومحطات الإطفاء"},
+	"dispatch:delete": {"حذف التوزيع", "حذف الوحدات وأنواع الوحدات ومحطات الإطفاء"},
 
 	// Departments
 	"departments:view":   {"عرض الإدارات", "عرض الإدارات"},

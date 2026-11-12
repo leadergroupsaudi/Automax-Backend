@@ -633,6 +633,12 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		{Name: "Design Workflows", Code: "workflows:design", Module: "workflows", Action: "design", ActionAr: "تصميم", Description: "Access workflow designer"},
 
 		// Incident permissions
+		{Name: "View Dispatch", Code: "dispatch:view", Module: "dispatch", Action: "view", ActionAr: "عرض", Description: "View units, unit types, and fire stations"},
+		{Name: "Create Dispatch", Code: "dispatch:create", Module: "dispatch", Action: "create", ActionAr: "إنشاء", Description: "Create units, unit types, and fire stations"},
+		{Name: "Update Dispatch", Code: "dispatch:update", Module: "dispatch", Action: "update", ActionAr: "تحديث", Description: "Update units, unit types, and fire stations"},
+		{Name: "Delete Dispatch", Code: "dispatch:delete", Module: "dispatch", Action: "delete", ActionAr: "حذف", Description: "Delete units, unit types, and fire stations"},
+		{Name: "Dispatch Dashboard", Code: "dashboard:dispatch", Module: "dashboard", Action: "dispatch", ActionAr: "التوزيع", Description: "Access the Dispatch Management card on the dashboard"},
+
 		{Name: "View Incidents", Code: "incidents:view", Module: "incidents", Action: "view", ActionAr: "عرض", Description: "View incidents"},
 		{Name: "Create Incidents", Code: "incidents:create", Module: "incidents", Action: "create", ActionAr: "إنشاء", Description: "Create new incidents"},
 		{Name: "Update Incidents", Code: "incidents:update", Module: "incidents", Action: "update", ActionAr: "تحديث", Description: "Update incident fields"},
@@ -1044,6 +1050,32 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		if len(toAdd) > 0 {
 			if err := db.Model(&agentRole).Association("Permissions").Append(toAdd); err != nil {
 				log.Printf("Failed to grant extension permissions to agent role: %v", err)
+			}
+		}
+	}
+
+	// Existing administrator roles were seeded before dispatch permissions existed.
+	// Append the new codes so an administrator can open Dispatch Management
+	// without rebuilding the role.
+	var dispatchAdmin models.Role
+	if err := db.Where("code = ?", "admin").Preload("Permissions").First(&dispatchAdmin).Error; err == nil {
+		existing := make(map[uuid.UUID]bool, len(dispatchAdmin.Permissions))
+		for _, p := range dispatchAdmin.Permissions {
+			existing[p.ID] = true
+		}
+		var dispatchPerms []models.Permission
+		db.Where("code IN ?", []string{
+			"dispatch:view", "dispatch:create", "dispatch:update", "dispatch:delete", "dashboard:dispatch",
+		}).Find(&dispatchPerms)
+		var toAdd []models.Permission
+		for _, p := range dispatchPerms {
+			if !existing[p.ID] {
+				toAdd = append(toAdd, p)
+			}
+		}
+		if len(toAdd) > 0 {
+			if err := db.Model(&dispatchAdmin).Association("Permissions").Append(toAdd); err != nil {
+				log.Printf("Failed to grant dispatch permissions to admin role: %v", err)
 			}
 		}
 	}

@@ -12,6 +12,7 @@ type Config struct {
 	Database                    DatabaseConfig
 	Redis                       RedisConfig
 	NATS                        NATSConfig
+	Registry                    RegistryConfig
 	MinIO                       MinIOConfig
 	JWT                         JWTConfig
 	LDAP                        LDAPConfig
@@ -273,6 +274,12 @@ type NATSConfig struct {
 	URL string
 }
 
+// RegistryConfig is the Automax Registry origin. Dispatch Management screens
+// are forwarded there; the rows stay in Registry.
+type RegistryConfig struct {
+	BaseURL string // env: REGISTRY_BASE_URL (default http://localhost:8082)
+}
+
 type MinIOConfig struct {
 	Endpoint        string
 	AccessKeyID     string
@@ -334,6 +341,9 @@ func Load() *Config {
 		},
 		NATS: NATSConfig{
 			URL: getEnv("NATS_URL", "nats://localhost:4223"),
+		},
+		Registry: RegistryConfig{
+			BaseURL: getEnv("REGISTRY_BASE_URL", "http://localhost:8082"),
 		},
 		MinIO: MinIOConfig{
 			Endpoint:        getEnv("MINIO_ENDPOINT", "localhost:9000"),

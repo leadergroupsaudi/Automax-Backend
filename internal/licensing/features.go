@@ -15,6 +15,7 @@ type FeatureCode string
 
 const (
 	FeatureIncidents     FeatureCode = "incidents"
+	FeatureDispatch      FeatureCode = "dispatch"
 	FeatureComplaints    FeatureCode = "complaints"
 	FeatureQueries       FeatureCode = "queries"
 	FeatureGoals         FeatureCode = "goals"
@@ -33,7 +34,7 @@ type Feature struct {
 	Code              FeatureCode   `json:"code"`
 	Name              string        `json:"name"`
 	Description       string        `json:"description"`
-	PermissionModules []string      `json:"permission_modules"`    // permission-module codes unlocked by this feature
+	PermissionModules []string      `json:"permission_modules"`     // permission-module codes unlocked by this feature
 	Dependencies      []FeatureCode `json:"dependencies,omitempty"` // other features that must be licensed too
 	TierMinimum       string        `json:"tier_minimum,omitempty"` // e.g. "standard", "professional", "enterprise"
 }
@@ -46,6 +47,13 @@ var Catalog = []Feature{
 		Name:              "Incidents",
 		Description:       "Incident tracking with SLAs, workflows, comments, bulk operations, and record-type variants (including requests).",
 		PermissionModules: []string{"incidents", "requests"},
+		TierMinimum:       "standard",
+	},
+	{
+		Code:              FeatureDispatch,
+		Name:              "Dispatch",
+		Description:       "Units, unit types, and fire stations used to dispatch resources to incidents.",
+		PermissionModules: []string{"dispatch"},
 		TierMinimum:       "standard",
 	},
 	{
@@ -70,8 +78,8 @@ var Catalog = []Feature{
 		TierMinimum:       "professional",
 	},
 	{
-		Code: FeatureDocuments,
-		Name: "Document Management",
+		Code:        FeatureDocuments,
+		Name:        "Document Management",
 		Description: "File storage, versioning, comments, and tagging via Documenta DMS integration.",
 		// documents routes currently reuse goals:* permissions (see cmd/server/main.go).
 		// A follow-up should introduce dedicated documents:view/update permissions and

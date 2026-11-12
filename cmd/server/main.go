@@ -577,6 +577,15 @@ func main() {
 	incidents.Get("/merge/:id/merged", authMiddleware.RequirePermission("incidents:view"), incidentMergeHandler.GetMergedIncidents)
 	incidents.Get("/merge/can-merge", authMiddleware.RequirePermission("incidents:view"), incidentMergeHandler.CanMerge)
 
+	// Dispatch Management. Registry stores units, unit types, and fire stations.
+	// These routes check the Automax login and forward the call.
+	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
+	dispatchAPI := v1.Group("/dispatch", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureDispatch)))
+	dispatchAPI.Get("/*", authMiddleware.RequirePermission("dispatch:view"), dispatchProxy.Forward)
+	dispatchAPI.Post("/*", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.Forward)
+	dispatchAPI.Put("/*", authMiddleware.RequirePermission("dispatch:update"), dispatchProxy.Forward)
+	dispatchAPI.Delete("/*", authMiddleware.RequirePermission("dispatch:delete"), dispatchProxy.Forward)
+
 	// Attachment download route (unified for incidents and notifications)
 	attachments := v1.Group("/attachments", authMiddleware.Authenticate())
 	attachments.Get("/:attachment_id", attachmentHandler.DownloadAttachment)
