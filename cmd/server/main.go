@@ -581,6 +581,7 @@ func main() {
 	// These routes check the Automax login and forward the call.
 	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
 	dispatchAPI := v1.Group("/dispatch", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureDispatch)))
+	dispatchAPI.Post("/fcm/push", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.ForwardDrivers(fcmService, incidentRepo))
 	dispatchAPI.Get("/*", authMiddleware.RequirePermission("dispatch:view"), dispatchProxy.Forward)
 	dispatchAPI.Post("/*", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.Forward)
 	dispatchAPI.Put("/*", authMiddleware.RequirePermission("dispatch:update"), dispatchProxy.Forward)

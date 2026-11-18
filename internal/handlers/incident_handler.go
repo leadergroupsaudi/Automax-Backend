@@ -44,6 +44,7 @@ type IncidentHandler struct {
 	lookupRepo          repository.LookupRepository
 	validator           *validator.Validate
 	cfg                 *config.Config
+	dispatch            *DispatchProxy
 }
 
 func NewIncidentHandler(service services.IncidentService, userService services.UserService, userRepo repository.UserRepository, incidentRepo repository.IncidentRepository, workflowRepo repository.WorkflowRepository, locationRepo repository.LocationRepository, classificationRepo repository.ClassificationRepository, storage *storage.MinIOStorage, presenceService services.PresenceService, cfg *config.Config) *IncidentHandler {
@@ -59,6 +60,7 @@ func NewIncidentHandler(service services.IncidentService, userService services.U
 		presenceService:    presenceService,
 		validator:          validator.New(),
 		cfg:                cfg,
+		dispatch:           NewDispatchProxy(cfg.Registry.BaseURL),
 	}
 }
 
@@ -679,6 +681,26 @@ func (h *IncidentHandler) listIncidentsCore(c *fiber.Ctx, filter *models.Inciden
 
 	if handled, err := h.scopeIncidentFilterToUser(c, filter); handled {
 		return err
+	}
+
+	if filter.UnitID != "" {
+		ids, err := h.dispatch.FetchUnitIncidentIDs(c.UserContext(), filter.UnitID)
+		if err != nil {
+			log.Printf("dispatch unit incidents lookup failed: %v", err)
+			return ErrorResponseWithKey(c, fiber.StatusBadGateway, "internal_server_error")
+		}
+		if len(ids) == 0 {
+			// An empty IN filter would be skipped and return everything.
+			return c.JSON(fiber.Map{
+				"success":     true,
+				"data":        []models.IncidentResponse{},
+				"page":        filter.Page,
+				"limit":       filter.Limit,
+				"total_items": 0,
+				"total_pages": 0,
+			})
+		}
+		filter.IncidentIDs = ids
 	}
 
 	incidents, total, err := h.service.ListIncidents(c.UserContext(), filter)

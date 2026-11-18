@@ -617,6 +617,8 @@ type IncidentMapMarker struct {
 
 type IncidentFilter struct {
 	Search              string     `query:"search" json:"search" validate:"omitempty"`
+	UnitID              string     `query:"unit_id" json:"unit_id" validate:"omitempty,uuid"` // dispatch unit (registry resource_id); resolved to IncidentIDs by the handler
+	IncidentIDs         []string   `query:"-" json:"-"`                                       // server-populated from dispatch; restricts results to these incidents
 	WorkflowID          []string   `query:"workflow_id" json:"workflow_id" validate:"omitempty,dive,uuid"`
 	CurrentStateID      []string   `query:"current_state_id" json:"current_state_id" validate:"omitempty,dive,uuid"`
 	CurrentStateCode    []string   `query:"current_state_code" json:"current_state_code" validate:"omitempty,dive,max=50"` // matches every workflow's state with this code; see normalizeStateCodes

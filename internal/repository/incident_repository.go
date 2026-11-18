@@ -258,6 +258,9 @@ const stateCodeSubquery = `current_state_id IN (
 // added to one automatically applies to the other.
 func (r *incidentRepository) applyIncidentFilters(ctx context.Context, query *gorm.DB, filter *models.IncidentFilter) *gorm.DB {
 	// Apply filters
+	if len(filter.IncidentIDs) != 0 {
+		query = query.Where("incidents.id IN ?", filter.IncidentIDs)
+	}
 	if len(filter.WorkflowID) != 0 {
 		query = query.Where("incidents.workflow_id IN ?", filter.WorkflowID)
 	}

@@ -639,6 +639,22 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		{Name: "Delete Dispatch", Code: "dispatch:delete", Module: "dispatch", Action: "delete", ActionAr: "حذف", Description: "Delete units, unit types, and fire stations"},
 		{Name: "Dispatch Dashboard", Code: "dashboard:dispatch", Module: "dashboard", Action: "dispatch", ActionAr: "التوزيع", Description: "Access the Dispatch Management card on the dashboard"},
 
+		// Dispatcher and unit management
+		{Name: "View Dispatcher", Code: "dispatcher:view", Module: "dispatcher", Action: "view", ActionAr: "عرض", Description: "View the dispatcher screen"},
+		{Name: "Dispatcher Dashboard", Code: "dashboard:dispatcher", Module: "dashboard", Action: "dispatcher", ActionAr: "المُرسِل", Description: "Access the Dispatcher card on the dashboard"},
+		{Name: "View Units", Code: "units:view", Module: "units", Action: "view", ActionAr: "عرض", Description: "View units"},
+		{Name: "Create Units", Code: "units:create", Module: "units", Action: "create", ActionAr: "إنشاء", Description: "Create units"},
+		{Name: "Update Units", Code: "units:update", Module: "units", Action: "update", ActionAr: "تحديث", Description: "Update units"},
+		{Name: "Delete Units", Code: "units:delete", Module: "units", Action: "delete", ActionAr: "حذف", Description: "Delete units"},
+		{Name: "View Unit Types", Code: "unit-types:view", Module: "unit-types", Action: "view", ActionAr: "عرض", Description: "View unit types"},
+		{Name: "Create Unit Types", Code: "unit-types:create", Module: "unit-types", Action: "create", ActionAr: "إنشاء", Description: "Create unit types"},
+		{Name: "Update Unit Types", Code: "unit-types:update", Module: "unit-types", Action: "update", ActionAr: "تحديث", Description: "Update unit types"},
+		{Name: "Delete Unit Types", Code: "unit-types:delete", Module: "unit-types", Action: "delete", ActionAr: "حذف", Description: "Delete unit types"},
+		{Name: "View Fire Stations", Code: "fire-stations:view", Module: "fire-stations", Action: "view", ActionAr: "عرض", Description: "View fire stations"},
+		{Name: "Create Fire Stations", Code: "fire-stations:create", Module: "fire-stations", Action: "create", ActionAr: "إنشاء", Description: "Create fire stations"},
+		{Name: "Update Fire Stations", Code: "fire-stations:update", Module: "fire-stations", Action: "update", ActionAr: "تحديث", Description: "Update fire stations"},
+		{Name: "Delete Fire Stations", Code: "fire-stations:delete", Module: "fire-stations", Action: "delete", ActionAr: "حذف", Description: "Delete fire stations"},
+
 		{Name: "View Incidents", Code: "incidents:view", Module: "incidents", Action: "view", ActionAr: "عرض", Description: "View incidents"},
 		{Name: "Create Incidents", Code: "incidents:create", Module: "incidents", Action: "create", ActionAr: "إنشاء", Description: "Create new incidents"},
 		{Name: "Update Incidents", Code: "incidents:update", Module: "incidents", Action: "update", ActionAr: "تحديث", Description: "Update incident fields"},
@@ -1066,6 +1082,7 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		var dispatchPerms []models.Permission
 		db.Where("code IN ?", []string{
 			"dispatch:view", "dispatch:create", "dispatch:update", "dispatch:delete", "dashboard:dispatch",
+			"dispatcher:view", "dashboard:dispatcher", "units:view", "units:create", "units:update", "units:delete", "unit-types:view", "unit-types:create", "unit-types:update", "unit-types:delete", "fire-stations:view", "fire-stations:create", "fire-stations:update", "fire-stations:delete",
 		}).Find(&dispatchPerms)
 		var toAdd []models.Permission
 		for _, p := range dispatchPerms {
