@@ -24,14 +24,14 @@ type SetPassCodeRequest struct {
 
 // PasscodeLoginRequest is the body of POST /auth/login/passcode.
 type PasscodeLoginRequest struct {
-	UserID   string `json:"userId" validate:"required,uuid"`
+	UserID   string `json:"user_id" validate:"required,uuid"`
 	Passcode string `json:"passcode" validate:"required,numeric,min=4,max=6"`
 }
 
 // PasscodeLoginResponse is returned by a successful passcode login.
 type PasscodeLoginResponse struct {
 	Token        string `json:"token"`
-	UserID       string `json:"userId"`
+	UserID       string `json:"user_id"`
 	UserName     string `json:"userName"`
 	UserEmail    string `json:"userEmail"`
 	ProfileImage string `json:"profileImage"`
