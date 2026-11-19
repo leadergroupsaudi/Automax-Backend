@@ -7,6 +7,7 @@ import (
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/services"
+	"github.com/automax/backend/pkg/constants"
 	"github.com/automax/backend/pkg/i18n"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/automax/backend/pkg/validation"
@@ -30,12 +31,12 @@ func NewPassCodeHandler(svc *services.PassCodeService, redisClient *redis.Client
 	return &PassCodeHandler{svc: svc, redis: redisClient}
 }
 
-// Set handles PUT /users/:userID/passcode (adds, or replaces the existing one).
+// Set handles PUT /users/passcode (adds, or replaces the existing one).
 func (h *PassCodeHandler) Set(c *fiber.Ctx) error {
 	ctx := c.UserContext()
-	userID, err := uuid.Parse(c.Params("userID"))
-	if err != nil {
-		return utils.ErrorResponse(c, fiber.StatusBadRequest, "invalid user id")
+	userID, ok := c.Locals(constants.ContextKeys.UserID).(uuid.UUID)
+	if !ok || userID == uuid.Nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(ctx, "invalid_user_id"))
 	}
 	var req models.SetPassCodeRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -53,12 +54,12 @@ func (h *PassCodeHandler) Set(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, "passcode saved", nil)
 }
 
-// Remove handles DELETE /users/:userID/passcode.
+// Remove handles DELETE /users/passcode.
 func (h *PassCodeHandler) Remove(c *fiber.Ctx) error {
 	ctx := c.UserContext()
-	userID, err := uuid.Parse(c.Params("userID"))
-	if err != nil {
-		return utils.ErrorResponse(c, fiber.StatusBadRequest, "invalid user id")
+	userID, ok := c.Locals(constants.ContextKeys.UserID).(uuid.UUID)
+	if !ok || userID == uuid.Nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(ctx, "invalid_user_id"))
 	}
 	if err := h.svc.Remove(ctx, userID); err != nil {
 		if errors.Is(err, services.ErrPassCodeNotFound) {
