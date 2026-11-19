@@ -473,6 +473,8 @@ func main() {
 	auth.Post("/register", userHandler.Register)
 	passCodeHandler := handlers.NewPassCodeHandler(services.NewPassCodeService(db, userRepo, jwtManager, sessionStore), redisClient)
 	auth.Post("/login/passcode", passCodeHandler.Login)
+	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
+	auth.Get("/unit/:unitId/user", handlers.NewUnitUserHandler(dispatchProxy, userRepo).GetByUnitID)
 	auth.Post("/sso/register", ssoHandler.SSORegister)
 	auth.Post("/login", loginRateLimitMiddleware, userHandler.Login)
 	auth.Post("/sso/login", ssoHandler.SSOLogin)
@@ -583,7 +585,6 @@ func main() {
 
 	// Dispatch Management. Registry stores units, unit types, and fire stations.
 	// These routes check the Automax login and forward the call.
-	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
 	dispatchAPI := v1.Group("/dispatch", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureDispatch)))
 	dispatchAPI.Post("/fcm/push", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.ForwardDrivers(fcmService, incidentRepo))
 	dispatchAPI.Get("/*", authMiddleware.RequirePermission("dispatch:view"), dispatchProxy.Forward)
