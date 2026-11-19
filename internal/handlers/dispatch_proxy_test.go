@@ -61,6 +61,35 @@ func TestDispatchProxyForwardsMethodPathQueryAndBody(t *testing.T) {
 	}
 }
 
+func TestDispatchProxyForwardsFireStationAlert(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != "/dispatch/fire-station-alerts" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		if !strings.Contains(string(body), `"service_point_ids"`) {
+			t.Errorf("body %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"message":"fire stations alerted"}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	app := fiber.New()
+	app.Post("/api/v1/dispatch/*", NewDispatchProxy(upstream.URL).Forward)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/dispatch/fire-station-alerts", strings.NewReader(`{"service_point_ids":["6fe332a8-dee8-40c6-ba6b-c1436c7963e4"],"all":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "fire stations alerted") {
+		t.Fatalf("status %d body %s", resp.StatusCode, raw)
+	}
+}
+
 func TestDispatchProxyReportsMissingRegistry(t *testing.T) {
 	app := fiber.New()
 	app.Get("/api/v1/dispatch/*", NewDispatchProxy("").Forward)
