@@ -890,6 +890,21 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		db.Model(&userRole).Association("Permissions").Append(viewPerms)
 	}
 
+	// Driver role: created for dispatch drivers registered through /dispatch/auth/register.
+	var driverRole models.Role
+	if err := db.Where("code = ?", "driver").First(&driverRole).Error; err == gorm.ErrRecordNotFound {
+		driverRole = models.Role{
+			Name:        "Driver",
+			Code:        "driver",
+			Description: "Dispatch driver (passcode login)",
+			IsSystem:    true,
+			IsActive:    true,
+		}
+		if err := db.Create(&driverRole).Error; err != nil {
+			log.Printf("Failed to seed driver role: %v", err)
+		}
+	}
+
 	// Manager role with broader permissions
 	var managerRole models.Role
 	result = db.Where("code = ?", "manager").First(&managerRole)

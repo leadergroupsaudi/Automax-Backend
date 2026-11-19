@@ -1126,6 +1126,13 @@ func (h *IncidentHandler) ExecuteTransition(c *fiber.Ctx) error {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
 	}
 
+	if req.UnitID != "" {
+		// The transition is already committed, so a Registry failure is only logged.
+		if err := h.dispatch.SetResourceIncident(c.UserContext(), req.UnitID, &id); err != nil {
+			log.Printf("dispatch: set unit %s incident %s failed: %v", req.UnitID, id, err)
+		}
+	}
+
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "transition_executed"), incident)
 }
 

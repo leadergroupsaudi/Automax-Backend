@@ -580,6 +580,11 @@ func main() {
 	// Dispatch Management. Registry stores units, unit types, and fire stations.
 	// These routes check the Automax login and forward the call.
 	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
+	// Public driver auth. Registered before the authenticated /dispatch group so the
+	// auth middleware and the /* proxy do not catch these paths.
+	driverAuthHandler := handlers.NewDriverAuthHandler(userService, dispatchProxy, redisClient)
+	v1.Post("/dispatch/auth/register", driverAuthHandler.Register)
+	v1.Post("/dispatch/auth/login/passcode", driverAuthHandler.LoginWithPasscode)
 	dispatchAPI := v1.Group("/dispatch", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureDispatch)))
 	dispatchAPI.Post("/fcm/push", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.ForwardDrivers(fcmService, incidentRepo))
 	dispatchAPI.Get("/*", authMiddleware.RequirePermission("dispatch:view"), dispatchProxy.Forward)

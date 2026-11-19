@@ -469,6 +469,9 @@ type IncidentTransitionRequest struct {
 	// e.g. "1 Day", "2 Days", "1 Week", "2 Weeks", "1 Month", "3 Months"
 	ReadyToCloseDuration string `json:"ready_to_close_duration"`
 
+	//UnitID for dispatch
+	UnitID string `query:"unit_id" json:"unit_id" validate:"omitempty,uuid"`
+
 	Version int `json:"version" validate:"required,min=1"`
 }
 

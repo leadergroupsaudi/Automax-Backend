@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
 	"io"
@@ -161,5 +162,66 @@ func TestForwardDriversNoPushOnUpstreamError(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if pusher.count() != 0 {
 		t.Fatalf("pushes = %d, want 0", pusher.count())
+	}
+}
+
+func TestSetResourceIncident(t *testing.T) {
+	var gotBody string
+	status := http.StatusOK
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		if r.Method != http.MethodPatch || r.URL.Path != "/dispatch/resources/u1/incident" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(upstream.Close)
+	p := NewDispatchProxy(upstream.URL)
+
+	id := uuid.New()
+	if err := p.SetResourceIncident(context.Background(), "u1", &id); err != nil || gotBody != `{"incident_id":"`+id.String()+`"}` {
+		t.Fatalf("uuid body=%s err=%v", gotBody, err)
+	}
+	if err := p.SetResourceIncident(context.Background(), "u1", nil); err != nil || gotBody != `{"incident_id":null}` {
+		t.Fatalf("null body=%s err=%v", gotBody, err)
+	}
+	status = http.StatusNotFound
+	if err := p.SetResourceIncident(context.Background(), "u1", &id); err == nil {
+		t.Fatal("expected error on 404")
+	}
+}
+
+func TestFetchUnitDriverID(t *testing.T) {
+	status := http.StatusOK
+	body := `{"data":{"driver_user_id":"11111111-1111-1111-1111-111111111111"}}`
+	var gotMethod, gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+	proxy := NewDispatchProxy(upstream.URL)
+
+	id, err := proxy.FetchUnitDriverID(context.Background(), "unit-7")
+	if err != nil || id != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("got %q, %v", id, err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/dispatch/resources/unit-7" {
+		t.Fatalf("unexpected request %s %s", gotMethod, gotPath)
+	}
+
+	body = `{"data":{}}`
+	if _, err := proxy.FetchUnitDriverID(context.Background(), "unit-7"); !errors.Is(err, ErrUnitDriverNotFound) {
+		t.Fatalf("expected ErrUnitDriverNotFound, got %v", err)
+	}
+	status = http.StatusNotFound
+	if _, err := proxy.FetchUnitDriverID(context.Background(), "unit-7"); !errors.Is(err, ErrUnitDriverNotFound) {
+		t.Fatalf("expected ErrUnitDriverNotFound on 404, got %v", err)
+	}
+	status = http.StatusInternalServerError
+	if _, err := proxy.FetchUnitDriverID(context.Background(), "unit-7"); err == nil || errors.Is(err, ErrUnitDriverNotFound) {
+		t.Fatalf("expected generic error on 500, got %v", err)
 	}
 }

@@ -23,6 +23,7 @@ type User struct {
 	Email                       string           `gorm:"uniqueIndex;not null" json:"email"`
 	Username                    string           `gorm:"uniqueIndex;not null" json:"username"`
 	Password                    string           `gorm:"not null" json:"-"`
+	Passcode                    string           `gorm:"size:255" json:"-"` // bcrypt hash, used by dispatch driver login
 	FirstName                   string           `gorm:"size:100" json:"first_name"`
 	MiddleName                  string           `gorm:"size:100" json:"middle_name"`
 	LastName                    string           `gorm:"size:100" json:"last_name"`
@@ -605,4 +606,27 @@ type RedisOTPData struct {
 	OTP      string `json:"otp"` // hashed OTP stored here
 	Channel  string `json:"channel"`
 	Attempts int    `json:"attempts"`
+}
+
+// DriverRegisterRequest is the body of POST /dispatch/auth/register.
+type DriverRegisterRequest struct {
+	Username string `json:"username" validate:"required,min=3,max=50"`
+	Email    string `json:"email" validate:"required,email"`
+	Passcode string `json:"passcode" validate:"required,numeric,min=4,max=6"`
+}
+
+// PasscodeLoginRequest is the body of POST /dispatch/auth/login/passcode.
+type PasscodeLoginRequest struct {
+	UnitID   string `json:"unitId" validate:"required,max=100"`
+	Passcode string `json:"passcode" validate:"required,numeric,min=4,max=6"`
+}
+
+// PasscodeLoginResponse is returned by a successful passcode login.
+type PasscodeLoginResponse struct {
+	Token        string `json:"token"`
+	UserID       string `json:"userId"`
+	UserName     string `json:"userName"`
+	UserEmail    string `json:"userEmail"`
+	ProfileImage string `json:"profileImage"`
+	Mobile       string `json:"mobile"`
 }
