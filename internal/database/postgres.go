@@ -66,6 +66,7 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 	migrationDB.Config.DisableForeignKeyConstraintWhenMigrating = true
 
 	err := migrationDB.AutoMigrate(
+		&models.UserPassCode{},
 		&models.Permission{},
 		&models.Role{},
 		&models.Category{},
@@ -146,6 +147,11 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 	)
 	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	// Passcodes now live in user_pass_code; drop the column an earlier build added to users.
+	if err := migrationDB.Exec("ALTER TABLE users DROP COLUMN IF EXISTS passcode").Error; err != nil {
+		log.Printf("Failed to drop users.passcode: %v", err)
 	}
 
 	if cfg.GoalManagement.Enabled {

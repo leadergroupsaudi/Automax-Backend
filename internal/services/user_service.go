@@ -68,8 +68,6 @@ type UserService interface {
 	ResetPassword(ctx context.Context, resetToken, newPassword string) error
 	ExistsByPhoneAndName(ctx context.Context, phone string, name ...string) (bool, error)
 	FindByIDWithRelations(ctx context.Context, userID uuid.UUID) (*models.User, error)
-	RegisterDriver(ctx context.Context, req *models.DriverRegisterRequest) (*models.User, error)
-	LoginWithPasscode(ctx context.Context, driverID uuid.UUID, passcode string) (*models.PasscodeLoginResponse, error)
 }
 
 type userService struct {

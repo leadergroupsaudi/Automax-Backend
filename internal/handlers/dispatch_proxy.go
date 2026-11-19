@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -113,49 +112,6 @@ func (h *DispatchProxy) FetchUnitIncidentIDs(ctx context.Context, unitID string)
 		return nil, err
 	}
 	return out.Data.IncidentIDs, nil
-}
-
-// ErrUnitDriverNotFound means Registry has no unit with that id, or the unit has no driver.
-var ErrUnitDriverNotFound = errors.New("unit or driver not found")
-
-// FetchUnitDriverID asks Registry for a unit (resource) and returns its driver user id.
-func (h *DispatchProxy) FetchUnitDriverID(ctx context.Context, unitID string) (string, error) {
-	if h == nil || h.base == "" {
-		return "", fmt.Errorf("dispatch service is not configured")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.base+"/dispatch/resources/"+url.PathEscape(unitID), nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set(fiber.HeaderAccept, fiber.MIMEApplicationJSON)
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return "", ErrUnitDriverNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("dispatch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var out struct {
-		Data struct {
-			// Assumed field name; adjust if Registry names it differently.
-			DriverUserID string `json:"driver_user_id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(out.Data.DriverUserID) == "" {
-		return "", ErrUnitDriverNotFound
-	}
-	return out.Data.DriverUserID, nil
 }
 
 // DriverPusher sends a push notification to one user (satisfied by *services.FCMService).

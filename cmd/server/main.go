@@ -471,6 +471,8 @@ func main() {
 	// Auth routes
 	auth := v1.Group("/auth")
 	auth.Post("/register", userHandler.Register)
+	passCodeHandler := handlers.NewPassCodeHandler(services.NewPassCodeService(db, userRepo, jwtManager, sessionStore), redisClient)
+	auth.Post("/login/passcode", passCodeHandler.Login)
 	auth.Post("/sso/register", ssoHandler.SSORegister)
 	auth.Post("/login", loginRateLimitMiddleware, userHandler.Login)
 	auth.Post("/sso/login", ssoHandler.SSOLogin)
@@ -504,6 +506,8 @@ func main() {
 	users.Put("/me/password", authMiddleware.Authenticate(), userHandler.ChangePassword)
 	users.Delete("/me", authMiddleware.Authenticate(), userHandler.DeleteAccount)
 	users.Put("/:userExtID/status", userHandler.UpdateUserCallStatus)
+	users.Put("/:userID/passcode", authMiddleware.Authenticate(), authMiddleware.RequirePermission("users:update"), passCodeHandler.Set)
+	users.Delete("/:userID/passcode", authMiddleware.Authenticate(), authMiddleware.RequirePermission("users:update"), passCodeHandler.Remove)
 	users.Put("/:userID/password", authMiddleware.Authenticate(), authMiddleware.RequirePermission("users:reset_password"), userHandler.AdminResetPassword)
 
 	// Incident routes (authenticated users)
@@ -580,11 +584,6 @@ func main() {
 	// Dispatch Management. Registry stores units, unit types, and fire stations.
 	// These routes check the Automax login and forward the call.
 	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
-	// Public driver auth. Registered before the authenticated /dispatch group so the
-	// auth middleware and the /* proxy do not catch these paths.
-	driverAuthHandler := handlers.NewDriverAuthHandler(userService, dispatchProxy, redisClient)
-	v1.Post("/dispatch/auth/register", driverAuthHandler.Register)
-	v1.Post("/dispatch/auth/login/passcode", driverAuthHandler.LoginWithPasscode)
 	dispatchAPI := v1.Group("/dispatch", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureDispatch)))
 	dispatchAPI.Post("/fcm/push", authMiddleware.RequirePermission("dispatch:create"), dispatchProxy.ForwardDrivers(fcmService, incidentRepo))
 	dispatchAPI.Get("/*", authMiddleware.RequirePermission("dispatch:view"), dispatchProxy.Forward)
