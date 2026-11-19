@@ -19,18 +19,20 @@ func (UserPassCode) TableName() string { return "user_pass_code" }
 
 // SetPassCodeRequest is the body of PUT /users/:userID/passcode.
 type SetPassCodeRequest struct {
-	Passcode string `json:"passcode" validate:"required,numeric,min=4,max=6"`
+	Passcode string `json:"passcode" validate:"required,numeric,len=4"`
 }
 
 // PasscodeLoginRequest is the body of POST /auth/login/passcode.
 type PasscodeLoginRequest struct {
 	UserID   string `json:"user_id" validate:"required,uuid"`
-	Passcode string `json:"passcode" validate:"required,numeric,min=4,max=6"`
+	Passcode string `json:"passcode" validate:"required,numeric,len=4"`
 }
 
 // PasscodeLoginResponse is returned by a successful passcode login.
 type PasscodeLoginResponse struct {
 	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
 	UserID       string `json:"user_id"`
 	UserName     string `json:"userName"`
 	UserEmail    string `json:"userEmail"`

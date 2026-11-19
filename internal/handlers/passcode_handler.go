@@ -85,7 +85,7 @@ func (h *PassCodeHandler) Login(c *fiber.Ctx) error {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, "invalid user id")
 	}
 
-	// A 4-6 digit passcode is easy to brute-force, so limit failures per user and per IP.
+	// A 4-digit passcode is easy to brute-force, so limit failures per user and per IP.
 	userKey := "passcode_attempts:user:" + strings.ToLower(userID.String())
 	ipKey := "passcode_attempts:ip:" + c.IP()
 	if h.blocked(c, userKey) || h.blocked(c, ipKey) {

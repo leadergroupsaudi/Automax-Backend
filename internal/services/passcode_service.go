@@ -103,6 +103,8 @@ func (s *PassCodeService) Login(ctx context.Context, userID uuid.UUID, passcode 
 
 	return &models.PasscodeLoginResponse{
 		Token:        tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresIn:    tokenPair.ExpiresIn,
 		UserID:       user.ID.String(),
 		UserName:     user.Username,
 		UserEmail:    user.Email,

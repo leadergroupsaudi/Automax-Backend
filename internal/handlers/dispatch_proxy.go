@@ -15,6 +15,7 @@ import (
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
+	"github.com/automax/backend/internal/services"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -26,7 +27,11 @@ import (
 type DispatchProxy struct {
 	base   string
 	client *http.Client
+	inApp  InAppNotifier // optional: also create in-app notifications for dispatched drivers
 }
+
+// SetInAppNotifier enables in-app notifications alongside FCM pushes.
+func (h *DispatchProxy) SetInAppNotifier(n InAppNotifier) { h.inApp = n }
 
 func NewDispatchProxy(baseURL string) *DispatchProxy {
 	return &DispatchProxy{
@@ -118,44 +123,50 @@ func (h *DispatchProxy) FetchUnitIncidentIDs(ctx context.Context, unitID string)
 // ErrUnitDriverNotFound means Registry has no unit with that id, or the unit has no driver.
 var ErrUnitDriverNotFound = errors.New("unit or driver not found")
 
-// FetchUnitDriverID asks Registry for a unit (resource) and returns its driver user id.
-func (h *DispatchProxy) FetchUnitDriverID(ctx context.Context, unitID string) (string, error) {
+// UnitInfo is the part of Registry's resource (unit) response that Automax uses.
+type UnitInfo struct {
+	ID           string `json:"id"`
+	UniqueID     string `json:"unique_id"`
+	PlateNumber  string `json:"plate_number"`
+	DriverUserID string `json:"driver_user_id"`
+}
+
+// FetchUnit asks Registry for a unit (resource) and returns it. It returns
+// ErrUnitDriverNotFound when the unit does not exist or has no driver.
+func (h *DispatchProxy) FetchUnit(ctx context.Context, unitID string) (*UnitInfo, error) {
 	if h == nil || h.base == "" {
-		return "", fmt.Errorf("dispatch service is not configured")
+		return nil, fmt.Errorf("dispatch service is not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.base+"/dispatch/resources/"+url.PathEscape(unitID), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.base+"/dispatch/resources/unique/"+url.PathEscape(unitID), nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set(fiber.HeaderAccept, fiber.MIMEApplicationJSON)
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return "", ErrUnitDriverNotFound
+		return nil, ErrUnitDriverNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("dispatch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("dispatch returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var out struct {
-		Data struct {
-			// Assumed field name; adjust if Registry names it differently.
-			DriverUserID string `json:"driver_user_id"`
-		} `json:"data"`
+		Data UnitInfo `json:"data"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", err
+		return nil, err
 	}
 	if strings.TrimSpace(out.Data.DriverUserID) == "" {
-		return "", ErrUnitDriverNotFound
+		return nil, ErrUnitDriverNotFound
 	}
-	return out.Data.DriverUserID, nil
+	return &out.Data, nil
 }
 
 // DriverPusher sends a push notification to one user (satisfied by *services.FCMService).
@@ -196,12 +207,12 @@ func (h *DispatchProxy) ForwardDrivers(pusher DriverPusher, incidents repository
 
 		driverIDs := out.Data.DriverUserIDs
 		serviceID := req.ServiceID
-		go notifyDrivers(pusher, incidents, incidentID, serviceID, driverIDs)
+		go notifyDrivers(pusher, h.inApp, incidents, incidentID, serviceID, driverIDs)
 		return nil
 	}
 }
 
-func notifyDrivers(pusher DriverPusher, incidents repository.IncidentRepository, incidentID uuid.UUID, serviceID string, driverIDs []string) {
+func notifyDrivers(pusher DriverPusher, inApp InAppNotifier, incidents repository.IncidentRepository, incidentID uuid.UUID, serviceID string, driverIDs []string) {
 	ctx := context.Background()
 	incident, err := incidents.FindByID(ctx, incidentID)
 	if err != nil || incident == nil {
@@ -229,6 +240,15 @@ func notifyDrivers(pusher DriverPusher, incidents repository.IncidentRepository,
 			log.Printf("FCM-DISPATCH: failed for driver %s: %v", userID, err)
 		} else {
 			log.Printf("FCM-DISPATCH: sent to driver %s", userID)
+		}
+		if inApp != nil {
+			subjectAr, bodyAr := services.DispatchAssignedTextsAr(incident.IncidentNumber, incident.Title)
+			if err := inApp.Notify(ctx, userID, pushReq.Title, pushReq.Body, subjectAr, bodyAr,
+				&models.NotificationMeta{ID: incidentID.String(), Type: recordType}); err != nil {
+				log.Printf("INAPP-DISPATCH: failed for driver %s: %v", userID, err)
+			} else {
+				log.Printf("INAPP-DISPATCH: sent to driver %s", userID)
+			}
 		}
 	}
 }

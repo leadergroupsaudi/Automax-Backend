@@ -474,6 +474,7 @@ func main() {
 	passCodeHandler := handlers.NewPassCodeHandler(services.NewPassCodeService(db, userRepo, jwtManager, sessionStore), redisClient)
 	auth.Post("/login/passcode", passCodeHandler.Login)
 	dispatchProxy := handlers.NewDispatchProxy(cfg.Registry.BaseURL)
+	dispatchProxy.SetInAppNotifier(handlers.NewInAppNotifier(notificationService, userRepo))
 	auth.Get("/unit/:unitId/user", handlers.NewUnitUserHandler(dispatchProxy, userRepo).GetByUnitID)
 	auth.Post("/sso/register", ssoHandler.SSORegister)
 	auth.Post("/login", loginRateLimitMiddleware, userHandler.Login)

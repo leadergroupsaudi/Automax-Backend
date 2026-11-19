@@ -32,14 +32,14 @@ func (h *UnitUserHandler) GetByUnitID(c *fiber.Ctx) error {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, "invalid unit id")
 	}
 
-	driverID, err := h.dispatch.FetchUnitDriverID(ctx, unitID)
+	unit, err := h.dispatch.FetchUnit(ctx, unitID)
 	if err != nil {
 		if errors.Is(err, ErrUnitDriverNotFound) {
 			return utils.ErrorResponse(c, fiber.StatusNotFound, "user not found for this unit")
 		}
 		return utils.ErrorResponse(c, fiber.StatusBadGateway, "dispatch service is unavailable")
 	}
-	id, err := uuid.Parse(driverID)
+	id, err := uuid.Parse(unit.DriverUserID)
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusNotFound, "user not found for this unit")
 	}
@@ -65,5 +65,8 @@ func (h *UnitUserHandler) GetByUnitID(c *fiber.Ctx) error {
 		"userId":       user.ID.String(),
 		"userName":     user.Username,
 		"profileImage": user.Avatar,
+		"unitId":       unit.ID,
+		"uniqueId":     unit.UniqueID,
+		"plateNumber":  unit.PlateNumber,
 	})
 }

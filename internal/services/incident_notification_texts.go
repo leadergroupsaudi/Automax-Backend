@@ -29,3 +29,8 @@ func PartialCloseExpiryTextsAr(incidentNumber, title, revertStateName, timeStr, 
 	)
 	return
 }
+
+func DispatchAssignedTextsAr(incidentNumber, title string) (subject, body string) {
+	return fmt.Sprintf("إرسال: %s", incidentNumber),
+		fmt.Sprintf("تم تكليفك بالتوجه إلى بلاغ \"%s\".", title)
+}
