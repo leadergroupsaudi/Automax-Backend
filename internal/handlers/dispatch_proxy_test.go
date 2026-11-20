@@ -246,7 +246,7 @@ func TestFetchUnit(t *testing.T) {
 		unit.ID != "u-1" || unit.UniqueID != "UNQ-9" || unit.PlateNumber != "ABC 1234" {
 		t.Fatalf("got %+v, %v", unit, err)
 	}
-	if gotMethod != http.MethodGet || gotPath != "/dispatch/resources/unit-7" {
+	if gotMethod != http.MethodGet || gotPath != "/dispatch/resources/unique/unit-7" {
 		t.Fatalf("unexpected request %s %s", gotMethod, gotPath)
 	}
 	body = `{"data":{}}`

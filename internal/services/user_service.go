@@ -84,6 +84,7 @@ type userService struct {
 	db               *gorm.DB
 	redis            *redis.Client
 	settingsRepo     repository.SettingsRepository
+	drivers          DriverSync
 }
 
 // SetLicenseService injects the license service (post-construction to avoid circular deps).
@@ -295,6 +296,7 @@ func (s *userService) Register(ctx context.Context, req *models.UserRegisterRequ
 
 	// Reload user with relations
 	user, _ = s.userRepo.FindByIDWithRelations(ctx, user.ID)
+	s.syncDriver(ctx, user)
 
 	// Log user creation with complete details
 	go func() {
@@ -1198,6 +1200,7 @@ func (s *userService) UpdateAdminProfile(ctx context.Context, userID uuid.UUID, 
 
 	// Reload with relations
 	user, _ = s.userRepo.FindByIDWithRelations(ctx, user.ID)
+	s.syncDriver(ctx, user)
 
 	response := models.ToUserResponse(user)
 
@@ -1778,6 +1781,7 @@ func (s *userService) DeleteUser(ctx context.Context) error {
 	// Deactivate instead of soft-deleting: keep the row alive (IsActive=false).
 	// Avatar file is preserved so a re-activated account keeps it.
 	_ = s.sessionStore.DeleteAllUserSessions(ctx, userID.String())
+	s.removeDriver(ctx, userID)
 
 	err = s.userRepo.UpdateProfile(ctx, map[string]interface{}{
 		"id":        userID,
@@ -1849,6 +1853,7 @@ func (s *userService) AdminDeleteUser(ctx context.Context, userID uuid.UUID) err
 	// Deactivate instead of soft-deleting: keep the row alive (IsActive=false).
 	// Avatar file is preserved so a re-activated account keeps it.
 	_ = s.sessionStore.DeleteAllUserSessions(ctx, userID.String())
+	s.removeDriver(ctx, userID)
 
 	err = s.userRepo.UpdateProfile(ctx, map[string]interface{}{
 		"id":        userID,

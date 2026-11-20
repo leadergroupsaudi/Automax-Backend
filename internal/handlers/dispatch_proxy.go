@@ -67,12 +67,16 @@ func (h *DispatchProxy) forwardTo(c *fiber.Ctx, tail string) error {
 	req.Header.Set(fiber.HeaderAccept, fiber.MIMEApplicationJSON)
 	resp, err := h.client.Do(req)
 	if err != nil {
+		log.Printf("backend: dispatch proxy failed method=%s path=%s err=%v", c.Method(), c.Path(), err)
 		return utils.ErrorResponse(c, fiber.StatusBadGateway, "dispatch service is unavailable")
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusBadGateway, "dispatch service is unavailable")
+	}
+	if resp.StatusCode >= 400 {
+		log.Printf("backend: dispatch proxy rejected method=%s path=%s status=%d", c.Method(), c.Path(), resp.StatusCode)
 	}
 	if contentType := resp.Header.Get(fiber.HeaderContentType); contentType != "" {
 		c.Set(fiber.HeaderContentType, contentType)

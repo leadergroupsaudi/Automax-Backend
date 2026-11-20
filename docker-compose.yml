@@ -52,7 +52,7 @@ services:
 
   backend:
     #image: yashplg/automax31-backend:latest
-    image: yashplg/automax31-backend-zkff:v2
+    image: yashplg/automax31-backend-zkff:v3
     container_name: automax-backend
     restart: always
     ports:
@@ -79,16 +79,23 @@ services:
       nats:
         condition: service_started
 
-  # frontend:
-  #   image: yashplg/automax31-frontend:v1.8.9.2
-  #   container_name: automax-frontend
-  #   restart: always
-  #   ports:
-  #     - "3000:3000"
-  #   env_file:
-  #     - .env
-  #   depends_on:
-  #     - backend
+  frontend:
+    image: yashplg/automax31-frontend-zkff:v1.01.01.01
+    container_name: automax-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:8080/api/v1
+      VITE_WS_URL: ws://localhost:8080
+      VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sed -i 's|alertFireStations:async a=>(await n(600),{success:!0,alerted:a})|alertFireStations:async a=>(await t.post("/dispatch/fire-station-alerts",{service_point_ids:a,all:!1})).data|' /app/dist/assets/dispatcher-*.js
+        exec /app/docker-entrypoint.sh
+    depends_on:
+      - backend
 
 volumes:
   automax_db:

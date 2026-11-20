@@ -272,8 +272,10 @@ func (r *userRepository) List(ctx context.Context, page, limit int, search, phon
 	hasFilters := len(roleIDs) > 0 || len(departmentIDs) > 0 || len(locationIDs) > 0 || len(classificationIDs) > 0
 	isStrict := len(strictDepartment) > 0 && strictDepartment[0]
 
-	// Build base query with search + join filters
-	base := r.db.WithContext(ctx).Model(&models.User{})
+	// Build base query with search + join filters.
+	// A deleted account is kept with is_active=false, so it stays out of the
+	// admin user list, the driver role list, and the unit driver dropdown.
+	base := r.db.WithContext(ctx).Model(&models.User{}).Where("users.is_active = ?", true)
 	if !withIVR {
 		// CreateIncident (incident_service.go) auto-registers a citizen user for
 		// unauthenticated channels, generating email as "<sourceSlug>_<phone>_<epoch>@domain"
