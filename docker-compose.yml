@@ -52,7 +52,7 @@ services:
 
   backend:
     #image: yashplg/automax31-backend:latest
-    image: yashplg/automax31-backend-zkff:v3
+    image: yashplg/automax31-backend-zkff:v4
     container_name: automax-backend
     restart: always
     ports:
