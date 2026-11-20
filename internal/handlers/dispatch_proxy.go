@@ -16,6 +16,7 @@ import (
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/internal/services"
+	"github.com/automax/backend/pkg/constants"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -207,8 +208,52 @@ func (h *DispatchProxy) ForwardDrivers(pusher DriverPusher, incidents repository
 
 		driverIDs := out.Data.DriverUserIDs
 		serviceID := req.ServiceID
-		go notifyDrivers(pusher, h.inApp, incidents, incidentID, serviceID, driverIDs)
+		performedBy, _ := c.Locals(constants.ContextKeys.UserID).(uuid.UUID)
+		go func() {
+			notifyDrivers(pusher, h.inApp, incidents, incidentID, serviceID, driverIDs)
+			recordDispatchRevision(context.Background(), incidents, incidentID, performedBy, serviceID, driverIDs)
+		}()
 		return nil
+	}
+}
+
+// recordDispatchRevision adds an incident revision noting that the dispatch
+// notification was sent to a fire station service and its drivers.
+func recordDispatchRevision(ctx context.Context, incidents repository.IncidentRepository, incidentID, performedBy uuid.UUID, serviceID string, driverIDs []string) {
+	changes := []models.IncidentFieldChange{
+		{
+			FieldName:  "dispatch_service_id",
+			FieldLabel: "Dispatch Service",
+			NewValue:   &serviceID,
+		},
+	}
+	drivers := strings.Join(driverIDs, ", ")
+	changes = append(changes, models.IncidentFieldChange{
+		FieldName:  "dispatch_driver_user_ids",
+		FieldLabel: "Dispatched Drivers",
+		NewValue:   &drivers,
+	})
+	changesJSON, err := json.Marshal(changes)
+	if err != nil {
+		log.Printf("REVISION-DISPATCH: marshal failed: %v", err)
+		return
+	}
+	nextRev, err := incidents.GetNextRevisionNumber(ctx, incidentID)
+	if err != nil {
+		log.Printf("REVISION-DISPATCH: next revision number failed for incident %s: %v", incidentID, err)
+		return
+	}
+	rev := &models.IncidentRevision{
+		IncidentID:     incidentID,
+		RevisionNumber: nextRev,
+		ActionType:     models.RevisionActionFieldChange,
+		ActionDescription: fmt.Sprintf("Dispatch notification sent to fire station service %s and drivers: %s",
+			serviceID, drivers),
+		Changes:       string(changesJSON),
+		PerformedByID: performedBy,
+	}
+	if err := incidents.CreateRevision(ctx, rev); err != nil {
+		log.Printf("REVISION-DISPATCH: create revision failed for incident %s: %v", incidentID, err)
 	}
 }
 

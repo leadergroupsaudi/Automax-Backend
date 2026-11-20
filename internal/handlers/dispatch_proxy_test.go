@@ -150,6 +150,14 @@ func (fakeIncidentRepo) FindByID(_ context.Context, id uuid.UUID) (*models.Incid
 	return &models.Incident{IncidentNumber: "INC-1", Title: "Fire", RecordType: "incident"}, nil
 }
 
+func (fakeIncidentRepo) GetNextRevisionNumber(context.Context, uuid.UUID) (int, error) {
+	return 1, nil
+}
+
+func (fakeIncidentRepo) CreateRevision(context.Context, *models.IncidentRevision) error {
+	return nil
+}
+
 func runDrivers(t *testing.T, status int, upstreamBody string) (*fakePusher, string) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/dispatch/resources/drivers" {
