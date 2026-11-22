@@ -169,6 +169,7 @@ func CapabilitiesFor(t *models.EORecordType) ([]EOEnabledCapability, error) {
 // and eoCapabilityRegistry.register for what a late caller is told.
 func RegisterEOCapabilities() {
 	RegisterCapability(NewEOApprovalCapability())
+	RegisterCapability(NewEODecisionsBaseCapability())
 	eoDefaultCapabilities.seal()
 }
 
@@ -301,6 +302,15 @@ type EOCapabilityReader interface {
 	// Links returns the typed links declared FROM recordID — the direction a
 	// child uses to name its parent, which is how a referral tree is walked.
 	Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
+	// RecordsOfType returns every record of one type, oldest first — the
+	// standing base decisions_base checks a draft against. It applies no
+	// row-level visibility, like Record above: a derived value must not
+	// depend on who saved the record, so a capability that must not pull up
+	// a restricted record filters on the RECORD'S own declared audience and
+	// says so (see eo_capability_decisions_base.go). An empty key, or one
+	// that names no type, is an error, never an empty base, because a typo
+	// must not look like "nothing standing".
+	RecordsOfType(ctx context.Context, recordTypeKey string) ([]models.EORecord, error)
 }
 
 // eoCapabilityReader binds the interface above to one pair of repository
@@ -335,6 +345,20 @@ func (d *eoCapabilityReader) Children(ctx context.Context, parentID uuid.UUID, r
 		return nil, fmt.Errorf("no record type with key %q", recordTypeKey)
 	}
 	return d.records.Children(ctx, parentID, &t.ID)
+}
+
+func (d *eoCapabilityReader) RecordsOfType(ctx context.Context, recordTypeKey string) ([]models.EORecord, error) {
+	if strings.TrimSpace(recordTypeKey) == "" {
+		return nil, fmt.Errorf("records of type: no record type key")
+	}
+	t, err := d.types.GetByKey(ctx, recordTypeKey)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("no record type with key %q", recordTypeKey)
+	}
+	return d.records.RecordsOfType(ctx, t.ID)
 }
 
 func (d *eoCapabilityReader) Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {

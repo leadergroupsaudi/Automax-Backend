@@ -571,3 +571,66 @@ func TestEORecordTypeAncestorsRejectACycle(t *testing.T) {
 		t.Errorf("ancestors of a cyclic type returned no error, want one rather than a loop")
 	}
 }
+
+// TestEORecordRecordsOfTypeIsTheWholeTypeNotAPage is the engine's type-scoped
+// read, built for the decisions_base capability: it answers "the standing
+// records of type X" for a caller that HAS no user, so it applies no §7.11
+// row-level visibility and no paging. List cannot do that job — it is the
+// register query, and an engine caller would get almost nothing from it while
+// looking like it worked.
+func TestEORecordRecordsOfTypeIsTheWholeTypeNotAPage(t *testing.T) {
+	db := eoRecordDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	decisionType, draftType := uuid.New(), uuid.New()
+	first := eoNewTestRecord(decisionType, "DEC-2026-001")
+	second := eoNewTestRecord(decisionType, "DEC-2026-002")
+	// Restricted to one body under the §7.11 control: the register query
+	// would hide it from most callers, and this read must NOT — the filtering
+	// decision belongs to the capability, visibly, not to a query whose
+	// caller has no user.
+	second.Values = datatypes.JSON([]byte(`{"visible_to":"` + uuid.New().String() + `"}`))
+	other := eoNewTestRecord(draftType, "DRF-2026-001")
+	gone := eoNewTestRecord(decisionType, "DEC-2026-003")
+	for _, r := range []*models.EORecord{first, second, other, gone} {
+		if err := repo.Create(ctx, r); err != nil {
+			t.Fatalf("create %s: %v", r.Reference, err)
+		}
+	}
+	if err := db.Where("id = ? AND record_type_id = ?", gone.ID, gone.RecordTypeID).
+		Delete(&models.EORecord{}).Error; err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+
+	t.Run("every live record of the type, oldest first", func(t *testing.T) {
+		got, err := repo.RecordsOfType(ctx, decisionType)
+		if err != nil {
+			t.Fatalf("records of type: %v", err)
+		}
+		if refs := eoReferences(got); !reflect.DeepEqual(refs, []string{first.Reference, second.Reference}) {
+			t.Errorf("records of type = %v, want the two live records of that type, oldest first", refs)
+		}
+	})
+	t.Run("the values come with them", func(t *testing.T) {
+		got, err := repo.RecordsOfType(ctx, decisionType)
+		if err != nil {
+			t.Fatalf("records of type: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("records of type = %d records, want 2", len(got))
+		}
+		if _, ok := eoValuesMap(t, got[1].Values)["visible_to"]; !ok {
+			t.Errorf("values of %s came back as %s; the capability matches on them", got[1].Reference, got[1].Values)
+		}
+	})
+	t.Run("a type with no records is empty, not an error", func(t *testing.T) {
+		got, err := repo.RecordsOfType(ctx, uuid.New())
+		if err != nil {
+			t.Fatalf("records of type: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("records of an unused type = %v, want none", got)
+		}
+	})
+}

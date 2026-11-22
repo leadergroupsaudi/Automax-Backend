@@ -85,6 +85,15 @@ type EORecordRepository interface {
 	// its own plus a row lock, and database/sql waits for a free one forever
 	// when the pool is capped.
 	Transaction(ctx context.Context, fn func(EORecordRepository, EORecordTypeRepository, EOTimerRepository) error) error
+	// RecordsOfType returns every live record of one record type, oldest
+	// first. It is the ENGINE's type-scoped read — services.decisions_base
+	// checks a draft against the standing records of another type — and it
+	// is deliberately not List: List is the register query, paged and scoped
+	// to the requesting user's §7.11 row-level visibility, and an engine
+	// caller has no user, so it would return almost nothing while looking
+	// like it worked. Confidentiality decisions over what this returns
+	// belong to the caller, visibly.
+	RecordsOfType(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error)
 }
 
 type eoRecordRepository struct {
@@ -223,6 +232,18 @@ func (r *eoRecordRepository) Children(ctx context.Context, parentID uuid.UUID, r
 	var out []models.EORecord
 	if err := q.Order("eo_records.created_at ASC, eo_records.id ASC").Find(&out).Error; err != nil {
 		return nil, fmt.Errorf("list children of eo record %s: %w", parentID, err)
+	}
+	return out, nil
+}
+
+func (r *eoRecordRepository) RecordsOfType(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	var out []models.EORecord
+	if err := r.db.WithContext(ctx).
+		Model(&models.EORecord{}).
+		Where("eo_records.record_type_id = ?", recordTypeID).
+		Order("eo_records.created_at ASC, eo_records.id ASC").
+		Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("list eo records of type %s: %w", recordTypeID, err)
 	}
 	return out, nil
 }
