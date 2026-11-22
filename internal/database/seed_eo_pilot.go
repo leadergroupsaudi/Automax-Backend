@@ -18,11 +18,12 @@ type eoMatrixKeyEntry struct {
 	// isColumn: the engine stores the value in a column of eo_records, not in
 	// the values bag.
 	isColumn bool
-	// hasNoField: a pilot type must NOT declare a field under the matrix
-	// spelling, because the matrix key is not a field of its own — it is
-	// either a column on the record itself (ticket_type, state) or lives in
-	// the values bag under the inherited definition (attachments).
-	hasNoField bool
+	// isEngineManaged: the engine owns this key — record identity
+	// (ticket_type), workflow state (state), or the attachment store. The
+	// BASE type does seed definitions named record_type_id, state_id and
+	// attachments (all engine-written or engine-handled), so this does NOT mean
+	// "there is no definition"; it means a pilot type must never declare one.
+	isEngineManaged bool
 }
 
 // eoMatrixKeys is the client field matrix's spelling of the seventeen
@@ -60,15 +61,19 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 // engine's. A pilot type's fields must be seeded under engineKey: a field
 // keyed with the matrix spelling lands in the values bag and shadows nothing.
 //
-//	isColumn   — the value lives in an eo_records column.
-//	hasNoField — do not declare a field for this matrix key at all.
+//	isColumn        — the value lives in an eo_records column.
+//	isEngineManaged — the engine owns the key (see eoMatrixKeyEntry).
+//
+// THE RULE: declare a field for a matrix key iff !isColumn && !isEngineManaged.
+// Every column key is already declared by the base type (override it only to
+// narrow it, under engineKey); an engine-managed key is never declared.
 //
 // A key the table does not know passes through unchanged as a values-bag key
-// (isColumn false, hasNoField false): type-specific matrix keys are the
+// (isColumn false, isEngineManaged false): type-specific matrix keys are the
 // engine's keys already.
-func eoMatrixKey(matrixKey string) (engineKey string, isColumn bool, hasNoField bool) {
+func eoMatrixKey(matrixKey string) (engineKey string, isColumn bool, isEngineManaged bool) {
 	if e, ok := eoMatrixKeys[matrixKey]; ok {
-		return e.engineKey, e.isColumn, e.hasNoField
+		return e.engineKey, e.isColumn, e.isEngineManaged
 	}
 	return matrixKey, false, false
 }
@@ -128,6 +133,15 @@ var eoSmokeTypeKeys = []string{eoSmokeParentTypeKey, eoSmokeChildTypeKey}
 //
 // It must run AFTER seedEOPlatform (it removes what that seed wrote).
 func seedEOPilot(db *gorm.DB) {
+	// Nothing to build on until the platform seed has written the base type.
+	var base int64
+	if err := db.Model(&models.EORecordType{}).Where("key = ?", eoBaseTypeKey).Count(&base).Error; err != nil {
+		log.Printf("EO pilot seed: could not check for record type %q: %v", eoBaseTypeKey, err)
+		return
+	}
+	if base == 0 {
+		return
+	}
 	needed, err := eoPilotSeedNeeded(db)
 	if err != nil {
 		log.Printf("EO pilot seed: could not check whether it is needed: %v", err)
@@ -149,54 +163,76 @@ func seedEOPilot(db *gorm.DB) {
 	}
 }
 
-// eoPilotSeedNeeded is the fast path: two counts. Work is needed while a smoke
-// type exists (either to remove it, or — when it holds records — to say again
-// that it was kept), or while the base type exists and nothing has ever been
-// marked.
+// eoPilotStep is one unit of the pilot seed.
+//
+// Whether a step has run is recorded in a DURABLE row (models.EOSeedStep, one
+// per step key), written in the same transaction as the step's own work. It is
+// never inferred from what the database currently contains: an inference such
+// as "a smoke type exists" is true only until the step has run once, after
+// which the fast path would shut and every step added later would never
+// execute on a database that had already booted an earlier version.
+//
+// ADDING A STEP: append it to eoPilotSteps. That is the whole of it — the fast
+// path compares applied rows with len(eoPilotSteps), so a new step reopens it
+// on every existing database by construction, and there is no predicate to
+// forget. (TestEOPilotRunsAStepAddedAfterTheOthersWereApplied pins this.)
+//
+// run returns done=false when it deliberately did nothing and wants to be
+// asked again next boot (smoke types kept because they hold records).
+type eoPilotStep struct {
+	key string
+	run func(tx *gorm.DB) (done bool, err error)
+}
+
+var eoPilotSteps = []eoPilotStep{
+	{"remove_smoke_configuration", eoRemoveSmokeConfiguration},
+	{"mark_base_labels_unsigned", func(tx *gorm.DB) (bool, error) { return true, eoMarkBaseLabelsUnsigned(tx) }},
+}
+
+// eoPilotSeedNeeded is the fast path: one count of applied-step rows.
 func eoPilotSeedNeeded(db *gorm.DB) (bool, error) {
-	var smoke int64
-	if err := db.Model(&models.EORecordType{}).Where("key IN ?", eoSmokeTypeKeys).Count(&smoke).Error; err != nil {
+	keys := make([]string, 0, len(eoPilotSteps))
+	for _, st := range eoPilotSteps {
+		keys = append(keys, st.key)
+	}
+	var applied int64
+	if err := db.Model(&models.EOSeedStep{}).Where("key IN ?", keys).Count(&applied).Error; err != nil {
 		return false, err
 	}
-	if smoke > 0 {
-		return true, nil
-	}
-	var base, marked int64
-	if err := db.Model(&models.EORecordType{}).Where("key = ?", eoBaseTypeKey).Count(&base).Error; err != nil {
-		return false, err
-	}
-	if base == 0 {
-		// The platform seed has not run (EO_PLATFORM off, or it rolled back);
-		// there is nothing to build on.
-		return false, nil
-	}
-	if err := db.Model(&models.EOFieldDef{}).Where("ar_untranslated = ?", true).Count(&marked).Error; err != nil {
-		return false, err
-	}
-	return marked == 0, nil
+	return applied < int64(len(keys)), nil
 }
 
 func eoSeedPilotTx(tx *gorm.DB) error {
-	if err := eoRemoveSmokeConfiguration(tx); err != nil {
-		return err
+	for _, st := range eoPilotSteps {
+		var n int64
+		if err := tx.Model(&models.EOSeedStep{}).Where("key = ?", st.key).Count(&n).Error; err != nil {
+			return fmt.Errorf("check step %q: %w", st.key, err)
+		}
+		if n > 0 {
+			continue
+		}
+		done, err := st.run(tx)
+		if err != nil {
+			return fmt.Errorf("step %q: %w", st.key, err)
+		}
+		if !done {
+			continue
+		}
+		if err := tx.Create(&models.EOSeedStep{Key: st.key}).Error; err != nil {
+			return fmt.Errorf("record step %q: %w", st.key, err)
+		}
 	}
-	return eoMarkBaseLabelsUnsigned(tx)
+	return nil
 }
 
 // eoMarkBaseLabelsUnsigned marks the base type's inherited labels as awaiting
 // sign-off: the Arabic on them was written by an implementer, not supplied by
-// the client (docs/superpowers/eo-plan1-carry-forward.md). It runs only while
-// NOTHING in the database is marked, so it fills in a database that predates
-// the column and never re-marks a label an administrator has since approved.
-// (A fresh database never needs it: eoBaseFieldDefs marks them at creation.)
+// the client (docs/superpowers/eo-plan1-carry-forward.md). It is a one-shot
+// step guarded ONLY by its applied-step row, so it fills in a database that
+// predates the column and can never re-mark a label an administrator has since
+// approved, however many labels remain marked. (A fresh database is marked at
+// creation by eoBaseFieldDefs; this is then a harmless first run.)
 func eoMarkBaseLabelsUnsigned(tx *gorm.DB) error {
-	var marked int64
-	if err := tx.Model(&models.EOFieldDef{}).Where("ar_untranslated = ?", true).Count(&marked).Error; err != nil {
-		return fmt.Errorf("count marked field labels: %w", err)
-	}
-	if marked > 0 {
-		return nil
-	}
 	var base models.EORecordType
 	if err := tx.Where("key = ?", eoBaseTypeKey).Limit(1).Find(&base).Error; err != nil {
 		return fmt.Errorf("read base record type: %w", err)
@@ -228,13 +264,13 @@ func eoMarkBaseLabelsUnsigned(tx *gorm.DB) error {
 // Hard deletes (Unscoped) throughout: the escalation policy name is on a unique
 // index that a soft-deleted row still occupies, and a leftover would make
 // every later boot's EO seed collide and roll back.
-func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
+func eoRemoveSmokeConfiguration(tx *gorm.DB) (bool, error) {
 	var smoke []models.EORecordType
 	if err := tx.Where("key IN ?", eoSmokeTypeKeys).Find(&smoke).Error; err != nil {
-		return fmt.Errorf("find smoke record types: %w", err)
+		return false, fmt.Errorf("find smoke record types: %w", err)
 	}
 	if len(smoke) == 0 {
-		return nil
+		return true, nil
 	}
 	smokeIDs := make([]uuid.UUID, 0, len(smoke))
 	for _, t := range smoke {
@@ -248,7 +284,7 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 			UNION
 			SELECT t.id FROM eo_record_types t JOIN sub ON t.parent_type_id = sub.id WHERE t.deleted_at IS NULL
 		) SELECT id FROM sub`, smokeIDs).Scan(&subtree).Error; err != nil {
-		return fmt.Errorf("walk the smoke types' subtree: %w", err)
+		return false, fmt.Errorf("walk the smoke types' subtree: %w", err)
 	}
 
 	var holders []struct {
@@ -259,7 +295,7 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 		SELECT t.key AS key, COUNT(*) AS n
 		FROM eo_records r JOIN eo_record_types t ON t.id = r.record_type_id
 		WHERE r.record_type_id IN ? GROUP BY t.key ORDER BY t.key`, subtree).Scan(&holders).Error; err != nil {
-		return fmt.Errorf("count records under the smoke types: %w", err)
+		return false, fmt.Errorf("count records under the smoke types: %w", err)
 	}
 	if len(holders) > 0 {
 		desc := make([]string, 0, len(holders))
@@ -268,22 +304,22 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 		}
 		sort.Strings(desc)
 		log.Printf("EO pilot: the smoke record types were KEPT because records exist under them: %v. They cannot be removed while populated (spec §7.14); delete those records and restart to remove them.", desc)
-		return nil
+		return false, nil
 	}
 	if len(subtree) != len(smokeIDs) {
 		log.Printf("EO pilot: the smoke record types were KEPT because other record types are defined beneath them (%d in the subtree, %d smoke types).", len(subtree), len(smokeIDs))
-		return nil
+		return false, nil
 	}
 
 	// Workflows bound to the smoke types.
 	var workflowIDs []uuid.UUID
 	if err := tx.Unscoped().Model(&models.Workflow{}).Where("record_type_id IN ?", smokeIDs).Pluck("id", &workflowIDs).Error; err != nil {
-		return fmt.Errorf("find smoke workflows: %w", err)
+		return false, fmt.Errorf("find smoke workflows: %w", err)
 	}
 	// The type's own workflow_id points at the workflow; release it first so
 	// neither delete order trips a foreign key.
 	if err := tx.Model(&models.EORecordType{}).Where("id IN ?", smokeIDs).Update("workflow_id", nil).Error; err != nil {
-		return fmt.Errorf("unbind smoke workflows: %w", err)
+		return false, fmt.Errorf("unbind smoke workflows: %w", err)
 	}
 
 	var policyIDs []uuid.UUID
@@ -291,35 +327,35 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 		if err := tx.Unscoped().Model(&models.WorkflowState{}).
 			Where("workflow_id IN ? AND escalation_policy_id IS NOT NULL", workflowIDs).
 			Distinct().Pluck("escalation_policy_id", &policyIDs).Error; err != nil {
-			return fmt.Errorf("find smoke escalation policies: %w", err)
+			return false, fmt.Errorf("find smoke escalation policies: %w", err)
 		}
 		var transitions []models.WorkflowTransition
 		if err := tx.Unscoped().Where("workflow_id IN ?", workflowIDs).Find(&transitions).Error; err != nil {
-			return fmt.Errorf("find smoke transitions: %w", err)
+			return false, fmt.Errorf("find smoke transitions: %w", err)
 		}
 		for i := range transitions {
 			tr := &transitions[i]
 			if err := tx.Model(tr).Association("AllowedRoles").Clear(); err != nil {
-				return fmt.Errorf("clear allowed roles of transition %q: %w", tr.Code, err)
+				return false, fmt.Errorf("clear allowed roles of transition %q: %w", tr.Code, err)
 			}
 			if err := tx.Model(tr).Association("AssignmentRoles").Clear(); err != nil {
-				return fmt.Errorf("clear assignment roles of transition %q: %w", tr.Code, err)
+				return false, fmt.Errorf("clear assignment roles of transition %q: %w", tr.Code, err)
 			}
 			if err := tx.Unscoped().Where("transition_id = ?", tr.ID).Delete(&models.TransitionRequirement{}).Error; err != nil {
-				return fmt.Errorf("delete requirements of transition %q: %w", tr.Code, err)
+				return false, fmt.Errorf("delete requirements of transition %q: %w", tr.Code, err)
 			}
 			if err := tx.Unscoped().Where("transition_id = ?", tr.ID).Delete(&models.TransitionFieldChange{}).Error; err != nil {
-				return fmt.Errorf("delete field changes of transition %q: %w", tr.Code, err)
+				return false, fmt.Errorf("delete field changes of transition %q: %w", tr.Code, err)
 			}
 		}
 		if err := tx.Unscoped().Where("workflow_id IN ?", workflowIDs).Delete(&models.WorkflowTransition{}).Error; err != nil {
-			return fmt.Errorf("delete smoke transitions: %w", err)
+			return false, fmt.Errorf("delete smoke transitions: %w", err)
 		}
 		if err := tx.Unscoped().Where("workflow_id IN ?", workflowIDs).Delete(&models.WorkflowState{}).Error; err != nil {
-			return fmt.Errorf("delete smoke states: %w", err)
+			return false, fmt.Errorf("delete smoke states: %w", err)
 		}
 		if err := tx.Unscoped().Where("id IN ?", workflowIDs).Delete(&models.Workflow{}).Error; err != nil {
-			return fmt.Errorf("delete smoke workflows: %w", err)
+			return false, fmt.Errorf("delete smoke workflows: %w", err)
 		}
 	}
 
@@ -327,30 +363,30 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 	// half-removal that left the name behind is the collision this guards.
 	var byName []uuid.UUID
 	if err := tx.Unscoped().Model(&models.EscalationPolicy{}).Where("name = ?", eoSmokePolicyName).Pluck("id", &byName).Error; err != nil {
-		return fmt.Errorf("find the smoke escalation policy by name: %w", err)
+		return false, fmt.Errorf("find the smoke escalation policy by name: %w", err)
 	}
 	policyIDs = append(policyIDs, byName...)
 	if len(policyIDs) > 0 {
 		var stillUsed int64
 		if err := tx.Model(&models.WorkflowState{}).Where("escalation_policy_id IN ?", policyIDs).Count(&stillUsed).Error; err != nil {
-			return fmt.Errorf("check the smoke policy is unused: %w", err)
+			return false, fmt.Errorf("check the smoke policy is unused: %w", err)
 		}
 		if stillUsed > 0 {
-			return fmt.Errorf("escalation policy %q is still referenced by %d workflow states outside the smoke workflows; refusing to delete it", eoSmokePolicyName, stillUsed)
+			return false, fmt.Errorf("escalation policy %q is still referenced by %d workflow states outside the smoke workflows; refusing to delete it", eoSmokePolicyName, stillUsed)
 		}
 		if err := tx.Unscoped().Where("policy_id IN ?", policyIDs).Delete(&models.EscalationPolicyStep{}).Error; err != nil {
-			return fmt.Errorf("delete smoke escalation steps: %w", err)
+			return false, fmt.Errorf("delete smoke escalation steps: %w", err)
 		}
 		if err := tx.Unscoped().Where("id IN ?", policyIDs).Delete(&models.EscalationPolicy{}).Error; err != nil {
-			return fmt.Errorf("delete smoke escalation policy: %w", err)
+			return false, fmt.Errorf("delete smoke escalation policy: %w", err)
 		}
 	}
 
 	if err := tx.Unscoped().Where("key = ?", eoSmokeLinkTypeKey).Delete(&models.EOLinkType{}).Error; err != nil {
-		return fmt.Errorf("delete smoke link type: %w", err)
+		return false, fmt.Errorf("delete smoke link type: %w", err)
 	}
 	if err := tx.Unscoped().Where("record_type_id IN ?", smokeIDs).Delete(&models.EOFieldDef{}).Error; err != nil {
-		return fmt.Errorf("delete smoke field definitions: %w", err)
+		return false, fmt.Errorf("delete smoke field definitions: %w", err)
 	}
 
 	// The six per-type permission codes, and their grants.
@@ -362,22 +398,22 @@ func eoRemoveSmokeConfiguration(tx *gorm.DB) error {
 	}
 	var permIDs []uuid.UUID
 	if err := tx.Unscoped().Model(&models.Permission{}).Where("code IN ?", codes).Pluck("id", &permIDs).Error; err != nil {
-		return fmt.Errorf("find smoke permissions: %w", err)
+		return false, fmt.Errorf("find smoke permissions: %w", err)
 	}
 	if len(permIDs) > 0 {
 		if err := tx.Exec(`DELETE FROM role_permissions WHERE permission_id IN ?`, permIDs).Error; err != nil {
-			return fmt.Errorf("revoke smoke permissions: %w", err)
+			return false, fmt.Errorf("revoke smoke permissions: %w", err)
 		}
 		if err := tx.Unscoped().Where("id IN ?", permIDs).Delete(&models.Permission{}).Error; err != nil {
-			return fmt.Errorf("delete smoke permissions: %w", err)
+			return false, fmt.Errorf("delete smoke permissions: %w", err)
 		}
 	}
 
 	if err := tx.Unscoped().Where("id IN ?", smokeIDs).Delete(&models.EORecordType{}).Error; err != nil {
-		return fmt.Errorf("delete smoke record types: %w", err)
+		return false, fmt.Errorf("delete smoke record types: %w", err)
 	}
 	log.Println("EO pilot: removed Plan 1's smoke configuration (eo_smoke_directive, eo_smoke_task)")
-	return nil
+	return true, nil
 }
 
 // seedEOPilotWhenEnabled is the gate Seed applies, a function so that the gate

@@ -37,6 +37,18 @@ dropdown option label were written by an implementer, not supplied by the
 client. Spec §9 lists client sign-off on Arabic labels as a serial dependency
 ahead of seeding. They are cheap to change only while no records exist.
 
+**Arabic sign-off clearing (named obligation, Plan 2 Task A1).** Fields whose
+Arabic the client has not signed off carry `eo_field_defs.ar_untranslated =
+true` (the 17 inherited labels, and every pilot field seeded through
+`eoUntranslatedLabel`). The flag is write-only by design: no endpoint clears
+it, and it must NOT be added to the designer's `eoFieldDefRequest` — that
+would let any designer save clear it silently, and the list is what §9's
+sign-off round works from. No approve endpoint is built yet because the
+client's signed-off list does not exist and its shape is unknown. When it
+arrives, clear the flag by a deliberate operation fed by that list (a seed
+step or an admin-only bulk action), not through the designer request. Editing
+`label_ar` does not clear it, correctly.
+
 **The smoke types ship to production.** `eo_smoke_directive` and
 `eo_smoke_task` (plus two workflows, an escalation policy, six permission codes,
 a requirement and a field change) are seeded under `EO_PLATFORM=true` and

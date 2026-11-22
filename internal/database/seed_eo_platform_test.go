@@ -97,6 +97,7 @@ func eoSeedTables() []any {
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
+		&models.EOSeedStep{},
 	}
 }
 

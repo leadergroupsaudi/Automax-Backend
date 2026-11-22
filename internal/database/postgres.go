@@ -155,6 +155,7 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
+		&models.EOSeedStep{},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)

@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -31,11 +33,11 @@ var eoMatrixInheritedKeys = []string{
 // {"classification", true, false}.
 func TestEOMatrixKeyTranslatesInheritedKeys(t *testing.T) {
 	tests := []struct {
-		name       string
-		in         string
-		wantKey    string
-		wantColumn bool
-		wantNoFld  bool
+		name        string
+		in          string
+		wantKey     string
+		wantColumn  bool
+		wantManaged bool
 	}{
 		{"classification renamed", "classification", "sensitivity", true, false},
 		{"owner_department renamed", "owner_department", "owning_body_id", true, false},
@@ -51,15 +53,15 @@ func TestEOMatrixKeyTranslatesInheritedKeys(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			key, isCol, noField := eoMatrixKey(tc.in)
+			key, isCol, managed := eoMatrixKey(tc.in)
 			if key != tc.wantKey {
 				t.Errorf("engine key = %q, want %q", key, tc.wantKey)
 			}
 			if isCol != tc.wantColumn {
 				t.Errorf("isColumn = %v, want %v", isCol, tc.wantColumn)
 			}
-			if noField != tc.wantNoFld {
-				t.Errorf("hasNoField = %v, want %v", noField, tc.wantNoFld)
+			if managed != tc.wantManaged {
+				t.Errorf("isEngineManaged = %v, want %v", managed, tc.wantManaged)
 			}
 		})
 	}
@@ -254,8 +256,9 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			typesBefore := eoStamps(t, db, "eo_record_types")
 			wfBefore := eoStamps(t, db, "workflows")
 			snapBefore := eoTake(t, db)
-			// The seed's marking of base labels is the one permitted write;
-			// take the baseline after the first run, then prove the SECOND is inert.
+			// snapBefore was taken BEFORE this first run: the seed must change
+			// nothing countable on a populated database, and the second run
+			// below must not touch any record type either.
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != snapBefore {
 				t.Errorf("a populated database changed: %+v, was %+v", got, snapBefore)
@@ -307,20 +310,114 @@ func TestSeedEOPilotIsIdempotent(t *testing.T) {
 	}
 }
 
-// An administrator's approval must not be undone by the next boot.
-// Mutation: change `marked == 0` in eoPilotSeedNeeded to `true` and the guard
-// in eoMarkBaseLabelsUnsigned to `if false`.
+// An administrator's approval must not be undone by the next boot, and the
+// guard that stops it must be tested where it is the ONLY guard: a smoke type
+// holding a record keeps the removal step unapplied, so the fast path stays
+// open and the run reaches the in-transaction applied-step check. ALL labels
+// are unmarked, the case where a content-based guard would see nothing marked
+// and re-mark the lot.
+// Mutation: delete the `if n > 0 { continue }` in eoSeedPilotTx.
 func TestSeedEOPilotDoesNotRemarkApprovedLabels(t *testing.T) {
 	db := eoPilotDB(t)
+	var child models.EORecordType
+	if err := db.Where("key = ?", eoSmokeChildTypeKey).First(&child).Error; err != nil {
+		t.Fatal(err)
+	}
+	eoInsertRecord(t, db, child.ID)
 	seedEOPilot(db)
-	if err := db.Model(&models.EOFieldDef{}).Where("key = ?", "priority").Update("ar_untranslated", false).Error; err != nil {
+	if open, err := eoPilotSeedNeeded(db); err != nil || !open {
+		t.Fatalf("fixture error: fast path should be open (needed=%v err=%v)", open, err)
+	}
+	if err := db.Model(&models.EOFieldDef{}).Where("1 = 1").Update("ar_untranslated", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A re-run of an applied step would hit the step table's primary key and
+	// roll back, which would ALSO leave the labels unmarked; the log is what
+	// tells "skipped correctly" from "failed and rolled back".
+	var logged strings.Builder
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	seedEOPilot(db)
+	log.SetOutput(os.Stderr)
+	if strings.Contains(logged.String(), "FAILED") {
+		t.Errorf("the second run failed instead of skipping the applied step: %s", logged.String())
+	}
+	var n int64
+	db.Model(&models.EOFieldDef{}).Where("ar_untranslated = ?", true).Count(&n)
+	if n != 0 {
+		t.Errorf("a boot re-marked %d labels an administrator had approved", n)
+	}
+}
+
+// A kept removal is not recorded as applied, so it is retried once the records
+// are gone. Mutation: delete `if !done { continue }` in eoSeedPilotTx.
+func TestSeedEOPilotRetriesAKeptRemovalOnceTheRecordsAreGone(t *testing.T) {
+	db := eoPilotDB(t)
+	var child models.EORecordType
+	if err := db.Where("key = ?", eoSmokeChildTypeKey).First(&child).Error; err != nil {
+		t.Fatal(err)
+	}
+	eoInsertRecord(t, db, child.ID)
+	seedEOPilot(db)
+	if err := db.Exec(`DELETE FROM eo_records`).Error; err != nil {
+		t.Fatal(err)
+	}
+	seedEOPilot(db)
+	var left int64
+	db.Model(&models.EORecordType{}).Where("key IN ?", eoSmokeTypeKeys).Count(&left)
+	if left != 0 {
+		t.Errorf("%d smoke types remain after the records were removed and the seed re-ran", left)
+	}
+}
+
+// The regression the applied-step record exists to prevent: a step added after
+// the others were applied on a database must still run. The fixture applies
+// every existing step first, then appends one.
+// Mutation: in eoPilotSeedNeeded return `applied < 2` instead of
+// `applied < int64(len(keys))`.
+func TestEOPilotRunsAStepAddedAfterTheOthersWereApplied(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	if open, err := eoPilotSeedNeeded(db); err != nil || open {
+		t.Fatalf("fixture error: everything should be applied (needed=%v err=%v)", open, err)
+	}
+	saved := eoPilotSteps
+	t.Cleanup(func() { eoPilotSteps = saved })
+	ran := false
+	eoPilotSteps = append(append([]eoPilotStep{}, saved...), eoPilotStep{
+		key: "a_later_step",
+		run: func(tx *gorm.DB) (bool, error) { ran = true; return true, nil },
+	})
+	seedEOPilot(db)
+	if !ran {
+		t.Error("a step added after the others were applied never ran")
+	}
+	ran = false
+	seedEOPilot(db)
+	if ran {
+		t.Error("an applied step ran again")
+	}
+}
+
+// The descendant-keep branch: a type beneath a smoke type, holding NO records,
+// still blocks removal (deleting the parent would orphan it).
+// Mutation: delete the `if len(subtree) != len(smokeIDs) { ... }` block.
+func TestSeedEOPilotKeepsSmokeTypesWithDescendants(t *testing.T) {
+	db := eoPilotDB(t)
+	var parent models.EORecordType
+	if err := db.Where("key = ?", eoSmokeParentTypeKey).First(&parent).Error; err != nil {
+		t.Fatal(err)
+	}
+	sub := models.EORecordType{ID: uuid.New(), Key: "eo_empty_sub", Name: "Sub", ParentTypeID: &parent.ID,
+		ReferenceMode: models.EOReferenceModeOwn, ReferencePrefix: "SUB", ReferencePattern: "SUB-YYYY-NNN", IsActive: true}
+	if err := db.Create(&sub).Error; err != nil {
 		t.Fatal(err)
 	}
 	seedEOPilot(db)
 	var n int64
-	db.Model(&models.EOFieldDef{}).Where("key = ? AND ar_untranslated = ?", "priority", true).Count(&n)
-	if n != 0 {
-		t.Error("a boot re-marked a label an administrator had approved")
+	db.Model(&models.EORecordType{}).Where("key IN ?", append(append([]string{}, eoSmokeTypeKeys...), "eo_empty_sub")).Count(&n)
+	if n != 3 {
+		t.Errorf("%d of the 3 types remain, want all 3", n)
 	}
 }
 
