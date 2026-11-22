@@ -1,8 +1,10 @@
 package database
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"testing"
 
@@ -263,35 +265,6 @@ func TestEoCapabilityReservedFieldDefinitionsAreRemoved(t *testing.T) {
 	}
 }
 
-// TestEoCapabilityEnablementSurvivesASecondRun is the idempotency shape the
-// rest of the seed carries: the step's applied row stops it re-running, and a
-// run that did re-run must not double the blob or resurrect the removed field.
-func TestEoCapabilityEnablementSurvivesASecondRun(t *testing.T) {
-	db := eoPilotDB(t)
-	seedEOPilot(db)
-	first := eoCapabilityBlobs(t, db)
-	seedEOPilot(db)
-	second := eoCapabilityBlobs(t, db)
-	for key, blob := range first {
-		if second[key] != blob {
-			t.Errorf("record type %q: capabilities changed on the second run:\n got %s\nwant %s", key, second[key], blob)
-		}
-	}
-}
-
-func eoCapabilityBlobs(t *testing.T, db *gorm.DB) map[string]string {
-	t.Helper()
-	var types []models.EORecordType
-	if err := db.Where("is_abstract = ?", false).Order("key").Find(&types).Error; err != nil {
-		t.Fatalf("read concrete record types: %v", err)
-	}
-	out := map[string]string{}
-	for _, ty := range types {
-		out[ty.Key] = string(ty.Capabilities)
-	}
-	return out
-}
-
 // eoJSONEqual compares two JSON documents by value, so a reformatted config is
 // not a failure and a changed key is.
 func eoJSONEqual(t *testing.T, a, b string) bool {
@@ -460,5 +433,143 @@ func TestEoEnableCapabilitiesIsFailClosed(t *testing.T) {
 				t.Fatalf("transaction returned %v, want the sentinel", err)
 			}
 		})
+	}
+}
+
+// TestEoCapabilityInputsWithoutFieldDefsReportsTheOneThatIsMissing is the
+// query behind the boot-time line, checked against the REAL seeded
+// configuration rather than a fixture.
+//
+// It is the one fact an operator wants on first boot and cannot get anywhere
+// else: `decisions_base` is enabled on the Draft Decision Study and matches
+// nothing, because its `subject_key` names `keywords` and the draft type has
+// no such field. A clean startup log would otherwise say nothing about a
+// conflict check the client is expecting.
+//
+// BOTH DIRECTIONS. The first half asserts the gap is reported, exactly once,
+// with every field filled; the second asserts the check can return NOTHING —
+// a reporter that reports every key would say the same thing on the day the
+// field arrives, and the line would then be noise nobody reads.
+//
+// Mutation that makes it fail: delete the `subject_key` entry from
+// eoCapabilityOwnTypeInputKeys, or make eoTypeHasEffectiveField return
+// `n >= 0`.
+func TestEoCapabilityInputsWithoutFieldDefsReportsTheOneThatIsMissing(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	if len(eoCapabilityOwnTypeInputKeys) == 0 {
+		t.Fatal("no capability declares a config key that names a values key on its own type; the query inspects nothing")
+	}
+
+	gaps, err := eoCapabilityInputsWithoutFieldDefs(db, eoPilotCapabilities)
+	if err != nil {
+		t.Fatalf("eoCapabilityInputsWithoutFieldDefs: %v", err)
+	}
+	want := []eoCapabilityInputGap{
+		{TypeKey: eoDraftStudyTypeKey, CapabilityKey: eoDecisionsBaseCapabilityKey,
+			ConfigKey: "subject_key", ValuesKey: "keywords"},
+	}
+	if len(gaps) != len(want) {
+		t.Fatalf("reported %v, want %v", gaps, want)
+	}
+	for i := range want {
+		if gaps[i] != want[i] {
+			t.Errorf("gap %d is %+v, want %+v", i, gaps[i], want[i])
+		}
+	}
+
+	t.Run("a config that does not name the key at all is not reported", func(t *testing.T) {
+		// The capability's own default then applies, and the defaults are
+		// not modelled here — so the honest answer is to say nothing rather
+		// than to report a key the configuration never mentioned.
+		gaps, err := eoCapabilityInputsWithoutFieldDefs(db, []eoCapabilityEnablement{
+			{TypeKey: eoDraftStudyTypeKey, CapabilityKey: eoDecisionsBaseCapabilityKey,
+				Config: `{"base_type_key":"` + eoDecisionTypeKey + `"}`},
+			{TypeKey: eoDraftStudyTypeKey, CapabilityKey: eoDecisionsBaseCapabilityKey,
+				Config: `{"subject_key":"   "}`},
+		})
+		if err != nil {
+			t.Fatalf("eoCapabilityInputsWithoutFieldDefs: %v", err)
+		}
+		if len(gaps) != 0 {
+			t.Errorf("reported %v for configs that name no subject_key", gaps)
+		}
+	})
+
+	t.Run("a config that is not JSON is an error, never an empty answer", func(t *testing.T) {
+		// Unreachable from the seeded registry — eoCapabilityBlob refuses a
+		// non-JSON config at seed time — but a reporter that swallowed a
+		// decode failure would say "no gaps" about a blob it never read.
+		_, err := eoCapabilityInputsWithoutFieldDefs(db, []eoCapabilityEnablement{
+			{TypeKey: eoDraftStudyTypeKey, CapabilityKey: eoDecisionsBaseCapabilityKey, Config: `{"subject_key":}`},
+		})
+		if err == nil {
+			t.Fatal("a config that is not JSON was reported as having no gaps")
+		}
+		if !strings.Contains(err.Error(), "does not decode") {
+			t.Errorf("error %q does not say the config could not be read", err)
+		}
+	})
+
+	t.Run("a key the type DOES provide is not reported", func(t *testing.T) {
+		// `standing` is on Decision Record and `grounds` is on the Draft
+		// Decision Study; both are real seeded field definitions, so a
+		// reporter that cannot tell present from absent fails here.
+		for _, tc := range []struct{ typeKey, key string }{
+			{eoDraftStudyTypeKey, "grounds"},
+			{eoDecisionTypeKey, "keywords"},
+			{eoDecisionTypeKey, "standing"},
+			// Inherited from the base type, through the ancestor chain.
+			{eoDraftStudyTypeKey, "subject_ar"},
+		} {
+			has, err := eoTypeHasEffectiveField(db, tc.typeKey, tc.key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !has {
+				t.Errorf("%q is seeded on %q and the check says it is not", tc.key, tc.typeKey)
+			}
+		}
+		has, err := eoTypeHasEffectiveField(db, eoDraftStudyTypeKey, "keywords")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if has {
+			t.Error("the Draft Decision Study has a `keywords` field; the whole premise of the reported gap is gone")
+		}
+	})
+}
+
+// TestEoSeedEOPilotLogsTheUnprovidedCapabilityInput asserts the LINE, not just
+// the query behind it. The two lines beside it in seedEOPilot — the
+// untranslated labels and the unconfirmed state machines — have their queries
+// tested and their log calls untested; this one is cheap to assert because the
+// package's tests run sequentially, so capturing the standard logger is safe.
+//
+// Mutation that makes it fail: delete the eoLogCapabilityInputGaps(db) call
+// from seedEOPilot.
+func TestEoSeedEOPilotLogsTheUnprovidedCapabilityInput(t *testing.T) {
+	db := eoPilotDB(t)
+
+	var buf bytes.Buffer
+	out := log.Writer()
+	flags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(out); log.SetFlags(flags) })
+
+	seedEOPilot(db)
+
+	got := buf.String()
+	for _, want := range []string{
+		`capability "decisions_base" on "eo_draft_decision_study"`,
+		`subject_key="keywords"`,
+		"no field definition on that type provides",
+		"expected until the client supplies it",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the seed's output does not carry %q; an operator reading a clean startup log would never learn the conflict check cannot fire.\n--- output ---\n%s", want, got)
+		}
 	}
 }

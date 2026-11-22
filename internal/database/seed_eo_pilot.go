@@ -248,6 +248,7 @@ func seedEOPilot(db *gorm.DB) {
 		log.Printf("EO pilot: %d field labels await Arabic sign-off (eo_field_defs.ar_untranslated)", len(set))
 	}
 	eoLogUnconfirmedStateMachines(db)
+	eoLogCapabilityInputGaps(db)
 }
 
 // eoPilotStep is one unit of the pilot seed.
@@ -2889,4 +2890,122 @@ func eoCapabilityBlob(entries []eoCapabilityEnablement) ([]byte, error) {
 // eoTypePermissionInertEN.
 func eoSeedPilotTypePermissions(tx *gorm.DB) (bool, error) {
 	return true, eoSeedTypePermissions(tx)
+}
+
+// ── Task A6: the capability input the configuration does not yet provide ────
+//
+// WHY THIS IS REPORTED AT BOOT. `decisions_base` is enabled on the Draft
+// Decision Study and matches nothing, deliberately: its `subject_key` names
+// `keywords`, which Decision Record carries and the draft type does not,
+// because the client's matrix gives the draft no subject-taxonomy field and
+// the taxonomy itself exists in no document here. The capability therefore
+// writes an empty list on every save — the honest degradation Task B2 chose
+// over a text-similarity fallback — and NOTHING SAYS SO. The seed already
+// tells an operator how many labels await Arabic and how many state machines
+// await sign-off; without this line, an operator reading a clean startup log
+// would never learn that the conflict check the client is expecting cannot
+// fire yet.
+//
+// It is FACTUAL, not alarming: this is the expected state until the client
+// supplies the taxonomy and the draft type gains the field.
+//
+// WHAT IT DOES NOT CHECK, so nobody reads more into it than it says. Only the
+// config keys that name a values key on the record type CARRYING the
+// capability. `decisions_base`'s `match_key`, `standing_key` and
+// `standing_values` name things on the BASE type, and `referral_tree`'s
+// `parent_key` names a key on the BRANCH type — none of those is checked by
+// anything, which is recorded as an open item in
+// docs/superpowers/eo-plan1-carry-forward.md ("Opened by Task A6").
+// A config key absent from the blob is skipped: the capability's own default
+// then applies, and the defaults are not modelled here.
+
+// eoCapabilityOwnTypeInputKeys is, per capability, the config keys that name a
+// values key ON THE TYPE THAT ENABLES IT.
+var eoCapabilityOwnTypeInputKeys = map[string][]string{
+	eoDecisionsBaseCapabilityKey: {"subject_key"},
+}
+
+// eoCapabilityInputGap is one such key that no effective field definition
+// provides.
+type eoCapabilityInputGap struct {
+	TypeKey       string
+	CapabilityKey string
+	// ConfigKey is the key in the capability's config blob.
+	ConfigKey string
+	// ValuesKey is what that config key names.
+	ValuesKey string
+}
+
+// eoCapabilityInputsWithoutFieldDefs is the set, in the order of the entries
+// it is given.
+//
+// It takes the entries rather than reading eoPilotCapabilities directly so
+// that the branch for "the config does not name this key at all" — where the
+// capability's own default applies and this function has nothing to say — is
+// reachable from a test. The production caller passes the real registry, and
+// the test that matters asserts against that one.
+func eoCapabilityInputsWithoutFieldDefs(db *gorm.DB, entries []eoCapabilityEnablement) ([]eoCapabilityInputGap, error) {
+	var out []eoCapabilityInputGap
+	for _, e := range entries {
+		wanted := eoCapabilityOwnTypeInputKeys[e.CapabilityKey]
+		if len(wanted) == 0 {
+			continue
+		}
+		cfg := map[string]any{}
+		if err := json.Unmarshal([]byte(e.Config), &cfg); err != nil {
+			return nil, fmt.Errorf("capability %q on %q: config does not decode: %w", e.CapabilityKey, e.TypeKey, err)
+		}
+		for _, configKey := range wanted {
+			valuesKey, _ := cfg[configKey].(string)
+			valuesKey = strings.TrimSpace(valuesKey)
+			if valuesKey == "" {
+				continue
+			}
+			has, err := eoTypeHasEffectiveField(db, e.TypeKey, valuesKey)
+			if err != nil {
+				return nil, err
+			}
+			if !has {
+				out = append(out, eoCapabilityInputGap{
+					TypeKey: e.TypeKey, CapabilityKey: e.CapabilityKey,
+					ConfigKey: configKey, ValuesKey: valuesKey,
+				})
+			}
+		}
+	}
+	return out, nil
+}
+
+// eoTypeHasEffectiveField reports whether key is defined anywhere on a type's
+// ancestor chain — the same resolution spec §7.2 gives the effective field set.
+func eoTypeHasEffectiveField(db *gorm.DB, typeKey, key string) (bool, error) {
+	var n int64
+	err := db.Raw(`
+		WITH RECURSIVE chain AS (
+			SELECT id, parent_type_id FROM eo_record_types WHERE key = ? AND deleted_at IS NULL
+			UNION ALL
+			SELECT p.id, p.parent_type_id FROM eo_record_types p JOIN chain c ON p.id = c.parent_type_id
+			WHERE p.deleted_at IS NULL
+		)
+		SELECT count(*) FROM eo_field_defs
+		WHERE record_type_id IN (SELECT id FROM chain) AND key = ? AND deleted_at IS NULL`,
+		typeKey, key).Scan(&n).Error
+	if err != nil {
+		return false, fmt.Errorf("look for field %q on record type %q: %w", key, typeKey, err)
+	}
+	return n > 0, nil
+}
+
+// eoLogCapabilityInputGaps is the boot-time line, in the shape the two beside
+// it already use.
+func eoLogCapabilityInputGaps(db *gorm.DB) {
+	gaps, err := eoCapabilityInputsWithoutFieldDefs(db, eoPilotCapabilities)
+	if err != nil {
+		log.Printf("EO pilot seed: %v", err)
+		return
+	}
+	for _, g := range gaps {
+		log.Printf("EO pilot: capability %q on %q reads %s=%q, which no field definition on that type provides, so it matches nothing and writes an empty result on every save; expected until the client supplies it",
+			g.CapabilityKey, g.TypeKey, g.ConfigKey, g.ValuesKey)
+	}
 }

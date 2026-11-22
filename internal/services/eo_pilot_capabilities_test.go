@@ -47,27 +47,6 @@ func eoPilotRegisterCapabilities(t *testing.T) {
 	RegisterEOCapabilities()
 }
 
-// eoPilotEnabledTypes returns the seeded record types that enable at least one
-// capability, keyed by type key.
-func eoPilotEnabledTypes(t *testing.T, f *eoWfFixture) map[string]*models.EORecordType {
-	t.Helper()
-	out := map[string]*models.EORecordType{}
-	for _, key := range eoPilotTypeKeysUnderTest {
-		ty, err := f.types.GetByKey(context.Background(), key)
-		if err != nil || ty == nil {
-			t.Fatalf("read record type %q: %v", key, err)
-		}
-		var entries []any
-		if err := json.Unmarshal(ty.Capabilities, &entries); err != nil {
-			t.Fatalf("record type %q: capabilities %s do not decode: %v", key, ty.Capabilities, err)
-		}
-		if len(entries) > 0 {
-			out[key] = ty
-		}
-	}
-	return out
-}
-
 // TestEoPilotCapabilityConfigsResolve is addendum item 6: CapabilitiesFor on
 // EVERY seeded type, asserting no error.
 //

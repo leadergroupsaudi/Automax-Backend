@@ -828,6 +828,119 @@ findable but does not make them questions; these are the questions.
   needs the blocking rule, the seam needs a link-type method, not a repository
   on the capability.
 
+### Opened by Task A6 (per-type permissions and capability enablement)
+
+Task A6 seeded spec §7.11's per-type codes for the eleven pilot types and
+enabled `decisions_base` on the Draft Decision Study and `referral_tree` on
+Incoming Correspondence. It enabled `approval` on NOTHING. Six obligations come
+out of it, and none of them lives anywhere else.
+
+- **`approval` is enabled on no type, and the decision HAS A DEADLINE: before
+  the pilot's first Outgoing Reply record.** The reasons are in
+  `database.eoCapabilitiesNotEnabled`, pinned by
+  `TestEoCapabilitiesNotEnabledAreRecordedAndAbsent`. In short: the
+  capability's two input-field suffixes (`<stamp>_authority`,
+  `<stamp>_delegation_note`) are string-concatenated and not configurable, so
+  enabling it means re-keying two cells of the client's matrix — and
+  `eoMatrixKeys` is keyed by matrix spelling ALONE while `approved_by` sits on
+  Execution Plan as well as Outgoing Reply, which
+  `TestEoTypeSpecificRenamesAreUnambiguousAcrossTheMatrix` refuses outright.
+  **Two premises that argued for doing it anyway turned out to be false, and
+  both corrections belong here.** First, the window is NOT one-way:
+  `models.ValidateTypeEdit` refuses removing a field while records exist, but
+  it governs the API type-edit path, and a SEED STEP writes field definitions
+  directly and is not subject to it — A6 deletes `related_refs` that way. A
+  later enablement is a seed step plus one jsonb UPDATE moving two values per
+  record, not a blocked migration. Second, the cost of pre-keying is not "two
+  oddly-named fields": it is a type-keyed rename mechanism that does not exist,
+  a re-key step, a values backfill, two `eoEngineKeyDecisions` entries and four
+  matrix-test edits.
+  **THE RECOMMENDED RESOLUTION, which makes the question disappear:** two
+  optional keys on `services.eoApprovalConfig` — `authority_key` and
+  `delegation_note_key`, defaulting to today's suffixes. About fifteen lines;
+  the client keeps `approved_by` and `delegation_note`, the stamp keeps its
+  sealed key, and no type is ever renamed.
+  **The residual until then:** `approved_by` on an Outgoing Reply is an
+  ordinary editable user field — nothing records who stamped it or when, and
+  nothing stops it being changed after the reply is approved or sent. On a
+  statutory register that is the control matrix step 6.2 describes, and the
+  pilot does not have it.
+
+- **`decisions_base` is enabled and matches nothing, by design, until the
+  client's taxonomy arrives.** Its `subject_key` names `keywords`, which
+  Decision Record carries (Required Yes, Options "Subject taxonomy") and the
+  Draft Decision Study DOES NOT — the matrix gives the draft no
+  subject-taxonomy field at all — and the vocabulary itself exists in no
+  document in this repository. The capability therefore writes an EMPTY LIST on
+  every save, which is Task B2's designed degradation and not a fault. Two
+  things are owed before the conflict check does anything: the client's
+  taxonomy, and a `keywords`-equivalent field on the draft type, which the
+  config then names as `subject_key`. **A6 made this visible at boot:**
+  `eoLogCapabilityInputGaps` logs one factual line per capability input that no
+  field definition on the carrying type provides, beside the untranslated-label
+  and unconfirmed-state-machine lines.
+  **WHY IT WAS ENABLED ANYWAY RATHER THAN DEFERRED:** not enabling would have
+  left A3's `related_refs` field definition standing — itself a labelled field
+  that nothing writes, the same wired-to-nothing shape — and the removal would
+  then have had to happen AFTER pilot records exist. Enabling settles ownership
+  of the key while settling it is free.
+
+- **A capability config's references to ANOTHER type's values keys are checked
+  by nothing.** Review Focus 2 made transition codes a startup-time refusal
+  (`Capability.ValidateWorkflow`), and A6's boot line covers the config keys
+  that name a values key on the capability's OWN type
+  (`eoCapabilityOwnTypeInputKeys`). Neither covers `decisions_base`'s
+  `match_key`, `standing_key` and `standing_values`, which name things on the
+  BASE type, nor `referral_tree`'s `parent_key`, which names a key on the
+  BRANCH type. A typo in `standing_values` — `"in-force"` for `"in_force"` —
+  would filter every standing record out and write an empty list, silently: the
+  same invisible-failure class the transition-code guard exists for. **The
+  seeded values are correct today** (`in_force` is one of the three options of
+  Decision Record's `standing` dropdown, checked in review), so this is a note,
+  not a fix. The seam, for whoever closes it: a capability-side
+  `ValidateAgainstTypes`, or extending `eoCapabilityOwnTypeInputKeys` to config
+  keys that name a type as well as a key.
+
+- **The per-type permission codes are seeded, granted and still INERT, and the
+  wording that says so must be deleted when enforcement arrives.** Nothing
+  consults `eo:<type_key>:view|create|update`; the API surface is gated by the
+  module-level `eo:*` codes and row-level visibility is the repository's §7.11
+  clause. Every per-type permission's `Description` and `DescriptionAr` now
+  ends with `database.eoTypePermissionInertEN` / `…AR`, so an administrator
+  ticking the box is told they are recording an intention, not applying a
+  control. **When the per-type gate is wired, those two sentences must go in
+  the SAME change** — a control that says it enforces nothing while enforcing
+  something is the same defect pointing the other way. Note also that
+  `eoSeedTypePermissions` never updates an existing row (its check keys on
+  Code), so a later rewording will not reach rows already in a customer's
+  database.
+
+- **The inert-permission sentences are implementer-written ARABIC, and this is
+  the only place the sign-off round can find them.** The string is
+  `database.eoTypePermissionInertAR` in `internal/database/seed_eo_platform.go`.
+  Tasks A4 and A5 met the same situation — no `ar_untranslated` marker on the
+  table — and left the ENGLISH standing rather than invent Arabic. A6 could not
+  do that: the `DescriptionAr` the sentence is appended to is ALREADY Plan 1
+  implementer Arabic, so an English tail would have been a visible
+  inconsistency inside one string rather than a visible obligation. It belongs
+  in the spec §9 sign-off round with the field labels, the link-type labels and
+  the workflow state and transition names.
+
+- **Nothing describes `related_refs` any more, and the client's matrix says it
+  should.** A6 removed its field definition from the Draft Decision Study in
+  the same step that enabled `decisions_base`, because the capability RESERVES
+  the key and `services.eoCapabilitiesCheckConfig` refuses a type whose field
+  definitions name a reserved key — at the first request against the type, not
+  at seed time. With no definition there is no label, no Arabic, no kind and no
+  entry in the effective field set, so a definition-driven UI has nothing to
+  render the capability-written value with. Recorded in
+  `database.eoMatrixFieldsNotSeeded`, and checked against the database by that
+  registry's own subtest. **It is an engine gap for Plan 4** — a capability
+  that owns a values key should be able to describe it, the way a field
+  definition describes a user key — and not a reason to keep a declaration that
+  disables the type.
+
+
 ---
 
 ## Deferred minors, by area

@@ -578,6 +578,19 @@ func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 // change that wires enforcement — a control that says it enforces nothing
 // while enforcing something is the same defect pointing the other way.
 // Pinned by TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem.
+//
+// THE ARABIC WAS WRITTEN BY AN IMPLEMENTER, NOT SUPPLIED BY THE CLIENT, and
+// it awaits the spec §9 sign-off round like every other Arabic string in this
+// seed. Tasks A4 and A5 met the same situation with link-type and workflow
+// labels and left the ENGLISH standing rather than invent Arabic, because an
+// invented translation is indistinguishable from a signed-off one once it is
+// in the database. That is not available here: `permissions` has no
+// ar_untranslated marker column, and the DescriptionAr this sentence is
+// appended to is ALREADY Plan 1 implementer Arabic, so an English tail would
+// have been a visible inconsistency inside one string rather than a visible
+// obligation. The obligation is carried instead by this comment and by
+// docs/superpowers/eo-plan1-carry-forward.md ("Opened by Task A6"), which
+// names the string so the sign-off round can find it.
 const (
 	eoTypePermissionInertEN = "NOT YET ENFORCED: nothing in the platform consults this code, so granting it records an intention and applies no control."
 	eoTypePermissionInertAR = "غير مُطبَّق بعد: لا شيء في المنصة يقرأ هذا الرمز، ومنحه يسجّل نيّة ولا يطبّق أي ضابط."
@@ -610,6 +623,18 @@ const (
 // ordering: that block runs while the roles are being created, and these codes
 // do not exist until the types they name have been seeded, which must happen
 // after the roles exist.
+//
+// IT IS CALLED TWICE: once from the platform seed and once from the pilot
+// seed's seed_type_permissions step, because the eleven pilot types are
+// created after the platform seed has already applied. The existence check
+// below keys on Code, so the second call adds exactly the types seeded since
+// the first — and, for the same reason, NEVER UPDATES AN EXISTING ROW. A
+// permission whose description was written before the sentences above existed
+// keeps the old text until somebody rewrites it; today that is nothing (the
+// only rows that predate them were the smoke types', which the pilot seed
+// deletes), but a future change to the wording will not reach rows already in
+// a customer's database. The grant is re-applied on every call and is safe:
+// GORM's many-to-many Append writes the join rows ON CONFLICT DO NOTHING.
 func eoSeedTypePermissions(db *gorm.DB) error {
 	var concrete []models.EORecordType
 	if err := db.Where("is_abstract = ?", false).Order("key").Find(&concrete).Error; err != nil {
