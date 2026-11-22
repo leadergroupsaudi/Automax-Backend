@@ -375,23 +375,31 @@ func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error
 }
 
 // applyEORecordVisibility enforces §7.11 row-level visibility. A record with a
-// visible_to value is shown only to an admin or to a caller whose bodies
+// visible_to value is shown only to an admin, to its creator (the office that
+// issued a referral must see it to consolidate), or to a caller whose bodies
 // include that body; a record with none is unrestricted. A caller with no
-// bodies therefore sees unrestricted records only. The sensitivity label is
-// deliberately not consulted: there is no clearance policy.
+// bodies and no UserID therefore sees unrestricted records only. The
+// sensitivity label is deliberately not consulted: there is no clearance policy.
 func applyEORecordVisibility(q *gorm.DB, f *models.EORecordFilter) *gorm.DB {
 	if f.IsAdmin {
 		return q
 	}
 	const restrictedTo = `eo_records."values"->>'` + eoVisibleToKey + `'`
-	if len(f.VisibleToDepartmentIDs) == 0 {
-		return q.Where(restrictedTo + " IS NULL")
+	clauses := []string{restrictedTo + " IS NULL"}
+	args := []any{}
+	if f.UserID != uuid.Nil {
+		clauses = append(clauses, "eo_records.created_by_id = ?")
+		args = append(args, f.UserID)
 	}
-	bodies := make([]string, len(f.VisibleToDepartmentIDs))
-	for i, id := range f.VisibleToDepartmentIDs {
-		bodies[i] = id.String()
+	if len(f.VisibleToDepartmentIDs) > 0 {
+		bodies := make([]string, len(f.VisibleToDepartmentIDs))
+		for i, id := range f.VisibleToDepartmentIDs {
+			bodies[i] = id.String()
+		}
+		clauses = append(clauses, restrictedTo+" IN ?")
+		args = append(args, bodies)
 	}
-	return q.Where("("+restrictedTo+" IS NULL OR "+restrictedTo+" IN ?)", bodies)
+	return q.Where("("+strings.Join(clauses, " OR ")+")", args...)
 }
 
 // eoLikeEscaper makes a search term match literally inside ILIKE.

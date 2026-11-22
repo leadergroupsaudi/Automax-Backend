@@ -347,3 +347,41 @@ func TestListAppliesRowLevelVisibility(t *testing.T) {
 		t.Errorf("values filter on visible_to leaked %v", eoRefs(got))
 	}
 }
+
+func TestListCreatorAlwaysSeesTheirRestrictedRecord(t *testing.T) {
+	db := eoRecordDB(t)
+	repo := NewEORecordRepository(db)
+	typeID := uuid.New()
+	referred, office, stranger := uuid.New(), uuid.New(), uuid.New()
+	// The Office issues a referral restricted to another body.
+	eoListRec(t, repo, typeID, "REFERRAL", func(r *models.EORecord) {
+		r.CreatedByID = office
+		r.Values = datatypes.JSON(`{"visible_to":"` + referred.String() + `"}`)
+	})
+	eoListRec(t, repo, typeID, "OPEN", nil)
+
+	list := func(f models.EORecordFilter) []string {
+		f.SortBy, f.SortDir = "reference", "asc"
+		got, total, err := repo.List(context.Background(), &f)
+		if err != nil || total != int64(len(got)) {
+			t.Fatalf("list: total %d len %d err %v", total, len(got), err)
+		}
+		return eoRefs(got)
+	}
+	// Creator, in no referred body: sees it.
+	if got := list(models.EORecordFilter{UserID: office, VisibleToDepartmentIDs: []uuid.UUID{uuid.New()}}); !reflect.DeepEqual(got, []string{"OPEN", "REFERRAL"}) {
+		t.Errorf("creator: %v, want OPEN and REFERRAL", got)
+	}
+	// Unrelated user, in neither set: does not.
+	if got := list(models.EORecordFilter{UserID: stranger}); !reflect.DeepEqual(got, []string{"OPEN"}) {
+		t.Errorf("stranger: %v, want OPEN only", got)
+	}
+	// An unset UserID is not a creator of anything.
+	if got := list(models.EORecordFilter{}); !reflect.DeepEqual(got, []string{"OPEN"}) {
+		t.Errorf("zero filter: %v, want OPEN only", got)
+	}
+	// The referred body still sees it.
+	if got := list(models.EORecordFilter{UserID: stranger, VisibleToDepartmentIDs: []uuid.UUID{referred}}); !reflect.DeepEqual(got, []string{"OPEN", "REFERRAL"}) {
+		t.Errorf("referred body: %v", got)
+	}
+}

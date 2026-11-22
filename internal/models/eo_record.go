@@ -206,10 +206,9 @@ type EORecordFilter struct {
 	Limit   int    `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`
 
 	// Set by the handler. VisibleToDepartmentIDs are the bodies the caller
-	// belongs to; IsAdmin bypasses row-level visibility. UserID and
-	// UserRoleIDs are carried for later filters and are not consulted yet.
+	// belongs to; UserID is the caller, who always sees records they created;
+	// IsAdmin bypasses row-level visibility.
 	UserID                 uuid.UUID   `json:"-"`
-	UserRoleIDs            []uuid.UUID `json:"-"`
 	IsAdmin                bool        `json:"-"`
 	VisibleToDepartmentIDs []uuid.UUID `json:"-"`
 }
