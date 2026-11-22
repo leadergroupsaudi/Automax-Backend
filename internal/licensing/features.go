@@ -26,6 +26,7 @@ const (
 	FeatureSSO           FeatureCode = "sso"
 	FeatureCommunication FeatureCode = "communication"
 	FeatureCallCentre    FeatureCode = "call_centre"
+	FeatureEOPlatform    FeatureCode = "eo_platform"
 )
 
 // Feature is the canonical descriptor for a licensable feature.
@@ -128,6 +129,13 @@ var Catalog = []Feature{
 		Name:              "Call Centre",
 		Description:       "SIP call handling, call logs, caller sentiment analysis.",
 		PermissionModules: []string{"call-logs", "caller-sentiment"},
+		TierMinimum:       "enterprise",
+	},
+	{
+		Code:              FeatureEOPlatform,
+		Name:              "Executive Office Platform",
+		Description:       "Configurable record types with custom fields, stage-based workflows, approvals and attachments for executive-office operations.",
+		PermissionModules: []string{"eo"},
 		TierMinimum:       "enterprise",
 	},
 }

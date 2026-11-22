@@ -839,6 +839,14 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		// Department-scoped permissions (configurable scoping)
 		{Name: "View Only Department Incidents", Code: "incidents:view_department_only", Module: "incidents", Action: "view_department_only", ActionAr: "عرض القسم فقط", Description: "Restrict incident view to own department"},
 		{Name: "View Only Department Users", Code: "users:view_department_only", Module: "users", Action: "view_department_only", ActionAr: "عرض القسم فقط", Description: "Restrict user view to own department"},
+
+		// EO platform permissions
+		{Name: "EO View Records", Code: "eo:view", Module: "eo", Action: "view", ActionAr: "عرض", Description: "View executive-office records"},
+		{Name: "EO Create Records", Code: "eo:create", Module: "eo", Action: "create", ActionAr: "إنشاء", Description: "Create executive-office records"},
+		{Name: "EO Update Records", Code: "eo:update", Module: "eo", Action: "update", ActionAr: "تحديث", Description: "Update executive-office records"},
+		{Name: "EO Delete Records", Code: "eo:delete", Module: "eo", Action: "delete", ActionAr: "حذف", Description: "Delete executive-office records"},
+		{Name: "EO Transition Records", Code: "eo:transition", Module: "eo", Action: "transition", ActionAr: "نقل", Description: "Move executive-office records between workflow stages"},
+		{Name: "EO Manage Record Types", Code: "eo:types:manage", Module: "eo", Action: "types:manage", ActionAr: "إدارة الأنواع", Description: "Create and configure executive-office record types"},
 	}
 
 	if cfg.GoalManagement.Enabled {
@@ -932,6 +940,13 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 	db.Where("module = ?", "escalation-logs").Find(&escalationLogPerms)
 	if len(escalationLogPerms) > 0 {
 		db.Model(&adminRole).Association("Permissions").Append(escalationLogPerms)
+	}
+
+	// Ensure the admin role has the EO platform permissions on existing databases.
+	var eoPerms []models.Permission
+	db.Where("module = ?", "eo").Find(&eoPerms)
+	if len(eoPerms) > 0 {
+		db.Model(&adminRole).Association("Permissions").Append(eoPerms)
 	}
 
 	// Remove department-scoping permissions from admin role on existing databases.
@@ -1070,6 +1085,44 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 			"incidents:view_department_only", "users:view_department_only",
 		}).Find(&supervisorPerms)
 		db.Model(&supervisorRole).Association("Permissions").Append(supervisorPerms)
+	}
+
+	// EO platform roles. Roles are data: created only when absent, never touched
+	// afterwards so a configured role keeps its permissions. Only eo_admin holds
+	// eo:types:manage; executive_office (the operators) holds the record permissions.
+	eoViewOnly := []string{"eo:view"}
+	eoRoles := []struct {
+		code, name, nameAr, desc, descAr string
+		perms                            []string
+	}{
+		{"executive_office", "Executive Office", "المكتب التنفيذي", "Office staff who operate and transition executive-office records", "موظفو المكتب الذين يديرون السجلات وينقلونها بين المراحل", []string{"eo:view", "eo:create", "eo:update", "eo:delete", "eo:transition"}},
+		{"head_of_office", "Head of Office", "رئيس المكتب", "Oversees executive-office records", "يشرف على سجلات المكتب التنفيذي", eoViewOnly},
+		{"public_relations", "Public Relations", "العلاقات العامة", "Public relations participant in executive-office records", "مشارك من العلاقات العامة في سجلات المكتب التنفيذي", eoViewOnly},
+		{"protocol", "Protocol", "المراسم", "Protocol participant in executive-office records", "مشارك من المراسم في سجلات المكتب التنفيذي", eoViewOnly},
+		{"department_user", "Department User", "مستخدم الإدارة", "Department participant in executive-office records", "مشارك من الإدارة في سجلات المكتب التنفيذي", eoViewOnly},
+		{"escalation_manager", "Escalation Manager", "مدير التصعيد", "Handles escalated executive-office records", "يتعامل مع سجلات المكتب التنفيذي المصعّدة", eoViewOnly},
+		{"eo_admin", "EO Administrator", "مسؤول المكتب التنفيذي", "Administers executive-office record types", "يدير أنواع سجلات المكتب التنفيذي", []string{"eo:view", "eo:types:manage"}},
+	}
+	for _, r := range eoRoles {
+		var eoRole models.Role
+		if db.Where("code = ?", r.code).First(&eoRole).Error != gorm.ErrRecordNotFound {
+			continue
+		}
+		var rolePerms []models.Permission
+		db.Where("code IN ?", r.perms).Find(&rolePerms)
+		eoRole = models.Role{
+			Name:          r.name,
+			NameAr:        r.nameAr,
+			Code:          r.code,
+			Description:   r.desc,
+			DescriptionAr: r.descAr,
+			IsSystem:      true,
+			IsActive:      true,
+			Permissions:   rolePerms,
+		}
+		if err := db.Create(&eoRole).Error; err != nil {
+			log.Printf("Failed to create role %s: %v", r.code, err)
+		}
 	}
 
 	// KPI Owner and L1 Reviewer — global roles used by the KPI Workflow's

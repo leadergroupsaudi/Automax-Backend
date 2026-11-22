@@ -122,3 +122,16 @@ func TestFindByCode(t *testing.T) {
 		t.Errorf("Find(nonexistent) should return nil")
 	}
 }
+
+func TestEOPlatformFeatureIsCatalogued(t *testing.T) {
+	f := Find(FeatureEOPlatform)
+	if f == nil {
+		t.Fatal("FeatureEOPlatform missing from Catalog")
+	}
+	if len(f.PermissionModules) != 1 || f.PermissionModules[0] != "eo" {
+		t.Errorf("PermissionModules = %v, want [eo]", f.PermissionModules)
+	}
+	if got := FeatureForModule("eo"); got == nil || *got != FeatureEOPlatform {
+		t.Errorf("FeatureForModule(eo) = %v, want FeatureEOPlatform", got)
+	}
+}
