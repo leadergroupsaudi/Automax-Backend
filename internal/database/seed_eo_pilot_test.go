@@ -2,6 +2,7 @@ package database
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -161,7 +162,8 @@ func eoRootFieldCount(t *testing.T) int64 {
 	t.Helper()
 	base := eoBaseFieldDefs(uuid.New())
 	var n int64
-	for _, spec := range eoPilotRootTypes {
+	specs := append(append([]eoPilotTypeSpec{}, eoPilotRootTypes...), eoPilotChildTypes...)
+	for _, spec := range specs {
 		defs, err := eoPilotFieldDefs(spec, uuid.New(), base)
 		if err != nil {
 			t.Fatalf("build the fields of %q: %v", spec.key, err)
@@ -215,7 +217,7 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 	// What is left is the abstract base type with its 17 inherited fields,
 	// plus the three root types this seed adds and their fields.
 	want := eoSnapshot{
-		types:  1 + int64(len(eoPilotRootTypes)),
+		types:  1 + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes)),
 		fields: 17 + eoRootFieldCount(t),
 		grants: before.grants - 12,
 	}
@@ -306,11 +308,11 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			wfBefore := eoStamps(t, db, "workflows")
 			snapBefore := eoTake(t, db)
 			// snapBefore was taken BEFORE this first run. The seed ADDS the
-			// three root types even on a populated database — that is the
+			// eleven pilot types even on a populated database — that is the
 			// point of them — but it must leave everything already there
 			// alone, and the second run below must not touch any record type.
 			want := snapBefore
-			want.types += int64(len(eoPilotRootTypes))
+			want.types += int64(len(eoPilotRootTypes) + len(eoPilotChildTypes))
 			want.fields += eoRootFieldCount(t)
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != want {
@@ -670,10 +672,27 @@ type eoMatrixRow struct {
 }
 
 // eoMatrixSections names the heading each record type's table sits under.
+//
+// eo_execution_plan_stage is DELIBERATELY ABSENT and must stay absent: the
+// client's document has no section for it, because it is a consequence of
+// spec §7.3 dropping the `table` kind rather than a client requirement. A
+// missing map entry yields "", and no section of the matrix is named "", so
+// the helpers below see the inherited table alone for that type — which is
+// the truth: its seventeen inherited fields ARE described by the client's
+// document and its own four are not. What guards the four instead is
+// eoStageMatrixlessFields, the roll-up test that reads `weeks` by name, and
+// the shape rules every seeded field passes.
 var eoMatrixSections = map[string]string{
-	eoDirectiveTypeKey:  "Directive",
-	eoDraftStudyTypeKey: "Draft Decision Study",
-	eoIncomingTypeKey:   "Incoming Correspondence",
+	eoDirectiveTypeKey:     "Directive",
+	eoDraftStudyTypeKey:    "Draft Decision Study",
+	eoIncomingTypeKey:      "Incoming Correspondence",
+	eoExecutionPlanTypeKey: "Execution Plan",
+	eoAssignmentTypeKey:    "Assignment",
+	eoObjectionTypeKey:     "Objection",
+	eoDecisionTypeKey:      "Decision Record",
+	eoReferralTypeKey:      "Referral",
+	eoOutgoingTypeKey:      "Outgoing Reply",
+	eoTaskTypeKey:          "Task",
 }
 
 // eoMatrixInheritedSection is the "All types" table every type inherits.
@@ -689,6 +708,13 @@ var eoMatrixRowCounts = map[string]int{
 	"Directive":               13,
 	"Draft Decision Study":    21,
 	"Incoming Correspondence": 16,
+	"Execution Plan":          8,
+	"Assignment":              10,
+	"Objection":               6,
+	"Decision Record":         8,
+	"Referral":                9,
+	"Outgoing Reply":          8,
+	"Task":                    10,
 }
 
 // eoMatrixRowPattern pulls the backticked keys out of a table cell.
@@ -740,15 +766,17 @@ func eoReadFieldMatrix(t *testing.T) map[string][]eoMatrixRow {
 	return out
 }
 
-// eoMatrixConditionalFields is every Conditional cell the matrix has for the
-// three root types, in the matrix's own spelling, READ FROM THE MATRIX. The
-// inherited table's cells count for all three types unless the type's own
-// table overrides the key.
+// eoMatrixConditionalFields is every Conditional cell the matrix has for
+// every pilot type, in the matrix's own spelling, READ FROM THE MATRIX. The
+// inherited table's cells count for every type unless the type's own table
+// overrides the key. eo_execution_plan_stage has no section of its own, so it
+// contributes the inherited five and nothing else.
 func eoMatrixConditionalFields(t *testing.T) map[string][]string {
 	t.Helper()
 	m := eoReadFieldMatrix(t)
 	out := map[string][]string{}
-	for typeKey, section := range eoMatrixSections {
+	for _, typeKey := range eoPilotTypeKeys {
+		section := eoMatrixSections[typeKey]
 		// Deliberately NOT eoMatrixExpectations: that resolves one engine
 		// field from two matrix names, and the question here is which CELLS
 		// the matrix marks Conditional. The inherited table marks `due_date`
@@ -1016,7 +1044,7 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	})
 }
 
-// Addendum 5: every field definition on the three new types is marked as
+// Addendum 5: every field definition on every pilot type is marked as
 // awaiting Arabic sign-off, so the §9 round is a query rather than a reread of
 // this file. Mutation: build one field with models.EOFieldDef{Label: ...}
 // directly instead of through eoUntranslatedLabel.
@@ -1032,7 +1060,11 @@ func TestRootTypeFieldsAwaitArabicSignOff(t *testing.T) {
 	for _, f := range set {
 		marked[f.TypeKey+"."+f.FieldKey] = true
 	}
-	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+	inherited := map[string]bool{}
+	for _, d := range eoOwnFieldDefs(t, db, eoBaseTypeKey) {
+		inherited[d.Key] = true
+	}
+	for _, typeKey := range eoPilotTypeKeys {
 		defs := eoOwnFieldDefs(t, db, typeKey)
 		if len(defs) == 0 {
 			t.Fatalf("%s seeds no fields", typeKey)
@@ -1041,10 +1073,15 @@ func TestRootTypeFieldsAwaitArabicSignOff(t *testing.T) {
 			if !marked[typeKey+"."+d.Key] {
 				t.Errorf("%s.%s is not marked as awaiting Arabic sign-off", typeKey, d.Key)
 			}
-			if _, isColumn, _ := eoMatrixKey(d.Key); isColumn {
+			if inherited[d.Key] {
 				// A narrowing of an inherited field COPIES the base type's
 				// definition, Arabic and all (which the base already marks
 				// unsigned). Its own test pins that the copy has not drifted.
+				// The predicate is "the BASE type defines this key", not "the
+				// key is a column": Incoming Correspondence narrows
+				// `attachments`, which is a values-bag key, and a copy of the
+				// base row carries the base's Arabic exactly as a column
+				// narrowing does.
 				continue
 			}
 			if d.LabelAr != d.Label {
@@ -1137,12 +1174,16 @@ func TestEveryConditionalMatrixFieldHasAStatedDecision(t *testing.T) {
 		}
 	}
 	// The count is the guard on the READING of the matrix: five inherited
-	// Conditional cells on each of three types, plus three of the Directive's
-	// own, one of the Draft Decision Study's and one of Incoming
-	// Correspondence's. A parse that found none would make both halves of the
-	// comparison below empty and the test vacuous.
-	if len(wanted) != 20 {
-		t.Fatalf("the matrix yields %d Conditional cells across the three root types, want 20: %v", len(wanted), conditional)
+	// Conditional cells on each of the ELEVEN pilot types (55), plus three of
+	// the Directive's own, one of the Draft Decision Study's, one of Incoming
+	// Correspondence's, and one each on Execution Plan (`supersedes`),
+	// Assignment (`from_stage`), Decision Record (`supersedes`), Referral
+	// (`parent_referral`) and Outgoing Reply (`delegation_note`) — 10 own
+	// cells in all. Objection, Task and the stage type have none of their
+	// own. A parse that found none would make both halves of the comparison
+	// below empty and the test vacuous.
+	if len(wanted) != 65 {
+		t.Fatalf("the matrix yields %d Conditional cells across the eleven pilot types, want 65: %v", len(wanted), conditional)
 	}
 	for id := range wanted {
 		if _, ok := declared[id]; !ok {
@@ -1358,11 +1399,14 @@ func TestSeededTypeRecordsLandInTheirOwnPartition(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+	for _, typeKey := range eoPilotTypeKeys {
 		t.Run(typeKey, func(t *testing.T) {
 			ty := eoRootType(t, db, typeKey)
+			// The reference is built from the type KEY rather than the
+			// prefix: a parent-derived type owns no prefix, and this test is
+			// about which partition the row lands in, not about numbering.
 			rec := models.EORecord{
-				ID: uuid.New(), RecordTypeID: ty.ID, Reference: ty.ReferencePrefix + "-2026-001",
+				ID: uuid.New(), RecordTypeID: ty.ID, Reference: typeKey + "-2026-001",
 				SubjectAr: "x", Priority: "normal", Sensitivity: "internal", Source: "correspondence",
 				CreatedByID: uuid.New(),
 			}
@@ -1457,7 +1501,7 @@ func TestRootTypeFieldsPassTheDesignerShapeRules(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+	for _, typeKey := range eoPilotTypeKeys {
 		for _, d := range eoOwnFieldDefs(t, db, typeKey) {
 			t.Run(typeKey+"."+d.Key, func(t *testing.T) {
 				if d.Label == "" {
@@ -1492,12 +1536,30 @@ func TestRootTypeFieldsPassTheDesignerShapeRules(t *testing.T) {
 							Label   string `json:"label"`
 							LabelAr string `json:"label_ar"`
 						} `json:"options"`
+						// OptionSource is the alternative spec §7.3 allows:
+						// a dropdown may draw its values from a
+						// LookupCategory, org units, users by role, workflow
+						// states or a query, instead of a static list. The
+						// pilot uses it once, for Decision Record's
+						// `keywords`, whose Options cell names the client's
+						// "Subject taxonomy" — a vocabulary no document in
+						// this repository contains and which the seed must
+						// not invent, because the options of a seeded
+						// dropdown are what every record is filed under.
+						OptionSource string `json:"option_source"`
+						LookupCode   string `json:"lookup_category_code"`
 					}
 					if err := json.Unmarshal(d.Config, &cfg); err != nil {
 						t.Fatalf("config: %v", err)
 					}
-					if len(cfg.Options) == 0 {
-						t.Error("a dropdown with no options can never be filled in")
+					if len(cfg.Options) == 0 && cfg.OptionSource == "" {
+						t.Error("a dropdown with neither options nor an option_source can never be filled in")
+					}
+					if len(cfg.Options) > 0 && cfg.OptionSource != "" {
+						t.Error("the field declares BOTH a static option list and an option_source; which one governs is then whatever the client reads first")
+					}
+					if cfg.OptionSource == "lookup_category" && strings.TrimSpace(cfg.LookupCode) == "" {
+						t.Error("option_source is a lookup category and no category code names it, so nothing can resolve the options")
 					}
 					for _, o := range cfg.Options {
 						if o.Value == "" || o.Label == "" {
@@ -1653,6 +1715,21 @@ func TestEOPilotFieldDefsRefusesUnusableSpecs(t *testing.T) {
 			narrowed: []eoInheritedNarrowing{{matrixKey: "state", required: models.EORequiredAlways}}}},
 		{"narrowing to conditional with no rule", eoPilotTypeSpec{key: "t",
 			narrowed: []eoInheritedNarrowing{{matrixKey: "due_date", required: models.EORequiredConditional}}}},
+		// Addendum 2. Until Task A3 this was DROPPED silently: no error, no
+		// log, and a type that spelled a column-backed field in `fields:`
+		// instead of `narrowed:` simply lost it. Both A2's cases now go
+		// through `narrowed:`, so nothing else would exercise the branch.
+		{"a column key declared under fields:", eoPilotTypeSpec{key: "t", fields: []eoPilotFieldSpec{
+			{matrixKey: "due_date", label: "Due date", kind: models.EOKindDate,
+				provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		}}},
+		{"a RENAMED column key declared under fields:", eoPilotTypeSpec{key: "t", fields: []eoPilotFieldSpec{
+			{matrixKey: "deadline", label: "Deadline", kind: models.EOKindDate,
+				provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+		}}},
+		{"narrowing to a provenance a narrowing may not set", eoPilotTypeSpec{key: "t",
+			narrowed: []eoInheritedNarrowing{{matrixKey: "due_date", required: models.EORequiredNever,
+				provenance: models.EOProvenanceDerived}}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1664,7 +1741,7 @@ func TestEOPilotFieldDefsRefusesUnusableSpecs(t *testing.T) {
 
 	// The control: the real specs are all accepted, so the guards above are
 	// not simply refusing everything.
-	for _, spec := range eoPilotRootTypes {
+	for _, spec := range append(append([]eoPilotTypeSpec{}, eoPilotRootTypes...), eoPilotChildTypes...) {
 		if _, err := eoPilotFieldDefs(spec, uuid.New(), base); err != nil {
 			t.Errorf("the seeded spec %q is refused by its own guards: %v", spec.key, err)
 		}
@@ -1692,12 +1769,42 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 		decided[d.TypeKey+"."+d.MatrixKey] = d
 	}
 
+	columnBacked := map[string]eoColumnBackedDecision{}
+	for _, d := range eoColumnBackedDecisions {
+		columnBacked[d.TypeKey+"."+d.MatrixKey] = d
+	}
+
 	checked := 0
-	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+	for _, typeKey := range eoPilotTypeKeys {
 		for engineKey, row := range eoMatrixExpectations(t, matrix, typeKey) {
+			if eoMatrixFieldIsNotSeeded(typeKey, row.Key) {
+				// Recorded as deliberately unseeded, with what carries the
+				// requirement instead; its own test checks the registry.
+				continue
+			}
 			checked++
 			t.Run(typeKey+"."+engineKey, func(t *testing.T) {
 				got := eoEffectiveField(t, db, typeKey, row.Key)
+				// A cell whose value an engine mechanism writes to a COLUMN
+				// is excused from the naive mapping below, and only with a
+				// recorded decision that names the mechanism and states what
+				// was seeded. The registry's own test checks the same rows
+				// against the database, so this is not a way round the
+				// matrix — it is the place where "the matrix says Derived and
+				// the engine writes a column" is written down.
+				if d, ok := columnBacked[typeKey+"."+row.Key]; ok {
+					if d.EngineKey != engineKey {
+						t.Errorf("the decision says %q lives in column %q; the matrix key resolves to %q", row.Key, d.EngineKey, engineKey)
+					}
+					if d.MatrixRequired != row.Required {
+						t.Errorf("the decision quotes the matrix as %q; the matrix says %q", d.MatrixRequired, row.Required)
+					}
+					if got.RequiredMode != d.SeededMode || got.Provenance != d.SeededProvenance {
+						t.Errorf("seeded %q/%q, the recorded decision says %q/%q",
+							got.RequiredMode, got.Provenance, d.SeededMode, d.SeededProvenance)
+					}
+					return
+				}
 				want := func(mode, provenance string) {
 					t.Helper()
 					if got.RequiredMode != mode {
@@ -1738,14 +1845,858 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 			})
 		}
 	}
-	// 15 inherited keys (17 less the two engine-managed) on each of three
-	// types, plus each type's own rows that are not already one of those 15:
-	// Directive 15+13, Draft Decision Study 15+21, Incoming Correspondence
-	// 15+14 (its `sender_deadline` and `attachments` rows name engine keys the
-	// inherited table already contributed). The per-section row counts in
-	// eoReadFieldMatrix are the primary guard against a parse that finds
-	// nothing; this is the second.
-	if checked != 28+36+29 {
-		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+36+29)
+	// 15 inherited keys (17 less the two engine-managed) on each of ELEVEN
+	// types, plus each type's own rows that are not already one of those 15
+	// and are not recorded as deliberately unseeded:
+	//
+	//	Directive               15+13   Execution Plan      15+7
+	//	Draft Decision Study    15+21     (8 rows less `plan_stages`)
+	//	Incoming Correspondence 15+14   Execution Plan Stage 15+0
+	//	  (`sender_deadline` and          (no matrix section)
+	//	   `attachments` name engine    Assignment          15+10
+	//	   keys the inherited table     Objection           15+6
+	//	   already contributed)         Decision Record     15+6
+	//	                                  (`decision_number` -> reference,
+	//	Referral            15+8           `source_study` -> parent_record_id)
+	//	  (`deadline` -> due_date)      Outgoing Reply      15+7
+	//	Task                15+7           (`out_ref` -> reference)
+	//	  (`parent_ticket`, `due_date` and `owner_department` all name
+	//	   inherited engine keys)
+	//
+	// The per-section row counts in eoReadFieldMatrix are the primary guard
+	// against a parse that finds nothing; this is the second.
+	if checked != 28+36+29+22+15+25+21+21+23+22+22 {
+		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+36+29+22+15+25+21+21+23+22+22)
+	}
+}
+
+// ── Task A3: the eight child types ──────────────────────────────────────────
+
+// eoStageMatrixlessFields is the ONE type the client's document does not
+// describe, written out here because nothing else can check it.
+//
+// HOW THE ROW-COUNT GUARD STAYS HONEST FOR IT. Every other pilot type is
+// checked against a parsed section of the matrix whose row count is pinned, so
+// a parser that silently stopped matching fails loudly. eo_execution_plan_stage
+// has no section, so that guard cannot reach its four own fields — it still
+// reaches its seventeen INHERITED ones, through eoMatrixExpectations. The four
+// are held instead by three things that are not transcriptions of each other:
+// this list (what the matrix's `Table (stage, weeks, body, output)` cell
+// names, in the cell's own order); the roll-up test below, which fails if
+// `weeks` is renamed, removed or made non-numeric, because Execution Plan's
+// total_weeks formula addresses it by key; and the shape rules every seeded
+// field of every type passes.
+var eoStageMatrixlessFields = []string{"stage", "weeks", "body", "output"}
+
+// eoParentDerivedChildTypes are the pilot types whose reference extends their
+// parent's, from the matrix's own patterns (addendum 4). They are EXEMPT from
+// models.ValidateReferencePrefix and own no prefix.
+var eoParentDerivedChildTypes = []string{
+	eoExecutionPlanTypeKey, eoStageTypeKey, eoAssignmentTypeKey,
+	eoObjectionTypeKey, eoReferralTypeKey,
+}
+
+// eoOwnSequenceChildTypes are the sub types that take a root sequence of their
+// own — spec §7.9's two-mode case. Task is the sharp one: own numbering AND a
+// parent.
+var eoOwnSequenceChildTypes = map[string]string{
+	eoDecisionTypeKey: "DEC",
+	eoOutgoingTypeKey: "OUT",
+	eoTaskTypeKey:     "TSK",
+}
+
+// Mutation: delete any entry from eoPilotChildTypes, or change
+// eoAssignmentTypeKey's spec key to anything but "eo_assignment".
+func TestSeedsEveryPilotChildType(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	base := eoRootType(t, db, eoBaseTypeKey)
+	want := map[string]string{
+		eoExecutionPlanTypeKey: "Execution Plan",
+		eoStageTypeKey:         "Execution Plan Stage",
+		eoAssignmentTypeKey:    "Assignment",
+		eoObjectionTypeKey:     "Objection",
+		eoDecisionTypeKey:      "Decision Record",
+		eoReferralTypeKey:      "Referral",
+		eoOutgoingTypeKey:      "Outgoing Reply",
+		eoTaskTypeKey:          "Task",
+	}
+	if len(want) != 8 {
+		t.Fatalf("the task seeds eight child types; this test names %d", len(want))
+	}
+	for key, name := range want {
+		t.Run(key, func(t *testing.T) {
+			ty := eoRootType(t, db, key)
+			if ty.Name != name {
+				t.Errorf("name = %q, want %q", ty.Name, name)
+			}
+			if ty.IsAbstract {
+				t.Error("the type is abstract; a sub type holds records")
+			}
+			if !ty.IsActive {
+				t.Error("the type is inactive")
+			}
+			// The type parent is the BASE type, not the matrix's "sub of"
+			// parent: the record-type parent is field inheritance, and
+			// pointing Execution Plan at the Directive type would give every
+			// plan the Directive's thirteen fields.
+			if ty.ParentTypeID == nil || *ty.ParentTypeID != base.ID {
+				t.Errorf("parent type = %v, want the base type %v", ty.ParentTypeID, base.ID)
+			}
+			if ty.PartitionPending {
+				t.Error("partition_pending is true although the seed creates this type's partition")
+			}
+			if ty.WorkflowID != nil {
+				t.Errorf("workflow = %v, want none until Task A5 binds one", ty.WorkflowID)
+			}
+			if strings.TrimSpace(ty.ReferencePattern) == "" {
+				t.Error("no reference pattern: services.allocateReference refuses to create a record of a type without one")
+			}
+		})
+	}
+	// Task A2 left the Directive's completion_rate rolling up over
+	// eoAssignmentTypeKey, a type that did not exist, so every Directive save
+	// logged a broken-configuration error. The constant is the hand-off.
+	if _, ok := want[eoAssignmentTypeKey]; !ok {
+		t.Fatal("the Assignment type is not seeded under eoAssignmentTypeKey")
+	}
+}
+
+// Addendum 4. A parent-derived type issues every reference inside its
+// parent's, so it owns no prefix and ValidateReferencePrefix must not be asked
+// of it — a blank prefix would be rejected outright and an invented one is
+// made permanent by ValidateTypeEdit.
+// Mutation: set eoExecutionPlanTypeKey's mode to models.EOReferenceModeOwn.
+func TestChildTypesUseParentDerivedReferences(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	for _, key := range eoParentDerivedChildTypes {
+		t.Run(key, func(t *testing.T) {
+			ty := eoRootType(t, db, key)
+			if ty.ReferenceMode != models.EOReferenceModeParent {
+				t.Errorf("reference mode = %q, want %q", ty.ReferenceMode, models.EOReferenceModeParent)
+			}
+			if ty.ReferencePrefix != "" {
+				t.Errorf("reference prefix = %q; a parent-derived type owns none, and a truthful one would always overlap its parent's", ty.ReferencePrefix)
+			}
+			// The exemption is what lets a blank prefix through, so prove the
+			// rule is still being applied and still accepts this type.
+			var all []models.EORecordType
+			if err := db.Find(&all).Error; err != nil {
+				t.Fatal(err)
+			}
+			others := make([]models.EORecordType, 0, len(all))
+			for _, o := range all {
+				if o.ID != ty.ID {
+					others = append(others, o)
+				}
+			}
+			if err := models.ValidateReferencePrefix(ty, others); err != nil {
+				t.Errorf("the parent-derived type was rejected by the prefix rule: %v", err)
+			}
+			// And the rule can still refuse: the same blank prefix on an
+			// own-mode type is rejected, so the pass above is the exemption
+			// and not a rule that accepts everything.
+			own := ty
+			own.ReferenceMode = models.EOReferenceModeOwn
+			if err := models.ValidateReferencePrefix(own, others); err == nil {
+				t.Error("a blank prefix was accepted on an own-mode type, so the exemption proves nothing")
+			}
+		})
+	}
+}
+
+// Addendum 4 and spec §7.9's two-mode case: a child may take its own root
+// sequence. These three are the ones the rule governs, and their prefixes must
+// not overlap the roots' EO-DIR, DRF or IN in either direction.
+// Mutation: change eoDecisionTypeKey's prefix to "DRF-DEC".
+func TestOutgoingReplyAndDecisionRecordTakeTheirOwnSequence(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var all []models.EORecordType
+	if err := db.Find(&all).Error; err != nil {
+		t.Fatal(err)
+	}
+	patterns := map[string]string{
+		eoDecisionTypeKey: "DEC-YYYY-NNN",
+		eoOutgoingTypeKey: "OUT-YYYY-NNNN",
+		eoTaskTypeKey:     "TSK-YYYY-NNNNN",
+	}
+	for key, prefix := range eoOwnSequenceChildTypes {
+		t.Run(key, func(t *testing.T) {
+			ty := eoRootType(t, db, key)
+			if ty.ReferenceMode != models.EOReferenceModeOwn {
+				t.Errorf("reference mode = %q, want %q", ty.ReferenceMode, models.EOReferenceModeOwn)
+			}
+			if ty.ReferencePrefix != prefix {
+				t.Errorf("reference prefix = %q, want %q", ty.ReferencePrefix, prefix)
+			}
+			if ty.ReferencePattern != patterns[key] {
+				t.Errorf("reference pattern = %q, want %q", ty.ReferencePattern, patterns[key])
+			}
+			others := make([]models.EORecordType, 0, len(all))
+			for _, o := range all {
+				if o.ID != ty.ID {
+					others = append(others, o)
+				}
+			}
+			if err := models.ValidateReferencePrefix(ty, others); err != nil {
+				t.Errorf("prefix %q is rejected against the rest of the register: %v", ty.ReferencePrefix, err)
+			}
+		})
+	}
+	// Task is the two-mode case and must not be collapsed into parent-derived
+	// numbering: own sequence AND a parent.
+	t.Run("Task keeps its own sequence although it hangs off a parent", func(t *testing.T) {
+		ty := eoRootType(t, db, eoTaskTypeKey)
+		if strings.Contains(ty.ReferencePattern, "#") {
+			t.Errorf("pattern %q is parent-derived; the matrix gives the universal type its own TSK sequence", ty.ReferencePattern)
+		}
+	})
+	// The negative half: a prefix extending one of these is refused, so the
+	// acceptances above are a rule doing work.
+	for _, tc := range []struct{ name, prefix string }{
+		{"a longer prefix under DEC", "DEC-X"},
+		{"a shorter prefix above OUT", "O"},
+		{"the same prefix in another case", "tsk"},
+	} {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			candidate := models.EORecordType{
+				Key: "eo_overlapping_child_candidate", Name: "Overlapping",
+				ReferenceMode: models.EOReferenceModeOwn, ReferencePrefix: tc.prefix,
+			}
+			if err := models.ValidateReferencePrefix(candidate, all); err == nil {
+				t.Errorf("prefix %q was accepted beside the seeded types", tc.prefix)
+			}
+		})
+	}
+}
+
+// Spec §7.3 drops `table` from the kind catalogue, and the matrix's only table
+// field becomes a child record type. This pins both halves: no seeded field is
+// of a kind outside the catalogue (`table` least of all), and the type that
+// replaces it exists with the four columns the matrix's cell names.
+// Mutation: in eoPilotChildTypes, restore plan_stages as a field of kind
+// "table" on Execution Plan; or delete the eo_execution_plan_stage spec.
+func TestExecutionPlanHasNoTableField(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var defs []models.EOFieldDef
+	if err := db.Find(&defs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("no field definitions at all; the test would pass vacuously")
+	}
+	for _, d := range defs {
+		if d.Kind == "table" {
+			t.Errorf("field %q is of kind `table`, which spec §7.3 drops from the catalogue", d.Key)
+		}
+		if !models.IsEOFieldKind(d.Kind) {
+			t.Errorf("field %q is of kind %q, which is not in models.EOFieldKinds", d.Key, d.Kind)
+		}
+	}
+	// `plan_stages` is a row of the matrix and must not be a field of any
+	// name: a values-bag `plan_stages` of some other kind would satisfy the
+	// loop above and still be the blob the stage type exists to replace.
+	for _, d := range eoOwnFieldDefs(t, db, eoExecutionPlanTypeKey) {
+		if d.Key == "plan_stages" {
+			t.Errorf("Execution Plan declares a `plan_stages` field of kind %q; the stages are the child type %q", d.Kind, eoStageTypeKey)
+		}
+	}
+
+	stage := eoRootType(t, db, eoStageTypeKey)
+	if stage.ReferenceMode != models.EOReferenceModeParent {
+		t.Errorf("the stage type's reference mode is %q; it is a child of the plan", stage.ReferenceMode)
+	}
+	got := map[string]models.EOFieldDef{}
+	for _, d := range eoOwnFieldDefs(t, db, eoStageTypeKey) {
+		got[d.Key] = d
+	}
+	for _, key := range eoStageMatrixlessFields {
+		d, ok := got[key]
+		if !ok {
+			t.Errorf("the stage type has no %q field; the matrix's table cell names (stage, weeks, body, output)", key)
+			continue
+		}
+		// The whole cell is one row marked Required Yes, so every column of
+		// it is required.
+		if d.RequiredMode != models.EORequiredAlways {
+			t.Errorf("stage.%s required_mode = %q, want %q: the matrix marks the `plan_stages` row Required Yes",
+				key, d.RequiredMode, models.EORequiredAlways)
+		}
+	}
+	if len(got) != len(eoStageMatrixlessFields) {
+		t.Errorf("the stage type declares %d own fields, want exactly the %d of the matrix's table cell", len(got), len(eoStageMatrixlessFields))
+	}
+}
+
+// eoPatternRenders mirrors services.RenderReference's grammar (spec §7.9,
+// internal/services/eo_numbering.go).
+//
+// IT RE-IMPLEMENTS THAT FUNCTION AND CANNOT CALL IT: package services imports
+// package database (otpService.go, user_service.go, extension_service.go), so
+// a test in package database that imported services would be an import cycle.
+// The same constraint is why Task A2's designer-shape test re-implements
+// handlers.eoValidateFieldShape. The two must be kept in step by hand — a
+// change to the pattern grammar belongs here too.
+//
+// It returns an error for exactly the inputs the real parser rejects: a
+// parent-derived pattern is the parent's segments plus one segment of letters
+// then `#`; an own-sequence pattern ends with YYYY then a run of N; and a
+// parent-derived pattern needs a parent reference of exactly the pattern's
+// segment count less one.
+func eoPatternRenders(pattern, parentRef string) error {
+	segs := strings.Split(pattern, "-")
+	if pattern == "" {
+		return fmt.Errorf("reference pattern is empty")
+	}
+	last := segs[len(segs)-1]
+	if strings.Contains(last, "#") {
+		if !regexp.MustCompile(`^[A-Za-z]+#$`).MatchString(last) {
+			return fmt.Errorf("suffix segment %q must be letters followed by a single #", last)
+		}
+		if len(segs) < 2 {
+			return fmt.Errorf("a parent-derived pattern needs the parent's segments before the suffix")
+		}
+		if parentRef == "" {
+			return fmt.Errorf("pattern %q is parent-derived but no parent reference was given", pattern)
+		}
+		if got, want := len(strings.Split(parentRef, "-")), len(segs)-1; got != want {
+			return fmt.Errorf("pattern %q expects a parent reference of %d segments, %q has %d", pattern, want, parentRef, got)
+		}
+		return nil
+	}
+	if len(segs) < 3 || !regexp.MustCompile(`^N+$`).MatchString(last) || segs[len(segs)-2] != "YYYY" {
+		return fmt.Errorf("pattern %q: an own-sequence pattern must end with YYYY then a run of N", pattern)
+	}
+	for _, s := range segs[:len(segs)-2] {
+		if !regexp.MustCompile(`^[A-Za-z0-9]+$`).MatchString(s) || s == "YYYY" || regexp.MustCompile(`^N+$`).MatchString(s) {
+			return fmt.Errorf("pattern %q: prefix segment %q must be a literal", pattern, s)
+		}
+	}
+	return nil
+}
+
+// Every seeded pattern must be one the engine can actually render, because
+// allocateReference runs on every create and a pattern it refuses makes the
+// type UNCREATABLE — with no record ever reaching the database to show it.
+// This is the test that caught the matrix's own `EO-DIR-YYYY-NNN-P`
+// (matrix:90): written verbatim, no Execution Plan could ever be created.
+// Mutation: drop the `#` from eo_execution_plan's pattern.
+func TestEoPilotReferencePatternsRenderAndRefuse(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	// A plausible parent reference per parent-derived type, in the shape the
+	// parent's own pattern renders.
+	parents := map[string]string{
+		eoExecutionPlanTypeKey: "EO-DIR-2026-001",
+		eoStageTypeKey:         "EO-DIR-2026-001-P1",
+		eoAssignmentTypeKey:    "EO-DIR-2026-001",
+		eoObjectionTypeKey:     "DRF-2026-001",
+		eoReferralTypeKey:      "IN-2026-0001",
+	}
+	for _, key := range eoPilotTypeKeys {
+		t.Run(key, func(t *testing.T) {
+			ty := eoRootType(t, db, key)
+			if err := eoPatternRenders(ty.ReferencePattern, parents[key]); err != nil {
+				t.Errorf("pattern %q cannot be rendered, so no record of this type can ever be created: %v", ty.ReferencePattern, err)
+			}
+			if ty.ReferenceMode == models.EOReferenceModeParent {
+				// The refusal that stands in for `parent_ticket`'s
+				// requiredness on these types: a parent-derived record cannot
+				// be numbered without a parent, so it cannot be created.
+				if err := eoPatternRenders(ty.ReferencePattern, ""); err == nil {
+					t.Error("the pattern renders with no parent reference, so a parentless record of a parent-derived type would be created")
+				}
+				// And a parent of the wrong depth is refused too.
+				if err := eoPatternRenders(ty.ReferencePattern, parents[key]+"-X9"); err == nil {
+					t.Error("the pattern renders against a parent one level too deep")
+				}
+			} else if _, isChild := eoOwnSequenceChildTypes[key]; isChild {
+				// The other side of eoColumnBackedDecisions' Task entry: an
+				// own-sequence child numbers cleanly with NO parent, so
+				// nothing in the engine refuses a parentless one. Recorded as
+				// a gap, pinned here so it cannot be closed silently or
+				// quietly worsen.
+				if err := eoPatternRenders(ty.ReferencePattern, ""); err != nil {
+					t.Errorf("an own-sequence type failed to render without a parent: %v", err)
+				}
+			}
+		})
+	}
+	// The matrix's own tension, pinned rather than hidden: the Assignment
+	// pattern counts the DIRECTIVE's segments, while the matrix says an
+	// Assignment may be "sub of Execution Plan, or of Directive directly".
+	// Under a plan, the create is refused at numbering.
+	t.Run("an Assignment under an Execution Plan is refused at numbering", func(t *testing.T) {
+		ty := eoRootType(t, db, eoAssignmentTypeKey)
+		if err := eoPatternRenders(ty.ReferencePattern, "EO-DIR-2026-001-P1"); err == nil {
+			t.Error("it rendered; the report records this as the matrix's tension, so a change here is a decision, not a fix")
+		}
+	})
+}
+
+// Every row of each child type's own matrix table is seeded, under the ENGINE
+// spelling, and nothing else is — with two recorded exceptions: a key the
+// registry records as deliberately unseeded, and a narrowing of an inherited
+// key.
+// Mutation: delete any field from any spec in eoPilotChildTypes.
+func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	matrix := eoReadFieldMatrix(t)
+
+	inherited := map[string]bool{}
+	for _, d := range eoOwnFieldDefs(t, db, eoBaseTypeKey) {
+		inherited[d.Key] = true
+	}
+	for _, typeKey := range eoPilotChildTypeKeys() {
+		if typeKey == eoStageTypeKey {
+			continue // no matrix section; eoStageMatrixlessFields holds it
+		}
+		t.Run(typeKey, func(t *testing.T) {
+			rows := matrix[eoMatrixSections[typeKey]]
+			if len(rows) == 0 {
+				t.Fatalf("no matrix rows parsed for %q", typeKey)
+			}
+			columnBacked := map[string]bool{}
+			for _, d := range eoColumnBackedDecisions {
+				columnBacked[d.TypeKey+"."+d.MatrixKey] = true
+			}
+			want := map[string]bool{}
+			for _, r := range rows {
+				if eoMatrixFieldIsNotSeeded(typeKey, r.Key) {
+					continue
+				}
+				if columnBacked[typeKey+"."+r.Key] {
+					// A column-backed cell is declared as its COLUMN, which
+					// may or may not need a narrowing of its own (the base's
+					// definition sometimes already says what the matrix
+					// wants). TestEoColumnBackedFieldsAreDeclaredAsTheirColumn
+					// checks the effective field for every one of them, which
+					// is the question that matters; checking for a row ON
+					// THIS TYPE would force a redundant override.
+					continue
+				}
+				key, _, managed := eoMatrixKey(r.Key)
+				if managed {
+					continue
+				}
+				want[key] = true
+			}
+			got := map[string]bool{}
+			for _, d := range eoOwnFieldDefs(t, db, typeKey) {
+				got[d.Key] = true
+			}
+			for k := range want {
+				if !got[k] {
+					t.Errorf("field %q is in the matrix for this type but not seeded on it", k)
+				}
+			}
+			for k := range got {
+				if !want[k] && !inherited[k] {
+					t.Errorf("field %q is seeded but is not in the matrix for this type", k)
+				}
+			}
+		})
+	}
+
+	// The registry's claim, checked against the database: a row recorded as
+	// deliberately unseeded really is absent, and really is in the matrix.
+	t.Run("the unseeded rows are recorded and absent", func(t *testing.T) {
+		if len(eoMatrixFieldsNotSeeded) == 0 {
+			t.Fatal("the registry is empty; the loop below proves nothing")
+		}
+		for _, e := range eoMatrixFieldsNotSeeded {
+			if strings.TrimSpace(e.Why) == "" || strings.TrimSpace(e.Instead) == "" {
+				t.Errorf("%s.%s is recorded as unseeded without saying why or what carries it instead", e.TypeKey, e.MatrixKey)
+			}
+			inMatrix := false
+			for _, r := range matrix[eoMatrixSections[e.TypeKey]] {
+				if r.Key == e.MatrixKey {
+					inMatrix = true
+				}
+			}
+			if !inMatrix {
+				t.Errorf("%s.%s is recorded as deliberately unseeded, but the matrix has no such row for that type", e.TypeKey, e.MatrixKey)
+			}
+			key, _, _ := eoMatrixKey(e.MatrixKey)
+			for _, d := range eoOwnFieldDefs(t, db, e.TypeKey) {
+				if d.Key == key {
+					t.Errorf("%s.%s is recorded as deliberately unseeded and is seeded anyway", e.TypeKey, e.MatrixKey)
+				}
+			}
+		}
+	})
+}
+
+// Addendum 1, generalised. A matrix cell whose value an engine mechanism
+// writes to a COLUMN must be declared as that column's key, not as its matrix
+// spelling — otherwise the clerk reads an empty values-bag field beside a
+// column the engine has already written, and nothing reports the difference.
+// Mutation: delete the `"deadline": {"due_date", true, false}` entry from
+// eoMatrixKeys (the Referral's deadline then becomes a values-bag field of its
+// own and the narrowing disappears).
+func TestEoColumnBackedFieldsAreDeclaredAsTheirColumn(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	if len(eoColumnBackedDecisions) == 0 {
+		t.Fatal("the registry is empty")
+	}
+	seen := map[string]bool{}
+	for _, d := range eoColumnBackedDecisions {
+		id := d.TypeKey + "." + d.MatrixKey
+		if seen[id] {
+			t.Errorf("two decisions for %s", id)
+		}
+		seen[id] = true
+		t.Run(id, func(t *testing.T) {
+			if strings.TrimSpace(d.Mechanism) == "" {
+				t.Error("the decision does not name what writes the column")
+			}
+			if strings.TrimSpace(d.Why) == "" {
+				t.Error("the decision does not say why")
+			}
+			// The key map must agree that this matrix key IS that column.
+			key, isColumn, managed := eoMatrixKey(d.MatrixKey)
+			if managed {
+				t.Fatalf("%q is engine-managed; no type may declare it at all", d.MatrixKey)
+			}
+			if !isColumn {
+				t.Errorf("eoMatrixKey says %q is a values-bag key; the decision says it is the column %q, and a values-bag field would shadow nothing", d.MatrixKey, d.EngineKey)
+			}
+			if key != d.EngineKey {
+				t.Errorf("eoMatrixKey maps %q to %q; the decision says %q", d.MatrixKey, key, d.EngineKey)
+			}
+			// And no values-bag field is seeded under the MATRIX spelling:
+			// that is the failure itself, not a near miss.
+			for _, f := range eoOwnFieldDefs(t, db, d.TypeKey) {
+				if f.Key == d.MatrixKey && d.MatrixKey != d.EngineKey {
+					t.Errorf("a field keyed %q is seeded beside the column %q; one of the two is always empty", d.MatrixKey, d.EngineKey)
+				}
+			}
+			got := eoEffectiveField(t, db, d.TypeKey, d.MatrixKey)
+			if got.Key != d.EngineKey {
+				t.Errorf("the effective field is keyed %q, want the column %q", got.Key, d.EngineKey)
+			}
+			if got.RequiredMode != d.SeededMode {
+				t.Errorf("required_mode = %q, the decision says %q", got.RequiredMode, d.SeededMode)
+			}
+			if got.Provenance != d.SeededProvenance {
+				t.Errorf("provenance = %q, the decision says %q", got.Provenance, d.SeededProvenance)
+			}
+		})
+	}
+
+	// The Referral's deadline is the one that cost Task A2 a fix round, so it
+	// is pinned by name as well as by the registry: provenance `auto` is what
+	// stops a clerk typing a deadline the matrix says is "not typed", and
+	// `never` is what stops the form demanding one.
+	t.Run("the Referral's deadline is the inherited due_date column", func(t *testing.T) {
+		got := eoEffectiveField(t, db, eoReferralTypeKey, "deadline")
+		base := eoEffectiveField(t, db, eoBaseTypeKey, "due_date")
+		if got.Key != "due_date" {
+			t.Fatalf("key = %q, want due_date", got.Key)
+		}
+		if got.ID == base.ID {
+			t.Error("the Referral does not redefine due_date at all, so it carries the base's label rather than the matrix's")
+		}
+		if got.Kind != base.Kind {
+			t.Errorf("kind = %q, want the inherited %q: a narrowing copies the base definition", got.Kind, base.Kind)
+		}
+		if got.Provenance == base.Provenance {
+			t.Errorf("provenance is still %q; the matrix marks this field Derived and \"not typed\"", got.Provenance)
+		}
+		if got.Label != "Deadline" {
+			t.Errorf("label = %q, want the matrix's %q", got.Label, "Deadline")
+		}
+	})
+}
+
+// A derived field's formula names a record type and a field by KEY, through
+// the env key services.eoAddChildAggregates publishes
+// (children_<type>_<aggregate>_<field>). Nothing resolves those keys until a
+// record is saved, and a formula naming a type or field that does not exist
+// resolves to nothing for ever — reported as waiting on data, or, for a
+// missing TYPE, as broken configuration on every save. Both roll-ups in the
+// pilot are checked here against the seeded types.
+// Mutation: rename the stage type's `weeks` field to `duration_weeks`, or
+// change eo_execution_plan's recompute_on type to "execution_plan_stage".
+func TestEoDerivedRollUpsNameASeededTypeAndField(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	numeric := map[string]bool{
+		models.EOKindNumber: true, models.EOKindPercent: true,
+	}
+	var defs []models.EOFieldDef
+	if err := db.Where("provenance = ?", models.EOProvenanceDerived).Find(&defs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) < 2 {
+		t.Fatalf("%d derived fields seeded; the pilot has at least the Directive's completion_rate and the plan's total_weeks", len(defs))
+	}
+	checked := 0
+	for _, d := range defs {
+		var deps []struct {
+			Scope      string   `json:"scope"`
+			Type       string   `json:"type"`
+			Field      string   `json:"field"`
+			Aggregates []string `json:"aggregates"`
+		}
+		if err := json.Unmarshal(d.RecomputeOn, &deps); err != nil {
+			t.Errorf("%s: recompute_on is not a dependency list: %v", d.Key, err)
+			continue
+		}
+		if len(deps) == 0 {
+			t.Errorf("%s is derived and declares no dependency, so nothing ever recomputes it", d.Key)
+			continue
+		}
+		for _, dep := range deps {
+			if dep.Scope != "child" {
+				continue
+			}
+			checked++
+			t.Run(d.Key+" over "+dep.Type, func(t *testing.T) {
+				child := eoRootType(t, db, dep.Type) // fatal if not seeded
+				var target models.EOFieldDef
+				if err := db.Where("record_type_id = ? AND key = ?", child.ID, dep.Field).
+					Limit(1).Find(&target).Error; err != nil {
+					t.Fatal(err)
+				}
+				if target.ID == uuid.Nil {
+					t.Fatalf("record type %q declares no field %q, so the aggregate key is never published and the roll-up resolves to nothing for ever", dep.Type, dep.Field)
+				}
+				if !numeric[target.Kind] {
+					t.Errorf("%s.%s is of kind %q; a child aggregate skips children with no NUMERIC value, so a non-numeric field aggregates to nothing", dep.Type, dep.Field, target.Kind)
+				}
+				for _, a := range dep.Aggregates {
+					want := "children_" + dep.Type + "_" + a + "_" + dep.Field
+					if !strings.Contains(d.Formula, want) {
+						t.Errorf("the dependency publishes %q and the formula %q never names it", want, d.Formula)
+					}
+				}
+			})
+		}
+	}
+	if checked < 2 {
+		t.Errorf("checked %d child roll-ups, want at least 2 (the Directive's completion_rate over assignments, the plan's total_weeks over stages)", checked)
+	}
+}
+
+// A link field says which record type it points at. NOTHING IN THE ENGINE
+// READS THAT CONFIG TODAY — the rule that actually permits or refuses a link
+// is models.EOLinkType's TargetTypeIDs, which Task A4 seeds — so the only
+// property that can be asserted here is the one that would be silently false:
+// that the type a link field names exists. A dangling key is a target the
+// designer offers and nothing can resolve.
+// Mutation: change `from_stage`'s target_type_key to "eo_plan_stage".
+func TestEoLinkFieldTargetsNameASeededType(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	seededTypes := map[string]bool{}
+	var all []models.EORecordType
+	if err := db.Find(&all).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, ty := range all {
+		seededTypes[ty.Key] = true
+	}
+
+	named := 0
+	for _, typeKey := range eoPilotTypeKeys {
+		for _, d := range eoOwnFieldDefs(t, db, typeKey) {
+			if d.Kind != models.EOKindLink && d.Kind != models.EOKindMultiLink {
+				continue
+			}
+			var cfg struct {
+				TargetTypeKey string `json:"target_type_key"`
+			}
+			if err := json.Unmarshal(d.Config, &cfg); err != nil {
+				t.Errorf("%s.%s: config: %v", typeKey, d.Key, err)
+				continue
+			}
+			if cfg.TargetTypeKey == "" {
+				continue // no claim made; nothing to check
+			}
+			named++
+			if !seededTypes[cfg.TargetTypeKey] {
+				t.Errorf("%s.%s points at record type %q, which is not seeded", typeKey, d.Key, cfg.TargetTypeKey)
+			}
+		}
+	}
+	// The link the eleventh type exists for must be one of them: without it
+	// the whole reason for seeding Execution Plan Stage is unexpressed.
+	t.Run("Assignment.from_stage points at the stage type", func(t *testing.T) {
+		var cfg struct {
+			TargetTypeKey string `json:"target_type_key"`
+		}
+		for _, d := range eoOwnFieldDefs(t, db, eoAssignmentTypeKey) {
+			if d.Key == "from_stage" {
+				if err := json.Unmarshal(d.Config, &cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if cfg.TargetTypeKey != eoStageTypeKey {
+			t.Errorf("from_stage points at %q, want %q — `Link (plan stage)` is why the stage is a record type at all", cfg.TargetTypeKey, eoStageTypeKey)
+		}
+	})
+	if named < 4 {
+		t.Errorf("%d link fields name a target type; the pilot's children seed four (supersedes twice, from_stage, parent_referral)", named)
+	}
+}
+
+// The matrix's fifth Required value, "Yes at closure", is required_at_state —
+// and the states are Task A5's. This pins what is true meanwhile: the fields
+// are at_state with NO state ids, which requires them at no state at all, and
+// the operation A5 calls fails closed.
+// Mutation: make eoRequireAtClosureState return nil without updating, or drop
+// one entry from eoAtClosureFields.
+func TestEoAtClosureFieldsAwaitTheirState(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	matrix := eoReadFieldMatrix(t)
+	// Read the set from the client's document rather than trusting the Go
+	// list: a "Yes at closure" cell with no entry would otherwise be seeded
+	// `always` and demand closing evidence at creation.
+	wanted := map[string]bool{}
+	for _, typeKey := range eoPilotTypeKeys {
+		for _, r := range matrix[eoMatrixSections[typeKey]] {
+			if r.Required == "Yes at closure" {
+				wanted[typeKey+"."+r.Key] = true
+			}
+		}
+	}
+	if len(wanted) != 2 {
+		t.Fatalf("the matrix yields %d \"Yes at closure\" cells across the pilot's types, want 2: %v", len(wanted), wanted)
+	}
+	declared := map[string]bool{}
+	for _, f := range eoAtClosureFields {
+		declared[f.TypeKey+"."+f.FieldKey] = true
+	}
+	for id := range wanted {
+		if !declared[id] {
+			t.Errorf("the matrix marks %s \"Yes at closure\" and eoAtClosureFields does not name it", id)
+		}
+	}
+	for id := range declared {
+		if !wanted[id] {
+			t.Errorf("%s is named as at-closure and the matrix does not mark it so", id)
+		}
+	}
+
+	for _, f := range eoAtClosureFields {
+		def := eoEffectiveField(t, db, f.TypeKey, f.FieldKey)
+		if def.RequiredMode != models.EORequiredAtState {
+			t.Errorf("%s.%s required_mode = %q, want %q", f.TypeKey, f.FieldKey, def.RequiredMode, models.EORequiredAtState)
+		}
+		if s := strings.TrimSpace(string(def.RequiredAtStateIDs)); s != "" && s != "[]" && s != "null" {
+			t.Errorf("%s.%s already names states %s; Task A5 owns the workflow", f.TypeKey, f.FieldKey, s)
+		}
+	}
+
+	closing := uuid.New()
+	if err := eoRequireAtClosureState(db, eoAssignmentTypeKey, closing); err != nil {
+		t.Fatalf("require the at-closure fields: %v", err)
+	}
+	def := eoEffectiveField(t, db, eoAssignmentTypeKey, "evidence")
+	var ids []uuid.UUID
+	if err := json.Unmarshal(def.RequiredAtStateIDs, &ids); err != nil {
+		t.Fatalf("required_at_state_ids: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != closing {
+		t.Errorf("required_at_state_ids = %v, want [%v]", ids, closing)
+	}
+	// The other type is untouched: an operation that updated every at-closure
+	// field everywhere would be a different, and wrong, operation.
+	other := eoEffectiveField(t, db, eoTaskTypeKey, "evidence")
+	if s := strings.TrimSpace(string(other.RequiredAtStateIDs)); s != "" && s != "[]" && s != "null" {
+		t.Errorf("the Task's evidence was required at %s by a call naming the Assignment", s)
+	}
+
+	// Fails closed on both halves.
+	if err := eoRequireAtClosureState(db, eoAssignmentTypeKey, uuid.Nil); err == nil {
+		t.Error("the nil state was accepted; it would require nothing and report success")
+	}
+	if err := eoRequireAtClosureState(db, eoDirectiveTypeKey, closing); err == nil {
+		t.Error("a type with no at-closure field was accepted")
+	}
+}
+
+// eoSeedPilotTypes' own refusals, which eoPilotFieldDefs cannot make because
+// they are about the TYPE rather than its fields. Each is a configuration that
+// would be accepted silently and then misnumber every record of the type —
+// and models.ValidateTypeEdit makes a reference mode, prefix or pattern
+// permanent once records exist.
+// Mutation: delete either guard at the top of eoSeedPilotTypes.
+func TestEoSeedRefusesAnIncoherentTypeSpec(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	base, baseFields, err := eoPilotBase(db)
+	if err != nil {
+		t.Fatalf("read the base type: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		spec eoPilotTypeSpec
+	}{
+		{"no reference mode at all", eoPilotTypeSpec{
+			key: "eo_probe_no_mode", name: "Probe", prefix: "PRB", pattern: "PRB-YYYY-NNN"}},
+		{"an unknown reference mode", eoPilotTypeSpec{
+			key: "eo_probe_bad_mode", name: "Probe", mode: "inherited",
+			prefix: "PRB", pattern: "PRB-YYYY-NNN"}},
+		{"a parent-derived type carrying a prefix", eoPilotTypeSpec{
+			key: "eo_probe_prefixed_child", name: "Probe", mode: models.EOReferenceModeParent,
+			prefix: "PRB", pattern: "EO-DIR-YYYY-NNN-Z#"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := db.Transaction(func(tx *gorm.DB) error {
+				return eoSeedPilotTypes(tx, []eoPilotTypeSpec{tc.spec}, base, baseFields)
+			})
+			if err == nil {
+				t.Error("accepted")
+			}
+			var n int64
+			if err := db.Model(&models.EORecordType{}).Where("key = ?", tc.spec.key).Count(&n).Error; err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Error("the record type was created although the spec was refused")
+			}
+		})
+	}
+
+	// The control: a coherent spec of each mode IS accepted, so the guards
+	// are not refusing everything. Rolled back, so it leaves nothing behind.
+	for _, spec := range []eoPilotTypeSpec{
+		{key: "eo_probe_own", name: "Probe", mode: models.EOReferenceModeOwn,
+			prefix: "PRB", pattern: "PRB-YYYY-NNN"},
+		{key: "eo_probe_child", name: "Probe", mode: models.EOReferenceModeParent,
+			prefix: "", pattern: "EO-DIR-YYYY-NNN-Z#"},
+	} {
+		t.Run("accepts "+spec.key, func(t *testing.T) {
+			errSentinel := fmt.Errorf("rollback")
+			err := db.Transaction(func(tx *gorm.DB) error {
+				if err := eoSeedPilotTypes(tx, []eoPilotTypeSpec{spec}, base, baseFields); err != nil {
+					return err
+				}
+				return errSentinel
+			})
+			if err != errSentinel {
+				t.Errorf("a coherent spec was refused: %v", err)
+			}
+		})
 	}
 }

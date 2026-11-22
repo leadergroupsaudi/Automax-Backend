@@ -116,6 +116,72 @@ edit. **Get the answer before the pilot's first Directive.** The plausible
 reading is "when `directive_origin` is `committee` or `weekly_meeting`", but the
 matrix does not say so.
 
+**Client sign-off: the Decision Record's subject taxonomy
+(named obligation, owner: the client, WITH A DEADLINE).** The matrix gives
+Decision Record a `keywords` field, Multi-select, Required Yes, with the
+Options cell "Subject taxonomy" — and that taxonomy exists in no document in
+this repository. It is what the conflict check on the next draft matches
+against, so it is load-bearing rather than decorative. Task A3 seeded the field
+with an **option source** (`option_source: lookup_category`,
+`lookup_category_code: eo_subject_taxonomy`) rather than an invented list,
+because the options of a seeded dropdown are what every record is filed under
+and a taxonomy guessed now would be permanent in the data. **Nothing resolves
+that category today** — no `LookupCategory` with that code is seeded, and
+nothing in the EO value pipeline reads an option source — so the field renders
+with no values to choose. Get the client's list before the first Decision
+Record.
+
+**Task A4 owns the Referral deadline, and without it no Referral has one.**
+Task A3 seeded Referral's `deadline` as a narrowing of the inherited `due_date`
+column with provenance `auto`, because the matrix marks it Derived and "not
+typed". The only mechanism that fills it is `services.DeriveDeadlineFromParent`,
+which is armed by the LINK TYPE between Incoming Correspondence and Referral
+carrying `derive_deadline_from_parent` and an offset. **Until A4 seeds that
+link type, every Referral has an empty deadline and no clerk may supply one** —
+`DeriveDeadlineFromParent` returns nil silently when nothing arms it, and an
+absent deadline is not an error anywhere in the engine.
+
+**Nothing refuses a parentless Decision Record, Outgoing Reply or Task.** The
+matrix marks `parent_ticket` mandatory on every sub type. On the five
+parent-derived types that is enforced for free, because
+`services.RenderReference` refuses to number a record whose parent reference is
+missing. The three own-sequence children number cleanly without a parent, and
+`parent_record_id` is provenance `auto`, which `ValidateRecordValues` exempts
+from requiredness entirely — so requiredness cannot carry it. It needs A4's
+link types (Task's is the polymorphic `any` one) or a create-path rule, and it
+is recorded in `eoColumnBackedDecisions` with the same words.
+
+**Task A5 must call `eoRequireAtClosureState` or delete it.** The matrix's
+fifth Required value, "Yes at closure", appears twice in the pilot:
+Assignment's and Task's `evidence`. Both are seeded `required_mode: at_state`
+with an EMPTY `required_at_state_ids`, which `ValidateRecordValues` reads as
+"required at no state" — a rule that cannot fire. The alternative was `always`,
+which would demand the closing evidence at creation and could never be relaxed
+once records existed. A5 owns the workflows and must point both at the closing
+state; the operation is exposed for it, beside
+`eoLockDraftFieldsAfterState`, and has no production caller until then.
+
+**Per-type permission codes do not exist for any pilot type.**
+`eoSeedTypePermissions` writes `eo:<type_key>:view|create|update` for every
+concrete type, and it runs only inside the PLATFORM seed, which is guarded by
+the base type's existence. The eleven pilot types are seeded afterwards, by the
+pilot seed, which never calls it — so none of them has the three codes spec
+§7.11 names. They are inert today (nothing consults them), which is why this is
+recorded rather than fixed here, but Plan 2's per-type gate will find them
+absent rather than present and granted, which is the opposite of what the §7.11
+note assumes.
+
+**Three fields are marked Auto and written by nothing.** Referral's
+`visibility` (spec §7.11's "row-level visibility … enforced in the repository
+layer" — no column, no filter clause and no enforcement exists), Task's
+`origin_cff` ("taken from the parent", which cannot be a §7.5 ancestor
+dependency because a Task hangs off any type in any subsystem, so no single
+ancestor type can be named), and Task's `completion_rate` ("rolls up to the
+parent's completion rate" — the pilot's only roll-up is the Directive's, over
+assignments, so a Task's rate reaches no parent). All three are provenance
+`auto` or `user`+optional, so nothing breaks and nothing lies to a clerk about
+being editable; what is absent is the mechanism.
+
 **Task A5 must call `eoLockDraftFieldsAfterState` or delete it.** The Draft
 Decision Study's `draft_text` and `draft_file` are the pilot's only field-level
 immutability (§7.12, "the original is never edited"). A2 seeded them unlocked,

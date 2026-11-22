@@ -1,6 +1,7 @@
 package database
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -80,6 +81,31 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// engine's key already (the fall-through below), so an entry here is a
 	// deliberate statement that two names are one field.
 	//
+	// TASK A3's four, all of the same shape as `sender_deadline` below: a
+	// matrix cell whose value an ENGINE MECHANISM writes to an eo_records
+	// COLUMN. Seeded under the matrix spelling each would be a values-bag key
+	// that shadows nothing, sitting empty beside the column the engine had
+	// already written — and nothing would report the discrepancy. See
+	// eoColumnBackedDecisions, which names the mechanism for each and is
+	// checked against the seeded rows.
+	//
+	// Referral's `deadline` is "Derived / Counted back from the sender's
+	// deadline" (matrix:300) and services.DeriveDeadlineFromParent, the only
+	// mechanism that derives one, writes the child's rec.DueDate COLUMN.
+	"deadline": {"due_date", true, false},
+	// Decision Record's `decision_number` and Outgoing Reply's `out_ref` are
+	// both "Auto number / Auto" with the type's OWN reference pattern in the
+	// Options cell (DEC-YYYY-NNN at matrix:171, OUT-YYYY-NNNN at matrix:316).
+	// That is the engine's `reference`: eoRecordService.allocateReference
+	// renders the type's ReferencePattern into rec.Reference on create. A
+	// second auto-number field beside it would be a number nothing allocates.
+	"decision_number": {"reference", true, false},
+	"out_ref":         {"reference", true, false},
+	// Decision Record's `source_study` is "Link (ticket) / Auto / The parent
+	// draft study" (matrix:179) — the record's parent, which is
+	// parent_record_id, taken from the create request.
+	"source_study": {"parent_record_id", true, false},
+
 	// `sender_deadline` IS the engine's due_date for Incoming Correspondence.
 	// The matrix says of it "every internal clock is derived from this date"
 	// (eo-field-matrix.md:282) and of its Referral child "Deadline derived
@@ -234,6 +260,7 @@ var eoPilotSteps = []eoPilotStep{
 	{"remove_smoke_configuration", eoRemoveSmokeConfiguration},
 	{"mark_base_labels_unsigned", func(tx *gorm.DB) (bool, error) { return true, eoMarkBaseLabelsUnsigned(tx) }},
 	{"seed_root_types", eoSeedRootTypes},
+	{"seed_child_types", eoSeedChildTypes},
 }
 
 // eoPilotSeedNeeded is the fast path: one count of applied-step rows.
@@ -494,6 +521,38 @@ const (
 	eoAssignmentTypeKey = "eo_assignment"
 )
 
+// ── Task A3: the eight child types ──────────────────────────────────────────
+
+// The keys of the eight sub types. Seven come from the client's field matrix;
+// eoStageTypeKey does not, and the comment on eoPilotChildTypes says why.
+// Like the root keys these are PERMANENT identifiers.
+const (
+	eoExecutionPlanTypeKey = "eo_execution_plan"       // matrix line 88
+	eoObjectionTypeKey     = "eo_objection"            // matrix line 152
+	eoDecisionTypeKey      = "eo_decision_record"      // matrix line 165
+	eoReferralTypeKey      = "eo_referral"             // matrix line 295
+	eoOutgoingTypeKey      = "eo_outgoing_reply"       // matrix line 311
+	eoTaskTypeKey          = "eo_task"                 // matrix line 518
+	eoStageTypeKey         = "eo_execution_plan_stage" // NO matrix section: see eoPilotChildTypes
+)
+
+// eoPilotTypeKeys is every concrete record type the pilot seeds, roots first.
+// The tests that read the client's matrix iterate it, so a type added to the
+// seed without being added here is checked against the matrix by nothing.
+var eoPilotTypeKeys = []string{
+	eoDirectiveTypeKey,
+	eoDraftStudyTypeKey,
+	eoIncomingTypeKey,
+	eoExecutionPlanTypeKey,
+	eoStageTypeKey,
+	eoAssignmentTypeKey,
+	eoObjectionTypeKey,
+	eoDecisionTypeKey,
+	eoReferralTypeKey,
+	eoOutgoingTypeKey,
+	eoTaskTypeKey,
+}
+
 // eoPilotFieldSpec is one row of a type's table in the client field matrix,
 // written in the MATRIX's own spelling. eoSeedRootTypes runs matrixKey through
 // eoMatrixKey, which decides both the engine key and whether a field may be
@@ -534,11 +593,25 @@ type eoInheritedNarrowing struct {
 	// writes, so it carries the Arabic sign-off marker. Empty keeps the base
 	// type's label, Arabic and all.
 	label string
+	// provenance, when set, replaces the base type's. It is a LARGER claim
+	// than a requiredness narrowing and is used in exactly one place: where
+	// the client's matrix says a column-backed field is written by the engine
+	// and "not typed" (Referral's deadline). services.ValidateRecordValues
+	// refuses a submitted value for an `auto` field, which is what "not
+	// typed" means in the engine's terms. Empty keeps the base's.
+	provenance string
 }
 
-// eoPilotTypeSpec is one root record type.
+// eoPilotTypeSpec is one record type of the pilot.
 type eoPilotTypeSpec struct {
 	key, name, icon string
+	// mode is models.EOReferenceModeOwn or ...Parent. It is not defaulted:
+	// the zero value would silently make every type own-sequence, and a
+	// parent-derived type seeded own-mode is rejected by
+	// models.ValidateReferencePrefix for its blank prefix — or, worse,
+	// accepted with an invented one that ValidateTypeEdit then makes
+	// permanent.
+	mode            string
 	prefix, pattern string
 	fields          []eoPilotFieldSpec
 	narrowed        []eoInheritedNarrowing
@@ -567,8 +640,12 @@ type eoConditionalDecision struct {
 	Why  string
 }
 
-// eoConditionalDecisions is the registry. Read it with the matrix open.
-var eoConditionalDecisions = []eoConditionalDecision{
+// eoConditionalDecisions is the registry, roots then children. Read it with
+// the matrix open.
+var eoConditionalDecisions = append(append([]eoConditionalDecision{}, eoRootConditionalDecisions...), eoChildConditionalDecisions()...)
+
+// eoRootConditionalDecisions is Task A2's three root types.
+var eoRootConditionalDecisions = []eoConditionalDecision{
 	// ── the five inherited Conditional fields, per type ──────────────────
 	// Plan 1 seeded all five `never` on the ABSTRACT base because none of the
 	// conditions is expressible at base level (seed_eo_platform.go). These are
@@ -712,7 +789,7 @@ func eoLockDraftFieldsAfterState(tx *gorm.DB, stateID uuid.UUID) error {
 var eoPilotRootTypes = []eoPilotTypeSpec{
 	{
 		key: eoDirectiveTypeKey, name: "Directive", icon: "clipboard-list",
-		prefix: "EO-DIR", pattern: "EO-DIR-YYYY-NNN",
+		mode: models.EOReferenceModeOwn, prefix: "EO-DIR", pattern: "EO-DIR-YYYY-NNN",
 		fields: []eoPilotFieldSpec{
 			{matrixKey: "directive_origin", label: "Directive origin",
 				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
@@ -783,7 +860,7 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 	},
 	{
 		key: eoDraftStudyTypeKey, name: "Draft Decision Study", icon: "file-search",
-		prefix: "DRF", pattern: "DRF-YYYY-NNN",
+		mode: models.EOReferenceModeOwn, prefix: "DRF", pattern: "DRF-YYYY-NNN",
 		fields: []eoPilotFieldSpec{
 			{matrixKey: "proposer", label: "Proposer",
 				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
@@ -858,7 +935,7 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 	},
 	{
 		key: eoIncomingTypeKey, name: "Incoming Correspondence", icon: "mail",
-		prefix: "IN", pattern: "IN-YYYY-NNNN",
+		mode: models.EOReferenceModeOwn, prefix: "IN", pattern: "IN-YYYY-NNNN",
 		fields: []eoPilotFieldSpec{
 			{matrixKey: "sender", label: "Sending body",
 				kind: models.EOKindExternalBody, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
@@ -872,11 +949,13 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 			// inherited due_date COLUMN, and it is seeded as the narrowing
 			// below. See that entry and eoConditionalDecisions.
 			//
-			// The matrix marks `attachments` Required YES on this type, and
-			// it is a plain values-bag key, so the declaration below is what
-			// makes a letter unfilable without its letter.
-			{matrixKey: "attachments", label: "Attachments",
-				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// The matrix marks `attachments` Required YES on this type.
+			// It is an INHERITED key, so the override goes through
+			// `narrowed:` below rather than being written out here: a
+			// hand-written copy freezes the kind, the config and the
+			// Arabic of the day it was typed, so a later designer edit to
+			// the base row would never reach this type — the exact drift
+			// the narrowing mechanism exists to prevent.
 			{matrixKey: "real_ask", label: "What is actually wanted",
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			{matrixKey: "affected_bodies", label: "Affected bodies",
@@ -906,6 +985,11 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 		},
 		narrowed: []eoInheritedNarrowing{
+			// A letter filed with no letter attached is what this
+			// prevents: the base type seeds `attachments` never and the
+			// matrix marks it Yes here. The narrowing keeps the base's
+			// kind, label and Arabic and changes the requiredness alone.
+			{matrixKey: "attachments", required: models.EORequiredAlways},
 			// The sender's deadline IS this record's due date. Seeding it as
 			// a field of its own would leave the due_date COLUMN empty, and
 			// services.DeriveDeadlineFromParent — the only thing that gives a
@@ -931,31 +1015,71 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 // against everything already in the register, rather than trusting the data
 // here: `reference` is unique per PARTITION only, so global uniqueness of
 // references rests entirely on prefixes never overlapping. All three types are
-// own-mode, which is the only kind the rule governs.
+// own-mode, which is the only kind the rule governs (eoSeedPilotTypes carries
+// the call, and Task A3's parent-derived children are exempt from it).
 //
 // Every sub-step returns its error; nothing is logged and skipped.
 func eoSeedRootTypes(tx *gorm.DB) (bool, error) {
+	base, baseFields, err := eoPilotBase(tx)
+	if err != nil {
+		return false, err
+	}
+	if err := eoSeedPilotTypes(tx, eoPilotRootTypes, base, baseFields); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// eoPilotBase reads the abstract base type and its STORED field definitions,
+// which every pilot type inherits and a narrowing copies.
+//
+// The definitions come from the DATABASE, not from eoBaseFieldDefs in memory:
+// the designer can edit a base field, and copying the Go source would make
+// every override a snapshot of what the base type looked like on the day this
+// file was written — the drift the copy exists to avoid.
+func eoPilotBase(tx *gorm.DB) (models.EORecordType, []models.EOFieldDef, error) {
 	var base models.EORecordType
 	if err := tx.Where("key = ?", eoBaseTypeKey).Limit(1).Find(&base).Error; err != nil {
-		return false, fmt.Errorf("read record type %q: %w", eoBaseTypeKey, err)
+		return base, nil, fmt.Errorf("read record type %q: %w", eoBaseTypeKey, err)
 	}
 	if base.ID == uuid.Nil {
-		return false, fmt.Errorf("record type %q is missing; the platform seed must run before the pilot seed", eoBaseTypeKey)
+		return base, nil, fmt.Errorf("record type %q is missing; the platform seed must run before the pilot seed", eoBaseTypeKey)
 	}
-	// Read the base type's definitions from the DATABASE, not from
-	// eoBaseFieldDefs in memory. A narrowing copies them, and the designer can
-	// edit a base field: copying the Go source would make the override a
-	// snapshot of what the base type looked like when this file was written,
-	// which is the drift the copy exists to avoid.
 	var baseFields []models.EOFieldDef
 	if err := tx.Where("record_type_id = ?", base.ID).Order("sort_order, key").Find(&baseFields).Error; err != nil {
-		return false, fmt.Errorf("read the inherited field definitions: %w", err)
+		return base, nil, fmt.Errorf("read the inherited field definitions: %w", err)
 	}
 	if len(baseFields) == 0 {
-		return false, fmt.Errorf("record type %q has no field definitions; the platform seed must run before the pilot seed", eoBaseTypeKey)
+		return base, nil, fmt.Errorf("record type %q has no field definitions; the platform seed must run before the pilot seed", eoBaseTypeKey)
 	}
+	return base, baseFields, nil
+}
 
-	for _, spec := range eoPilotRootTypes {
+// eoSeedPilotTypes creates one group of pilot record types: the type row, its
+// own partition of eo_records, and its field definitions. Both type-seeding
+// steps go through it, so a rule added here reaches the roots and the children
+// alike.
+//
+// ParentTypeID is the BASE type for every pilot type, including the sub types.
+// The record-type parent is the FIELD-INHERITANCE parent
+// (services.ResolveEffectiveFields walks it); the matrix's "Sub of Directive"
+// is a hierarchy of RECORDS, carried by parent_record_id and the reference
+// pattern. Pointing Execution Plan's type at the Directive type would give
+// every plan the Directive's thirteen fields, which the matrix does not ask
+// for.
+func eoSeedPilotTypes(tx *gorm.DB, specs []eoPilotTypeSpec, base models.EORecordType, baseFields []models.EOFieldDef) error {
+	for _, spec := range specs {
+		switch spec.mode {
+		case models.EOReferenceModeOwn, models.EOReferenceModeParent:
+		default:
+			return fmt.Errorf("record type %q has reference mode %q; it must be %q or %q, and defaulting it would silently number a child type as a root", spec.key, spec.mode, models.EOReferenceModeOwn, models.EOReferenceModeParent)
+		}
+		// A parent-derived type issues every reference inside its parent's, so
+		// a prefix of its own would be a small lie that ValidateTypeEdit then
+		// makes permanent (a prefix change is destructive once records exist).
+		if spec.mode == models.EOReferenceModeParent && spec.prefix != "" {
+			return fmt.Errorf("record type %q is parent-derived and carries the prefix %q; a parent-derived type owns no prefix", spec.key, spec.prefix)
+		}
 		t := models.EORecordType{
 			ID:           uuid.New(),
 			Key:          spec.key,
@@ -968,7 +1092,7 @@ func eoSeedRootTypes(tx *gorm.DB) (bool, error) {
 			// treats a later change to it as destructive once records exist,
 			// so it is set deliberately, from the matrix, for every type.
 			ReferencePrefix:  spec.prefix,
-			ReferenceMode:    models.EOReferenceModeOwn,
+			ReferenceMode:    spec.mode,
 			ReferencePattern: spec.pattern,
 			Capabilities:     datatypes.JSON(`[]`),
 			IsActive:         true,
@@ -980,40 +1104,69 @@ func eoSeedRootTypes(tx *gorm.DB) (bool, error) {
 			// opposite of the truth.
 		}
 
-		// Read the register back for every type, so the second and third are
-		// validated against the first as well as against what was already
-		// there. One query on the transaction's own handle.
+		// Read the register back for every type, so each is validated against
+		// the ones already written by this same step as well as against what
+		// was there before. One query on the transaction's own handle.
 		var existing []models.EORecordType
 		if err := tx.Find(&existing).Error; err != nil {
-			return false, fmt.Errorf("read the record type register: %w", err)
+			return fmt.Errorf("read the record type register: %w", err)
 		}
 		if err := models.ValidateReferencePrefix(t, existing); err != nil {
-			return false, fmt.Errorf("record type %q: %w", spec.key, err)
+			return fmt.Errorf("record type %q: %w", spec.key, err)
 		}
 		if err := tx.Create(&t).Error; err != nil {
-			return false, fmt.Errorf("create record type %q: %w", spec.key, err)
+			return fmt.Errorf("create record type %q: %w", spec.key, err)
 		}
 		if err := migrations.CreateEORecordPartition(tx, t.Key, t.ID); err != nil {
-			return false, err
+			return err
 		}
 		// Only now: the label says "this type's records are in the default
 		// partition", and that stopped being true one statement ago.
 		if err := tx.Model(&models.EORecordType{}).Where("id = ?", t.ID).
 			Update("partition_pending", false).Error; err != nil {
-			return false, fmt.Errorf("clear partition_pending on %q: %w", spec.key, err)
+			return fmt.Errorf("clear partition_pending on %q: %w", spec.key, err)
 		}
 
 		defs, err := eoPilotFieldDefs(spec, t.ID, baseFields)
 		if err != nil {
-			return false, err
+			return err
 		}
 		for _, d := range defs {
 			if err := tx.Create(&d).Error; err != nil {
-				return false, fmt.Errorf("create field %q on %q: %w", d.Key, spec.key, err)
+				return fmt.Errorf("create field %q on %q: %w", d.Key, spec.key, err)
 			}
 		}
-		log.Printf("EO pilot: seeded record type %q (%s) with %d fields and its own partition %s",
-			spec.key, spec.prefix, len(defs), migrations.EORecordPartitionName(spec.key))
+		log.Printf("EO pilot: seeded record type %q (%s, %s) with %d fields and its own partition %s",
+			spec.key, spec.pattern, spec.mode, len(defs), migrations.EORecordPartitionName(spec.key))
+	}
+	return nil
+}
+
+// eoSeedChildTypes is the pilot seed's "seed_child_types" step: the eight sub
+// types of the pilot, their fields, and a partition of eo_records for each.
+//
+// It is a STEP OF ITS OWN, not an extension of seed_root_types: the applied
+// row for that step already exists on every database that has booted Task A2,
+// so work folded into it would never run there (see eoPilotStep).
+func eoSeedChildTypes(tx *gorm.DB) (bool, error) {
+	base, baseFields, err := eoPilotBase(tx)
+	if err != nil {
+		return false, err
+	}
+	// The roots must exist first: the children's reference patterns extend
+	// them, their roll-ups name them, and a child seeded against a missing
+	// root would be a type nothing can parent.
+	for _, key := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+		var n int64
+		if err := tx.Model(&models.EORecordType{}).Where("key = ?", key).Count(&n).Error; err != nil {
+			return false, fmt.Errorf("check root record type %q: %w", key, err)
+		}
+		if n == 0 {
+			return false, fmt.Errorf("record type %q is missing; the pilot's root types must be seeded before its child types", key)
+		}
+	}
+	if err := eoSeedPilotTypes(tx, eoPilotChildTypes, base, baseFields); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -1036,11 +1189,20 @@ func eoPilotFieldDefs(spec eoPilotTypeSpec, typeID uuid.UUID, baseFields []model
 	order := 100
 	for _, f := range spec.fields {
 		key, isColumn, isEngineManaged := eoMatrixKey(f.matrixKey)
-		if isColumn || isEngineManaged {
-			// Declared by the base type already (a column), or never
-			// declarable by a pilot type (engine-managed). A narrowing of a
-			// column key goes through spec.narrowed, which copies the base's
-			// definition instead of writing a second one.
+		if isColumn {
+			// REFUSED, not skipped. A column key is declared by the base type
+			// already, so a second definition here would either be ignored or
+			// shadow the inherited one with a hand-written copy. Until Task
+			// A3 this branch DROPPED the entry silently — no error, no log —
+			// so a type that spelled a column-backed field in `fields:`
+			// instead of `narrowed:` lost it entirely and nothing said so.
+			// Every legitimate narrowing goes through spec.narrowed, which
+			// copies the base's stored definition.
+			return nil, fmt.Errorf("record type %q declares %q (matrix %q) under `fields:`, but it is an eo_records COLUMN the base type already defines; narrow it through `narrowed:` instead, or the definition is lost", spec.key, key, f.matrixKey)
+		}
+		if isEngineManaged {
+			// Never declarable by a pilot type: the engine owns the value
+			// (record identity, workflow state), so no form may ask for it.
 			continue
 		}
 		if f.required == models.EORequiredConditional && strings.TrimSpace(f.rule) == "" {
@@ -1088,6 +1250,21 @@ func eoPilotFieldDefs(spec eoPilotTypeSpec, typeID uuid.UUID, baseFields []model
 		if n.label != "" {
 			d = eoUntranslatedLabel(d, n.label)
 		}
+		if n.provenance != "" {
+			switch n.provenance {
+			case models.EOProvenanceUser, models.EOProvenanceAuto, models.EOProvenanceSystem:
+			default:
+				// NOT `derived`: a derived field needs a formula (the guard on
+				// the own-field path above says so, and RecomputeDerived skips
+				// a derived field without one), and the mechanisms that write
+				// these columns are link rules and the create request, not
+				// §7.5 formulas. A narrowing to `derived` would therefore ask
+				// for a formula that would compute a SECOND value for a column
+				// something else already writes.
+				return nil, fmt.Errorf("narrowing of %q on %q: provenance %q cannot be set here", key, spec.key, n.provenance)
+			}
+			d.Provenance = n.provenance
+		}
 		if (n.required == models.EORequiredConditional) != (strings.TrimSpace(n.rule) != "") {
 			return nil, fmt.Errorf("narrowing of %q on %q: a conditional needs a rule and a rule needs a conditional", key, spec.key)
 		}
@@ -1113,4 +1290,677 @@ func eoJSONOr(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// ── Task A3: the eight child types ──────────────────────────────────────────
+
+// eoMatrixFieldNotSeeded records one row of the client's field matrix that the
+// seed deliberately does NOT turn into a field definition.
+//
+// There is exactly one, and it is a modelling consequence rather than a
+// refusal: spec §7.3 drops the `table` kind from the catalogue, so Execution
+// Plan's `plan_stages` becomes a child record type. Without this registry the
+// omission would be indistinguishable from a field somebody forgot — and the
+// matrix-reading tests, which demand that every row of a type's table is
+// seeded, would have to be weakened with an unexplained exception.
+type eoMatrixFieldNotSeeded struct {
+	TypeKey   string
+	MatrixKey string
+	// Instead names what carries the matrix's requirement instead.
+	Instead string
+	Why     string
+}
+
+// eoMatrixFieldsNotSeeded is the whole of it.
+var eoMatrixFieldsNotSeeded = []eoMatrixFieldNotSeeded{
+	{eoExecutionPlanTypeKey, "plan_stages",
+		"the child record type " + eoStageTypeKey,
+		"The matrix gives it the kind `Table (stage, weeks, body, output)` and spec §7.3 DROPS `table` from the kind catalogue: Assignment's `from_stage` is a `Link (plan stage)`, and a link needs a RECORD to point at — you cannot cleanly reference a row inside a table field. So the four columns become the four fields of a child type, the plan's stages are its child records, and `total_weeks` (`Sum of the stages`) is a real roll-up over them instead of arithmetic over a blob nothing can address.",
+	},
+}
+
+// eoMatrixFieldIsNotSeeded reports whether (typeKey, matrixKey) is recorded as
+// deliberately unseeded.
+func eoMatrixFieldIsNotSeeded(typeKey, matrixKey string) bool {
+	for _, e := range eoMatrixFieldsNotSeeded {
+		if e.TypeKey == typeKey && e.MatrixKey == matrixKey {
+			return true
+		}
+	}
+	return false
+}
+
+// eoColumnBackedDecision records one matrix cell whose value an ENGINE
+// MECHANISM writes to an eo_records COLUMN rather than to a values-bag key.
+//
+// This is the trap addendum 1 names, generalised. Seeded under its matrix
+// spelling such a field is a values-bag key that shadows nothing: the clerk
+// reads an empty field on a record whose value the engine has already written
+// into the column beside it, and NOTHING reports the discrepancy — not
+// validation, which sees a well-formed optional field, and not the derive
+// classifier, which was never asked. Every one of them is therefore declared
+// under the ENGINE key, as a narrowing of the inherited definition, carrying
+// the matrix's own label.
+//
+// The registry is the statement of which cells those are and what writes each.
+// TestEoColumnBackedFieldsAreDeclaredAsTheirColumn checks every entry against
+// the seeded rows, and the required-mode sweep consults it before applying its
+// naive matrix-to-engine mapping, so an entry cannot drift from what was
+// seeded and a cell cannot be excused from the sweep without one.
+type eoColumnBackedDecision struct {
+	TypeKey   string
+	MatrixKey string
+	// EngineKey is the eo_records column the value lives in.
+	EngineKey string
+	// MatrixRequired is the Required cell verbatim.
+	MatrixRequired string
+	// Mechanism names the code that writes the column.
+	Mechanism string
+	// SeededMode and SeededProvenance are what the narrowing actually says.
+	SeededMode       string
+	SeededProvenance string
+	Why              string
+}
+
+// eoColumnBackedDecisions is the registry, total over the pilot — Task A2's
+// `sender_deadline` included, so that the inventory is in one place.
+var eoColumnBackedDecisions = []eoColumnBackedDecision{
+	{eoIncomingTypeKey, "sender_deadline", "due_date", "Yes",
+		"the clerk types it; services.eoRecordColumnWriters writes rec.DueDate",
+		models.EORequiredAlways, models.EOProvenanceUser,
+		"Task A2's. \"Every internal clock is derived from this date\" (matrix:282), and the only mechanism that derives a child's deadline reads parent.DueDate, the column. Kept here so the inventory is complete."},
+
+	{eoReferralTypeKey, "deadline", "due_date", "Derived",
+		"services.DeriveDeadlineFromParent, applied by the save pipeline from the parent LINK TYPE's derive_deadline_from_parent and its offset; it writes rec.DueDate",
+		models.EORequiredNever, models.EOProvenanceAuto,
+		"\"Counted back from the sender's deadline\" (matrix:300) and \"Deadline derived from the parent, not typed\" (matrix:295). Provenance `auto`, not `derived`: services.ValidateRecordValues refuses a submitted value for an auto field, which is exactly what \"not typed\" means — while `derived` additionally demands a §7.5 FORMULA, and the mechanism here is a link rule. A formula would compute a second value for a column something else already writes. REQUIRES TASK A4: the mechanism is armed by the link type between Incoming Correspondence and Referral, and until that link type carries derive_deadline_from_parent no Referral gets a deadline at all and no clerk may type one. DeriveDeadlineFromParent returns nil silently when the parent has no due date, which is why Incoming's sender_deadline is `always`."},
+
+	{eoDecisionTypeKey, "decision_number", "reference", "Auto",
+		"services.RenderReference, through eoRecordService.allocateReference, which renders this type's ReferencePattern into rec.Reference",
+		models.EORequiredNever, models.EOProvenanceAuto,
+		"The matrix's Options cell IS the reference pattern (DEC-YYYY-NNN, matrix:171) and the type's own sequence renders it. A separate auto-number field would be a number nothing allocates, sitting blank beside the reference the engine had already issued. Seeded as a narrowing that carries the matrix's label, \"Decision number\", over the inherited `reference`."},
+
+	{eoOutgoingTypeKey, "out_ref", "reference", "Auto",
+		"services.RenderReference, through eoRecordService.allocateReference",
+		models.EORequiredNever, models.EOProvenanceAuto,
+		"OUT-YYYY-NNNN (matrix:316) is this type's own reference pattern; see eo_decision_record.decision_number."},
+
+	{eoDecisionTypeKey, "source_study", "parent_record_id", "Auto",
+		"the create request's parent_record_id, denormalised onto eo_records (spec §7.6)",
+		models.EORequiredNever, models.EOProvenanceAuto,
+		"\"Link (ticket) / Auto / The parent draft study\" (matrix:179) is the record's parent, and the parent is a column. A values-bag `source_study` would be a second, hand-typed pointer at the record the hierarchy already names, free to disagree with it."},
+
+	{eoTaskTypeKey, "parent_ticket", "parent_record_id", "Yes",
+		"the create request's parent_record_id",
+		models.EORequiredNever, models.EOProvenanceAuto,
+		"The matrix marks it Yes — \"Hangs off anything, including across subsystems\" — and the key is the parent_record_id COLUMN, whose base definition is provenance `auto` because the client chooses the parent on the create REQUEST, not as a value. services.ValidateRecordValues EXEMPTS auto fields from requiredness entirely (it rejects a submitted value and moves on before the required check), so `always` here would be configuration that looks like enforcement and can never refuse anything — this programme's signature defect. It is seeded `never` and the requirement is recorded here instead. WHAT DOES ENFORCE IT: the four parent-derived types and the stage type cannot be created without a parent at all, because services.RenderReference refuses a parent-derived pattern with no parent reference (TestEoPilotReferencePatternsRenderAndRefuse pins this). Task takes its OWN sequence, so that refusal does not apply to it: nothing today stops a parentless Task. Task A4's link type for Task — target `any`, blocks_parent_closure — is where that becomes real."},
+
+	{eoTaskTypeKey, "due_date", "due_date", "Yes",
+		"the clerk types it; services.eoRecordColumnWriters writes rec.DueDate",
+		models.EORequiredAlways, models.EOProvenanceUser,
+		"\"The clock that drives reminders and escalation\" (matrix:526). An ordinary narrowing of the inherited column to `always`: the clock really does watch a Task, so the inherited Conditional holds unconditionally here."},
+
+	{eoTaskTypeKey, "owner_department", "owning_body_id", "Yes",
+		"the clerk types it; services.eoRecordColumnWriters writes rec.OwningBodyID",
+		models.EORequiredAlways, models.EOProvenanceUser,
+		"One of Task A1's six renames, and the base type ALREADY seeds owning_body_id `always`+`user`. No narrowing is seeded, deliberately: an override that changes nothing is a second row to keep in step with the first for no gain. Listed here because it is a column-backed matrix cell and the inventory is meant to be total."},
+}
+
+// eoPilotChildTypes is the eight sub types, in the matrix's order within each
+// CFF. Every `label` is the matrix's English wording; no Arabic is invented.
+//
+// THE ELEVENTH TYPE. eo_execution_plan_stage has no section in the client's
+// matrix, and that is the point: it is a consequence of spec §7.3 dropping the
+// `table` kind, not a client requirement. Its four fields are the four columns
+// the matrix names inside Execution Plan's `plan_stages` cell —
+// `Table (stage, weeks, body, output)` — and the row is marked Required Yes,
+// so all four are `always`. See eoMatrixFieldsNotSeeded.
+//
+// REFERENCE MODES come from the matrix's own patterns and are not re-derived
+// here (the brief's addendum 4):
+//
+//	parent-derived: Execution Plan, Execution Plan Stage, Assignment,
+//	                Objection, Referral — exempt from ValidateReferencePrefix,
+//	                because a parent-derived reference is its parent's plus a
+//	                suffix the parent's sequence can never produce.
+//	own sequence:   Decision Record (DEC), Outgoing Reply (OUT), Task (TSK) —
+//	                governed by the rule, and none of the three overlaps the
+//	                roots' EO-DIR, DRF or IN in either direction.
+//
+// Task is the §7.9 TWO-MODE CASE and must not be collapsed into parent-derived
+// numbering: "Universal type. Hangs off anything, including across subsystems.
+// Always blocks its parent from closing" (matrix:520) — its own sequence AND a
+// parent.
+var eoPilotChildTypes = []eoPilotTypeSpec{
+	// ── EO-DIR ───────────────────────────────────────────────────────────
+	{
+		key: eoExecutionPlanTypeKey, name: "Execution Plan", icon: "map",
+		mode: models.EOReferenceModeParent, prefix: "",
+		// The matrix writes this pattern `EO-DIR-YYYY-NNN-P` (matrix:90),
+		// WITHOUT the `#`. That text cannot be rendered: services'
+		// parseEOPattern reads a parent-derived pattern as the parent's
+		// segments followed by one segment of letters then `#`, so
+		// `...-NNN-P` falls through to the own-sequence branch and is
+		// rejected for not ending in YYYY then a run of N. Seeded verbatim it
+		// would not misnumber a plan — it would make every Execution Plan
+		// UNCREATABLE, at allocateReference, with no plan ever reaching the
+		// database to show it. The `#` is added and the sequence it renders
+		// is per parent, so the matrix's "one per directive" reads as
+		// EO-DIR-2026-001-P1 and a replan is -P2, which is what `supersedes`
+		// is for. Recorded in the task report.
+		pattern: "EO-DIR-YYYY-NNN-P#",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "plan_summary", label: "Plan summary",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// `plan_stages` is NOT here: it is the stage child type. See
+			// eoMatrixFieldsNotSeeded.
+			//
+			// `total_weeks` is "Sum of the stages", and with the stages as
+			// records that is a §7.5 child roll-up rather than arithmetic
+			// over a blob. The env key services.eoAddChildAggregates
+			// publishes is children_<type key>_<aggregate>_<field>, so the
+			// formula names the stage type and its `weeks` field by key:
+			// TestEoDerivedRollUpsNameASeededTypeAndField proves both exist,
+			// because a formula over a type that is not seeded resolves to
+			// nothing for ever and is logged as waiting on data.
+			{matrixKey: "total_weeks", label: "Total duration (weeks)",
+				kind: models.EOKindNumber, provenance: models.EOProvenanceDerived, required: models.EORequiredNever,
+				formula:     "children_" + eoStageTypeKey + "_sum_weeks",
+				recomputeOn: `[{"scope":"child","type":"` + eoStageTypeKey + `","field":"weeks","aggregates":["sum"]}]`},
+			{matrixKey: "plan_start", label: "Plan start",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "plan_end", label: "Plan end",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "approved_by", label: "Approved by",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "approval_date", label: "Approval date",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "supersedes", label: "Supersedes",
+				kind: models.EOKindLink, provenance: models.EOProvenanceUser, required: models.EORequiredNever,
+				config: `{"target_type_key":"` + eoExecutionPlanTypeKey + `"}`},
+		},
+	},
+	{
+		key: eoStageTypeKey, name: "Execution Plan Stage", icon: "list-ordered",
+		mode: models.EOReferenceModeParent, prefix: "",
+		// Three levels, like the spec's own CMT-YYYY-NN-M#-I# example: the
+		// parent is an Execution Plan, whose reference already carries the
+		// directive's.
+		pattern: "EO-DIR-YYYY-NNN-P#-S#",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "stage", label: "Stage",
+				kind: models.EOKindText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// `weeks` is what Execution Plan's total_weeks sums. Renaming it
+			// breaks that roll-up silently in production and loudly in
+			// TestEoDerivedRollUpsNameASeededTypeAndField.
+			{matrixKey: "weeks", label: "Duration (weeks)",
+				kind: models.EOKindNumber, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "body", label: "Owning body for this stage",
+				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "output", label: "Stage output",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		},
+	},
+	{
+		key: eoAssignmentTypeKey, name: "Assignment", icon: "user-check",
+		mode: models.EOReferenceModeParent, prefix: "",
+		// The matrix says "Sub of Execution Plan, OR of Directive directly"
+		// and gives one pattern, EO-DIR-YYYY-NNN-A#, whose parent segment
+		// count is the Directive's. An assignment created under a PLAN
+		// (EO-DIR-2026-001-P1, five segments) is refused by RenderReference,
+		// which checks the parent reference's segment count against the
+		// pattern. That is the matrix's own tension, not a seeding choice;
+		// the report carries it, and the conservative reading — the pattern
+		// the client wrote — is what is seeded, because ValidateTypeEdit
+		// makes a pattern change destructive once records exist.
+		pattern: "EO-DIR-YYYY-NNN-A#",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "assigned_body", label: "Assigned body",
+				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "assignment_owner", label: "Assignment owner",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "scope", label: "Scope of work",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// The link the eleventh type exists for: `Link (plan stage)`.
+			{matrixKey: "from_stage", label: "From stage",
+				kind: models.EOKindLink, provenance: models.EOProvenanceUser, required: models.EORequiredNever,
+				config: `{"target_type_key":"` + eoStageTypeKey + `"}`},
+			{matrixKey: "start_date", label: "Start date",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// THE DIRECTIVE'S ROLL-UP READS THIS FIELD, on this type key:
+			// children_eo_assignment_avg_completion_rate. Task A2 seeded that
+			// formula against a type that did not yet exist, so every
+			// Directive save logged a broken-configuration error; seeding
+			// this ends it.
+			{matrixKey: "completion_rate", label: "Completion rate",
+				kind: models.EOKindPercent, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// "Yes at closure" — the matrix's own fifth value, and the one
+			// the engine spells required_at_state. The STATE IDS ARE EMPTY
+			// until Task A5 creates the workflow: see eoAtClosureFields and
+			// eoRequireAtClosureState.
+			{matrixKey: "evidence", label: "Evidence documents",
+				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
+			{matrixKey: "evidence_note", label: "Evidence description",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			// Two rows in the matrix, two fields here. models.EOKindUserDate
+			// is the one-field primitive (§7.3) and is used where the matrix
+			// gives ONE row for a user and a date together — Task's
+			// "Verified by and on". Assignment's matrix gives two rows with
+			// two kinds, User and Date, and the row-count guard reads the
+			// document as written.
+			{matrixKey: "verified_by", label: "Verified by",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "verified_on", label: "Verification date",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		},
+	},
+
+	// ── EO-DRF ───────────────────────────────────────────────────────────
+	{
+		key: eoObjectionTypeKey, name: "Objection", icon: "alert-triangle",
+		mode: models.EOReferenceModeParent, prefix: "",
+		pattern: "DRF-YYYY-NNN-O#",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "clause_ref", label: "Point referenced",
+				kind: models.EOKindText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "objection_reason", label: "Objection reason",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "proof", label: "Supporting document",
+				kind: models.EOKindFile, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "raised_by", label: "Raised by",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "outcome", label: "Outcome",
+				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				config: `{"options":[` +
+					`{"value":"accepted","label":"Accepted","label_ar":"Accepted"},` +
+					`{"value":"dismissed","label":"Dismissed","label_ar":"Dismissed"}]}`},
+			{matrixKey: "outcome_reason", label: "Outcome reason",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		},
+	},
+	{
+		key: eoDecisionTypeKey, name: "Decision Record", icon: "gavel",
+		mode: models.EOReferenceModeOwn, prefix: "DEC", pattern: "DEC-YYYY-NNN",
+		fields: []eoPilotFieldSpec{
+			// `decision_number` and `source_study` are NOT here: both are
+			// eo_records columns, and eoPilotFieldDefs now REFUSES a column
+			// key written under `fields:` rather than dropping it. They are
+			// the narrowings below. See eoColumnBackedDecisions.
+			{matrixKey: "decision_text", label: "Decision text",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "issued_by", label: "Issued by",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "effective_date", label: "Effective date",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// "Subject taxonomy" is a CLIENT VOCABULARY that no document in
+			// this repository contains, and it is what the conflict check on
+			// the next draft matches against (matrix:176). Inventing a list
+			// of subjects would be inventing the client's taxonomy, and the
+			// options of a seeded dropdown are what every future record is
+			// filed under. The field therefore declares its option SOURCE —
+			// one of the five spec §7.3 allows beside a static list — and the
+			// category it names must be supplied before the first Decision
+			// Record. Recorded in the report as a §9 sign-off obligation.
+			{matrixKey: "keywords", label: "Subject keywords",
+				kind: models.EOKindMultiSelect, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				config: `{"option_source":"lookup_category","lookup_category_code":"eo_subject_taxonomy"}`},
+			{matrixKey: "supersedes", label: "Supersedes",
+				kind: models.EOKindLink, provenance: models.EOProvenanceUser, required: models.EORequiredNever,
+				config: `{"target_type_key":"` + eoDecisionTypeKey + `"}`},
+			{matrixKey: "standing", label: "Standing",
+				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				config: `{"options":[` +
+					`{"value":"in_force","label":"In force","label_ar":"In force"},` +
+					`{"value":"superseded","label":"Superseded","label_ar":"Superseded"},` +
+					`{"value":"revoked","label":"Revoked","label_ar":"Revoked"}]}`},
+		},
+		narrowed: []eoInheritedNarrowing{
+			{matrixKey: "decision_number", required: models.EORequiredNever, label: "Decision number"},
+			{matrixKey: "source_study", required: models.EORequiredNever, label: "Source study"},
+		},
+	},
+
+	// ── EO-COM ───────────────────────────────────────────────────────────
+	{
+		key: eoReferralTypeKey, name: "Referral", icon: "git-branch",
+		mode: models.EOReferenceModeParent, prefix: "",
+		pattern: "IN-YYYY-NNNN-R#",
+		fields: []eoPilotFieldSpec{
+			// `referred_body` is a field of its own and NOT the inherited
+			// owning_body_id: the matrix gives Referral both — the inherited
+			// "Owning body (the unit answerable for the record)" and its own
+			// "Referred to (each referral carries a body)" — and the parsed
+			// row counts would not balance if one were folded into the other.
+			{matrixKey: "referred_body", label: "Referred to",
+				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "referral_owner", label: "Named owner",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "ask_type", label: "What is wanted",
+				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				config: `{"options":[` +
+					`{"value":"information","label":"Information","label_ar":"Information"},` +
+					`{"value":"position","label":"Position","label_ar":"Position"},` +
+					`{"value":"comment_on_study","label":"Comment on the study","label_ar":"Comment on the study"},` +
+					`{"value":"deeper_study","label":"Deeper study","label_ar":"Deeper study"}]}`},
+			{matrixKey: "instruction", label: "Instruction",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// `deadline` is NOT here: it is the inherited due_date COLUMN,
+			// narrowed below. See eoColumnBackedDecisions.
+			{matrixKey: "response", label: "View submitted",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "response_files", label: "Response attachments",
+				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			{matrixKey: "parent_referral", label: "Parent referral",
+				kind: models.EOKindLink, provenance: models.EOProvenanceUser, required: models.EORequiredNever,
+				config: `{"target_type_key":"` + eoReferralTypeKey + `"}`},
+			// Marked Auto by the matrix and WRITTEN BY NOTHING TODAY. Spec
+			// §7.11 names it as the second of three access-control
+			// mechanisms, "row-level visibility ... enforced in the
+			// repository layer", and no such column, filter or clause exists
+			// in the engine: models.EORecord has no visibility column and
+			// models.EORecordFilter no clause. Provenance `auto` is what
+			// keeps a clerk from typing a visibility nothing enforces; the
+			// gap itself is reported, not papered over.
+			{matrixKey: "visibility", label: "Visible to",
+				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceAuto, required: models.EORequiredNever},
+		},
+		narrowed: []eoInheritedNarrowing{
+			{matrixKey: "deadline", required: models.EORequiredNever,
+				provenance: models.EOProvenanceAuto, label: "Deadline"},
+		},
+	},
+	{
+		key: eoOutgoingTypeKey, name: "Outgoing Reply", icon: "send",
+		mode: models.EOReferenceModeOwn, prefix: "OUT", pattern: "OUT-YYYY-NNNN",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "addressee", label: "Addressee",
+				kind: models.EOKindExternalBody, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// `out_ref` is NOT here: it is this type's own reference.
+			{matrixKey: "reply_text", label: "Reply text",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "reply_files", label: "Reply attachments",
+				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			{matrixKey: "approved_by", label: "Approved by",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "delegation_note", label: "Delegation note",
+				kind: models.EOKindText, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			{matrixKey: "sent_on", label: "Sent on",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "channel", label: "Channel",
+				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				config: `{"options":[` +
+					`{"value":"admin_communications_system","label":"Administrative communications system","label_ar":"Administrative communications system"},` +
+					`{"value":"official_email","label":"Official email","label_ar":"Official email"},` +
+					`{"value":"hand_delivery","label":"Hand delivery","label_ar":"Hand delivery"}]}`},
+		},
+		narrowed: []eoInheritedNarrowing{
+			{matrixKey: "out_ref", required: models.EORequiredNever, label: "Outgoing reference"},
+		},
+	},
+
+	// ── Universal ────────────────────────────────────────────────────────
+	{
+		key: eoTaskTypeKey, name: "Task", icon: "check-square",
+		mode: models.EOReferenceModeOwn, prefix: "TSK", pattern: "TSK-YYYY-NNNNN",
+		fields: []eoPilotFieldSpec{
+			{matrixKey: "task_text", label: "Task description",
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// `parent_ticket`, `owner_department` and `due_date` are NOT
+			// here: all three are eo_records columns. See
+			// eoColumnBackedDecisions, which also says why only two of them
+			// are narrowed.
+			//
+			// `origin_cff` is Auto and "taken from the parent", and it is NOT
+			// a §7.5 derived field: an ancestor dependency names ONE record
+			// type, and a Task hangs off any type in any subsystem, so there
+			// is no single ancestor type to name. Provenance `auto` with no
+			// formula is the honest statement — the engine will set it, and
+			// nothing sets it yet.
+			{matrixKey: "origin_cff", label: "Originating subsystem",
+				kind: models.EOKindText, provenance: models.EOProvenanceAuto, required: models.EORequiredNever},
+			{matrixKey: "owner", label: "Named owner",
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			{matrixKey: "start_date", label: "Start date",
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			// "Rolls up to the parent's completion rate" — and NOTHING ROLLS
+			// IT UP: the only roll-up in the pilot is the Directive's, over
+			// eo_assignment. A Task's rate reaches no parent today. Reported.
+			{matrixKey: "completion_rate", label: "Completion rate",
+				kind: models.EOKindPercent, provenance: models.EOProvenanceUser, required: models.EORequiredNever},
+			{matrixKey: "evidence", label: "Evidence",
+				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
+			// ONE row in the matrix — "Verified by and on", kind "User +
+			// Date" — so one field of models.EOKindUserDate, the §7.3
+			// primitive, keyed on the first of the two keys the cell names,
+			// exactly as the base type's created_by_id is.
+			{matrixKey: "verified_by", label: "Verified by and on",
+				kind: models.EOKindUserDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		},
+		narrowed: []eoInheritedNarrowing{
+			{matrixKey: "due_date", required: models.EORequiredAlways},
+		},
+	},
+}
+
+// eoAtClosureField names one field the client's matrix marks "Yes at closure"
+// — its own fifth Required value, "enforced as a workflow requirement on the
+// terminal transition, not as form validation", which the engine spells
+// required_mode `at_state`.
+type eoAtClosureField struct {
+	TypeKey  string
+	FieldKey string
+}
+
+// eoAtClosureFields is the pilot's whole set: both are evidence, and both
+// carry the matrix's own words, "the proof tied to each output" and "always
+// blocks its parent from closing until evidence is attached".
+var eoAtClosureFields = []eoAtClosureField{
+	{eoAssignmentTypeKey, "evidence"},
+	{eoTaskTypeKey, "evidence"},
+}
+
+// eoRequireAtClosureState points the eoAtClosureFields of one type at the
+// workflow state that closes it, after which services.ValidateRecordValues
+// requires them of any transition INTO that state.
+//
+// IT HAS NO PRODUCTION CALLER IN THIS TASK, and that is an ordering fact
+// rather than an oversight — the same one eoLockDraftFieldsAfterState records.
+// required_at_state_ids names workflow STATES; the workflows are Task A5's and
+// no state exists to point at while this seed runs. UNTIL A5 CALLS IT THE TWO
+// FIELDS ARE REQUIRED BY NOBODY: ValidateRecordValues reads an empty
+// required_at_state_ids as "required at no state", so `at_state` with no ids
+// is a rule that can never fire. That is the weaker of the two available
+// wrongs — the other is `always`, which would demand the closing evidence at
+// CREATION and, per models.ValidateTypeEdit, could then never be relaxed once
+// records existed.
+//
+// It fails closed on both halves: a nil state, and a row count other than the
+// number of fields named for that type (a renamed or missing field would
+// otherwise require nothing and report success).
+func eoRequireAtClosureState(tx *gorm.DB, typeKey string, stateID uuid.UUID) error {
+	if stateID == uuid.Nil {
+		return fmt.Errorf("require the at-closure fields of %q: no state given; a nil state would require nothing", typeKey)
+	}
+	var keys []string
+	for _, f := range eoAtClosureFields {
+		if f.TypeKey == typeKey {
+			keys = append(keys, f.FieldKey)
+		}
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("record type %q has no fields marked \"Yes at closure\" in the client's matrix", typeKey)
+	}
+	var ty models.EORecordType
+	if err := tx.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
+		return fmt.Errorf("read record type %q: %w", typeKey, err)
+	}
+	if ty.ID == uuid.Nil {
+		return fmt.Errorf("record type %q is not seeded, so its at-closure fields cannot be required", typeKey)
+	}
+	ids, err := json.Marshal([]uuid.UUID{stateID})
+	if err != nil {
+		return fmt.Errorf("encode the closing state of %q: %w", typeKey, err)
+	}
+	res := tx.Model(&models.EOFieldDef{}).
+		Where("record_type_id = ? AND key IN ?", ty.ID, keys).
+		Update("required_at_state_ids", datatypes.JSON(ids))
+	if res.Error != nil {
+		return fmt.Errorf("require the at-closure fields of %q: %w", typeKey, res.Error)
+	}
+	if res.RowsAffected != int64(len(keys)) {
+		return fmt.Errorf("required %d of %d at-closure fields on %q (%v); a partial result leaves the rest enforced by nobody",
+			res.RowsAffected, len(keys), typeKey, keys)
+	}
+	return nil
+}
+
+// eoChildConditionalDecisions is Task A3's: the five inherited Conditional
+// cells on each of the eight sub types, and the five Conditional cells of
+// their own tables.
+//
+// READ THE OWN-TABLE FIVE FIRST, because all five are `never` and that is a
+// claim worth testing. Each names a condition the rule grammar cannot reach,
+// and the reason is the same shape every time: the condition is a fact about
+// the record's NEIGHBOURS (is there an earlier plan? is my parent a plan or a
+// directive? is this referral a sub-referral?) and services.ValidateRecordValues
+// evaluates a required_rule against the record's OWN values alone. The
+// alternative — a plausible rule over an unrelated field — would compile,
+// never fire, and look configured, which is the defect this registry exists to
+// make impossible to ship silently.
+func eoChildConditionalDecisions() []eoConditionalDecision {
+	// ── the inherited five, per type ─────────────────────────────────────
+	out := []eoConditionalDecision{
+		// `parent_ticket`. The condition is TRUE for all eight — they are all
+		// sub types — and that is exactly why the mode is not `always`: the
+		// key is the parent_record_id COLUMN, whose base definition is
+		// provenance `auto`, and ValidateRecordValues exempts auto fields
+		// from requiredness entirely (it rejects a submitted value and
+		// `continue`s before the required check). `always` here would be
+		// configuration that reads as enforcement and can refuse nothing.
+		// What enforces it instead differs by numbering mode, so the two
+		// groups carry different reasons.
+		{eoExecutionPlanTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"True for this type, and not enforceable through requiredness: parent_record_id is provenance `auto` and ValidateRecordValues exempts auto fields. IT IS ENFORCED ANYWAY, and loudly: this type is parent-derived, so services.RenderReference refuses to number a record with no parent reference and the create fails outright. A parentless Execution Plan cannot exist."},
+		{eoStageTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Parent-derived; see eo_execution_plan.parent_ticket. Its parent is an Execution Plan, three levels below the Directive."},
+		{eoAssignmentTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Parent-derived; see eo_execution_plan.parent_ticket."},
+		{eoObjectionTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Parent-derived; see eo_execution_plan.parent_ticket."},
+		{eoReferralTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Parent-derived; see eo_execution_plan.parent_ticket."},
+		{eoDecisionTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"True for this type and ENFORCED BY NOTHING, unlike the parent-derived sub types: a Decision Record takes its own DEC sequence, so RenderReference never asks for a parent reference and a parentless record numbers cleanly. The matrix's own `source_study` row (Auto, \"The parent draft study\") is the same statement from the other side, and it is the narrowing of parent_record_id. Closing this needs the link type Task A4 seeds, or a create-path rule that a type with a configured parent link must have a parent; requiredness on an auto field cannot."},
+		{eoOutgoingTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Own sequence (OUT); see eo_decision_record.parent_ticket — nothing refuses a parentless record of this type today."},
+		{eoTaskTypeKey, "parent_ticket",
+			"Mandatory on every sub and sub-sub type.",
+			models.EORequiredNever,
+			"Own sequence (TSK) and the matrix marks the type's OWN `parent_ticket` row Required Yes, not Conditional — the universal type \"hangs off anything\". Both statements reach the same column and the same answer; see eoColumnBackedDecisions, which carries the full reasoning and the enforcement gap."},
+
+		// `due_date`: "required on any type the clock watches". Per type,
+		// which clock — if any — watches it.
+		{eoExecutionPlanTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"A plan's dates are `plan_start` and `plan_end`, both Required Yes on this type, and the matrix adds that the end \"must not run past the directive's due date\" — the directive's, not its own. No escalation, delay or reminder in the matrix watches a plan. Requiring due_date would demand a third date at creation that no CFF step asks for."},
+		{eoStageTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"The stage type has no matrix section at all and no clock: a stage carries a DURATION (`weeks`), which the plan sums, not a date of its own."},
+		{eoAssignmentTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"The matrix gives Assignment a `start_date` and no end date; the clock that escalates at +3, +7 and +14 days is the DIRECTIVE's, whose due_date Task A2 seeded `always` for that reason. Requiring one here would invent a per-assignment deadline the client's document does not describe, and ValidateTypeEdit would then refuse to remove it once records existed."},
+		{eoObjectionTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"An objection blocks the raising step rather than a date: it \"must be resolved or dismissed before the parent can go to H.E.\". The matrix gives it no date field of any kind."},
+		{eoDecisionTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"A decision is the OUTCOME of the study's clock, not subject to one; its dates are `effective_date` and the parent study's."},
+		{eoReferralTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"The clock DOES watch a referral — and this field IS that clock, under the matrix's own name for it, `deadline`. It is `never` rather than `always` because the matrix marks it Derived and \"not typed\": requiring it of the clerk is precisely what the client's document refuses. The narrowing sets provenance `auto` so a clerk cannot supply one, and services.DeriveDeadlineFromParent writes the column. See eoColumnBackedDecisions, including what Task A4 must seed for that to happen at all."},
+		{eoOutgoingTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredNever,
+			"The reply's date is `sent_on`, Required Yes, and it is measured against the PARENT letter's deadline (\"two days inside the Ministry's deadline\"). A due date of its own would be a second deadline beside the one the letter already carries."},
+		{eoTaskTypeKey, "due_date",
+			"Required on any type the clock watches.",
+			models.EORequiredAlways,
+			"The clock watches a Task explicitly: the matrix's own table marks `due_date` Required Yes and calls it \"the clock that drives reminders and escalation\". The inherited condition therefore holds unconditionally for this type, and the narrowing says so."},
+
+		// ── the sub types' own Conditional cells, all five `never` ───────
+		{eoExecutionPlanTypeKey, "supersedes",
+			"A replanned directive keeps the earlier version. Options: an earlier plan on the same directive.",
+			models.EORequiredNever,
+			"Not expressible: the condition is \"this plan replaces an earlier one on the same directive\", which is a fact about the record's SIBLINGS. A required_rule is evaluated against this record's own values (services.ValidateRecordValues passes eoFlattenStored(rec) plus the submission), and there is no sibling scope in the grammar — recompute_on's `child` and `ancestor` scopes belong to derived fields and run at save time, not inside a rule. Nothing on the plan itself says \"this is a replan\". What it would take: a Yes/No `is_replan` the client's matrix does not have, or enforcement on the transition that opens a second plan."},
+		{eoAssignmentTypeKey, "from_stage",
+			"3.3 — tasks are drawn from the approved plan. Options: stages on the approved plan.",
+			models.EORequiredNever,
+			"Not expressible: the matrix says an Assignment is \"sub of Execution Plan, OR of Directive directly\", so the condition is \"my parent is a plan\" — a fact about the PARENT'S TYPE. The rule environment carries parent_record_id (an id, from the column) and nothing else about the parent; eoformula is a pure evaluator with no lookup, so there is no expression that means \"my parent is of type eo_execution_plan\". The Directive's `plan_required` would answer it, but it is a field of the grandparent, not of this record. What it would take: the parent's type key in the rule environment, or a per-transition requirement on the step that creates an assignment under a plan."},
+		{eoDecisionTypeKey, "supersedes",
+			"6.3 — keeps the base consistent.",
+			models.EORequiredNever,
+			"Not expressible, and NOT for want of a candidate field: `standing` (In force | Superseded | Revoked) is the tempting one and it is the wrong way round — it records that THIS decision has been superseded by a later one, not that it supersedes an earlier one. A rule over it would fire on exactly the records that should not carry a link and stay silent on the ones that should. The real condition is a fact about another record in the decisions base."},
+		{eoReferralTypeKey, "parent_referral",
+			"5.3 — a sub-referral stays visible in the parent letter's tree.",
+			models.EORequiredNever,
+			"Not expressible: the condition is \"this referral is a SUB-referral\", and both kinds have a parent — a top-level referral's parent is the letter, a sub-referral's is another referral. The rule environment has parent_record_id for both and no way to tell their types apart, which is the same limit as eo_assignment.from_stage. The referral tree itself is a §7.9 capability (`referral_tree`) and the structure lives in eo_record_links, not in a value on the record."},
+		{eoOutgoingTypeKey, "delegation_note",
+			"6.2 — recorded when H.E. delegates the signature.",
+			models.EORequiredNever,
+			"Not expressible: the condition is \"the approver was a delegate rather than H.E. himself\", and the matrix gives this type no field that says which. `approved_by` is a User whose Options cell reads \"H.E. or his delegate\"; a rule comparing it to H.E.'s identity would have to hard-code a person's user id into seeded configuration, which is both invented client policy and a value that changes with the post-holder. What it would take: a Yes/No `signed_by_delegate`, or the delegation recorded by the transition that approves the reply."},
+	}
+
+	// `assigned_user`, `change_reason` and `delay_reason` carry the same
+	// answer on every pilot type, for reasons that are properties of the
+	// ENGINE rather than of any type. They are generated so that adding a
+	// type cannot leave one of them behind; the text is Task A2's, which the
+	// three root types already carry.
+	for _, key := range eoPilotChildTypeKeys() {
+		out = append(out,
+			eoConditionalDecision{key, "assigned_user",
+				"Set by the transition's assignment rules (auto_detect_department, auto_match_user).",
+				models.EORequiredNever,
+				"A workflow statement, not a form condition: the value is written by a transition's assignment rules, which belong to the workflow Task A5 binds. There is no expression over the record's own values that means \"a transition has run\", and making it required at creation would refuse the very first save, before any transition exists to assign anyone."},
+			eoConditionalDecision{key, "change_reason",
+				"Material changes are logged — moving a date, changing an owner, altering scope.",
+				models.EORequiredNever,
+				"Not expressible: the engine cannot tell a material change from any other. The rule grammar evaluates the record's values, not the DIFFERENCE between a submission and what is stored, so there is no expression that means \"the due date moved\". Enforcing it needs either a diff-aware condition in the save pipeline or a per-transition requirement; neither exists today."},
+			eoConditionalDecision{key, "delay_reason",
+				"Mandatory once the due date passes.",
+				models.EORequiredNever,
+				"Needs a CLOCK, and eoformula deliberately has none: it is a pure evaluator with no now()/today() primitive, so \"the due date has passed\" cannot be written as a required_rule. A formula that compiled, never fired and looked configured is this programme's signature defect, so it is not written. See eo_directive.delay_reason for what it would take."},
+		)
+	}
+	return out
+}
+
+// eoPilotChildTypeKeys is the eight sub types' keys, read from the specs so
+// that a type added to eoPilotChildTypes cannot be missed by the registry
+// above.
+func eoPilotChildTypeKeys() []string {
+	out := make([]string, 0, len(eoPilotChildTypes))
+	for _, spec := range eoPilotChildTypes {
+		out = append(out, spec.key)
+	}
+	return out
 }
