@@ -645,7 +645,11 @@ func TestCapabilityReaderRecordsOfTypeResolvesTheKeyOnItsOwnHandles(t *testing.T
 	typ := &models.EORecordType{ID: uuid.New(), Key: eoDecBaseTypeKey}
 	rec := eoDecBaseRec(t, "DEC-2026-001", map[string]any{"standing": "in_force"})
 	records := &eoDecBaseRecordsRepo{byType: map[uuid.UUID][]models.EORecord{typ.ID: {rec}}}
-	types := &eoDecBaseTypesRepo{byKey: map[string]*models.EORecordType{typ.Key: typ}}
+	// The blank keys resolve to a type ON PURPOSE. In production they would
+	// not, so a reader with no blank-key guard would still error — and the
+	// guard would be untested. Resolving them here leaves the reader's own
+	// check as the only thing that can make a blank key an error.
+	types := &eoDecBaseTypesRepo{byKey: map[string]*models.EORecordType{typ.Key: typ, "": typ, "   ": typ}}
 	read := eoNewCapabilityReader(records, types)
 
 	got, err := read.RecordsOfType(ctx, eoDecBaseTypeKey)
