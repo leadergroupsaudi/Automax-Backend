@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/services/eoformula"
 	"github.com/google/uuid"
 )
 
@@ -431,3 +432,7 @@ func TestValidateTypedNilStoredValuesAreEmpty(t *testing.T) {
 		}
 	})
 }
+
+// The real evaluator must satisfy the consumer interface. A compile error here
+// is the test.
+var _ FormulaEvaluator = (*eoformula.Evaluator)(nil)
