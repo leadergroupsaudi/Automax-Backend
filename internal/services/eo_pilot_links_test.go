@@ -144,6 +144,7 @@ func eoPilotNewFixture(t *testing.T) *eoPilotFixture {
 	f.records = NewEORecordServiceWithSLA(f.repo, f.types, repository.NewEOSequenceRepository(db), repository.NewWorkflowRepository(db), repository.NewEscalationPolicyRepository(db))
 	f.transits = NewEOTransitionServiceWithSLA(f.repo, f.types, repository.NewWorkflowRepository(db), nil, repository.NewEscalationPolicyRepository(db))
 
+	f.eoPilotDeactivateTheSeededWorkflows(t)
 	for _, key := range eoPilotTypeKeysUnderTest {
 		ty, err := f.types.GetByKey(context.Background(), key)
 		if err != nil || ty == nil {
@@ -169,6 +170,43 @@ func eoPilotNewFixture(t *testing.T) *eoPilotFixture {
 		}
 	}
 	return f
+}
+
+// eoPilotDeactivateTheSeededWorkflows takes Task A5's real machines out of the
+// way of this file's scaffolding ones.
+//
+// WHY, AND WHY NOT INSTEAD USE THEM. Every test in this file is about a LINK
+// rule — the endpoints, the cardinality, the derived deadline, the two block
+// semantics — and each needs the SMALLEST machine in which the two block
+// semantics can be told apart: one `close` into a terminal state and one
+// non-terminal transition coded eoPilotRaiseToHECode, both out of the state a
+// new record is created in. A5's machines are the real ones and have neither
+// shape: a Directive closes from `verification`, four states along, and only
+// the Draft Decision Study has a raise at all. Walking each of eleven machines
+// to its terminal state here would make every link-rule assertion depend on
+// the whole of A5's configuration, which is the opposite of what these tests
+// isolate.
+//
+// A5's machines are exercised, through the real pipelines and with nothing
+// deactivated, in eo_pilot_workflows_test.go — including the objection's
+// raise-to-H.E., which is the one rule this file and that one both reach.
+//
+// services.ResolveWorkflowForType matches on record_type_id AND is_active, so
+// deactivating is enough and nothing is deleted. It is checked rather than
+// hoped for: a day when the pilot seeds no workflow is a day this helper is a
+// silent no-op and the comment above is a lie.
+func (f *eoPilotFixture) eoPilotDeactivateTheSeededWorkflows(t *testing.T) {
+	t.Helper()
+	res := f.db.Model(&models.Workflow{}).
+		Where("record_type_id IS NOT NULL AND is_active = ?", true).
+		Update("is_active", false)
+	if res.Error != nil {
+		t.Fatalf("deactivate the seeded pilot workflows: %v", res.Error)
+	}
+	if res.RowsAffected < int64(len(eoPilotTypeKeysUnderTest)) {
+		t.Fatalf("deactivated %d bound workflows and the pilot seeds %d; this helper is no longer doing what its comment says",
+			res.RowsAffected, len(eoPilotTypeKeysUnderTest))
+	}
 }
 
 // eoPilotWorkflow gives one record type open -> raised -> closed, with a

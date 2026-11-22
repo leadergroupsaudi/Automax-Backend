@@ -471,6 +471,15 @@ func main() {
 	eoRecordService := services.NewEORecordServiceWithSLA(eoRecordRepo, eoTypeRepo, eoSequenceRepo, workflowRepo, escalationPolicyRepo)
 	eoActionExecutor := services.NewEOActionExecutor(eoRecordService, eoRecordRepo, eoTypeRepo, userRepo, departmentRepo, notificationService)
 	eoTransitionService := services.NewEOTransitionServiceWithSLA(eoRecordRepo, eoTypeRepo, workflowRepo, eoActionExecutor, escalationPolicyRepo)
+	// Closes the construction cycle the two services make: the transition
+	// service dispatches to the executor after its commit, and the executor's
+	// `close_parent` action — the client's "a Decision Record closes its
+	// study", "an Outgoing Reply closes its letter" — runs a transition on
+	// the PARENT record through the service above, so every rule the engine
+	// has applies to that closure too. Without this line the action fails
+	// loudly on every record rather than quietly doing nothing, which is why
+	// it is a setter and not an optional field.
+	eoActionExecutor.SetTransitions(eoTransitionService)
 
 	eoRecordHandler := handlers.NewEORecordHandler(eoRecordService, eoTransitionService, eoRecordRepo, eoTypeRepo)
 	eoRecordTypeHandler := handlers.NewEORecordTypeHandler(eoTypeRepo, eoRecordRepo)

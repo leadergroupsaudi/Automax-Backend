@@ -229,6 +229,13 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 		grants: before.grants - 12,
 	}
 	want.perms = before.perms - 6
+	// Plan 1's two smoke workflows and its one-step escalation policy go;
+	// Task A5's eleven machines and its 3/7/14 ladder replace them, counted
+	// from the specs for the same reason.
+	wfc := eoPilotWorkflowSpecCounts()
+	want.workflows, want.states, want.transitions = wfc.workflows, wfc.states, wfc.transitions
+	want.requirements, want.policies, want.steps = wfc.requirements, wfc.policies, wfc.policySteps
+	want.changes = wfc.fieldChanges
 	if got != want {
 		t.Errorf("after the pilot seed: %+v, want %+v", got, want)
 	}
@@ -324,6 +331,16 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			// The smoke link type is KEPT here (its types hold records), and
 			// the pilot's own link types are added beside it.
 			want.links += int64(len(eoPilotLinkTypes))
+			// The smoke WORKFLOWS are kept here too, and Task A5's eleven
+			// are added beside them.
+			wfc := eoPilotWorkflowSpecCounts()
+			want.workflows += wfc.workflows
+			want.states += wfc.states
+			want.transitions += wfc.transitions
+			want.requirements += wfc.requirements
+			want.changes += wfc.fieldChanges
+			want.policies += wfc.policies
+			want.steps += wfc.policySteps
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != want {
 				t.Errorf("a populated database changed: %+v, want %+v (was %+v)", got, want, snapBefore)
@@ -684,6 +701,12 @@ type eoMatrixRow struct {
 	// Derived or "Yes at closure" (the matrix's own five-valued column, plus
 	// No).
 	Required string
+	// Why is the last cell verbatim: the CFF step number and the client's own
+	// sentence about the field. Task A5 reads it, because the step numbers
+	// are what order the derived state machines and because a "Yes" row whose
+	// Why cell names CLOSING is how eoClosureArtefacts is justified against
+	// the document rather than against a reading of it.
+	Why string
 }
 
 // eoMatrixSections names the heading each record type's table sits under.
@@ -771,6 +794,7 @@ func eoReadFieldMatrix(t *testing.T) map[string][]eoMatrixRow {
 			Key:      keys[1],
 			Kind:     strings.TrimSpace(cells[2]),
 			Required: strings.TrimSpace(cells[3]),
+			Why:      strings.TrimSpace(cells[5]),
 		})
 	}
 	for section, want := range eoMatrixRowCounts {
@@ -945,8 +969,12 @@ func TestSeedsTheThreeRootTypes(t *testing.T) {
 			if ty.PartitionPending {
 				t.Error("partition_pending is true although the seed creates this type's partition")
 			}
-			if ty.WorkflowID != nil {
-				t.Errorf("workflow = %v, want none until Task A5 binds one", ty.WorkflowID)
+			// TASK A5 NOW BINDS ONE, and the designer's copy of the
+			// binding must agree with the one the engine reads
+			// (workflows.record_type_id). The earlier reading of this
+			// assertion was "want none until Task A5 binds one".
+			if ty.WorkflowID == nil {
+				t.Errorf("no workflow is bound, so services.ResolveWorkflowForType errors on every create of this type")
 			}
 		})
 	}
@@ -1360,8 +1388,12 @@ func TestRootConditionalRulesFireOnlyOnTheConditionTheyName(t *testing.T) {
 }
 
 // §7.12's "the original is never edited": the only field-level immutability in
-// the pilot. The two fields are seeded here; the state they lock after is
-// Task A5's, so the seed exposes the operation A5 calls and this pins it.
+// the pilot. A2 seeded the two fields and exposed the operation; TASK A5 CALLS
+// IT, with the id of the Draft Decision Study's `submitted` state — which is
+// what TestEoDraftOriginalIsLockedAfterTheSubmittedState checks, and what the
+// paragraph this test used to carry ("the state they lock after is Task A5's")
+// was waiting for. What remains HERE is the operation's own behaviour: it
+// moves both fields together, and it fails closed.
 // Mutation: drop "draft_file" from eoDraftLockedFieldKeys (the row count check
 // in eoLockDraftFieldsAfterState then reports one of two), or make that
 // function return nil without updating.
@@ -1371,8 +1403,8 @@ func TestDraftFieldsLockAfterSubmit(t *testing.T) {
 
 	for _, key := range eoDraftLockedFieldKeys {
 		def := eoEffectiveField(t, db, eoDraftStudyTypeKey, key)
-		if def.IsLockedAfterStateID != nil {
-			t.Errorf("%s is already locked after state %v; Task A5 owns the state", key, def.IsLockedAfterStateID)
+		if def.IsLockedAfterStateID == nil {
+			t.Errorf("%s is locked after NO state, so §7.12's \"the original is never edited\" is configured by nobody", key)
 		}
 	}
 
@@ -1843,6 +1875,20 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				}
 				switch row.Required {
 				case "Yes":
+					// TASK A5, ADDENDUM 4. A "Yes" row the matrix's own Why
+					// cell places at CLOSING is seeded `at_state` and
+					// pointed at the terminal state by
+					// eoRequireAtClosureState, with a recorded decision in
+					// eoClosureArtefacts. That registry's own test checks
+					// each entry against this document and against the
+					// seeded row, so this is not a way round the matrix — it
+					// is the place where "the matrix says Yes and the step
+					// it names is the last one" is written down. Every other
+					// "Yes" stays `always`.
+					if eoIsResolvedClosureArtefact(typeKey, row.Key) {
+						want(models.EORequiredAtState, models.EOProvenanceUser)
+						return
+					}
 					want(models.EORequiredAlways, models.EOProvenanceUser)
 				case "No":
 					want(models.EORequiredNever, models.EOProvenanceUser)
@@ -2010,8 +2056,12 @@ func TestSeedsEveryPilotChildType(t *testing.T) {
 			if ty.PartitionPending {
 				t.Error("partition_pending is true although the seed creates this type's partition")
 			}
-			if ty.WorkflowID != nil {
-				t.Errorf("workflow = %v, want none until Task A5 binds one", ty.WorkflowID)
+			// TASK A5 NOW BINDS ONE, and the designer's copy of the
+			// binding must agree with the one the engine reads
+			// (workflows.record_type_id). The earlier reading of this
+			// assertion was "want none until Task A5 binds one".
+			if ty.WorkflowID == nil {
+				t.Errorf("no workflow is bound, so services.ResolveWorkflowForType errors on every create of this type")
 			}
 			if strings.TrimSpace(ty.ReferencePattern) == "" {
 				t.Error("no reference pattern: services.allocateReference refuses to create a record of a type without one")
@@ -2684,8 +2734,14 @@ func TestEoAtClosureFieldsAwaitTheirState(t *testing.T) {
 		if def.RequiredMode != models.EORequiredAtState {
 			t.Errorf("%s.%s required_mode = %q, want %q", f.TypeKey, f.FieldKey, def.RequiredMode, models.EORequiredAtState)
 		}
-		if s := strings.TrimSpace(string(def.RequiredAtStateIDs)); s != "" && s != "[]" && s != "null" {
-			t.Errorf("%s.%s already names states %s; Task A5 owns the workflow", f.TypeKey, f.FieldKey, s)
+		// TASK A5 HAS NOW POINTED THEM AT A STATE, and the empty list this
+		// test used to assert is the thing that is gone. The original
+		// paragraph read "already names states … Task A5 owns the workflow";
+		// the state ids themselves are checked against the seeded terminal
+		// state by TestEoClosureArtefactsNameTheirTypesTerminalState, which
+		// is the test that would fail if the arming were removed.
+		if s := strings.TrimSpace(string(def.RequiredAtStateIDs)); s == "" || s == "[]" || s == "null" {
+			t.Errorf("%s.%s names NO state: ValidateRecordValues reads that as \"required at no state\", so the matrix's \"Yes at closure\" is enforced by nobody", f.TypeKey, f.FieldKey)
 		}
 	}
 
@@ -2702,18 +2758,26 @@ func TestEoAtClosureFieldsAwaitTheirState(t *testing.T) {
 		t.Errorf("required_at_state_ids = %v, want [%v]", ids, closing)
 	}
 	// The other type is untouched: an operation that updated every at-closure
-	// field everywhere would be a different, and wrong, operation.
+	// field everywhere would be a different, and wrong, operation. The Task's
+	// evidence still names the state the SEED gave it, which is its own
+	// workflow's terminal state and not the id above.
 	other := eoEffectiveField(t, db, eoTaskTypeKey, "evidence")
-	if s := strings.TrimSpace(string(other.RequiredAtStateIDs)); s != "" && s != "[]" && s != "null" {
-		t.Errorf("the Task's evidence was required at %s by a call naming the Assignment", s)
+	var otherIDs []uuid.UUID
+	if err := json.Unmarshal(other.RequiredAtStateIDs, &otherIDs); err != nil {
+		t.Fatalf("the Task's required_at_state_ids: %v", err)
+	}
+	if len(otherIDs) != 1 || otherIDs[0] == closing {
+		t.Errorf("the Task's evidence names %v; a call naming the Assignment must not have touched it", otherIDs)
 	}
 
 	// Fails closed on both halves.
 	if err := eoRequireAtClosureState(db, eoAssignmentTypeKey, uuid.Nil); err == nil {
 		t.Error("the nil state was accepted; it would require nothing and report success")
 	}
-	if err := eoRequireAtClosureState(db, eoDirectiveTypeKey, closing); err == nil {
-		t.Error("a type with no at-closure field was accepted")
+	// A type with NO closure artefact at all: neither a matrix "Yes at
+	// closure" cell nor a "Yes" row Task A5 resolved as one.
+	if err := eoRequireAtClosureState(db, eoObjectionTypeKey, closing); err == nil {
+		t.Error("a type with no closure artefact was accepted")
 	}
 }
 
@@ -3616,4 +3680,15 @@ func TestEoBlockedTransitionNamesATransitionItsWorkflowHas(t *testing.T) {
 	if bound == 0 {
 		t.Logf("vacuous as expected: %d link type(s) name a blocked transition and no workflow is bound to any of their parent types yet. Task A5 binds them, and this test becomes binding then.", named)
 	}
+}
+
+// eoIsResolvedClosureArtefact reports whether Task A5 resolved this matrix
+// "Yes" cell as required at closure instead of at creation.
+func eoIsResolvedClosureArtefact(typeKey, matrixKey string) bool {
+	for _, a := range eoClosureArtefacts {
+		if a.TypeKey == typeKey && a.FieldKey == matrixKey {
+			return true
+		}
+	}
+	return false
 }

@@ -93,6 +93,7 @@ func eoSeedTables() []any {
 		&models.WorkflowState{},
 		&models.WorkflowTransition{},
 		&models.TransitionRequirement{},
+		&models.TransitionAction{},
 		&models.TransitionFieldChange{},
 		&models.EORecordType{},
 		&models.EOFieldDef{},

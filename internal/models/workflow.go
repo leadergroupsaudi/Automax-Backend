@@ -147,6 +147,24 @@ type WorkflowState struct {
 	NewIncidentEmailTemplateCode string `gorm:"size:100" json:"new_incident_email_template_code"`
 	NewIncidentSMSTemplateCode   string `gorm:"size:100" json:"new_incident_sms_template_code"`
 
+	// EOClientUnconfirmed marks a state whose shape was DERIVED rather than
+	// transcribed. The seven Executive Office Core Function Flows are not in
+	// this repository, so the EO pilot's state machines were built from the
+	// client's field matrix — its "Yes at closure" cells, its CFF step
+	// numbers and its per-type prose — and nobody has signed them off. The
+	// flag is what makes that gap a QUERY (database.eoUnconfirmedStateMachines)
+	// rather than a memory, exactly as eo_field_defs.ar_untranslated does for
+	// the Arabic labels.
+	//
+	// It is write-only by design, like ar_untranslated: no handler sets it and
+	// it is absent from WorkflowStateCreateRequest and
+	// WorkflowStateUpdateRequest, so a designer save cannot clear it silently
+	// and the sign-off round works from the whole marked set. The column is
+	// additive and defaults false, exactly as Workflow.RecordTypeID and
+	// WorkflowTransition.EOActorRules are, so no incident workflow is changed
+	// by it.
+	EOClientUnconfirmed bool `gorm:"column:eo_client_unconfirmed;not null;default:false;index" json:"eo_client_unconfirmed"`
+
 	SortOrder int            `gorm:"default:0" json:"sort_order"`
 	IsActive  bool           `gorm:"default:true" json:"is_active"`
 	CreatedAt time.Time      `json:"created_at"`
@@ -243,17 +261,22 @@ type WorkflowTransition struct {
 
 	// IsRejection marks this transition as a rejection action.
 	// When true, executing this transition will create an IncidentRejectionLog record.
-	IsRejection     bool           `gorm:"default:false" json:"is_rejection"`
-	IsNotBelong     bool           `gorm:"default:false" json:"is_not_belong"`    // IsNotBelong marks this transition as a "Not Belong" closure action.
-	IsMissingInfo   bool           `gorm:"default:false" json:"is_missing_info"`  // IsMissingInfo marks this transition as a "Missing Incident Information" closure action — triggers SMS to citizen.
-	IsReopen        bool           `gorm:"default:false" json:"is_reopen"`        // IsReopen marks this transition as a reopen action — used by AI Quality Audit to identify the reopen transition.
-	RequireAssignee bool           `gorm:"default:false" json:"require_assignee"` // RequireAssignee: when true, only the assigned user(s) can execute this transition
-	IsActive        bool           `gorm:"default:true" json:"is_active"`
-	IsFinalClose    bool           `gorm:"default:false" json:"is_final_close"` // IsFinalClose marks this transition as the definitive closure from a Ready-to-Close state — triggers SMS to citizen.
-	SortOrder       int            `gorm:"default:0" json:"sort_order"`
-	CreatedAt       time.Time      `json:"created_at"`
-	UpdatedAt       time.Time      `json:"updated_at"`
-	DeletedAt       gorm.DeletedAt `gorm:"index" json:"-"`
+	IsRejection     bool `gorm:"default:false" json:"is_rejection"`
+	IsNotBelong     bool `gorm:"default:false" json:"is_not_belong"`    // IsNotBelong marks this transition as a "Not Belong" closure action.
+	IsMissingInfo   bool `gorm:"default:false" json:"is_missing_info"`  // IsMissingInfo marks this transition as a "Missing Incident Information" closure action — triggers SMS to citizen.
+	IsReopen        bool `gorm:"default:false" json:"is_reopen"`        // IsReopen marks this transition as a reopen action — used by AI Quality Audit to identify the reopen transition.
+	RequireAssignee bool `gorm:"default:false" json:"require_assignee"` // RequireAssignee: when true, only the assigned user(s) can execute this transition
+	IsActive        bool `gorm:"default:true" json:"is_active"`
+	IsFinalClose    bool `gorm:"default:false" json:"is_final_close"` // IsFinalClose marks this transition as the definitive closure from a Ready-to-Close state — triggers SMS to citizen.
+
+	// EOClientUnconfirmed marks a transition the EO pilot DERIVED rather than
+	// transcribed; see WorkflowState.EOClientUnconfirmed for the whole of it.
+	EOClientUnconfirmed bool `gorm:"column:eo_client_unconfirmed;not null;default:false;index" json:"eo_client_unconfirmed"`
+
+	SortOrder int            `gorm:"default:0" json:"sort_order"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 func (t *WorkflowTransition) BeforeCreate(tx *gorm.DB) error {

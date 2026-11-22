@@ -545,6 +545,14 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
 		"services.NewEOTransitionServiceWithSLA(",
+		// Task A5's `close_parent` action — the client's "a Decision Record
+		// closes its study", "an Outgoing Reply closes its letter" — runs a
+		// transition on the PARENT through the transition service, which
+		// already holds the executor. The cycle is closed by this setter, and
+		// without the call the action fails on every record. Nothing else in
+		// the suite reads main.go, so this line is the only thing that would
+		// notice it going missing.
+		"eoActionExecutor.SetTransitions(eoTransitionService)",
 		"services.NewEOEscalationHandler(",
 		"services.NewEOTimerRouter(",
 		// The router's map must be KEYED on the exported constant the

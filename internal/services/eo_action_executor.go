@@ -55,6 +55,18 @@ type EOActionNotifier interface {
 // the EOTransitionActionDispatcher task 14's service calls after its commit.
 type EOActionExecutor interface {
 	ExecuteActions(ctx context.Context, rec *models.EORecord, transition *models.WorkflowTransition, performedBy *models.User) error
+	// SetTransitions closes the construction cycle: the transition service
+	// takes this executor as its post-commit dispatcher, and the
+	// `close_parent` action needs the transition service back, to move the
+	// PARENT record through its own workflow with every rule the engine has
+	// — blocking children, requirements, actor roles, SLA clocks and history
+	// — rather than writing a state id behind their backs.
+	//
+	// cmd/server/main.go calls it immediately after building the transition
+	// service. Until it is called, a close_parent action FAILS LOUDLY (it is
+	// logged and written to the record's history) instead of quietly doing
+	// nothing.
+	SetTransitions(transitions EOTransitionService)
 }
 
 type eoActionExecutor struct {
@@ -65,6 +77,15 @@ type eoActionExecutor struct {
 	depts      repository.DepartmentRepository
 	notifier   EOActionNotifier
 	httpClient *http.Client
+
+	// transitions runs a transition on ANOTHER record — the parent, for
+	// close_parent. It is set after construction rather than injected,
+	// because the transition service already holds this executor (it is its
+	// post-commit dispatcher), so the two cannot both be built with the other
+	// in hand. A nil one is an ERROR at dispatch, never a silent skip: the
+	// whole point of the action is that a governance rule stops being
+	// something nobody runs.
+	transitions EOTransitionService
 
 	// async tracks IsAsync actions so a test can wait for them.
 	async sync.WaitGroup
@@ -170,6 +191,10 @@ func eoNewWebhookClient() *http.Client {
 
 func (e *eoActionExecutor) wait() { e.async.Wait() }
 
+func (e *eoActionExecutor) SetTransitions(transitions EOTransitionService) {
+	e.transitions = transitions
+}
+
 // ExecuteActions runs the transition's active actions in ExecutionOrder.
 func (e *eoActionExecutor) ExecuteActions(ctx context.Context, rec *models.EORecord, transition *models.WorkflowTransition, performedBy *models.User) error {
 	if rec == nil || transition == nil || len(transition.Actions) == 0 {
@@ -237,6 +262,8 @@ func (e *eoActionExecutor) dispatch(ctx context.Context, action *models.Transiti
 		return e.executeFieldUpdate(ctx, action, rec, performedBy)
 	case "spawn_record":
 		return e.executeSpawnRecord(ctx, action, rec, transition, performedBy)
+	case "close_parent":
+		return e.executeCloseParent(ctx, action, rec, transition, performedBy)
 	default:
 		return fmt.Errorf("unknown action type: %s", action.ActionType)
 	}
@@ -812,6 +839,14 @@ func (e *eoActionExecutor) spawnedChild(ctx context.Context, rec *models.EORecor
 }
 
 func (e *eoActionExecutor) recordSpawnFailure(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User, cause error) {
+	e.recordActionFailure(ctx, action, rec, transition, by,
+		fmt.Sprintf("spawn_record action %q did not create a record: %v", action.Name, cause))
+}
+
+// recordActionFailure writes the note on the record itself, so the person
+// looking at it sees that something the configuration promised did not happen.
+// A log line alone is invisible to them.
+func (e *eoActionExecutor) recordActionFailure(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User, note string) {
 	var tid *uuid.UUID
 	if transition != nil {
 		id := transition.ID
@@ -822,12 +857,125 @@ func (e *eoActionExecutor) recordSpawnFailure(ctx context.Context, action *model
 		RecordTypeID:   rec.RecordTypeID,
 		TransitionID:   tid,
 		PerformedByID:  eoSentBy(by),
-		Comment:        fmt.Sprintf("spawn_record action %q did not create a record: %v", action.Name, cause),
+		Comment:        note,
 		OldValues:      datatypes.JSON(`{}`),
 		NewValues:      datatypes.JSON(`{}`),
 		IsSystemAction: true,
 	})
 	if err != nil {
-		log.Printf("eo: record %s: could not record the failed spawn_record in its history: %v", rec.Reference, err)
+		log.Printf("eo: record %s: could not record the failed action %q in its history: %v", rec.Reference, action.Name, err)
 	}
+}
+
+// ── close_parent ────────────────────────────────────────────────────────────
+
+// eoCloseParentConfig is the action's configuration. It must stay in step with
+// database.eoCloseParentConfig, which writes it.
+type eoCloseParentConfig struct {
+	// LinkType names WHICH parent: a record may carry several links, and the
+	// client's rule is about the one it hangs off.
+	LinkType string `json:"link_type"`
+	// Transition is the Code of the transition to run on the parent's own
+	// workflow.
+	Transition string `json:"transition"`
+}
+
+// executeCloseParent is the client's "Closes the parent": a Decision Record
+// closes its Draft Decision Study (matrix:165) and an Outgoing Reply closes
+// its Incoming Correspondence (matrix:311).
+//
+// WHY IT IS AN ACTION AND NOT A LINK-TYPE FLAG. No field of models.EOLinkType
+// closes anything, and the nearest one — BlocksParentClosure — is the exact
+// INVERSION of the client's sentence: it would make a decision record hold its
+// study open for ever. Spec §7.8's transition action is the mechanism that can
+// express it, and this is it.
+//
+// IT RUNS A REAL TRANSITION, through EOTransitionService.Execute, rather than
+// writing a state id. That is the whole design: the parent's own blocking
+// children, requirements, allowed roles, field changes, SLA timers and history
+// all apply. A letter with an open referral therefore REFUSES to be closed by
+// its reply, which is both link rules holding at once and is what the client's
+// two sentences together mean.
+//
+// IT IS IDEMPOTENT: an already-closed parent is a no-op, so a transition
+// dispatched twice does not fail the second time.
+//
+// EVERY REFUSAL IS LOUD. The error is returned (runAction logs it) AND a note
+// is written to the CHILD's history, because a parent that silently stayed
+// open is precisely the failure this action exists to prevent, and the person
+// looking at the record is the one who needs to know.
+func (e *eoActionExecutor) executeCloseParent(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User) error {
+	err := e.closeParent(ctx, action, rec, by)
+	if err != nil {
+		log.Printf("eo: record %s (%s): close_parent %q DID NOT CLOSE THE PARENT: %v", rec.Reference, rec.ID, action.Name, err)
+		e.recordActionFailure(ctx, action, rec, transition, by,
+			fmt.Sprintf("close_parent action %q did not close the parent record: %v", action.Name, err))
+	}
+	return err
+}
+
+func (e *eoActionExecutor) closeParent(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, by *models.User) error {
+	var cfg eoCloseParentConfig
+	if err := json.Unmarshal([]byte(action.Config), &cfg); err != nil {
+		return fmt.Errorf("invalid close_parent config: %w", err)
+	}
+	if strings.TrimSpace(cfg.LinkType) == "" {
+		return errors.New("close_parent config names no link type, so it cannot say which parent")
+	}
+	if strings.TrimSpace(cfg.Transition) == "" {
+		return errors.New("close_parent config names no transition")
+	}
+	if e.transitions == nil {
+		return errors.New("close_parent needs the transition service and none is set; cmd/server/main.go must call SetTransitions after building it")
+	}
+	if by == nil {
+		return errors.New("close_parent has no actor, and a transition on a statutory register records who ran it")
+	}
+
+	links, err := e.records.LinksFrom(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("read the links of %s: %w", rec.Reference, err)
+	}
+	var parentID, parentTypeID uuid.UUID
+	for _, l := range links {
+		if l.LinkTypeKey == cfg.LinkType {
+			parentID, parentTypeID = l.ToRecordID, l.ToRecordTypeID
+			break
+		}
+	}
+	if parentID == uuid.Nil {
+		return fmt.Errorf("carries no %q link, so there is no parent to close", cfg.LinkType)
+	}
+	parent, err := e.records.GetByID(ctx, parentID, parentTypeID)
+	if err != nil {
+		return fmt.Errorf("read the parent %s: %w", parentID, err)
+	}
+	if parent == nil {
+		return fmt.Errorf("the parent %s no longer exists", parentID)
+	}
+	if parent.ClosedAt != nil {
+		log.Printf("eo: record %s: close_parent %q skipped, the parent %s is already closed", rec.Reference, action.Name, parent.Reference)
+		return nil
+	}
+
+	available, err := e.transitions.AvailableTransitions(ctx, parent, by)
+	if err != nil {
+		return fmt.Errorf("list the transitions out of %s's current state: %w", parent.Reference, err)
+	}
+	for i := range available {
+		if available[i].Code != cfg.Transition {
+			continue
+		}
+		if _, err := e.transitions.Execute(ctx, parent, available[i].ID, by, models.EOTransitionInput{
+			Comment: fmt.Sprintf("Closed by %s (%s): the client's field matrix says this record closes its parent.", rec.Reference, action.Name),
+		}); err != nil {
+			return fmt.Errorf("run transition %q on the parent %s: %w", cfg.Transition, parent.Reference, err)
+		}
+		return nil
+	}
+	codes := make([]string, len(available))
+	for i := range available {
+		codes[i] = available[i].Code
+	}
+	return fmt.Errorf("the parent %s offers this actor %v out of its current state and not %q", parent.Reference, codes, cfg.Transition)
 }

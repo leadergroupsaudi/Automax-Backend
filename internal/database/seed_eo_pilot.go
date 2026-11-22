@@ -247,6 +247,7 @@ func seedEOPilot(db *gorm.DB) {
 	} else if len(set) > 0 {
 		log.Printf("EO pilot: %d field labels await Arabic sign-off (eo_field_defs.ar_untranslated)", len(set))
 	}
+	eoLogUnconfirmedStateMachines(db)
 }
 
 // eoPilotStep is one unit of the pilot seed.
@@ -288,6 +289,13 @@ var eoPilotSteps = []eoPilotStep{
 	{"seed_root_types", eoSeedRootTypes},
 	{"seed_child_types", eoSeedChildTypes},
 	{"seed_link_types", eoSeedLinkTypes},
+	// ADDENDUM 1: the workflows MUST be seeded from here. Task A4's
+	// TestEoBlockedTransitionNamesATransitionItsWorkflowHas calls
+	// seedEOPilot and checks only the workflows that call creates, so a
+	// workflow seeded from a function this list does not reach would leave
+	// that guard vacuous for ever — and the guard exists precisely to catch a
+	// raise-to-H.E. transition seeded under the wrong code.
+	{eoSeedWorkflowsStepKey, eoSeedPilotWorkflows},
 }
 
 // eoPilotSeedNeeded is the fast path: one count of applied-step rows.
@@ -783,12 +791,11 @@ var eoDraftLockedFieldKeys = []string{"draft_text", "draft_file"}
 // that CHANGES their stored value (an unchanged echo is still accepted, so a
 // client may resend a whole form).
 //
-// IT HAS NO PRODUCTION CALLER IN THIS TASK, and that is an ordering fact, not
-// an oversight: IsLockedAfterStateID names a workflow state, the Draft
-// Decision Study's workflow and its "submitted" state are TASK A5's, and no
-// state exists to point at while this seed runs. The fields are therefore
-// seeded here unlocked and A5 calls this inside its own step. Until it does,
-// the two fields are editable — the lock is configured by nobody.
+// ITS PRODUCTION CALLER IS TASK A5's eoSeedOnePilotWorkflow, with the id of
+// the Draft Decision Study's `submitted` state — the matrix's "stamped and
+// locked on receipt". It had none when A2 shipped it, which was an ordering
+// fact rather than an oversight: IsLockedAfterStateID names a workflow state
+// and no state for that type existed while A2's seed ran.
 //
 // It fails closed on both halves: the nil state, and a row count other than
 // the number of keys (a renamed or missing field would otherwise lock nothing
@@ -886,8 +893,12 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 					`{"value":"direct_manager","label":"Direct manager","label_ar":"Direct manager"},` +
 					`{"value":"grade_above","label":"Grade above","label_ar":"Grade above"},` +
 					`{"value":"executive_office","label":"Executive Office","label_ar":"Executive Office"}]}`},
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "verification_notes", label: "Verification notes",
-				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
 		},
 		narrowed: []eoInheritedNarrowing{
 			{matrixKey: "due_date", required: models.EORequiredAlways},
@@ -954,18 +965,30 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 					`{"value":"return_for_clarification","label":"Return for clarification","label_ar":"Return for clarification"}]}`},
 			{matrixKey: "study_report", label: "Study report",
 				kind: models.EOKindFile, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "he_decision", label: "H.E. decision",
-				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
+				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAtState,
 				config: `{"options":[` +
 					`{"value":"approved_original","label":"Approved original","label_ar":"Approved original"},` +
 					`{"value":"approved_redrafted","label":"Approved redrafted","label_ar":"Approved redrafted"},` +
 					`{"value":"amended_by_he","label":"Amended by H.E.","label_ar":"Amended by H.E."},` +
 					`{"value":"rejected","label":"Rejected","label_ar":"Rejected"},` +
 					`{"value":"returned_for_further_study","label":"Returned for further study","label_ar":"Returned for further study"}]}`},
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "he_reason", label: "H.E. reason",
-				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "decision_date", label: "Decision date",
-				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
 		},
 	},
 	{
@@ -1627,10 +1650,18 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			// "Verified by and on". Assignment's matrix gives two rows with
 			// two kinds, User and Date, and the row-count guard reads the
 			// document as written.
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "verified_by", label: "Verified by",
-				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindUser, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "verified_on", label: "Verification date",
-				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
 		},
 	},
 
@@ -1846,8 +1877,12 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			// Date" — so one field of models.EOKindUserDate, the §7.3
 			// primitive, keyed on the first of the two keys the cell names,
 			// exactly as the base type's created_by_id is.
+			// ADDENDUM 4 (Task A5): a CLOSURE ARTEFACT, not a creation
+			// field. The matrix marks it "Yes"; eoClosureArtefacts says why
+			// this is required at the closing state instead, and
+			// eoRequireAtClosureState names that state.
 			{matrixKey: "verified_by", label: "Verified by and on",
-				kind: models.EOKindUserDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+				kind: models.EOKindUserDate, provenance: models.EOProvenanceUser, required: models.EORequiredAtState},
 		},
 		narrowed: []eoInheritedNarrowing{
 			{matrixKey: "due_date", required: models.EORequiredAlways},
@@ -1872,12 +1907,17 @@ var eoAtClosureFields = []eoAtClosureField{
 	{eoTaskTypeKey, "evidence"},
 }
 
-// eoRequireAtClosureState points the eoAtClosureFields of one type at the
+// eoRequireAtClosureState points the CLOSURE ARTEFACTS of one type at the
 // workflow state that closes it, after which services.ValidateRecordValues
-// requires them of any transition INTO that state.
+// requires them of any transition INTO that state. The set is
+// eoClosureArtefactFieldKeys: the matrix's own "Yes at closure" cells
+// (eoAtClosureFields) plus the "Yes" rows Task A5 resolved as closure
+// artefacts (eoClosureArtefacts).
 //
-// IT HAS NO PRODUCTION CALLER IN THIS TASK, and that is an ordering fact
-// rather than an oversight — the same one eoLockDraftFieldsAfterState records.
+// ITS PRODUCTION CALLER IS TASK A5's eoSeedOnePilotWorkflow, which calls it
+// once per type that declares a closureState, with the id of the state the
+// terminal transition enters. The paragraph below is the position it was
+// shipped in and is kept because it says what the empty state list MEANT.
 // required_at_state_ids names workflow STATES; the workflows are Task A5's and
 // no state exists to point at while this seed runs. UNTIL A5 CALLS IT THE TWO
 // FIELDS ARE REQUIRED BY NOBODY: ValidateRecordValues reads an empty
@@ -1894,14 +1934,9 @@ func eoRequireAtClosureState(tx *gorm.DB, typeKey string, stateID uuid.UUID) err
 	if stateID == uuid.Nil {
 		return fmt.Errorf("require the at-closure fields of %q: no state given; a nil state would require nothing", typeKey)
 	}
-	var keys []string
-	for _, f := range eoAtClosureFields {
-		if f.TypeKey == typeKey {
-			keys = append(keys, f.FieldKey)
-		}
-	}
+	keys := eoClosureArtefactFieldKeys(typeKey)
 	if len(keys) == 0 {
-		return fmt.Errorf("record type %q has no fields marked \"Yes at closure\" in the client's matrix", typeKey)
+		return fmt.Errorf("record type %q has no closure artefacts: neither a \"Yes at closure\" cell in the client's matrix (eoAtClosureFields) nor a \"Yes\" row this task resolved as one (eoClosureArtefacts)", typeKey)
 	}
 	var ty models.EORecordType
 	if err := tx.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
