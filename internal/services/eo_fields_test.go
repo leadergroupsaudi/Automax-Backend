@@ -162,30 +162,21 @@ func (s *eoStubEval) EvalBool(expr string, env map[string]any) (bool, error) {
 	return s.results[expr], nil
 }
 
-func eoValidate(t *testing.T, fields []models.EOFieldDef, rec *models.EORecord, values map[string]any, target *uuid.UUID, entered map[uuid.UUID]bool, ev FormulaEvaluator) map[string]string {
+func eoValidate(t *testing.T, fields []models.EOFieldDef, stored map[string]any, values map[string]any, target *uuid.UUID, entered map[uuid.UUID]bool, ev FormulaEvaluator) map[string]string {
 	t.Helper()
-	errs, err := ValidateRecordValues(fields, rec, values, target, entered, ev)
+	errs, err := ValidateRecordValues(fields, stored, values, target, entered, ev)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return errs
 }
 
-func eoRecWith(t *testing.T, vals map[string]any) *models.EORecord {
-	t.Helper()
-	b, err := json.Marshal(vals)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &models.EORecord{Values: b}
-}
-
 func TestValidateRequiredModeAlways(t *testing.T) {
 	f := []models.EOFieldDef{{Key: "title", Label: "Title", RequiredMode: models.EORequiredAlways}}
-	rec := eoRecWith(t, map[string]any{"title": "stored"})
+	rec := map[string]any{"title": "stored"}
 	tests := []struct {
 		name    string
-		rec     *models.EORecord
+		rec     map[string]any
 		values  map[string]any
 		wantErr bool
 	}{
@@ -206,6 +197,20 @@ func TestValidateRequiredModeAlways(t *testing.T) {
 				t.Fatalf("errs = %v, want error %v", errs, tc.wantErr)
 			}
 		})
+	}
+}
+
+// An inherited base field (stored in a real column, flattened into stored by
+// the caller) that is always-required must not be reported missing on a
+// partial update that does not resend it.
+func TestValidateStoredValuesSatisfyRequiredOnPartialUpdate(t *testing.T) {
+	f := []models.EOFieldDef{{Key: "subject_ar", Label: "Subject", RequiredMode: models.EORequiredAlways}}
+	stored := map[string]any{"subject_ar": "موضوع"}
+	if errs := eoValidate(t, f, stored, map[string]any{"other": 1}, nil, nil, nil); len(errs) != 0 {
+		t.Fatalf("errs = %v, want none", errs)
+	}
+	if errs := eoValidate(t, f, nil, map[string]any{}, nil, nil, nil); len(errs) != 1 {
+		t.Fatalf("create without subject_ar: errs = %v, want one", errs)
 	}
 }
 
@@ -275,7 +280,7 @@ func TestValidateRequiredModeConditional(t *testing.T) {
 	})
 	t.Run("env merges stored with submitted, submitted wins", func(t *testing.T) {
 		ev := &eoStubEval{results: map[string]bool{"overdue": false}}
-		rec := eoRecWith(t, map[string]any{"a": "old", "b": "kept"})
+		rec := map[string]any{"a": "old", "b": "kept"}
 		eoValidate(t, f, rec, map[string]any{"a": "new"}, nil, nil, ev)
 		if ev.lastEnv["a"] != "new" || ev.lastEnv["b"] != "kept" {
 			t.Fatalf("env = %v", ev.lastEnv)
@@ -344,7 +349,7 @@ func TestValidateRejectsWritesToDerivedAndAutoFields(t *testing.T) {
 func TestValidateRespectsIsLockedAfter(t *testing.T) {
 	submitted, other := uuid.New(), uuid.New()
 	f := []models.EOFieldDef{{Key: "draft_text", IsLockedAfterStateID: &submitted}}
-	rec := eoRecWith(t, map[string]any{"draft_text": "original", "n": 3})
+	rec := map[string]any{"draft_text": "original", "n": 3}
 	n := []models.EOFieldDef{{Key: "n", IsLockedAfterStateID: &submitted}}
 	passed := map[uuid.UUID]bool{submitted: true}
 	tests := []struct {
@@ -365,10 +370,7 @@ func TestValidateRespectsIsLockedAfter(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// rec.StateID is deliberately an earlier state: only history counts.
-			r := *rec
-			r.StateID = &other
-			errs := eoValidate(t, tc.fields, &r, tc.values, nil, tc.entered, nil)
+			errs := eoValidate(t, tc.fields, rec, tc.values, nil, tc.entered, nil)
 			if len(errs) > 1 || (len(errs) == 1) != tc.wantErr {
 				t.Fatalf("errs = %v, want error %v", errs, tc.wantErr)
 			}

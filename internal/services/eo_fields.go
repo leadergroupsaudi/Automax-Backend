@@ -105,8 +105,14 @@ type FormulaEvaluator interface {
 // valid. The error return is for failures of the machinery itself (an
 // evaluator error, a malformed field definition), never for invalid input.
 //
-// values is the submitted payload, possibly partial. rec is the stored record,
-// or nil on create. For requiredness a field's effective value is the
+// values is the submitted payload, possibly partial.
+//
+// stored is the record's current effective values keyed by field key, nil or
+// empty on create. It spans BOTH the real eo_records columns (the inherited
+// base fields such as subject_ar, priority, due_date) and the jsonb values
+// bag; the caller flattens them. Do not read rec.Values here: that would make
+// every inherited field look empty. This function stays ignorant of storage
+// layout on purpose. For requiredness a field's effective value is the
 // submitted one if its key is present, else the stored one. An explicit nil
 // (or a blank string, or an empty list) is empty, exactly as an absent key
 // with nothing stored is.
@@ -118,19 +124,12 @@ type FormulaEvaluator interface {
 // enteredStateIDs is every state the record has ever entered, from history.
 func ValidateRecordValues(
 	fields []models.EOFieldDef,
-	rec *models.EORecord,
+	stored map[string]any,
 	values map[string]any,
 	targetStateID *uuid.UUID,
 	enteredStateIDs map[uuid.UUID]bool,
 	eval FormulaEvaluator,
 ) (map[string]string, error) {
-	var stored map[string]any
-	if rec != nil && len(rec.Values) > 0 {
-		if err := json.Unmarshal(rec.Values, &stored); err != nil {
-			return nil, fmt.Errorf("validate record values: decode stored values: %w", err)
-		}
-	}
-
 	errs := map[string]string{}
 	var env map[string]any // built lazily, only if a rule needs it
 
