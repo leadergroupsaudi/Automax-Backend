@@ -32,6 +32,7 @@ type Config struct {
 	Nasaq                       NasaqConfig
 	AutoAssign                  AutoAssignConfig
 	GoalManagement              GoalManagementConfig
+	EOPlatform                  EOPlatformConfig
 	License                     LicenseConfig
 	Integration                 IntegrationConfig
 	FinalCloseWhatsAppFeedback  FinalCloseWhatsAppFeedbackConfig
@@ -194,6 +195,15 @@ type AutoAssignConfig struct {
 
 type GoalManagementConfig struct {
 	Enabled bool // env: GOAL_MANAGEMENT
+}
+
+// EOPlatformConfig gates the Executive Office record platform's SEED. The
+// tables themselves are created on every boot by migrations.MigrateEOPlatform
+// and the HTTP surface is gated by the eo_platform licence; this flag only
+// decides whether database.Seed writes the base record type, the smoke types
+// and their per-type permission codes.
+type EOPlatformConfig struct {
+	Enabled bool // env: EO_PLATFORM
 }
 
 type DocumentaConfig struct {
@@ -537,6 +547,9 @@ func Load() *Config {
 		},
 		GoalManagement: GoalManagementConfig{
 			Enabled: getEnvAsBool("GOAL_MANAGEMENT", false),
+		},
+		EOPlatform: EOPlatformConfig{
+			Enabled: getEnvAsBool("EO_PLATFORM", false),
 		},
 		License: LicenseConfig{
 			EncryptionKey:     getEnv("LICENSE_ENCRYPTION_KEY", ""),

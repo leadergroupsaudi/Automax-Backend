@@ -1140,6 +1140,17 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		}
 	}
 
+	// The EO platform's base configuration: the abstract base record type
+	// with the field matrix's 17 inherited fields, the smoke types that
+	// exercise the engine, their link type and workflows, and the per-type
+	// permission codes of spec §7.11. It runs HERE, after the role block
+	// above, because the smoke workflows attach the executive_office role to
+	// their closing transition and the per-type codes are granted to admin and
+	// executive_office. Behind EO_PLATFORM: a deployment that has not bought
+	// the platform gets none of it. The TABLES are created on every boot
+	// regardless, by migrations.MigrateEOPlatform in Migrate.
+	seedEOPlatformWhenEnabled(db, cfg.EOPlatform.Enabled)
+
 	// KPI Owner and L1 Reviewer — global roles used by the KPI Workflow's
 	// Draft→Reviewed→Approved→Active→Closed lifecycle transitions
 	// (kpi_dictionary_workflow_seed.go's AllowedRoles). Granted kpi:view/
