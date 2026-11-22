@@ -941,6 +941,173 @@ out of it, and none of them lives anywhere else.
   disables the type.
 
 
+### Opened by Task A7 (the transition actions, and Plan 1's four deferred decisions)
+
+Task A7 seeded the pilot's only `spawn_record` action — EO-DIR's Directive →
+Task, on `assign_directly` — and answered the four decisions Plan 1's ledger
+deferred to Plan 2 **by name**. Three are answered "the pilot does not need
+it"; the reason is what a later plan must check against its own configuration,
+so each is written out with the condition that would reopen it.
+
+**THE ANSWERS.**
+
+- **Re-approval: NOT NEEDED, AND THE PILOT CANNOT REACH IT AT ALL.** Plan 1
+  made a sealed approval stamp refuse a second stamp and deferred modelling
+  re-approval "because how many approval rounds a record genuinely takes is a
+  CFF question that the pilot seeding will answer". The pilot's answer is in
+  two parts. First, **`approval` is enabled on no pilot type** (Task A6,
+  `database.eoCapabilitiesNotEnabled`, with its own deadline — before the
+  pilot's first Outgoing Reply record), so `services.eoApprovalCapability`
+  never runs and the sealed stamp is never written: there is no first stamp to
+  refuse a second. Second, and independently of that, **no pilot type is
+  approved twice on the same record.** The two sign-offs the matrix names are
+  Execution Plan's `approved_by`/`approval_date` (2.2) and Outgoing Reply's
+  `approved_by`/`delegation_note` (6.2), and both of their A5 machines run
+  `drafting → approved` once with NO return transition. EO-DRF does return a
+  draft for revision in the client's vocabulary — `recommendation` has
+  `return_for_clarification` and `he_decision` has
+  `returned_for_further_study` — but those are **recorded outcomes on fields**,
+  not states, and A5's machine has no transition back out of `with_he`; a
+  returned draft is a new Draft Decision Study. The replan case is the same
+  shape read from the other end: `supersedes` and the per-parent sequence make
+  a replan a SECOND Execution Plan (`…-P2`), each approved once, rather than
+  one plan approved twice. **WHAT REOPENS IT:** a return transition into a
+  state an approval has already passed, on a type that enables `approval` —
+  i.e. the first type to get both. Distinct stamp keys per round is then the
+  shape, not a second stamp under one key.
+
+- **`cascade_sensitivity` on update: NOT NEEDED, AND EXTENDING IT WOULD BE
+  WORSE THAN NOT EXTENDING IT.** Plan 1 applies the cascade at creation only,
+  and §7.11 treats the resulting gap as a classification defect rather than an
+  access leak. The decisive fact is Task A4's: **the flag is `false` on all
+  eight pilot link types** (`database.eoLinkRuleDecisions`), so there is no
+  cascade in the pilot to extend to the update path, and the re-labelling sweep
+  the ledger asked for has no descendant to sweep. The reason A4 left it off is
+  the reason not to extend it either: `services.applyLinkRules` assigns
+  `rec.Sensitivity = parent.Sensitivity` **outright**
+  (internal/services/eo_record_service.go:847), so a Confidential child under
+  an Internal parent is silently DOWNGRADED — the opposite of what §7.6's
+  sentence is for. Running that on every update would turn a one-off
+  mislabelling at creation into one repeated on every save. **THE ORDER THE
+  WORK HAS TO HAPPEN IN, and it is not the order the ledger implied:** (1) the
+  engine's cascade is made monotonic — raise only, never lower; (2) the client
+  says whether a referral of a confidential letter is confidential; (3) only
+  then does update-time cascade plus a re-labelling sweep mean anything. Doing
+  (3) first spreads a lossy control.
+
+- **`spawned_by_action_id`: NOT NEEDED, AND THE PILOT'S CONFIGURATION CANNOT
+  REACH EITHER CASE.** Plan 1's skip key is (parent, target type, link type),
+  narrowed by Task A4 to include the link type key, and two shapes still
+  collapse. **(a) Two `spawn_record` actions on one transition naming the same
+  target type through the same link type.** The pilot seeds exactly ONE spawn
+  action in total. **(b) A record re-entering a spawning transition through a
+  return loop.** The Directive's machine is a forward DAG — `recorded` reaches
+  `in_execution` by two disjoint paths and nothing returns — so
+  `assign_directly` can run at most once per record. Both halves are kept true
+  by `database.TestEoSpawnsCannotCollapseInThePilotConfiguration`, which counts
+  the seeded actions and walks `eoPilotWorkflows` for a path from a spawning
+  transition's `to` state back to its `from`. **WHAT REOPENS IT:** a second
+  spawn on one transition to one target type, or any return loop added to a
+  machine that carries a spawn. That test fails on the day either arrives, and
+  the column is then owed before the configuration is.
+  **ONE CONSEQUENCE THAT STANDS TODAY AND IS NOT A DEFECT:** the skip key does
+  not know who created a child, so a Directive that already carries a Task
+  SOMEBODY CREATED BY HAND will not spawn one — the executor logs a skip naming
+  the parent, target type and link type, and creates nothing. On the no-plan
+  path that is arguably right (the work is already tracked), but it is a
+  behaviour nobody configured and nobody is told about outside the log.
+
+- **`DefaultParentLinkTypeKey`: NOT NEEDED, BECAUSE THE PILOT GIVES A CLIENT NO
+  CHOICE TO MAKE.** The gap is that `ParentLinkTypeKey` comes from the create
+  request, so where two link types both permit (this child type → this parent
+  type) a client could name the one carrying no rule and skip the other's
+  derived deadline or `blocks_parent_closure`. In the pilot each of the eight
+  seeded link types names exactly ONE source type and no two name the same one,
+  so a child type has exactly one key to give and `services.ValidateLink`
+  refuses every other; `eoRecordService.Create` refuses a parent given with no
+  key at all. **The premise is pinned by Task A4's existing
+  `TestEoEveryPilotChildTypeHasOneParentLinkType`**, whose comment now says so —
+  A7 deliberately wrote no second test for it. **WHAT REOPENS IT:** a second
+  link type on any pilot child type. Note that the three link types with no
+  rule (`eo_decision_record_parent`, `eo_outgoing_reply_parent`,
+  `eo_execution_plan_stage_parent`) are not an instance of the gap: none is an
+  ALTERNATIVE to a ruled link type, and the first two have their rule as a
+  `close_parent` transition action instead.
+
+**WHAT A7 OPENED, which later plans must carry.**
+
+- **The spawning transition is a CONFIGURATION CHOICE, not a reading of the
+  matrix, and the client has not seen it.** The Directive's own matrix section
+  (matrix:68) has no spawned-task row; the authority for Directive → Task is
+  spec §12's mechanism table and §7.8's pattern. A7 put the action on
+  `assign_directly` — the Q1 = no step — because with no Execution Plan there
+  is nothing else in the configuration that carries the work, and put it NOT on
+  `plan_approved` because the plan, its stages and its assignments already are
+  that structure and already block the directive's closure. **The client must
+  confirm that a directive taking the PLANNED path opens no task of its own.**
+  It belongs in the §9 sign-off round with the derived state machines.
+
+- **EVERY DIRECTIVE ON THE NO-PLAN PATH NOW CARRIES A MANDATORY TASK.**
+  `eo_task_parent` sets `blocks_parent_closure` ("Always blocks its parent from
+  closing", matrix:520), so from the first boot after this change a directive
+  that ran `assign_directly` cannot be closed until the spawned task has its
+  evidence attached and is verified. That is the client's Task rule meeting the
+  client's Directive rule ("closes only when every child is closed"), and it is
+  what makes the spawn real rather than decorative — but it is a live behaviour
+  change on the pilot's root type, applied by configuration, and nobody has
+  signed it off.
+
+- **A SPAWN CAN FAIL EXACTLY THE WAY `close_parent` CAN, AND THE REMEDY IS THE
+  SAME ONE: A NOTE, NOT A RETRY.** The dispatch is post-commit and fire and
+  forget (`eoTransitionService.Execute`), so a failing spawn leaves a committed
+  transition and no child. `services.executeSpawnRecord` logs the failure and
+  writes a history entry **on the parent** naming the action and the reason, so
+  the directive carries the evidence; nothing re-runs it, and an operator must
+  create the task by hand or re-run the step. **A7 narrowed the likeliest cause
+  rather than accepting it**: `eoCheckSpawnFieldMap` refuses, at seed time, a
+  field map that does not fill every `always`-required user field of the target
+  type, or that fills one of them out of a source field that is not itself
+  `always`-required — which is the spawn's form of the rule A5's review derived
+  for `close_parent` ("what an action needs must be satisfiable from what the
+  record it runs on always has"). What remains are causes no configuration can
+  exclude: the target type deactivated in the designer, a database failure, a
+  capability refusing the child. **The retry is still the recorded engine item
+  from Task A5** — `models.EOTimer` has a router, a delay and a retry budget —
+  and it now covers two action types rather than one.
+
+- **A SPAWN'S FIELD MAP IS CHECKED AGAINST THE SEEDED FIELD DEFINITIONS, AND
+  THOSE MOVE.** `eoCheckSpawnFieldMap` and
+  `TestEoSpawnFieldMapUsesOnlyDefinedKeys` read the DATABASE, not the client's
+  matrix, because A6 removes a field definition in a seed step
+  (`related_refs`) and B2/B3 reserve values keys that no definition may name.
+  Anybody who removes or reserves a key on `eo_task` must look at the
+  Directive's field map in `database.eoPilotSpawnActions` in the same change:
+  an undefined key fails the WHOLE spawn, not the one key, and it fails
+  post-commit. The seed is fail-closed, so the failure surfaces as a rolled-back
+  boot rather than a silent gap — which is also why removing a mapped key makes
+  the pilot seed refuse to apply and several unrelated tests report "record
+  type \"eo_directive\" is not seeded".
+
+- **A TASK SPAWNED UNDER A DIRECTIVE STILL ROLLS UP TO NOTHING.** The matrix
+  says a Task's `completion_rate` "Rolls up to the parent's completion rate",
+  and the pilot's only roll-up is the Directive's over `eo_assignment`
+  (recorded at the close of Task A3). So on the no-plan path the directive's
+  `completion_rate` is derived from a set of Assignments that will usually be
+  empty while the work is really being tracked on the spawned Task. The spawn
+  makes that pre-existing gap reachable on the pilot's main path rather than
+  theoretical.
+
+- **THE §7.8 PATTERN IS NOW SET FOR THE THREE PROCESSES THAT INHERIT IT.**
+  On-air Commitment → Task (matrix:385), Visitor Direction → Task (matrix:512)
+  and Official Visit → Protocol Task reuse this shape, and in the matrix each
+  of them ALSO carries a `linked_task` field ("Link (Task) / Auto / Created in
+  the EO-DIR tracker"). The pilot's Directive has no such field, so nothing
+  here writes one — and `spawn_record` does not write a link FIELD on the
+  parent at all; it writes an `eo_record_links` row from the child. Whoever
+  configures the first of those three owes either an engine change (the spawn
+  records the child on the parent) or the honest statement that `linked_task`
+  is the link row, read back rather than stored.
+
 ---
 
 ## Deferred minors, by area
