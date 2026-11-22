@@ -45,8 +45,19 @@ type EOTimerRepository interface {
 	// it failed (terminal); otherwise it stays claimed and is re-delivered
 	// after the lease. It returns whether the timer is now failed.
 	RecordFailure(ctx context.Context, id uuid.UUID, msg string) (failed bool, err error)
+	// Release hands a claimed-but-unprocessed timer back (pending, the attempt
+	// uncounted). A worker that is shutting down uses it for the timers it
+	// claimed and never ran, so an orderly stop cannot walk a healthy timer
+	// towards failed.
+	Release(ctx context.Context, id uuid.UUID) error
 	// CancelForRecord cancels every timer of the record that has not fired.
 	CancelForRecord(ctx context.Context, recordID uuid.UUID) error
+	// WithTx returns a repository whose every call runs on tx. Schedule and
+	// CancelForRecord belong in the same transaction as the record change that
+	// motivates them: on the pooled handle a Schedule commits on its own
+	// connection and survives a rolled-back transition. Inside a transaction,
+	// use only the bound handle (a pooled call takes a second connection).
+	WithTx(tx *gorm.DB) EOTimerRepository
 }
 
 type eoTimerRepository struct {
@@ -57,12 +68,27 @@ func NewEOTimerRepository(db *gorm.DB) EOTimerRepository {
 	return &eoTimerRepository{db: db}
 }
 
+func (r *eoTimerRepository) WithTx(tx *gorm.DB) EOTimerRepository {
+	return &eoTimerRepository{db: tx}
+}
+
+func (r *eoTimerRepository) Release(ctx context.Context, id uuid.UUID) error {
+	if err := r.db.WithContext(ctx).Exec(
+		`UPDATE eo_timers SET status = 'pending', claimed_at = NULL, attempts = GREATEST(attempts - 1, 0)
+		 WHERE id = ? AND status = 'claimed'`, id).Error; err != nil {
+		return fmt.Errorf("release timer: %w", err)
+	}
+	return nil
+}
+
 func (r *eoTimerRepository) Schedule(ctx context.Context, t *models.EOTimer) error {
 	if t.FireAt.IsZero() || t.RecordID == uuid.Nil || t.RecordTypeID == uuid.Nil || t.CapabilityKey == "" {
 		return errors.New("schedule timer: fire_at, record_id, record_type_id and capability_key are required")
 	}
 	t.Status = models.EOTimerPending
 	t.ClaimedAt = nil
+	t.Attempts = 0
+	t.LastError = ""
 	if len(t.Payload) == 0 {
 		t.Payload = []byte(`{}`)
 	}
@@ -82,6 +108,11 @@ func (r *eoTimerRepository) Schedule(ctx context.Context, t *models.EOTimer) err
 // re-evaluating the LIMIT per outer row and claiming more than n timers (the
 // limit test caught exactly this). Materialising evaluates it once.
 //
+// The lease runs on the DATABASE clock (now(), interval), never the caller's:
+// with several replicas, one whose clock runs fast would otherwise compute a
+// cut-off that expires another replica's fresh claim and run the timer twice.
+// Only fire_at is compared with the caller's now, as the interface requires.
+//
 // Abandoned claims (older than the lease) are only reclaimed while attempts <
 // max. The `dead` CTE gives up on the rest, which covers a timer that kills its
 // worker before RecordFailure can run.
@@ -89,17 +120,17 @@ const eoClaimDueSQL = `
 WITH dead AS (
 	UPDATE eo_timers SET status = 'failed',
 		last_error = CASE WHEN last_error = '' THEN 'abandoned: worker did not finish' ELSE last_error END
-	WHERE status = 'claimed' AND claimed_at <= @stale AND attempts >= @max
+	WHERE status = 'claimed' AND claimed_at <= now() - make_interval(secs => @lease) AND attempts >= @max
 ),
 due AS MATERIALIZED (
 	SELECT id FROM eo_timers
 	WHERE fire_at <= @now
-	  AND (status = 'pending' OR (status = 'claimed' AND claimed_at <= @stale AND attempts < @max))
+	  AND (status = 'pending' OR (status = 'claimed' AND claimed_at <= now() - make_interval(secs => @lease) AND attempts < @max))
 	ORDER BY fire_at, id
 	LIMIT @limit
 	FOR UPDATE SKIP LOCKED
 )
-UPDATE eo_timers t SET status = 'claimed', claimed_at = @now, attempts = t.attempts + 1
+UPDATE eo_timers t SET status = 'claimed', claimed_at = now(), attempts = t.attempts + 1
 FROM due
 WHERE t.id = due.id
 RETURNING t.*`
@@ -111,7 +142,7 @@ func (r *eoTimerRepository) ClaimDue(ctx context.Context, now time.Time, limit i
 	var out []models.EOTimer
 	err := r.db.WithContext(ctx).Raw(eoClaimDueSQL, map[string]any{
 		"now":   now,
-		"stale": now.Add(-EOTimerClaimLease),
+		"lease": EOTimerClaimLease.Seconds(),
 		"limit": limit,
 		"max":   EOTimerMaxAttempts,
 	}).Scan(&out).Error

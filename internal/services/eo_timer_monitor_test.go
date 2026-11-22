@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
@@ -27,6 +28,7 @@ type eoFakeTimerRepo struct {
 	batches   []int
 	failures  map[uuid.UUID]string
 	failedNow bool
+	released  []uuid.UUID
 }
 
 func (f *eoFakeTimerRepo) Schedule(context.Context, *models.EOTimer) error { return nil }
@@ -67,6 +69,15 @@ func (f *eoFakeTimerRepo) RecordFailure(_ context.Context, id uuid.UUID, msg str
 	f.failures[id] = msg
 	return f.failedNow, nil
 }
+
+func (f *eoFakeTimerRepo) Release(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = append(f.released, id)
+	return nil
+}
+
+func (f *eoFakeTimerRepo) WithTx(*gorm.DB) repository.EOTimerRepository { return f }
 
 func (f *eoFakeTimerRepo) CancelForRecord(_ context.Context, id uuid.UUID) error {
 	f.mu.Lock()
@@ -207,3 +218,81 @@ func TestTimerMonitorRunOnceReportsClaimErrorAndNoHandler(t *testing.T) {
 
 // a compile-time check that the fake satisfies the real interface.
 var _ repository.EOTimerRepository = (*eoFakeTimerRepo)(nil)
+
+func TestTimerMonitorMarkFiredErrorBranches(t *testing.T) {
+	cases := []struct {
+		name    string
+		fireErr error
+		wantErr bool
+	}{
+		{"cancelled while running is benign", repository.ErrEOTimerNotClaimed, false},
+		{"any other mark error is reported, not swallowed", errors.New("db down"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &eoFakeTimerRepo{queue: eoTimers(1), fireErr: tc.fireErr}
+			err := NewEOTimerMonitor(repo, eoNoopHandler, time.Hour).RunOnce(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if len(repo.failures) != 0 {
+				t.Error("a handler that succeeded was recorded as failed")
+			}
+		})
+	}
+}
+
+func TestTimerMonitorReportsAGiveUp(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(1), failedNow: true}
+	h := func(context.Context, models.EOTimer) error { return errors.New("always") }
+	err := NewEOTimerMonitor(repo, h, time.Hour).RunOnce(context.Background())
+	if err == nil || len(repo.failures) != 1 {
+		t.Fatalf("err = %v, failures = %d", err, len(repo.failures))
+	}
+}
+
+func TestTimerMonitorBoundsHandlerRuntime(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(1)}
+	m := NewEOTimerMonitor(repo, func(ctx context.Context, _ models.EOTimer) error {
+		<-ctx.Done() // a hung handler
+		return ctx.Err()
+	}, time.Hour).(*eoTimerMonitor)
+	m.timeout = 20 * time.Millisecond
+	done := make(chan error, 1)
+	go func() { done <- m.RunOnce(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a hung handler was never cut off")
+	}
+	if eoTimerHandlerTimeout >= repository.EOTimerClaimLease {
+		t.Errorf("handler timeout %v must be inside the lease %v", eoTimerHandlerTimeout, repository.EOTimerClaimLease)
+	}
+}
+
+func TestTimerMonitorShutdownMidBatchReleasesTheRest(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(5)}
+	ctx, cancel := context.WithCancel(context.Background())
+	ran := 0
+	h := func(context.Context, models.EOTimer) error {
+		ran++
+		cancel() // Stop arrives during the first handler
+		return nil
+	}
+	err := NewEOTimerMonitor(repo, h, time.Hour).RunOnce(ctx)
+	if err == nil {
+		t.Error("expected the cancellation to be reported")
+	}
+	if ran != 1 {
+		t.Errorf("handler ran %d times after cancellation, want 1", ran)
+	}
+	if len(repo.released) != 4 {
+		t.Errorf("released %d, want the 4 unprocessed timers handed back", len(repo.released))
+	}
+	if len(repo.failures) != 0 {
+		t.Error("a shutdown recorded failures")
+	}
+}

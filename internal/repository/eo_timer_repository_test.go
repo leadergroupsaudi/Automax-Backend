@@ -55,12 +55,16 @@ func TestClaimDueIsExactlyOnceAcrossConcurrentClaimers(t *testing.T) {
 		want[tm.ID] = true
 	}
 
-	// Prove the claimers genuinely overlap: count statements in flight on the
-	// pooled handle, and hold each one briefly before it reaches the server so
-	// the window is wide. eoTestDB's single connection would pin this at 1.
+	// Prove the claimers genuinely overlap IN THE POOL. gorm takes the
+	// connection inside gorm:row, so a Before callback would count goroutines
+	// that merely have not been scheduled yet (and read 4 even on one
+	// connection). An After callback runs once the statement has executed and
+	// the rows are still open, i.e. with the connection held; holding it for
+	// 30ms makes every claimer that could run in parallel do so. eoTestDB's
+	// single connection pins this at 1.
 	var inflight, maxInflight int32
 	cb := db.Callback().Row()
-	if err := cb.Before("gorm:row").Register("eo_timer_test:enter", func(tx *gorm.DB) {
+	if err := cb.After("gorm:row").Register("eo_timer_test:enter", func(tx *gorm.DB) {
 		n := atomic.AddInt32(&inflight, 1)
 		for {
 			m := atomic.LoadInt32(&maxInflight)
@@ -69,13 +73,9 @@ func TestClaimDueIsExactlyOnceAcrossConcurrentClaimers(t *testing.T) {
 			}
 		}
 		time.Sleep(30 * time.Millisecond)
-	}); err != nil {
-		t.Fatalf("register enter: %v", err)
-	}
-	if err := cb.After("gorm:row").Register("eo_timer_test:leave", func(tx *gorm.DB) {
 		atomic.AddInt32(&inflight, -1)
 	}); err != nil {
-		t.Fatalf("register leave: %v", err)
+		t.Fatalf("register: %v", err)
 	}
 
 	var wg sync.WaitGroup
@@ -360,7 +360,13 @@ func TestMigrateEOPlatformDetectsEOTimersDrift(t *testing.T) {
 // for re-delivery.
 func eoTimerRound(t *testing.T, repo EOTimerRepository, clock *time.Time) []models.EOTimer {
 	t.Helper()
-	*clock = clock.Add(EOTimerClaimLease + time.Minute)
+	// The lease runs on the database clock, so expire it by backdating the
+	// claims rather than by advancing the caller's clock.
+	if err := repo.(*eoTimerRepository).db.Exec(
+		`UPDATE eo_timers SET claimed_at = claimed_at - make_interval(secs => ?) WHERE status = 'claimed'`,
+		(EOTimerClaimLease + time.Minute).Seconds()).Error; err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
 	got, err := repo.ClaimDue(context.Background(), *clock, 10)
 	if err != nil {
 		t.Fatalf("ClaimDue: %v", err)
@@ -453,5 +459,106 @@ func TestClaimDueFailsTimersThatExhaustedAttemptsWithoutReporting(t *testing.T) 
 	}
 	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFailed {
 		t.Errorf("status = %q, want failed", s)
+	}
+}
+
+// The lease is judged on the database clock. A replica whose clock runs ahead
+// must not be able to expire another replica's fresh claim.
+func TestClaimDueLeaseIgnoresACallerClockSkew(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	tm := eoNewTimer(time.Now().Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.ClaimDue(ctx, time.Now(), 10); err != nil || len(got) != 1 {
+		t.Fatalf("first claim: %v %d", err, len(got))
+	}
+	// A second replica whose clock is a day fast.
+	got, err := repo.ClaimDue(ctx, time.Now().Add(24*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatal("a fast caller clock expired a fresh claim: the timer would run twice")
+	}
+	// And a slow caller clock must not make an expired claim immortal.
+	if err := db.Exec(`UPDATE eo_timers SET claimed_at = now() - interval '1 hour'`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.ClaimDue(ctx, time.Now().Add(-24*time.Hour+2*time.Hour), 10); err != nil || len(got) != 0 {
+		// fire_at is an hour in the past, so a clock a day behind sees it as not yet due
+		t.Fatalf("not-yet-due timer claimed on a slow clock: %v %d", err, len(got))
+	}
+	if got, err := repo.ClaimDue(ctx, time.Now(), 10); err != nil || len(got) != 1 {
+		t.Fatalf("expired claim not reclaimed: %v %d", err, len(got))
+	}
+}
+
+func TestWithTxScheduleRollsBackWithTheTransaction(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+
+	rolled := eoNewTimer(time.Now())
+	tx := db.Begin()
+	if err := repo.WithTx(tx).Schedule(ctx, rolled); err != nil {
+		t.Fatal(err)
+	}
+	tx.Rollback()
+	committed := eoNewTimer(time.Now())
+	tx = db.Begin()
+	if err := repo.WithTx(tx).Schedule(ctx, committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	db.Raw(`SELECT count(*) FROM eo_timers WHERE id = ?`, rolled.ID).Scan(&n)
+	if n != 0 {
+		t.Error("a Schedule on a rolled-back transaction survived")
+	}
+	db.Raw(`SELECT count(*) FROM eo_timers WHERE id = ?`, committed.ID).Scan(&n)
+	if n != 1 {
+		t.Error("a Schedule on a committed transaction is missing")
+	}
+}
+
+func TestScheduleResetsAttemptsAndReleaseGivesTheAttemptBack(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	now := time.Now()
+	tm := eoNewTimer(now.Add(-time.Minute))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := repo.ClaimDue(ctx, now, 1)
+	if len(got) != 1 || got[0].Attempts != 1 {
+		t.Fatalf("claim: %v", got)
+	}
+	if err := repo.Release(ctx, tm.ID); err != nil {
+		t.Fatal(err)
+	}
+	var attempts int
+	db.Raw(`SELECT attempts FROM eo_timers WHERE id = ?`, tm.ID).Scan(&attempts)
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerPending || attempts != 0 {
+		t.Errorf("after Release: status %q attempts %d, want pending / 0", s, attempts)
+	}
+
+	// Re-scheduling a struct that came back from ClaimDue starts clean.
+	again := got[0]
+	again.ID = uuid.Nil
+	again.Attempts, again.LastError = 4, "stale"
+	if err := repo.Schedule(ctx, &again); err != nil {
+		t.Fatal(err)
+	}
+	var msg string
+	db.Raw(`SELECT attempts FROM eo_timers WHERE id = ?`, again.ID).Scan(&attempts)
+	db.Raw(`SELECT last_error FROM eo_timers WHERE id = ?`, again.ID).Scan(&msg)
+	if attempts != 0 || msg != "" {
+		t.Errorf("rescheduled timer carries attempts %d / error %q", attempts, msg)
 	}
 }
