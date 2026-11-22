@@ -1090,17 +1090,17 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 	// EO platform roles. Roles are data: created only when absent, never touched
 	// afterwards so a configured role keeps its permissions. Only eo_admin holds
 	// eo:types:manage; executive_office (the operators) holds the record permissions.
-	eoViewOnly := []string{"eo:view"}
+	eoParticipant := []string{"eo:view", "eo:update", "eo:transition"}
 	eoRoles := []struct {
 		code, name, nameAr, desc, descAr string
 		perms                            []string
 	}{
 		{"executive_office", "Executive Office", "المكتب التنفيذي", "Office staff who operate and transition executive-office records", "موظفو المكتب الذين يديرون السجلات وينقلونها بين المراحل", []string{"eo:view", "eo:create", "eo:update", "eo:delete", "eo:transition"}},
-		{"head_of_office", "Head of Office", "رئيس المكتب", "Oversees executive-office records", "يشرف على سجلات المكتب التنفيذي", eoViewOnly},
-		{"public_relations", "Public Relations", "العلاقات العامة", "Public relations participant in executive-office records", "مشارك من العلاقات العامة في سجلات المكتب التنفيذي", eoViewOnly},
-		{"protocol", "Protocol", "المراسم", "Protocol participant in executive-office records", "مشارك من المراسم في سجلات المكتب التنفيذي", eoViewOnly},
-		{"department_user", "Department User", "مستخدم الإدارة", "Department participant in executive-office records", "مشارك من الإدارة في سجلات المكتب التنفيذي", eoViewOnly},
-		{"escalation_manager", "Escalation Manager", "مدير التصعيد", "Handles escalated executive-office records", "يتعامل مع سجلات المكتب التنفيذي المصعّدة", eoViewOnly},
+		{"head_of_office", "Head of Office", "رئيس المكتب", "Oversees executive-office records", "يشرف على سجلات المكتب التنفيذي", eoParticipant},
+		{"public_relations", "Public Relations", "العلاقات العامة", "Public relations participant in executive-office records", "مشارك من العلاقات العامة في سجلات المكتب التنفيذي", eoParticipant},
+		{"protocol", "Protocol", "المراسم", "Protocol participant in executive-office records", "مشارك من المراسم في سجلات المكتب التنفيذي", eoParticipant},
+		{"department_user", "Department User", "مستخدم الإدارة", "Department participant in executive-office records", "مشارك من الإدارة في سجلات المكتب التنفيذي", eoParticipant},
+		{"escalation_manager", "Escalation Manager", "مدير التصعيد", "Handles escalated executive-office records", "يتعامل مع سجلات المكتب التنفيذي المصعّدة", eoParticipant},
 		{"eo_admin", "EO Administrator", "مسؤول المكتب التنفيذي", "Administers executive-office record types", "يدير أنواع سجلات المكتب التنفيذي", []string{"eo:view", "eo:types:manage"}},
 	}
 	for _, r := range eoRoles {
