@@ -83,6 +83,35 @@ func (x *EORecord) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
+// EORecordCreateRequest is the payload of the record create pipeline.
+//
+// Values is keyed by FIELD KEY and spans both kinds of storage: the inherited
+// fields that are real columns (subject_ar, priority, due_date, …) and the
+// type-specific tail that lives in the values jsonb. Which key goes where is
+// the engine's business, not the caller's — a client fills in the form the
+// field definitions describe and nothing else. Keys the engine owns
+// (reference, state_id, created_by_id, the timestamps) are rejected rather
+// than written.
+type EORecordCreateRequest struct {
+	RecordTypeID   uuid.UUID  `json:"record_type_id"`
+	ParentRecordID *uuid.UUID `json:"parent_record_id"`
+	// ParentLinkTypeKey names the link type tying this record to its parent.
+	// Its rules — derive_deadline_from_parent, cascade_sensitivity — are
+	// applied while saving, and the link row is written with it. Empty means
+	// the hierarchy is recorded by parent_record_id alone, with no typed link
+	// and therefore no link rules.
+	ParentLinkTypeKey string         `json:"parent_link_type_key"`
+	Values            map[string]any `json:"values"`
+}
+
+// EORecordUpdateRequest is a partial edit: keys absent from Values keep their
+// stored value. RecordTypeID is required beside the record id because the
+// primary key is composite.
+type EORecordUpdateRequest struct {
+	RecordTypeID uuid.UUID      `json:"record_type_id"`
+	Values       map[string]any `json:"values"`
+}
+
 // EORecordLink is one typed relationship between two records (spec §7.6).
 // Both endpoints carry the record's type because a foreign key referencing a
 // partitioned table must name the partition key; the link resolver reads the

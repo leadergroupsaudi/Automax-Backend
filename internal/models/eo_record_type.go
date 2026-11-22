@@ -73,15 +73,24 @@ const (
 
 // EORecordType describes a configurable record type.
 type EORecordType struct {
-	ID               uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
-	Key              string         `gorm:"size:100;not null;uniqueIndex:idx_eo_record_types_key,where:deleted_at IS NULL" json:"key"`
-	Name             string         `gorm:"size:255;not null" json:"name"`
-	NameAr           string         `gorm:"size:255" json:"name_ar"`
-	Icon             string         `gorm:"size:100" json:"icon"`
-	ParentTypeID     *uuid.UUID     `gorm:"type:uuid;index" json:"parent_type_id"`
-	IsAbstract       bool           `gorm:"default:false" json:"is_abstract"`
-	ReferencePrefix  string         `gorm:"size:50" json:"reference_prefix"`
-	ReferenceMode    string         `gorm:"size:20;default:'own'" json:"reference_mode"`
+	ID              uuid.UUID  `gorm:"type:uuid;primary_key" json:"id"`
+	Key             string     `gorm:"size:100;not null;uniqueIndex:idx_eo_record_types_key,where:deleted_at IS NULL" json:"key"`
+	Name            string     `gorm:"size:255;not null" json:"name"`
+	NameAr          string     `gorm:"size:255" json:"name_ar"`
+	Icon            string     `gorm:"size:100" json:"icon"`
+	ParentTypeID    *uuid.UUID `gorm:"type:uuid;index" json:"parent_type_id"`
+	IsAbstract      bool       `gorm:"default:false" json:"is_abstract"`
+	ReferencePrefix string     `gorm:"size:50" json:"reference_prefix"`
+	ReferenceMode   string     `gorm:"size:20;default:'own'" json:"reference_mode"`
+	// ReferencePattern is the type's numbering pattern, in the grammar
+	// services.RenderReference parses: an own-sequence pattern such as
+	// EO-DIR-YYYY-NNN, or a parent-derived one such as EO-DIR-YYYY-NNN-A#
+	// (spec §7.9). ReferencePrefix states which prefixes a type owns, and
+	// ValidateReferencePrefix keeps those from overlapping; the pattern says
+	// how a reference is rendered, which the prefix alone cannot (it carries
+	// neither the sequence width nor a child's suffix letter). A type cannot
+	// be numbered without one.
+	ReferencePattern string         `gorm:"size:100" json:"reference_pattern"`
 	WorkflowID       *uuid.UUID     `gorm:"type:uuid;index" json:"workflow_id"`
 	Capabilities     datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"capabilities"`
 	IsActive         bool           `gorm:"default:true" json:"is_active"`
