@@ -22,18 +22,21 @@ type eoMatrixKeyEntry struct {
 	// the values bag.
 	isColumn bool
 	// isEngineManaged: the engine owns this key — record identity
-	// (ticket_type), workflow state (state), or the attachment store. The
-	// BASE type does seed definitions named record_type_id, state_id and
-	// attachments (all engine-written or engine-handled), so this does NOT mean
-	// "there is no definition"; it means a pilot type must never declare one.
+	// (ticket_type) or workflow state (state). The BASE type does seed
+	// definitions named record_type_id and state_id (both engine-written), so
+	// this does NOT mean "there is no definition"; it means a pilot type must
+	// never declare one, because the engine, not a form, decides the value.
 	isEngineManaged bool
 }
 
 // eoMatrixKeys is the client field matrix's spelling of the seventeen
-// inherited keys, mapped to the engine's. It is deliberately TOTAL over the
-// seventeen — the eight keys spelled identically are listed too — so that
+// inherited keys, mapped to the engine's, PLUS the type-specific renames a
+// pilot type needs. The inherited block is deliberately TOTAL over the
+// seventeen — the keys spelled identically are listed too — so that
 // TestEOMatrixKeyCoversTheBaseType can prove it covers exactly the keys the
-// base type seeds. The six renames are the plan's Global Constraints table.
+// base type seeds; that test reads the inherited seventeen and is unaffected
+// by entries below them. The six renames are the plan's Global Constraints
+// table.
 var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	"reference":  {"reference", true, false},
 	"subject_ar": {"subject_ar", true, false},
@@ -53,11 +56,39 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	"created_by":       {"created_by_id", true, false},
 	"parent_ticket":    {"parent_record_id", true, false},
 
-	// The three with no field of their own. The engine key is still reported
+	// The two with no field of their own. The engine key is still reported
 	// so a caller can say what the matrix key MEANS.
 	"ticket_type": {"record_type_id", true, true},
 	"state":       {"state_id", true, true},
-	"attachments": {"attachments", false, true},
+
+	// `attachments` is a VALUES-BAG key like any other, and a pilot type may
+	// declare it. It was marked engine-managed in Task A1 and that was wrong:
+	// it is absent from services.eoEngineOwnedKeys, from
+	// services.eoRecordColumnWriters and from services.eoFlattenStored, so
+	// eoApplyValues routes it into the bag exactly as it routes a user field,
+	// and services.EOTransitionInput.Attachments is a separate thing (its ids
+	// are checked for presence and dropped, never stored here). The
+	// consequence of the old marking was concrete: the matrix marks
+	// `attachments` **Yes** on Incoming Correspondence and the seed could not
+	// say so, so the pilot would file a government letter with no letter
+	// attached. Corrected in A2's fix round.
+	"attachments": {"attachments", false, false},
+
+	// TYPE-SPECIFIC RENAMES. The table above is total over the seventeen
+	// INHERITED keys; these are keys one pilot type spells its own way for a
+	// field the engine already has. A type-specific key is normally the
+	// engine's key already (the fall-through below), so an entry here is a
+	// deliberate statement that two names are one field.
+	//
+	// `sender_deadline` IS the engine's due_date for Incoming Correspondence.
+	// The matrix says of it "every internal clock is derived from this date"
+	// (eo-field-matrix.md:282) and of its Referral child "Deadline derived
+	// from the parent, not typed" — and the only mechanism that derives a
+	// child's deadline, services.DeriveDeadlineFromParent, reads
+	// parent.DueDate, THE COLUMN, and nothing else. Seeded as a values-bag key
+	// it would be a second date the clerk types beside due_date, with every
+	// derived child deadline silently absent. See eoConditionalDecisions.
+	"sender_deadline": {"due_date", true, false},
 }
 
 // eoMatrixKey translates a key as the client's field matrix spells it into the
@@ -488,12 +519,21 @@ type eoPilotFieldSpec struct {
 // redefining an ancestor's key replaces it AT THE ANCESTOR'S SLOT
 // (services.ResolveEffectiveFields), so the field keeps its position on the
 // form and the override is a narrowing, not a new field. The whole definition
-// is copied from the base type's so that a later change to the base's label,
-// kind or options cannot leave a stale copy behind on a pilot type.
+// is copied from the base type's STORED row — read from the transaction, not
+// from eoBaseFieldDefs in memory — so that a base field the designer has since
+// edited is what gets narrowed, rather than what the Go source said on the day
+// this was written.
 type eoInheritedNarrowing struct {
 	matrixKey string
 	required  string
 	rule      string
+	// label, when set, is the client matrix's wording for this field ON THIS
+	// TYPE — used where a type spells an inherited field its own way
+	// (Incoming Correspondence's "Their deadline" IS the engine's due_date).
+	// It goes through eoUntranslatedLabel like any other label the seed
+	// writes, so it carries the Arabic sign-off marker. Empty keeps the base
+	// type's label, Arabic and all.
+	label string
 }
 
 // eoPilotTypeSpec is one root record type.
@@ -569,8 +609,8 @@ var eoConditionalDecisions = []eoConditionalDecision{
 		"The clock that watches a Draft Decision Study is its own `study_deadline`, which the matrix marks Auto and derives from the claimed urgency — not due_date. Requiring due_date here would demand a second, unrelated date at creation that no CFF step asks for."},
 	{eoIncomingTypeKey, "due_date",
 		"Required on any type the clock watches.",
-		models.EORequiredNever,
-		"The clock that watches an Incoming Correspondence is `sender_deadline` — the matrix says \"every internal clock is derived from this date\" — and that field is seeded `always`. due_date is not this type's clock."},
+		models.EORequiredAlways,
+		"The clock that watches an Incoming Correspondence is the matrix's `sender_deadline` — \"every internal clock is derived from this date\" — AND THAT IS THIS FIELD: eoMatrixKey maps sender_deadline onto the inherited due_date column, so the two names are one field with the matrix's label (\"Their deadline\"). Seeding them apart would have been the quiet failure: services.DeriveDeadlineFromParent is the only mechanism that gives a child the deadline the matrix calls \"derived from the parent, not typed\", it reads parent.DueDate (THE COLUMN) and nothing else, and an absent deadline is not an error — so Task A3's Referral would have derived no deadline at all, silently. The condition therefore holds unconditionally for this type, exactly as it does for the Directive."},
 
 	{eoDirectiveTypeKey, "change_reason",
 		"Material changes are logged — moving a date, changing an owner, altering scope.",
@@ -703,8 +743,18 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 			// "Rolled up from its assignments." The aggregate key is published
 			// by the child dependency below; it is OMITTED from the env while
 			// no assignment carries a numeric completion rate, so the field
-			// resolves to nothing on a directive with no assignments yet and
-			// is reported as waiting on data, not as a misconfiguration.
+			// resolves to nothing on a directive whose assignments have no
+			// figures yet and is reported as WAITING ON DATA.
+			//
+			// THAT IS TRUE ONLY ONCE TASK A3 HAS SEEDED eoAssignmentTypeKey.
+			// Before it does, services.eoRecordDeps.Children fails outright
+			// ("no record type with key %q"), and that error is not an
+			// unresolved reference, so eoClassifyDeriveError files it as
+			// BROKEN CONFIGURATION — the one signal that classifier exists to
+			// keep clean. An A2-only deployment therefore logs a
+			// broken-configuration error on every Directive save. It is
+			// expected, it is not data loss (the save succeeds; the field is
+			// left unset), and A3 ends it.
 			{matrixKey: "completion_rate", label: "Completion rate",
 				kind: models.EOKindPercent, provenance: models.EOProvenanceDerived, required: models.EORequiredNever,
 				formula:     "children_" + eoAssignmentTypeKey + "_avg_completion_rate",
@@ -818,14 +868,13 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			{matrixKey: "received_date", label: "Date received",
 				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
-			{matrixKey: "sender_deadline", label: "Their deadline",
-				kind: models.EOKindDate, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
-			// The matrix marks `attachments` Required YES on this type. It is
-			// ENGINE-MANAGED (eoMatrixKey), so no pilot type may declare it
-			// and eoSeedRootTypes drops it: the base type's definition, which
-			// is `never`, governs. This is the one place the three root types
-			// say something WEAKER than the matrix, and it is kept in the list
-			// so the drop happens through the helper and is visible here.
+			// `sender_deadline` is NOT here: eoMatrixKey maps it onto the
+			// inherited due_date COLUMN, and it is seeded as the narrowing
+			// below. See that entry and eoConditionalDecisions.
+			//
+			// The matrix marks `attachments` Required YES on this type, and
+			// it is a plain values-bag key, so the declaration below is what
+			// makes a letter unfilable without its letter.
 			{matrixKey: "attachments", label: "Attachments",
 				kind: models.EOKindMultiFile, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			{matrixKey: "real_ask", label: "What is actually wanted",
@@ -856,6 +905,14 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 			{matrixKey: "consolidated", label: "Consolidated output",
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 		},
+		narrowed: []eoInheritedNarrowing{
+			// The sender's deadline IS this record's due date. Seeding it as
+			// a field of its own would leave the due_date COLUMN empty, and
+			// services.DeriveDeadlineFromParent — the only thing that gives a
+			// Referral the deadline the matrix says is "derived from the
+			// parent, not typed" — reads that column and nothing else.
+			{matrixKey: "sender_deadline", required: models.EORequiredAlways, label: "Their deadline"},
+		},
 	},
 }
 
@@ -885,7 +942,18 @@ func eoSeedRootTypes(tx *gorm.DB) (bool, error) {
 	if base.ID == uuid.Nil {
 		return false, fmt.Errorf("record type %q is missing; the platform seed must run before the pilot seed", eoBaseTypeKey)
 	}
-	baseFields := eoBaseFieldDefs(base.ID)
+	// Read the base type's definitions from the DATABASE, not from
+	// eoBaseFieldDefs in memory. A narrowing copies them, and the designer can
+	// edit a base field: copying the Go source would make the override a
+	// snapshot of what the base type looked like when this file was written,
+	// which is the drift the copy exists to avoid.
+	var baseFields []models.EOFieldDef
+	if err := tx.Where("record_type_id = ?", base.ID).Order("sort_order, key").Find(&baseFields).Error; err != nil {
+		return false, fmt.Errorf("read the inherited field definitions: %w", err)
+	}
+	if len(baseFields) == 0 {
+		return false, fmt.Errorf("record type %q has no field definitions; the platform seed must run before the pilot seed", eoBaseTypeKey)
+	}
 
 	for _, spec := range eoPilotRootTypes {
 		t := models.EORecordType{
@@ -1017,6 +1085,9 @@ func eoPilotFieldDefs(spec eoPilotTypeSpec, typeID uuid.UUID, baseFields []model
 		d.RecordTypeID = typeID
 		d.RequiredMode = n.required
 		d.RequiredRule = n.rule
+		if n.label != "" {
+			d = eoUntranslatedLabel(d, n.label)
+		}
 		if (n.required == models.EORequiredConditional) != (strings.TrimSpace(n.rule) != "") {
 			return nil, fmt.Errorf("narrowing of %q on %q: a conditional needs a rule and a rule needs a conditional", key, spec.key)
 		}

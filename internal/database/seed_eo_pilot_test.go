@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -49,9 +50,13 @@ func TestEOMatrixKeyTranslatesInheritedKeys(t *testing.T) {
 		{"parent_ticket renamed", "parent_ticket", "parent_record_id", true, false},
 		{"ticket_type is a column, no field", "ticket_type", "record_type_id", true, true},
 		{"state is a column, no field", "state", "state_id", true, true},
-		{"attachments live in the bag, no field", "attachments", "attachments", false, true},
+		// A1 marked this engine-managed; A2's fix round corrected it. It is a
+		// plain values-bag key, so a pilot type may declare it — which is how
+		// Incoming Correspondence gets the matrix's Required: Yes.
+		{"attachments live in the bag and may be declared", "attachments", "attachments", false, false},
 		{"identical spelling stays", "priority", "priority", true, false},
 		{"unknown key passes through to the bag", "meeting_date", "meeting_date", false, false},
+		{"a type-specific rename onto a column", "sender_deadline", "due_date", true, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -644,53 +649,154 @@ func TestBaseFieldsAreCreatedMarkedUntranslated(t *testing.T) {
 
 // ── Task A2: the three root types ───────────────────────────────────────────
 
-// eoMatrixConditionalFields is the client matrix's Conditional cells for the
-// three root types, in the MATRIX's own spelling, written out here rather than
-// derived from the configuration under test. The five inherited ones come from
-// the matrix's "All types (inherited)" table, which marks them Conditional on
-// every type; the rest are each type's own rows
-// (docs/superpowers/specs/eo-field-matrix.md:68, :124, :272).
+// ── reading the client's field matrix ───────────────────────────────────────
+
+// eoFieldMatrixPath is the client's own document, relative to this package.
+// The tests below READ it rather than restating it: a hand transcription is
+// checked once, by the person who wrote it, and every value it gets wrong is
+// a value no test constrains. This file is the authority for which fields each
+// type has and when each is required.
+const eoFieldMatrixPath = "../../docs/superpowers/specs/eo-field-matrix.md"
+
+// eoMatrixRow is one row of one of the matrix's field tables.
+type eoMatrixRow struct {
+	// Key is the matrix's spelling; run it through eoMatrixKey for the
+	// engine's.
+	Key string
+	// Required is the Required cell verbatim: Yes, No, Conditional, Auto,
+	// Derived or "Yes at closure" (the matrix's own five-valued column, plus
+	// No).
+	Required string
+}
+
+// eoMatrixSections names the heading each record type's table sits under.
+var eoMatrixSections = map[string]string{
+	eoDirectiveTypeKey:  "Directive",
+	eoDraftStudyTypeKey: "Draft Decision Study",
+	eoIncomingTypeKey:   "Incoming Correspondence",
+}
+
+// eoMatrixInheritedSection is the "All types" table every type inherits.
+const eoMatrixInheritedSection = "All types (inherited)"
+
+// eoMatrixRowCounts is how many field rows each section must yield. It is the
+// guard on the PARSER: without it a parser that stopped matching — a changed
+// table format, a renamed heading — would yield nothing, and every test built
+// on it would pass vacuously, which is this programme's signature defect
+// wearing a different hat.
+var eoMatrixRowCounts = map[string]int{
+	eoMatrixInheritedSection:  17,
+	"Directive":               13,
+	"Draft Decision Study":    21,
+	"Incoming Correspondence": 16,
+}
+
+// eoMatrixRowPattern pulls the backticked keys out of a table cell.
+var eoMatrixRowPattern = regexp.MustCompile("`([^`]+)`")
+
+// eoReadFieldMatrix parses the client's field matrix into section -> rows.
 //
-// Mutation: drop "corrective_action" from the Directive list — the decision
-// registry then carries a decision nothing asked for and the test fails.
-var eoMatrixConditionalFields = func() map[string][]string {
-	inherited := []string{"parent_ticket", "assigned_user", "due_date", "change_reason", "delay_reason"}
-	own := map[string][]string{
-		eoDirectiveTypeKey:  {"origin_record", "decision_reference", "corrective_action"},
-		eoDraftStudyTypeKey: {"redraft_text"},
-		eoIncomingTypeKey:   {"coordinator"},
+// A field table row is a pipe row of at least six cells whose SECOND cell
+// carries a backticked key, which excludes the header, the separator and the
+// Contents table. A cell naming several keys ("`created_by`, `created_at`")
+// yields the first: it is the one the engine stores a definition for, and the
+// base type's own comment says why.
+func eoReadFieldMatrix(t *testing.T) map[string][]eoMatrixRow {
+	t.Helper()
+	raw, err := os.ReadFile(eoFieldMatrixPath)
+	if err != nil {
+		t.Fatalf("read the client field matrix: %v", err)
 	}
-	out := map[string][]string{}
-	for k, v := range own {
-		out[k] = append(append([]string{}, inherited...), v...)
+	out := map[string][]eoMatrixRow{}
+	section := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if h := strings.TrimLeft(line, "#"); len(line)-len(h) >= 2 && len(line)-len(h) <= 3 {
+			section = strings.TrimSpace(h)
+			continue
+		}
+		if section == "" || !strings.HasPrefix(line, "|") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+		if len(cells) < 6 {
+			continue
+		}
+		keys := eoMatrixRowPattern.FindStringSubmatch(strings.TrimSpace(cells[1]))
+		if keys == nil {
+			continue
+		}
+		out[section] = append(out[section], eoMatrixRow{
+			Key:      keys[1],
+			Required: strings.TrimSpace(cells[3]),
+		})
+	}
+	for section, want := range eoMatrixRowCounts {
+		if got := len(out[section]); got != want {
+			t.Fatalf("parsed %d field rows under %q, want %d: the matrix's table format or heading has changed and every test reading it is now proving nothing",
+				got, section, want)
+		}
 	}
 	return out
-}()
+}
 
-// eoMatrixRootFieldKeys is every field key the matrix gives each root type, in
-// the matrix's spelling and the matrix's order, written out here independently
-// of the seed. Incoming Correspondence's `attachments` row is included: the
-// test below asserts it is the one key the seed must NOT declare.
-var eoMatrixRootFieldKeys = map[string][]string{
-	eoDirectiveTypeKey: {
-		"directive_origin", "origin_date", "origin_record", "decision_reference",
-		"directive_text", "required_outcome", "responsible_officer", "expected_deliverable",
-		"plan_required", "completion_rate", "corrective_action", "escalation_level",
-		"verification_notes",
-	},
-	eoDraftStudyTypeKey: {
-		"proposer", "proposing_body", "claimed_urgency", "grounds", "draft_text",
-		"draft_file", "received_at", "study_deadline", "related_refs", "conflict_verdict",
-		"feasibility", "feasibility_notes", "issuing_authority", "affected_bodies",
-		"redraft_text", "version", "recommendation", "study_report", "he_decision",
-		"he_reason", "decision_date",
-	},
-	eoIncomingTypeKey: {
-		"sender", "sender_ref", "letter_date", "received_date", "sender_deadline",
-		"attachments", "real_ask", "affected_bodies", "brief_view", "brief_recommendation",
-		"brief_file", "direction_pattern", "direction_text", "coordinator",
-		"direction_round", "consolidated",
-	},
+// eoMatrixConditionalFields is every Conditional cell the matrix has for the
+// three root types, in the matrix's own spelling, READ FROM THE MATRIX. The
+// inherited table's cells count for all three types unless the type's own
+// table overrides the key.
+func eoMatrixConditionalFields(t *testing.T) map[string][]string {
+	t.Helper()
+	m := eoReadFieldMatrix(t)
+	out := map[string][]string{}
+	for typeKey, section := range eoMatrixSections {
+		// Deliberately NOT eoMatrixExpectations: that resolves one engine
+		// field from two matrix names, and the question here is which CELLS
+		// the matrix marks Conditional. The inherited table marks `due_date`
+		// Conditional on every type, including Incoming Correspondence, whose
+		// own table names the same engine field `sender_deadline` and marks
+		// it Yes. Both statements deserve a recorded decision; resolving them
+		// first would hide the inherited one.
+		for _, rows := range [][]eoMatrixRow{m[eoMatrixInheritedSection], m[section]} {
+			for _, r := range rows {
+				if _, _, managed := eoMatrixKey(r.Key); managed {
+					continue
+				}
+				if r.Required == "Conditional" {
+					out[typeKey] = append(out[typeKey], r.Key)
+				}
+			}
+		}
+		sort.Strings(out[typeKey])
+	}
+	return out
+}
+
+// eoMatrixExpectations is what the matrix says about one type, keyed by ENGINE
+// key: the inherited table, then the type's own table laid over it. Both are
+// needed, and the override must happen on the engine key rather than the
+// matrix key — Incoming Correspondence's `sender_deadline` and the inherited
+// `due_date` are two matrix names for one engine field, and the type's own
+// row is the one that governs.
+//
+// Engine-managed keys are left out. The matrix marks `ticket_type` Yes and
+// `state` Auto, but the client chooses them on the create REQUEST rather than
+// as values, so the engine seeds them `auto`/`never` and no type may say
+// otherwise (seed_eo_platform.go, eoBaseFieldDefs' PROVENANCE note).
+func eoMatrixExpectations(t *testing.T, m map[string][]eoMatrixRow, typeKey string) map[string]eoMatrixRow {
+	t.Helper()
+	out := map[string]eoMatrixRow{}
+	add := func(rows []eoMatrixRow) {
+		for _, r := range rows {
+			key, _, managed := eoMatrixKey(r.Key)
+			if managed {
+				continue
+			}
+			out[key] = r
+		}
+	}
+	add(m[eoMatrixInheritedSection])
+	add(m[eoMatrixSections[typeKey]])
+	return out
 }
 
 // eoRootType reads one seeded record type. Fixture; no mutation of its own.
@@ -807,14 +913,16 @@ func TestSeedsTheThreeRootTypes(t *testing.T) {
 func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
+	matrix := eoReadFieldMatrix(t)
 
 	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
 		t.Run(typeKey, func(t *testing.T) {
-			// What the seed MUST declare: every matrix key that is neither an
-			// eo_records column nor engine-managed, under the ENGINE spelling.
+			// What the seed MUST declare: every key of THIS TYPE'S OWN table
+			// in the matrix that is neither an eo_records column nor
+			// engine-managed, under the ENGINE spelling.
 			want := map[string]bool{}
-			for _, mk := range eoMatrixRootFieldKeys[typeKey] {
-				key, isColumn, managed := eoMatrixKey(mk)
+			for _, r := range matrix[eoMatrixSections[typeKey]] {
+				key, isColumn, managed := eoMatrixKey(r.Key)
 				if isColumn || managed {
 					continue
 				}
@@ -879,12 +987,30 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 		}
 	})
 
-	// Addendum 5: `attachments` is engine-managed, so no pilot type declares
-	// it however the matrix marks it.
-	t.Run("the engine-managed attachments key is not declared", func(t *testing.T) {
-		for _, d := range eoOwnFieldDefs(t, db, eoIncomingTypeKey) {
-			if d.Key == "attachments" {
-				t.Error("Incoming Correspondence declares `attachments`, which the engine owns")
+	// `attachments` is a plain values-bag key, so a pilot type may declare it
+	// — and Incoming Correspondence must, because the matrix marks it
+	// Required: Yes there while the base type seeds it `never`. Without the
+	// declaration the pilot files a government letter with no letter attached.
+	// A1 marked the key engine-managed; A2's fix round corrected that.
+	t.Run("attachments is declared and required on Incoming Correspondence", func(t *testing.T) {
+		got := eoEffectiveField(t, db, eoIncomingTypeKey, "attachments")
+		if got.RequiredMode != models.EORequiredAlways {
+			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredAlways)
+		}
+		// The override, not a second field: it replaces the base's definition
+		// at the base's slot, so the key appears once.
+		base := eoEffectiveField(t, db, eoBaseTypeKey, "attachments")
+		if got.ID == base.ID {
+			t.Error("Incoming Correspondence does not redefine attachments at all")
+		}
+		if base.RequiredMode != models.EORequiredNever {
+			t.Errorf("the base type's attachments is %q; the override is only meaningful against %q",
+				base.RequiredMode, models.EORequiredNever)
+		}
+		// And the other two types keep the inherited definition.
+		for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey} {
+			if d := eoEffectiveField(t, db, typeKey, "attachments"); d.ID != base.ID {
+				t.Errorf("%s redefines attachments; the matrix only requires it on Incoming Correspondence", typeKey)
 			}
 		}
 	})
@@ -1004,10 +1130,19 @@ func TestEveryConditionalMatrixFieldHasAStatedDecision(t *testing.T) {
 	}
 
 	wanted := map[string]bool{}
-	for typeKey, keys := range eoMatrixConditionalFields {
+	conditional := eoMatrixConditionalFields(t)
+	for typeKey, keys := range conditional {
 		for _, mk := range keys {
 			wanted[typeKey+"."+mk] = true
 		}
+	}
+	// The count is the guard on the READING of the matrix: five inherited
+	// Conditional cells on each of three types, plus three of the Directive's
+	// own, one of the Draft Decision Study's and one of Incoming
+	// Correspondence's. A parse that found none would make both halves of the
+	// comparison below empty and the test vacuous.
+	if len(wanted) != 20 {
+		t.Fatalf("the matrix yields %d Conditional cells across the three root types, want 20: %v", len(wanted), conditional)
 	}
 	for id := range wanted {
 		if _, ok := declared[id]; !ok {
@@ -1306,8 +1441,17 @@ func TestCreateEORecordPartitionRefusesAMismatchedBound(t *testing.T) {
 
 // The designer refuses a field whose kind is not a configured kind, whose
 // provenance or required_mode is outside the vocabulary, or which is derived
-// with no formula (handlers.eoValidateFieldShape). Seeded data goes in behind
-// the HTTP path, so nothing would otherwise hold it to the same rules.
+// with no formula. Seeded data goes in behind the HTTP path, so nothing would
+// otherwise hold it to the same rules.
+//
+// THIS RE-IMPLEMENTS handlers.eoValidateFieldShape
+// (internal/handlers/eo_record_type_handler.go, func eoValidateFieldShape) and
+// cannot call it: that function is unexported, takes a *fiber.Ctx for its i18n
+// lookups, and package handlers imports package database. The two must be kept
+// in step by hand — a rule added there should be added here. The extra checks
+// below (valid JSON config, dropdowns with options, no invented Arabic in an
+// option label) are not in the designer's set; they are properties of SEEDED
+// configuration specifically.
 // Mutation: give any seeded field Kind: "drop_down".
 func TestRootTypeFieldsPassTheDesignerShapeRules(t *testing.T) {
 	db := eoPilotDB(t)
@@ -1370,53 +1514,63 @@ func TestRootTypeFieldsPassTheDesignerShapeRules(t *testing.T) {
 }
 
 // A narrowing redefines an inherited field AT THE ANCESTOR'S SLOT, so the copy
-// must be the base's definition in every respect but its requiredness; a
-// hand-written override would quietly freeze the label, kind and options of
-// the day it was written. Mutation: in eoPilotFieldDefs, build the narrowing
-// from models.EOFieldDef{Key: key, Kind: models.EOKindDate} instead of
-// copying src.
+// must be the base's STORED definition in every respect but its requiredness
+// and, where the type has its own name for the field, its label. A hand-written
+// override would quietly freeze the kind, options and provenance of the day it
+// was written. Mutation: in eoPilotFieldDefs, build the narrowing from
+// models.EOFieldDef{Key: key, Kind: models.EOKindDate} instead of copying src;
+// or read baseFields from eoBaseFieldDefs again instead of from tx.
 func TestNarrowedInheritedFieldsCopyTheBaseDefinition(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
 	base := eoEffectiveField(t, db, eoBaseTypeKey, "due_date")
-	got := eoEffectiveField(t, db, eoDirectiveTypeKey, "due_date")
-	if got.ID == base.ID {
-		t.Fatal("the Directive does not redefine due_date at all")
+	tests := []struct {
+		name, typeKey, wantLabel string
+	}{
+		// The Directive narrows requiredness only: the field is still "Due
+		// date" and keeps the base's Arabic.
+		{"Directive narrows requiredness only", eoDirectiveTypeKey, base.Label},
+		// Incoming Correspondence also renames it: the matrix calls this
+		// field "Their deadline" (`sender_deadline`), and it IS the engine's
+		// due_date.
+		{"Incoming Correspondence renames it too", eoIncomingTypeKey, "Their deadline"},
 	}
-	if got.RequiredMode != models.EORequiredAlways {
-		t.Errorf("required_mode = %q, want %q: the clock watches a Directive", got.RequiredMode, models.EORequiredAlways)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := eoEffectiveField(t, db, tc.typeKey, "due_date")
+			if got.ID == base.ID {
+				t.Fatal("the type does not redefine due_date at all")
+			}
+			if got.RequiredMode != models.EORequiredAlways {
+				t.Errorf("required_mode = %q, want %q: this type's clock watches it",
+					got.RequiredMode, models.EORequiredAlways)
+			}
+			if got.RequiredRule != "" {
+				t.Errorf("required_rule = %q on an `always` field; it is never evaluated", got.RequiredRule)
+			}
+			if got.Label != tc.wantLabel {
+				t.Errorf("label = %q, want %q", got.Label, tc.wantLabel)
+			}
+			// Everything the narrowing does not set comes from the base.
+			if got.Key != base.Key || got.Kind != base.Kind ||
+				got.Provenance != base.Provenance || string(got.Config) != string(base.Config) {
+				t.Errorf("the narrowing drifted from the inherited definition:\n got %+v\nbase %+v", got, base)
+			}
+			if !got.ArUntranslated {
+				t.Error("the narrowing is not marked as awaiting Arabic sign-off")
+			}
+			if tc.wantLabel != base.Label && got.LabelAr != tc.wantLabel {
+				t.Errorf("label_ar = %q; a renamed field carries the English until sign-off, not the base's Arabic for a different field", got.LabelAr)
+			}
+		})
 	}
-	if got.Key != base.Key || got.Kind != base.Kind || got.Label != base.Label ||
-		got.LabelAr != base.LabelAr || got.Provenance != base.Provenance ||
-		string(got.Config) != string(base.Config) || got.ArUntranslated != base.ArUntranslated {
-		t.Errorf("the narrowing drifted from the inherited definition:\n got %+v\nbase %+v", got, base)
-	}
-	if got.RequiredRule != "" {
-		t.Errorf("required_rule = %q on an `always` field; it is never evaluated", got.RequiredRule)
-	}
-	// The other two roots do not narrow it, so the inherited definition still
-	// governs there: the override is per type, not global.
-	for _, typeKey := range []string{eoDraftStudyTypeKey, eoIncomingTypeKey} {
-		if d := eoEffectiveField(t, db, typeKey, "due_date"); d.ID != base.ID {
-			t.Errorf("%s redefines due_date; only the Directive should", typeKey)
-		}
-	}
-}
 
-// Plan 1's base type seeds PartitionPending: false and the column carries
-// `gorm:"default:true"`, which makes GORM omit the zero value from the INSERT.
-// The base type's label is therefore the opposite of what its seed says.
-// Recorded as a finding, not fixed here: the base type is abstract and holds
-// no records, so the label is wrong about a type that will never want a
-// partition, and changing Plan 1's seed is outside this task.
-func TestBaseTypePartitionPendingIsTrueDespiteItsSeed(t *testing.T) {
-	db := eoPilotDB(t)
-	ty := eoRootType(t, db, eoBaseTypeKey)
-	if !ty.PartitionPending {
-		t.Skip("the GORM default-tag behaviour this records has changed; delete this test and the note in the report")
+	// The Draft Decision Study does not narrow it, so the inherited definition
+	// still governs there: an override is per type, not global.
+	if d := eoEffectiveField(t, db, eoDraftStudyTypeKey, "due_date"); d.ID != base.ID {
+		t.Error("the Draft Decision Study redefines due_date; its clock is study_deadline")
 	}
-	t.Logf("KNOWN, UNFIXED: %s has partition_pending = true although seed_eo_platform.go sets it false", eoBaseTypeKey)
 }
 
 // The wiring proof for Review Focus 1: a test that only calls
@@ -1437,9 +1591,11 @@ func TestSeedRefusesARootTypeWhosePrefixOverlaps(t *testing.T) {
 	}
 
 	var logged strings.Builder
+	prev := log.Writer()
 	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prev) })
 	seedEOPilot(db)
-	log.SetOutput(os.Stderr)
+	log.SetOutput(prev)
 
 	if !strings.Contains(logged.String(), "FAILED") {
 		t.Errorf("the seed did not fail on an overlapping prefix; log was:\n%s", logged.String())
@@ -1512,5 +1668,84 @@ func TestEOPilotFieldDefsRefusesUnusableSpecs(t *testing.T) {
 		if _, err := eoPilotFieldDefs(spec, uuid.New(), base); err != nil {
 			t.Errorf("the seeded spec %q is refused by its own guards: %v", spec.key, err)
 		}
+	}
+}
+
+// Every field of the three root types, checked against the Required column of
+// the client's own document — not against a transcription of it. The matrix's
+// column is five-valued (Yes, Conditional, Yes at closure, Auto, Derived) plus
+// No, and each value has one engine spelling; a Conditional must be covered by
+// eoConditionalDecisions, which is what makes a weakened requirement a
+// recorded decision rather than an accident.
+//
+// This is the test that holds the ~45 non-Conditional requirednesses, which
+// nothing else constrains. Mutation: change any `required:` in
+// eoPilotRootTypes — e.g. `grounds` from EORequiredAlways to EORequiredNever —
+// or any `provenance:` on an Auto or Derived row.
+func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	matrix := eoReadFieldMatrix(t)
+
+	decided := map[string]eoConditionalDecision{}
+	for _, d := range eoConditionalDecisions {
+		decided[d.TypeKey+"."+d.MatrixKey] = d
+	}
+
+	checked := 0
+	for _, typeKey := range []string{eoDirectiveTypeKey, eoDraftStudyTypeKey, eoIncomingTypeKey} {
+		for engineKey, row := range eoMatrixExpectations(t, matrix, typeKey) {
+			checked++
+			t.Run(typeKey+"."+engineKey, func(t *testing.T) {
+				got := eoEffectiveField(t, db, typeKey, row.Key)
+				want := func(mode, provenance string) {
+					t.Helper()
+					if got.RequiredMode != mode {
+						t.Errorf("the matrix says %q, so required_mode should be %q; it is %q",
+							row.Required, mode, got.RequiredMode)
+					}
+					if provenance != "" && got.Provenance != provenance {
+						t.Errorf("the matrix says %q, so provenance should be %q; it is %q",
+							row.Required, provenance, got.Provenance)
+					}
+				}
+				switch row.Required {
+				case "Yes":
+					want(models.EORequiredAlways, models.EOProvenanceUser)
+				case "No":
+					want(models.EORequiredNever, models.EOProvenanceUser)
+				case "Auto":
+					want(models.EORequiredNever, models.EOProvenanceAuto)
+				case "Derived":
+					want(models.EORequiredNever, models.EOProvenanceDerived)
+				case "Yes at closure":
+					// Enforced as a workflow requirement on the terminal
+					// transition, which is required_at_state. None of the
+					// three root types has one; a sub type does (Assignment's
+					// `evidence`), so this arm exists for Task A3.
+					want(models.EORequiredAtState, models.EOProvenanceUser)
+				case "Conditional":
+					d, ok := decided[typeKey+"."+row.Key]
+					if !ok {
+						t.Fatalf("the matrix marks this Conditional and eoConditionalDecisions records no decision for it")
+					}
+					if got.RequiredMode != d.Mode {
+						t.Errorf("required_mode is %q, the recorded decision says %q", got.RequiredMode, d.Mode)
+					}
+				default:
+					t.Fatalf("unknown Required value %q in the matrix; the test does not know what to expect of it", row.Required)
+				}
+			})
+		}
+	}
+	// 15 inherited keys (17 less the two engine-managed) on each of three
+	// types, plus each type's own rows that are not already one of those 15:
+	// Directive 15+13, Draft Decision Study 15+21, Incoming Correspondence
+	// 15+14 (its `sender_deadline` and `attachments` rows name engine keys the
+	// inherited table already contributed). The per-section row counts in
+	// eoReadFieldMatrix are the primary guard against a parse that finds
+	// nothing; this is the second.
+	if checked != 28+36+29 {
+		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+36+29)
 	}
 }

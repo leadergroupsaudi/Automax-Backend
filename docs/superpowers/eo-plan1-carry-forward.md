@@ -83,6 +83,59 @@ forms and the client-signed Arabic labels.
 
 ---
 
+## Opened by Plan 2, recorded here so it survives the plan
+
+**Client sign-off: which "Yes" fields are really "Yes at closure"
+(named obligation, owner: Plan 2 Task A5).** The client's field matrix has a
+five-valued Required column and uses `Yes at closure` deliberately — Assignment's
+`evidence` carries it. Task A2 therefore seeded every `Yes` as
+`required_mode: always`, literally, for the three root types. The consequence is
+that several plainly end-of-process fields are demanded at **creation**: a Draft
+Decision Study cannot be created without `he_decision`, `he_reason`,
+`decision_date`, `recommendation` and `study_report`; a Directive cannot be
+created without `verification_notes`. As seeded, no clerk can submit one.
+
+This is deliberate and is the **recoverable** direction:
+`models.ValidateTypeEdit` allows `always -> never` once records exist and refuses
+`never -> always`, so strict preserves the client's options and loose destroys
+them. But it must be settled, not left. A5 owns it, because A5 is where the
+workflows and their terminal transitions arrive and `required_at_state` becomes
+expressible. The sign-off question for the client is: **for each `Yes` row, is it
+required when the record is opened, or when it is closed?** The answer turns some
+of them into `at_state` on the terminal transition and leaves the rest alone.
+
+**Client sign-off: the condition on `decision_reference`
+(owner: Plan 2 Task A5, with a deadline).** The matrix marks Directive's
+`decision_reference` Conditional and names **no** condition — the Options cell is
+empty and the Why cell gives only an example reference. Task A2 seeded it `never`
+with that reason recorded in `eoConditionalDecisions`, rather than invent client
+policy. Unlike the item above, this one does **not** stay recoverable: tightening
+`never -> required` is refused by `ValidateTypeEdit` once records exist, so after
+the first Directive record it takes a seed step or a migration rather than an
+edit. **Get the answer before the pilot's first Directive.** The plausible
+reading is "when `directive_origin` is `committee` or `weekly_meeting`", but the
+matrix does not say so.
+
+**Task A5 must call `eoLockDraftFieldsAfterState` or delete it.** The Draft
+Decision Study's `draft_text` and `draft_file` are the pilot's only field-level
+immutability (§7.12, "the original is never edited"). A2 seeded them unlocked,
+because `IsLockedAfterStateID` names a workflow state and no state for that type
+existed yet, and exposed `eoLockDraftFieldsAfterState` for A5 to call from its own
+step. Until it is called the two fields are editable and the lock is configured by
+nobody.
+
+**`eo_base.partition_pending` is `true` although its seed sets it `false`
+(deferred minor).** `models.EORecordType.PartitionPending` carries
+`gorm:"default:true"`, and GORM omits a zero-valued field with a `default:` tag
+from its INSERT, so `eoSeedBaseType`'s `PartitionPending: false` inserts the
+default instead. The model's own doc comment asserts the opposite. Harmless — the
+base type is abstract and will never want a partition, and nothing in the engine
+reads the column — but the comment and the data disagree. One line in
+`eoSeedBaseType`: write the column explicitly after the create, the way
+`eoSeedRootTypes` does.
+
+---
+
 ## Carried engine items
 
 - **Removing a capability from a record type leaves its timers armed.** They
