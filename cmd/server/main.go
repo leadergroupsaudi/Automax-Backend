@@ -39,6 +39,7 @@ func main() {
 
 	log.Printf("GOAL_MANAGEMENT enabled: %v", cfg.GoalManagement.Enabled)
 	validation.InitValidatorRegistry()
+	services.RegisterEOCapabilities() // explicit, not an init(): see services/eo_capability.go
 	db, err := database.Connect(&cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)

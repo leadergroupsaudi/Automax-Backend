@@ -130,6 +130,7 @@ type eoTransitionService struct {
 	workflows repository.WorkflowRepository
 	eval      FormulaEvaluator
 	actions   EOTransitionActionDispatcher
+	caps      eoCapabilityResolver
 }
 
 // NewEOTransitionService builds the executor. actions may be nil until Task 15
@@ -235,6 +236,23 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			transition.Code, transition.ToStateID, wf.Code)
 	}
 
+	// Capabilities are resolved BEFORE the transaction: that needs a type read,
+	// and a pooled read taken while the transaction holds its own connection
+	// and the row lock can wait forever for a free one. The hooks themselves
+	// receive no repository at all.
+	recType, err := s.types.GetByID(ctx, rec.RecordTypeID)
+	if err != nil {
+		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
+	}
+	if recType == nil {
+		return nil, fmt.Errorf("execute transition %q on record %s: no record type %s", transition.Code, rec.ID, rec.RecordTypeID)
+	}
+	caps, err := s.caps.resolve(recType)
+	if err != nil {
+		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
+	}
+	ctx = WithEOActor(ctx, actor)
+
 	var updated *models.EORecord
 	err = s.records.Transaction(ctx, func(r repository.EORecordRepository) error {
 		// The row lock is the FIRST statement in the transaction: a
@@ -301,6 +319,24 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
+		// 5b. the capabilities: their save-time checks over the record with the
+		// field changes applied, then their transition hooks, which may write
+		// engine-owned values (the approval stamp). Both run before the derived
+		// step so a formula can read what they wrote, and an error from either
+		// rolls the transition back.
+		capErrs, err := eoCapabilitiesValidate(ctx, caps, fresh)
+		if err != nil {
+			return err
+		}
+		if err := eoValidationError(capErrs); err != nil {
+			return err
+		}
+		for _, c := range caps {
+			if err := c.OnTransition(ctx, fresh, transition, c.Config); err != nil {
+				return err
+			}
+		}
+
 		// 6. the new state. A terminal state closes the record; leaving one
 		// re-opens it, so closed_at is cleared rather than left stale.
 		fresh.StateID = &transition.ToStateID
@@ -327,6 +363,9 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// outside the transaction. (The save pipeline recomputes BEFORE
 		// opening its transaction, so it is no precedent for doing otherwise.)
 		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: s.types})
+		if err := eoCapabilitiesDerive(ctx, caps, fresh); err != nil {
+			return err
+		}
 
 		// 8. the record and its journal entry are one write.
 		if err := r.Update(ctx, fresh); err != nil {

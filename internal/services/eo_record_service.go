@@ -367,6 +367,9 @@ type eoRecordService struct {
 	workflows repository.WorkflowRepository
 	eval      FormulaEvaluator
 	deps      DependencyLoader
+	// caps resolves a type's enabled capabilities; nil means the process-wide
+	// registry. A test seam, like eval.
+	caps eoCapabilityResolver
 }
 
 func NewEORecordService(
@@ -411,6 +414,11 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
+	caps, err := s.caps.resolve(t)
+	if err != nil {
+		return nil, fmt.Errorf("create eo record: %w", err)
+	}
+	ctx = WithEOActor(ctx, actor)
 
 	var parent *models.EORecord
 	if req.ParentRecordID != nil {
@@ -463,6 +471,14 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	if err := eoValidationError(eoApplyValues(rec, req.Values)); err != nil {
 		return nil, err
 	}
+	// The capabilities' save-time checks, over the record as it will be saved.
+	capErrs, err := eoCapabilitiesValidate(ctx, caps, rec)
+	if err != nil {
+		return nil, fmt.Errorf("create eo record: %w", err)
+	}
+	if err := eoValidationError(capErrs); err != nil {
+		return nil, err
+	}
 
 	// 2. allocate the reference. The number is drawn only once the payload is
 	// known to be good; a failure after this point leaves a gap, since the
@@ -483,6 +499,9 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 
 	// 5. derived fields, over the values written above.
 	s.applyDerived(ctx, fields, rec)
+	if err := eoCapabilitiesDerive(ctx, caps, rec); err != nil {
+		return nil, fmt.Errorf("create eo record: %w", err)
+	}
 
 	// 6. persist. The record, its parent link and the history row that says
 	// it entered its initial state are one write.
@@ -535,6 +554,11 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 	if err != nil {
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
+	caps, err := s.caps.resolve(t)
+	if err != nil {
+		return nil, fmt.Errorf("update eo record %s: %w", id, err)
+	}
+	ctx = WithEOActor(ctx, actor)
 
 	// is_locked_after asks whether the record has EVER entered a state, which
 	// only the history answers: EO workflows have return and exception paths,
@@ -559,8 +583,18 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 	if err := eoValidationError(eoApplyValues(rec, req.Values)); err != nil {
 		return nil, err
 	}
+	capErrs, err := eoCapabilitiesValidate(ctx, caps, rec)
+	if err != nil {
+		return nil, fmt.Errorf("update eo record %s: %w", id, err)
+	}
+	if err := eoValidationError(capErrs); err != nil {
+		return nil, err
+	}
 
 	s.applyDerived(ctx, fields, rec)
+	if err := eoCapabilitiesDerive(ctx, caps, rec); err != nil {
+		return nil, fmt.Errorf("update eo record %s: %w", id, err)
+	}
 
 	// A field edit is not a transition, so the history row carries no
 	// transition and no state change — but it is still a change to a record

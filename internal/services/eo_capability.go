@@ -119,3 +119,47 @@ func CapabilitiesFor(t *models.EORecordType) ([]EOEnabledCapability, error) {
 func RegisterEOCapabilities() {
 	RegisterCapability(NewEOApprovalCapability())
 }
+
+// eoCapabilityResolver is how a service finds a type's capabilities. Nil means
+// the process-wide registry; tests inject their own.
+type eoCapabilityResolver func(*models.EORecordType) ([]EOEnabledCapability, error)
+
+func (r eoCapabilityResolver) resolve(t *models.EORecordType) ([]EOEnabledCapability, error) {
+	if r == nil {
+		return CapabilitiesFor(t)
+	}
+	return r(t)
+}
+
+// eoCapabilitiesValidate runs every capability's Validate over rec and merges
+// the field errors. A returned error means a capability is misconfigured.
+func eoCapabilitiesValidate(ctx context.Context, caps []EOEnabledCapability, rec *models.EORecord) (map[string]string, error) {
+	out := map[string]string{}
+	for _, c := range caps {
+		errs, err := c.Validate(ctx, rec, c.Config)
+		if err != nil {
+			return nil, fmt.Errorf("capability %q: %w", c.Key(), err)
+		}
+		out = eoMergeFieldErrors(out, errs)
+	}
+	return out, nil
+}
+
+// eoCapabilitiesDerive writes every capability's derived values onto rec. They
+// go through eoApplyValues, not the request path, so they need no field
+// definition — but they still cannot overwrite an engine-owned column.
+func eoCapabilitiesDerive(ctx context.Context, caps []EOEnabledCapability, rec *models.EORecord) error {
+	for _, c := range caps {
+		derived, err := c.Derive(ctx, rec, c.Config)
+		if err != nil {
+			return fmt.Errorf("capability %q: %w", c.Key(), err)
+		}
+		if len(derived) == 0 {
+			continue
+		}
+		if errs := eoApplyValues(rec, derived); len(errs) > 0 {
+			return fmt.Errorf("capability %q derived values could not be stored: %v", c.Key(), errs)
+		}
+	}
+	return nil
+}
