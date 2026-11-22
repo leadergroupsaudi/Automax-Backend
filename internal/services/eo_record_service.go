@@ -175,6 +175,9 @@ func eoUnknownFieldErrors(fields []models.EOFieldDef, values map[string]any) map
 // eoMergeFieldErrors folds src into dst without overwriting a message already
 // there, so the first explanation of a key wins.
 func eoMergeFieldErrors(dst, src map[string]string) map[string]string {
+	if dst == nil {
+		dst = map[string]string{}
+	}
 	for k, v := range src {
 		if _, ok := dst[k]; !ok {
 			dst[k] = v

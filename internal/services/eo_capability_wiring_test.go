@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/repository"
+	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
 
@@ -222,4 +224,72 @@ func TestApprovalStampThroughTransition(t *testing.T) {
 			t.Error("stamped on an unlisted transition")
 		}
 	})
+}
+
+// eoInTxRecords marks the window in which a transaction is open.
+type eoInTxRecords struct {
+	*eoTxRecordRepo
+	open *bool
+}
+
+func (r eoInTxRecords) Transaction(ctx context.Context, fn func(repository.EORecordRepository) error) error {
+	*r.open = true
+	defer func() { *r.open = false }()
+	return r.eoTxRecordRepo.Transaction(ctx, fn)
+}
+
+// eoInTxTypes counts type-repository reads taken while a transaction is open.
+type eoInTxTypes struct {
+	*eoTxTypeRepo
+	open *bool
+	inTx *[]string
+}
+
+func (r eoInTxTypes) note(name string) {
+	if *r.open {
+		*r.inTx = append(*r.inTx, name)
+	}
+}
+
+func (r eoInTxTypes) GetByID(ctx context.Context, id uuid.UUID) (*models.EORecordType, error) {
+	r.note("GetByID")
+	return r.eoTxTypeRepo.GetByID(ctx, id)
+}
+
+func (r eoInTxTypes) Ancestors(ctx context.Context, t *models.EORecordType) ([]models.EORecordType, error) {
+	r.note("Ancestors")
+	return r.eoTxTypeRepo.Ancestors(ctx, t)
+}
+
+func (r eoInTxTypes) FieldDefs(ctx context.Context, ids []uuid.UUID) ([]models.EOFieldDef, error) {
+	r.note("FieldDefs")
+	return r.eoTxTypeRepo.FieldDefs(ctx, ids)
+}
+
+// The capability list and the effective fields are read on the pooled handle
+// BEFORE the transaction, never inside it.
+func TestTransitionReadsTypeAndFieldsBeforeTheTransaction(t *testing.T) {
+	f := eoNewTxFixture(t)
+	open := false
+	var inTx []string
+	svc := NewEOTransitionService(
+		eoInTxRecords{f.records, &open},
+		eoInTxTypes{eoTxTypeRepo: f.types, open: &open, inTx: &inTx},
+		f.workflows, f.actions)
+	if _, err := svc.Execute(context.Background(), f.rec, f.transition("raise").ID, f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(inTx) != 0 {
+		t.Fatalf("pooled type reads inside the transaction: %v", inTx)
+	}
+}
+
+func TestMergeFieldErrorsToleratesANilDestination(t *testing.T) {
+	got := eoMergeFieldErrors(nil, map[string]string{"a": "bad"})
+	if got["a"] != "bad" {
+		t.Fatalf("got %v", got)
+	}
+	if got := eoMergeFieldErrors(nil, nil); got == nil {
+		t.Error("want a usable map back, not nil")
+	}
 }

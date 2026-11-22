@@ -247,6 +247,13 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	if recType == nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: no record type %s", transition.Code, rec.ID, rec.RecordTypeID)
 	}
+	// The effective fields are read here for the same reason: field
+	// definitions cannot change mid-transition, and a pooled read inside the
+	// transaction waits forever for a connection if the pool is capped.
+	fields, err := eoEffectiveFields(ctx, s.types, recType)
+	if err != nil {
+		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
+	}
 	caps, err := s.caps.resolve(recType)
 	if err != nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
@@ -294,10 +301,6 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// 5. the field changes the transition declares, validated against the
 		// TARGET state so that "required at closure" is asked of the state
 		// being entered.
-		fields, err := s.effectiveFields(ctx, fresh.RecordTypeID)
-		if err != nil {
-			return err
-		}
 		before := eoFlattenStored(fresh)
 
 		// Assignment resolution comes before the field changes, so an
@@ -821,18 +824,6 @@ func eoValidationBaseline(before, current, submitted map[string]any) map[string]
 		}
 	}
 	return out
-}
-
-// effectiveFields resolves a record type's own fields plus every ancestor's.
-func (s *eoTransitionService) effectiveFields(ctx context.Context, typeID uuid.UUID) ([]models.EOFieldDef, error) {
-	t, err := s.types.GetByID(ctx, typeID)
-	if err != nil {
-		return nil, err
-	}
-	if t == nil {
-		return nil, fmt.Errorf("no record type %s", typeID)
-	}
-	return eoEffectiveFields(ctx, s.types, t)
 }
 
 // eoStateByID finds a state in the workflow that owns it. Reading the state
