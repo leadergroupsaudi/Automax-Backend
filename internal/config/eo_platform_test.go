@@ -101,7 +101,7 @@ func TestEODocumentaConfigIsSeparateFromTheOthers(t *testing.T) {
 		"EO_DOCUMENTA_WORKSPACE_NAME", "EO_DOCUMENTA_ENABLED",
 		"DOCUMENTA_ENABLED", "DOCUMENTA_CLIENT_ID", "KPI_DOCUMENTA_ENABLED", "KPI_DOCUMENTA_CLIENT_ID",
 	}
-	clear := func(t *testing.T) {
+	clearEnv := func(t *testing.T) {
 		for _, k := range envs {
 			t.Setenv(k, "")
 			os.Unsetenv(k)
@@ -109,7 +109,7 @@ func TestEODocumentaConfigIsSeparateFromTheOthers(t *testing.T) {
 	}
 
 	t.Run("default off with no endpoint", func(t *testing.T) {
-		clear(t)
+		clearEnv(t)
 		// The other two being enabled must not enable this one.
 		t.Setenv("DOCUMENTA_ENABLED", "true")
 		t.Setenv("KPI_DOCUMENTA_ENABLED", "true")
@@ -123,7 +123,7 @@ func TestEODocumentaConfigIsSeparateFromTheOthers(t *testing.T) {
 	})
 
 	t.Run("reads its own variables", func(t *testing.T) {
-		clear(t)
+		clearEnv(t)
 		t.Setenv("EO_DOCUMENTA_BASE_URL", "https://eo.example")
 		t.Setenv("EO_DOCUMENTA_CLIENT_ID", "eo-id")
 		t.Setenv("EO_DOCUMENTA_CLIENT_SECRET", "eo-secret")
@@ -137,15 +137,27 @@ func TestEODocumentaConfigIsSeparateFromTheOthers(t *testing.T) {
 	})
 
 	t.Run("other blocks are unaffected", func(t *testing.T) {
-		clear(t)
-		t.Setenv("EO_DOCUMENTA_ENABLED", "true")
-		t.Setenv("EO_DOCUMENTA_CLIENT_ID", "eo-id")
-		cfg := Load()
-		if cfg.Documenta.Enabled || cfg.KpiDocumenta.Enabled {
-			t.Errorf("enabling EO Documenta enabled another block: documenta=%v kpi=%v", cfg.Documenta.Enabled, cfg.KpiDocumenta.Enabled)
+		clearEnv(t)
+		for _, k := range []string{
+			"DOCUMENTA_BASE_URL", "DOCUMENTA_CLIENT_SECRET", "DOCUMENTA_WORKSPACE_NAME",
+			"KPI_DOCUMENTA_BASE_URL", "KPI_DOCUMENTA_CLIENT_SECRET", "KPI_DOCUMENTA_WORKSPACE_NAME",
+		} {
+			t.Setenv(k, "")
+			os.Unsetenv(k)
 		}
-		if cfg.Documenta.ClientID == "eo-id" || cfg.KpiDocumenta.ClientID == "eo-id" {
-			t.Errorf("EO credentials leaked into another block")
+		t.Setenv("EO_DOCUMENTA_ENABLED", "true")
+		t.Setenv("EO_DOCUMENTA_BASE_URL", "https://eo.example")
+		t.Setenv("EO_DOCUMENTA_CLIENT_ID", "eo-id")
+		t.Setenv("EO_DOCUMENTA_CLIENT_SECRET", "eo-secret")
+		t.Setenv("EO_DOCUMENTA_WORKSPACE_NAME", "eo-workspace")
+		cfg := Load()
+		wantDoc := DocumentaConfig{BaseURL: "http://localhost:8090", WorkspaceName: "automax"}
+		wantKpi := DocumentaConfig{BaseURL: "https://mydocs.axionic.io", WorkspaceName: "automax"}
+		if cfg.Documenta != wantDoc {
+			t.Errorf("Documenta = %+v, want its own defaults %+v", cfg.Documenta, wantDoc)
+		}
+		if cfg.KpiDocumenta != wantKpi {
+			t.Errorf("KpiDocumenta = %+v, want its own defaults %+v", cfg.KpiDocumenta, wantKpi)
 		}
 	})
 }

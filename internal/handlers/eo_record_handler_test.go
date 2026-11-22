@@ -545,7 +545,10 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		// Task C1's third Documenta client: its own config block, default off.
 		// C2 consumes it; until then this pins that it is built from the EO
 		// block and not from cfg.Documenta / cfg.KpiDocumenta.
-		"storage.NewHTTPDocumentaClient(cfg.EODocumenta,",
+		// The FULL call, including the nil Redis client: the HTTP client's
+		// Redis token and folder-cache keys carry no client identity, so
+		// passing redisClient here would serve EO another client's token.
+		"storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)",
 		"cfg.EODocumenta.Enabled",
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
