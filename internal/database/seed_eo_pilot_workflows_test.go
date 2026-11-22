@@ -1195,7 +1195,13 @@ func TestEoSpawnFieldMapFillsEveryAlwaysRequiredTargetField(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	for _, s := range eoSeededSpawns(t, db) {
+	spawns := eoSeededSpawns(t, db)
+	// Its sibling has this and this one lacked it: with no spawn seeded the
+	// loop below passes over an empty set and proves nothing.
+	if len(spawns) != 1 {
+		t.Fatalf("%d spawn_record actions are seeded, want 1 (EO-DIR's Directive -> Task)", len(spawns))
+	}
+	for _, s := range spawns {
 		t.Run(s.sourceTypeKey+"."+s.transitionCode, func(t *testing.T) {
 			targetDefs := eoReadEffectiveFieldDefs(t, db, s.cfg.TargetType)
 			sourceDefs := eoReadEffectiveFieldDefs(t, db, s.sourceTypeKey)
@@ -1228,6 +1234,14 @@ func TestEoSpawnFieldMapFillsEveryAlwaysRequiredTargetField(t *testing.T) {
 				if !defined {
 					t.Errorf("field_map[%q] reads {{%s}}, which %q does not define; the executor fails the WHOLE spawn on an unknown reference", key, m[1], s.sourceTypeKey)
 					continue
+				}
+				// THE KINDS, on every mapping and not only the required
+				// ones: a whole {{placeholder}} carries the source's value
+				// with its own type, so a date filled from a text is refused
+				// at Create, post-commit, exactly like a missing one.
+				if targetDefs[key].Kind != src.Kind {
+					t.Errorf("field_map[%q] fills a %q on %q from %q.%s, which is a %q; the value is carried with its own type and the spawn would be refused at Create",
+						key, targetDefs[key].Kind, s.cfg.TargetType, s.sourceTypeKey, m[1], src.Kind)
 				}
 				if !required[key] {
 					continue
@@ -1332,6 +1346,14 @@ func TestEoSpawnsCannotCollapseInThePilotConfiguration(t *testing.T) {
 
 // eoStateReaches reports whether `to` can reach `from` by following this
 // workflow's transitions — a return loop, in other words.
+//
+// THE TARGET IS TESTED BEFORE THE VISITED SET, and that ordering is the whole
+// of the self-loop case. `start` is marked visited before the walk begins, so
+// testing `seen` first would make a transition with from == to — the shortest
+// return loop there is, and a record re-entering a spawning transition on the
+// spot — report "cannot be re-entered". No pilot transition is a self-loop
+// today; this function exists to catch the configuration that does not exist
+// yet, which is exactly where one would come from.
 func eoStateReaches(spec eoWorkflowSpec, start, target string) bool {
 	seen := map[string]bool{start: true}
 	queue := []string{start}
@@ -1339,17 +1361,52 @@ func eoStateReaches(spec eoWorkflowSpec, start, target string) bool {
 		cur := queue[0]
 		queue = queue[1:]
 		for _, tr := range spec.transitions {
-			if tr.from != cur || seen[tr.to] {
+			if tr.from != cur {
 				continue
 			}
 			if tr.to == target {
 				return true
+			}
+			if seen[tr.to] {
+				continue
 			}
 			seen[tr.to] = true
 			queue = append(queue, tr.to)
 		}
 	}
 	return false
+}
+
+// eoStateReaches is driven by the seeded specs, where no self-loop and no
+// return loop exists — so the branch that matters has never run. This gives it
+// three hand-made machines: the self-loop the ordering above is for, a longer
+// return loop, and the forward DAG that must still come out false.
+//
+// Mutation: in eoStateReaches, test `seen[tr.to]` before `tr.to == target`.
+func TestEoStateReachesFindsAReturnLoop(t *testing.T) {
+	tr := func(code, from, to string) eoTransitionSpec {
+		return eoTransitionSpec{code: code, from: from, to: to}
+	}
+	for _, tc := range []struct {
+		name        string
+		transitions []eoTransitionSpec
+		start, want string
+		reaches     bool
+	}{
+		{"a self-loop on the spawning transition",
+			[]eoTransitionSpec{tr("rework", "open", "open")}, "open", "open", true},
+		{"a return loop two states long",
+			[]eoTransitionSpec{tr("a", "one", "two"), tr("b", "two", "three"), tr("c", "three", "one")}, "two", "one", true},
+		{"a forward DAG with two paths to one state",
+			[]eoTransitionSpec{tr("a", "one", "two"), tr("b", "one", "three"), tr("c", "two", "three")}, "three", "one", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := eoWorkflowSpec{typeKey: "eo_fake", transitions: tc.transitions}
+			if got := eoStateReaches(spec, tc.start, tc.want); got != tc.reaches {
+				t.Errorf("eoStateReaches(%q, %q) = %v, want %v", tc.start, tc.want, got, tc.reaches)
+			}
+		})
+	}
 }
 
 // The spawn actions are their OWN step of the pilot seed, not an extension of
@@ -1436,8 +1493,15 @@ func TestEoSpawnSeedRefusesAMisconfiguredSpawn(t *testing.T) {
 				"whole {{placeholders}}"},
 			{"a placeholder the source type does not define", func(s *eoSpawnSpec) { s.fieldMap["task_text"] = "{{nope}}" },
 				`from {{nope}}, which "eo_directive" does not define`},
-			{"a required field filled from an optional one", func(s *eoSpawnSpec) { s.fieldMap["owner"] = "{{decision_reference}}" },
+			// `assigned_user_id` and not `decision_reference`: it is the one
+			// optional field on the Directive of the SAME KIND as `owner`,
+			// so this case tests the requiredness rule and nothing else. A
+			// text source would be refused by the kind rule first and this
+			// case would pass for the wrong reason.
+			{"a required field filled from an optional one", func(s *eoSpawnSpec) { s.fieldMap["owner"] = "{{assigned_user_id}}" },
 				"rather than user/always"},
+			{"a field filled from a source of another kind", func(s *eoSpawnSpec) { s.fieldMap["due_date"] = "{{directive_text}}" },
+				`from "eo_directive".directive_text, which is "long_text"`},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				err := eoCheckSpawnFieldMap(db, base(tc.edit))
@@ -1536,4 +1600,93 @@ func TestEoSpawnSeedRefusesAMisconfiguredSpawn(t *testing.T) {
 			t.Errorf("refused with %q, which does not say the type is missing", err)
 		}
 	})
+
+	// THE TWO GUARDS' CALL SITES, which every case above leaves unpinned
+	// because they drive eoCheckSpawnFieldMap and eoCheckSpawnLinkType
+	// DIRECTLY. Deleting the two lines that call them from
+	// eoSeedOneSpawnAction leaves a suite that is otherwise entirely green:
+	// the helpers would still refuse everything they are asked about, and
+	// nothing would ask them. These two cases go through the function a boot
+	// actually runs, so the wiring is the thing under test and not the rule.
+	//
+	// Mutation: delete `if err := eoCheckSpawnFieldMap(tx, spec); err != nil
+	// { return err }` from eoSeedOneSpawnAction, or its eoCheckSpawnLinkType
+	// twin.
+	t.Run("the seed calls the field-map guard", func(t *testing.T) {
+		err := eoSeedOneSpawnAction(db, base(func(s *eoSpawnSpec) { delete(s.fieldMap, "owner") }))
+		if err == nil {
+			t.Fatalf("the seed accepted a map that does not fill a required field of the target; eoCheckSpawnFieldMap refuses it, so nothing is calling it")
+		}
+		if !strings.Contains(err.Error(), "does not fill owner") {
+			t.Errorf("refused with %q, which is not the field-map guard's refusal", err)
+		}
+	})
+	t.Run("the seed calls the link-type guard", func(t *testing.T) {
+		err := eoSeedOneSpawnAction(db, base(func(s *eoSpawnSpec) { s.linkTypeKey = eoReferralLinkKey }))
+		if err == nil {
+			t.Fatalf("the seed accepted a link type whose source is another record type; eoCheckSpawnLinkType refuses it, so nothing is calling it")
+		}
+		if !strings.Contains(err.Error(), "must be its only source") {
+			t.Errorf("refused with %q, which is not the link-type guard's refusal", err)
+		}
+	})
+}
+
+// MINOR 5: THE ONE PROPERTY OF eoEffectiveFieldDefs NOTHING ELSE ASSERTS.
+// Its contract is that a type's OWN definition replaces an ancestor's of the
+// same key — spec §7.2's resolution, the one services.ResolveEffectiveFields
+// performs. If the chain were walked the other way round, `due_date` on
+// eo_task would resolve to the BASE definition, which is required `never`;
+// eoCheckSpawnFieldMap would then quietly stop demanding it, and no other A7
+// test would notice, because a map that fills MORE than the required set is
+// not an error. The services test proves the map carries `due_date`; it does
+// not prove the resolution order that makes it mandatory.
+//
+// The base's own value is asserted too, so this cannot pass by both
+// definitions happening to agree.
+//
+// Mutation: in eoEffectiveFieldDefs, change the chain query's
+// `ORDER BY depth DESC` to `ORDER BY depth`.
+func TestEoEffectiveFieldDefsPrefersTheTypesOwnDefinition(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	taskID, err := eoRecordTypeID(db, eoTaskTypeKey)
+	if err != nil {
+		t.Fatalf("read the task type: %v", err)
+	}
+	defs, err := eoEffectiveFieldDefs(db, eoTaskTypeKey)
+	if err != nil {
+		t.Fatalf("resolve the effective fields of %q: %v", eoTaskTypeKey, err)
+	}
+
+	// The ancestor's value, so the comparison below is a real one.
+	var base models.EOFieldDef
+	if err := db.Raw(`
+		SELECT f.* FROM eo_field_defs f
+		JOIN eo_record_types t ON t.id = f.record_type_id
+		JOIN eo_record_types child ON child.parent_type_id = t.id
+		WHERE child.key = ? AND f.key = 'due_date' AND f.deleted_at IS NULL`, eoTaskTypeKey).
+		Scan(&base).Error; err != nil {
+		t.Fatalf("read the base type's due_date: %v", err)
+	}
+	if base.ID == uuid.Nil {
+		t.Fatalf("the base type defines no due_date, so there is no override to prefer")
+	}
+	if base.RequiredMode != models.EORequiredNever {
+		t.Fatalf("the base type's due_date is %q, not %q; this test can no longer tell the two definitions apart", base.RequiredMode, models.EORequiredNever)
+	}
+
+	got, ok := defs["due_date"]
+	if !ok {
+		t.Fatalf("due_date is absent from the effective fields of %q", eoTaskTypeKey)
+	}
+	if got.RecordTypeID != taskID {
+		t.Errorf("due_date resolved to the definition on record type %s, want %q's own (%s); the ancestor chain is being walked nearest-last",
+			got.RecordTypeID, eoTaskTypeKey, taskID)
+	}
+	if got.RequiredMode != models.EORequiredAlways {
+		t.Errorf("due_date resolves to required_mode %q on %q, want %q; the Task's narrowing is being overwritten by the base's, and eoCheckSpawnFieldMap would stop demanding the one field that makes the spawn's clock work",
+			got.RequiredMode, eoTaskTypeKey, models.EORequiredAlways)
+	}
 }

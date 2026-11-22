@@ -981,8 +981,20 @@ so each is written out with the condition that would reopen it.
   and §7.11 treats the resulting gap as a classification defect rather than an
   access leak. The decisive fact is Task A4's: **the flag is `false` on all
   eight pilot link types** (`database.eoLinkRuleDecisions`), so there is no
-  cascade in the pilot to extend to the update path, and the re-labelling sweep
-  the ledger asked for has no descendant to sweep. The reason A4 left it off is
+  cascade in the pilot to extend to the update path.
+  **THE OTHER HALF OF THIS REASON WAS RETIRED IN A7'S OWN FIX ROUND, AND A7 IS
+  WHAT RETIRED IT.** This entry first added "and the re-labelling sweep the
+  ledger asked for has no descendant to sweep". There IS now a descendant: the
+  Directive's field map carries `"sensitivity": "{{sensitivity}}"`, which
+  SNAPSHOTS the directive's classification onto its spawned Task at creation
+  and is re-synced by nothing — so a directive later re-classified Confidential
+  leaves a Task reading Internal. That is the drift §7.11 calls a
+  classification defect, arriving by a route that is not the link-type cascade
+  at all, and no link-type flag would close it. **The decision itself is
+  unchanged** — the flag is still off on every link type and extending a
+  non-monotonic cascade would still be worse than not extending it — but
+  whoever revisits this owns the spawn's snapshot as part of the sweep's scope,
+  and must not read "nothing to sweep" off this entry. The reason A4 left it off is
   the reason not to extend it either: `services.applyLinkRules` assigns
   `rec.Sensitivity = parent.Sensitivity` **outright**
   (internal/services/eo_record_service.go:847), so a Confidential child under

@@ -1173,12 +1173,20 @@ var eoPilotSpawnActions = []eoSpawnSpec{
 		// EVERY KEY HERE HAS A FIELD DEFINITION ON eo_task AS THE SEED STANDS
 		// (A6 removed `related_refs` from another type and B2/B3 reserve keys,
 		// so this is checked against the database rather than the matrix), and
-		// every ALWAYS-required user field of eo_task is here: the seven
-		// inherited ones the base type requires, plus the type's own
-		// `task_text` and `owner`, plus `due_date`, which eo_task narrows to
-		// Always ("The clock that drives reminders and escalation",
-		// matrix:520). Each is filled from a field the Directive ALSO requires
-		// always, so the map cannot fail for want of a value on the parent.
+		// every ALWAYS-required user field of eo_task is here. That is EIGHT
+		// keys: the FIVE the base type requires always (`subject_ar`,
+		// `priority`, `sensitivity`, `source`, `owning_body_id`), the type's
+		// own `task_text` and `owner`, and `due_date`, which eo_task narrows
+		// from the base's `never` to Always ("The clock that drives reminders
+		// and escalation", matrix:520). The ninth entry, `subject_en`, is
+		// optional on both ends and is carried because losing a subject the
+		// directive has is worse than carrying it.
+		//
+		// Each of the eight is filled from a field the Directive ALSO requires
+		// always, so the map cannot fail for want of a value on the parent,
+		// and each is filled from a field of THE SAME KIND, so it cannot fail
+		// for a value the column will not take. eoCheckSpawnFieldMap enforces
+		// both.
 		fieldMap: map[string]string{
 			"subject_ar":     "{{subject_ar}}",
 			"subject_en":     "{{subject_en}}",
@@ -1348,6 +1356,11 @@ func eoCheckSpawnLinkType(tx *gorm.DB, spec eoSpawnSpec, sourceID, targetID uuid
 // retried. This is the spawn's form of the rule Task A5's review derived for
 // close_parent: what an action needs must be satisfiable from what the record
 // it runs on always has.
+//
+// AND THE THIRD THING, which the first two do not cover: the KINDS on the two
+// ends must match. A value can be present, required on both ends, and still
+// refused at Create for being a sentence where a date belongs. See the check
+// itself for why the rule is strict equality and why no widening is invented.
 func eoCheckSpawnFieldMap(tx *gorm.DB, spec eoSpawnSpec) error {
 	if len(spec.fieldMap) == 0 {
 		return errors.New("has an empty field map, so the spawned record would carry nothing")
@@ -1397,6 +1410,26 @@ func eoCheckSpawnFieldMap(tx *gorm.DB, spec eoSpawnSpec) error {
 		src, defined := sourceDefs[m[1]]
 		if !defined {
 			return fmt.Errorf("the field map fills %q from {{%s}}, which %q does not define; the executor fails the whole spawn on an unknown reference", key, m[1], spec.sourceTypeKey)
+		}
+		// THE KINDS MUST MATCH, and the rule is deliberately STRICT EQUALITY.
+		// A whole {{placeholder}} takes the source's value WITH ITS OWN TYPE
+		// (services.eoActionExecutor passes it through eoPlain and hands it
+		// to Create unchanged), so a `date` target filled from a `text`
+		// source reaches eoSetTime as a sentence and fails the whole spawn at
+		// Create — post-commit, logged, unretried, which is the exact outcome
+		// the two checks above exist to exclude. Provenance and requiredness
+		// alone do not catch it.
+		//
+		// NO COMPATIBILITY TABLE IS INVENTED HERE. `text` into `long_text`
+		// would plainly be safe and so would several others, but the pilot's
+		// nine mappings are all exact and a widening written for no caller is
+		// the shape this programme keeps catching. The day one of the four
+		// later processes needs a widening, THAT is the moment to write the
+		// pairs down — and a refusal at seed time is how it will be found,
+		// rather than a spawn that fails after the commit.
+		if d.Kind != src.Kind {
+			return fmt.Errorf("the field map fills %q, which is %q on %q, from %q.%s, which is %q; a whole {{placeholder}} carries the source's value with its own type, so the spawn would be refused at Create, after the commit",
+				key, d.Kind, spec.targetTypeKey, spec.sourceTypeKey, m[1], src.Kind)
 		}
 		if required[key] && (src.Provenance != models.EOProvenanceUser || src.RequiredMode != models.EORequiredAlways) {
 			return fmt.Errorf("the field map fills %q — which %q requires — from %q.%s, which is %s/%s rather than user/always; a %s with that field blank would commit its transition and then fail to spawn",
