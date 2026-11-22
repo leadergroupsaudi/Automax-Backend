@@ -39,14 +39,10 @@ type eoRefTreeReader struct {
 	// asked records every (parent, type key) the capability read, so a test
 	// can prove the capability did NOT read as well as that it did.
 	asked []string
-	err   error
 }
 
 func (r *eoRefTreeReader) Children(_ context.Context, parentID uuid.UUID, key string) ([]models.EORecord, error) {
 	r.asked = append(r.asked, key)
-	if r.err != nil {
-		return nil, r.err
-	}
 	byKey, ok := r.children[parentID]
 	if !ok {
 		byKey = map[string][]models.EORecord{}
@@ -401,6 +397,12 @@ func TestReferralTreeConsolidatesEveryBranch(t *testing.T) {
 	// The ancestor bound exists because the chain is untrusted input: it is
 	// clerk-entered values, not a column the database constrains. A chain
 	// past the bound must still consolidate every branch.
+	//
+	// "Exactly one branch is flagged" is pinned to THIS fixture's build
+	// order, not asserted as a property: cutting a branch detaches the chain
+	// above it, so in another order a different branch — or a different
+	// NUMBER of them — carries the flag. What holds in every order is the
+	// count assertion above it: every branch appears exactly once.
 	t.Run("a chain deeper than the ancestor bound is cut and SAID, and every branch is still consolidated", func(t *testing.T) {
 		rec := eoRefTreeLetter(t, nil)
 		branches := make([]models.EORecord, 0, eoMaxAncestorDepth+2)
@@ -658,7 +660,7 @@ func TestReferralTreeDoesNotDuplicateDeadlineDerivation(t *testing.T) {
 	t.Run("no configuration can aim this capability at the deadline", func(t *testing.T) {
 		rec := eoRefTreeLetter(t, nil)
 		read := eoRefTreeReaderFor(rec, nil)
-		for _, target := range []string{"due_date", "deadline"} {
+		for _, target := range []string{"due_date", "deadline", "closed_at", "state_id", "owning_body_id", "sensitivity"} {
 			c := eoRefTreeConfig(t, map[string]any{"branch_type_key": eoRefTreeBranchTypeKey, "target_key": target})
 			if _, err := capability.Derive(ctx, read, rec, c); err == nil {
 				t.Errorf("target_key %q was accepted; the link rule owns the deadline", target)
@@ -702,14 +704,18 @@ func TestReferralTreeDoesNotDuplicateDeadlineDerivation(t *testing.T) {
 			}
 			return true
 		})
-		for _, want := range []string{`"due_date"`, `"deadline"`, `"consolidated"`} {
+		// `due_date` is deliberately NOT here: the column is refused
+		// structurally against eoRecordColumnWriters, so the file names it
+		// nowhere at all, and the sweep below is what holds that.
+		for _, want := range []string{`"deadline"`, `"consolidated"`, `"reply_text"`} {
 			if !eoRefTreeHas(denied, want) {
 				t.Errorf("%s = %v; %s must be refused by name, not left to another file's field definitions", denyList, denied, want)
 			}
 		}
 		// The words that must appear in no other string literal of the file:
-		// the two spellings of the deadline the link rule owns, and the
-		// officer's own prose field the client reserved for a person.
+		// the matrix's spelling of the deadline the link rule owns, the
+		// column it maps onto, and the officer's own prose field the client
+		// reserved for a person.
 		for _, forbidden := range []string{"due_date", "deadline", "consolidat"} {
 			ast.Inspect(file, func(n ast.Node) bool {
 				lit, ok := n.(*ast.BasicLit)
@@ -790,13 +796,26 @@ func TestReferralTreeCarriesNoBranchContentAcrossBodies(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode derived: %v", err)
 		}
+		// Every marker is searched for, whatever SHAPE the branch stored it
+		// in. Skipping non-strings would have left a list-valued field
+		// (`response_files`) unsearched, so an answer lifted out of a list
+		// and stuffed into a field the declared shape DOES have — Anomaly,
+		// say — would have passed both halves of this guarantee.
+		searched := map[string]bool{}
 		for key, value := range content {
-			s, ok := value.(string)
-			if !ok {
-				continue
+			for _, marker := range eoRefTreeMarkers(t, value) {
+				searched[marker] = true
+				if strings.Contains(string(raw), marker) {
+					t.Errorf("the consolidated value carries the branch's %q (%s). The letter carries no visible_to, so storing a restricted branch's content on it routes §7.11 around its own control", key, marker)
+				}
 			}
-			if strings.Contains(string(raw), s) {
-				t.Errorf("the consolidated value carries the branch's %q (%q). The letter carries no visible_to, so storing a restricted branch's content on it routes §7.11 around its own control", key, s)
+		}
+		// The search itself is worth an assertion: a marker that is not
+		// looked for is a leak nobody would notice, and the element inside
+		// the list is the one a shape-blind search drops.
+		for _, want := range []string{"eo-marker-file", "eo-marker-response-legal-flags-the-zoning-bylaw", legalBody} {
+			if !searched[want] {
+				t.Errorf("%q was never searched for; a value this test does not look at is a value it does not protect", want)
 			}
 		}
 	})
@@ -826,7 +845,9 @@ func TestReferralTreeConfigIsStrict(t *testing.T) {
 		{"a blank parent key, so the tree would have no shape", `{"branch_type_key":"eo_referral","parent_key":"   "}`},
 		{"a blank target key, so the tree would have nowhere to go", `{"branch_type_key":"eo_referral","target_key":"  "}`},
 		{"the target key is also the parent key the clerk fills", `{"branch_type_key":"eo_referral","parent_key":"parent_referral","target_key":"parent_referral"}`},
-		{"the target key is the deadline the link rule owns", `{"branch_type_key":"eo_referral","target_key":"due_date"}`},
+		{"the target key is the deadline the link rule owns", `{"branch_type_key":"eo_referral","target_key":"deadline"}`},
+		{"the target key is the column that deadline maps onto", `{"branch_type_key":"eo_referral","target_key":"due_date"}`},
+		{"the target key is a key the engine owns outright", `{"branch_type_key":"eo_referral","target_key":"reference"}`},
 		{"the target key is the officer's own prose", `{"branch_type_key":"eo_referral","target_key":"consolidated"}`},
 		{"a malformed blob", `{"branch_type_key":`},
 	} {
@@ -935,6 +956,41 @@ func TestReferralTreeIsRegisteredByTheWiringCall(t *testing.T) {
 }
 
 // ── small helpers ───────────────────────────────────────────────────────────
+
+// eoRefTreeMarkers returns every string that appears anywhere inside v, plus
+// v's own JSON encoding. A leak is caught whether it copies the whole value or
+// lifts one element out of a list.
+func eoRefTreeMarkers(t *testing.T, v any) []string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("encode a branch value: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode a branch value: %v", err)
+	}
+	out := []string{string(raw)}
+	var walk func(any)
+	walk = func(n any) {
+		switch x := n.(type) {
+		case string:
+			if strings.TrimSpace(x) != "" {
+				out = append(out, x)
+			}
+		case []any:
+			for _, e := range x {
+				walk(e)
+			}
+		case map[string]any:
+			for _, e := range x {
+				walk(e)
+			}
+		}
+	}
+	walk(decoded)
+	return out
+}
 
 func eoRefTreeHas(list []string, want string) bool {
 	for _, got := range list {

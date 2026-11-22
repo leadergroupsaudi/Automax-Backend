@@ -262,8 +262,9 @@ const eoReadCapKey = "eo_read_probe"
 
 // eoReadCap is a capability whose every record-facing hook reaches for ANOTHER
 // record through the reader the engine hands it. It is the shape Tasks B2 and
-// B3 will have: decisions_base reads standing records of a type other than the
-// draft's, referral_tree reads a letter's referrals and their typed links.
+// B3 have: decisions_base reads standing records of a type other than the
+// draft's, referral_tree reads a letter's referrals — in ONE call, because
+// every referral is a record child of the letter.
 //
 // It deliberately does NOT embed Capability, and so departs from the
 // convention of the three fakes above it (eoCapFake, eoWireCap, eoBridgeCap).
@@ -316,9 +317,6 @@ func (c *eoReadCap) reach(ctx context.Context, hook string, read EOCapabilityRea
 		if _, err := read.Record(ctx, c.otherID); err != nil {
 			return 0, err
 		}
-	}
-	if _, err := read.Links(ctx, rec.ID); err != nil {
-		return 0, err
 	}
 	if _, err := read.RecordType(ctx, c.childTypeKey); err != nil {
 		return 0, err

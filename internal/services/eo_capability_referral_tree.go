@@ -111,18 +111,20 @@ const EOReferralTreeKey = "referral_tree"
 const eoReferralTreeDefaultParentKey = "parent_referral"
 
 // eoReferralTreeForbiddenTargets are values keys this capability may never
-// own, whatever a configuration says.
+// own, whatever a configuration says. They are the keys a HUMAN or another
+// MECHANISM owns, which no structural test can recognise:
 //
-//   - `due_date` and `deadline` are the one column the Referral's deadline
-//     lives in (eoMatrixKey maps the matrix's `deadline` onto the inherited
-//     due_date). services.DeriveDeadlineFromParent is its only writer, and the
-//     spec naming it in two places is exactly how one column acquires two
-//     mechanisms.
+//   - `deadline` is the matrix's spelling of the Referral's due date, which
+//     eoMatrixKey maps onto the inherited due_date COLUMN.
+//     services.DeriveDeadlineFromParent is its only writer, and the spec
+//     naming that rule in two places (§7.5 and §7.6) is exactly how one value
+//     acquires two mechanisms. The column itself is refused structurally in
+//     parse, so it is not named here.
 //   - `consolidated` is the letter's "many inputs, one answer", Required Yes
-//     and written by a PERSON. The engine consolidates what bears on it and
-//     writes none of it.
+//     and written by a PERSON. The engine gathers what bears on it and writes
+//     none of it.
 //   - `reply_text` is the same sentence on the Outgoing Reply.
-var eoReferralTreeForbiddenTargets = []string{"due_date", "deadline", "consolidated", "reply_text"}
+var eoReferralTreeForbiddenTargets = []string{"deadline", "consolidated", "reply_text"}
 
 // The anomalies a branch can carry. Each marks a branch that is IN the tree
 // and attached at the root because its declared parent could not be honoured
@@ -144,6 +146,14 @@ const (
 	// than eoMaxAncestorDepth. The chain is clerk-entered values, not a
 	// column the database constrains, so it is bounded like every other
 	// ancestry walk in the engine.
+	//
+	// WHICH branch of an over-long chain carries this flag depends on the
+	// order the repository returned the branches: cutting one detaches the
+	// chain above it, so a branch examined later may walk a now-short chain
+	// and need no flag. Every branch still appears exactly once in every
+	// order, and the cut always lands inside the over-long run — but a test
+	// that asserts "exactly one branch is flagged" is reading an artifact of
+	// build order, not a property of the function.
 	eoReferralTreeParentTooDeep = "parent_too_deep"
 )
 
@@ -254,6 +264,13 @@ func (c *eoReferralTreeCapability) parse(cfg datatypes.JSON) (eoReferralTreeConf
 	}
 	if out.TargetKey == out.ParentKey {
 		return out, fmt.Errorf("referral_tree: target_key %q is also the parent_key; the capability owns the target, so the clerk could never name a parent branch", out.TargetKey)
+	}
+	// Every column the engine writes, and every key it owns outright, refused
+	// as a set rather than by name: a capability that could aim its target at
+	// a column would be a second mechanism writing it, and the list of
+	// columns grows without this file hearing about it.
+	if _, column := eoRecordColumnWriters[out.TargetKey]; column || eoEngineOwnedKeys[out.TargetKey] {
+		return out, fmt.Errorf("referral_tree: target_key %q is a column the engine owns and writes itself; a capability that aimed at one would be a second mechanism writing it", out.TargetKey)
 	}
 	for _, forbidden := range eoReferralTreeForbiddenTargets {
 		if out.TargetKey == forbidden {

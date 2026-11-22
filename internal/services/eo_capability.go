@@ -261,10 +261,20 @@ func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFie
 
 // EOCapabilityReader is how a capability hook reaches a record other than the
 // one it was called about: decisions_base reads records of a type other than
-// the draft's, referral_tree reads a letter's referrals, their sub-referrals
-// and the typed links between them. It is read-only on purpose — a capability
-// writes through the values it derives and through OnTransition's mutation of
-// rec, never behind the pipeline's back.
+// the draft's, referral_tree reads a letter's referrals — sub-referrals
+// included, because every referral is a record child of the LETTER. It is
+// read-only on purpose — a capability writes through the values it derives and
+// through OnTransition's mutation of rec, never behind the pipeline's back.
+//
+// IT CARRIES NO LINK READ, and that is a decision rather than an omission.
+// Task B1 added a Links method on the premise that a sub-referral's parentage
+// lived in eo_record_links; Task B3 established that it does not — no
+// `parent_referral` LINK TYPE is seeded, and EORecordHandler.CreateLink
+// refuses a link type that resolves to none, so no such row can exist. The
+// method was therefore present, plausible and consumed nowhere, and it was
+// removed rather than left for a later reader to believe. If a capability ever
+// genuinely needs the typed links of a record, the way back is this interface
+// plus a repository method — never a repository on the capability.
 //
 // WHY A HANDED-IN READER RATHER THAN A REPOSITORY ON THE CAPABILITY.
 // A capability is a process-wide singleton, registered at startup before any
@@ -300,9 +310,6 @@ type EOCapabilityReader interface {
 	// recordTypeKey means every type; a key that names no type is an error,
 	// never an empty result, because a typo must not look like "no children".
 	Children(ctx context.Context, parentID uuid.UUID, recordTypeKey string) ([]models.EORecord, error)
-	// Links returns the typed links declared FROM recordID — the direction a
-	// child uses to name its parent, which is how a referral tree is walked.
-	Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
 	// RecordsOfType returns every record of one type, oldest first — the
 	// standing base decisions_base checks a draft against. It applies no
 	// row-level visibility, like Record above: a derived value must not
@@ -360,10 +367,6 @@ func (d *eoCapabilityReader) RecordsOfType(ctx context.Context, recordTypeKey st
 		return nil, fmt.Errorf("no record type with key %q", recordTypeKey)
 	}
 	return d.records.RecordsOfType(ctx, t.ID)
-}
-
-func (d *eoCapabilityReader) Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
-	return d.records.LinksFrom(ctx, recordID)
 }
 
 // ── embeddable no-ops ───────────────────────────────────────────────────────

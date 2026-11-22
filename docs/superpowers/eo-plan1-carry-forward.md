@@ -700,11 +700,14 @@ findable but does not make them questions; these are the questions.
   and an anomaly where the declared parent could not be honoured). The letter
   carries no `visible_to` of its own, so a `response` or an `instruction`
   copied onto it would be readable by every reader of the letter — §7.11
-  routed around by the engine meant to enforce it. The residual, stated:
-  a reader entitled to the letter learns that branch `IN-YYYY-NNNN-R3` exists
-  and whether it has answered, without being entitled to open it. If the
-  client holds even the SHAPE of the tree confidential, the answer is not to
-  trim the list silently — it is to stop storing it on the letter.
+  routed around by the engine meant to enforce it. The residual, stated in
+  full: a reader entitled to the letter learns that branch `IN-YYYY-NNNN-R3`
+  exists, whether it has answered, **where it sits in the tree** (`parent_id`
+  and `depth`, so which branch it was spun off) and **whether its parentage is
+  malformed** (`anomaly`) — all without being entitled to open it. What it does
+  NOT learn is any value the branch carries. If the client holds even the SHAPE
+  of the tree confidential, the answer is not to trim the list silently — it is
+  to stop storing it on the letter.
 - **`EOCapabilityReader.Children` resolves the record type key on every call**
   (`GetByKey` then `Children`). A referral-tree recursion therefore issues one
   `GetByKey` per node for a key it resolved at the root. Inside a transaction
@@ -775,14 +778,20 @@ findable but does not make them questions; these are the questions.
   refuses a link type that does not exist, so no `eo_record_links` row of that
   key can ever be written. B3 therefore reads the `parent_referral` values key.
   The comment at ~2074 should be corrected by whoever next touches that block.
-- **`EOCapabilityReader.Links` still has no production consumer.** B1 added it
-  "the direction a child uses to name its parent, which is how a referral tree is
-  walked", and B3 — the task it was added for — does not call it, for the reason
-  above: the typed link it would read cannot exist. It is exercised only by
-  `eoReadCap`. Either a later task seeds a `parent_referral` LINK TYPE and moves
-  the shape onto `eo_record_links` (which would also give the pairing a
-  cardinality and an endpoint-type check the values key has neither of), or the
-  method is dead surface on the seam and should be said to be.
+- **`EOCapabilityReader.Links` had no production consumer — REMOVED in B3's fix
+  round.** B1 added it "the direction a child uses to name its parent, which is
+  how a referral tree is walked", and B3 — the task it was added for — could not
+  call it, for the reason above: the typed link it would read cannot exist. That
+  is "present, plausible, consumed nowhere", the shape this programme has caught
+  nine times, so the seam method and its implementation are gone along with the
+  two sentences that described a capability reading typed links. The REPOSITORY
+  method `EORecordRepository.LinksFrom` is untouched and keeps its five real
+  consumers; only the capability seam narrowed. If a capability ever genuinely
+  needs the typed links of a record, the way back is this interface plus a
+  repository method — never a repository on the capability. The open question it
+  leaves: whether a later task should seed a `parent_referral` LINK TYPE and move
+  the tree's shape onto `eo_record_links`, which would give the pairing a
+  cardinality rule and an endpoint-type check that a values key has neither of.
 - **Nothing validates a `parent_referral` value.** It is provenance `user`,
   Required Never, kind `link` with `{"target_type_key":"eo_referral"}` — and
   **nothing in the engine reads a link field's config**, so a clerk may store any
