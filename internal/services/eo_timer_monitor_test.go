@@ -107,6 +107,10 @@ func (f *eoFakeTimerRepo) CancelForRecord(_ context.Context, id uuid.UUID) error
 	return nil
 }
 
+func (f *eoFakeTimerRepo) CancelForRecordByCapability(context.Context, uuid.UUID, string) error {
+	return nil
+}
+
 func (f *eoFakeTimerRepo) claimCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

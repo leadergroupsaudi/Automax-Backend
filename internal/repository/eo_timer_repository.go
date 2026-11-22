@@ -62,6 +62,10 @@ type EOTimerRepository interface {
 	Release(ctx context.Context, id uuid.UUID, claimedAt time.Time) error
 	// CancelForRecord cancels every timer of the record that has not fired.
 	CancelForRecord(ctx context.Context, recordID uuid.UUID) error
+	// CancelForRecordByCapability cancels the record's unfired timers of one
+	// capability_key only, for a caller that owns one kind of timer (a state's
+	// SLA clock) and must not cancel the record's others (a reminder).
+	CancelForRecordByCapability(ctx context.Context, recordID uuid.UUID, capabilityKey string) error
 	// WithTx returns a repository whose every call runs on tx. Schedule and
 	// CancelForRecord belong in the same transaction as the record change that
 	// motivates them: on the pooled handle a Schedule commits on its own
@@ -198,6 +202,16 @@ func (r *eoTimerRepository) CancelForRecord(ctx context.Context, recordID uuid.U
 		`UPDATE eo_timers SET status = 'cancelled' WHERE record_id = ? AND status IN ('pending', 'claimed')`,
 		recordID).Error; err != nil {
 		return fmt.Errorf("cancel timers for record: %w", err)
+	}
+	return nil
+}
+
+func (r *eoTimerRepository) CancelForRecordByCapability(ctx context.Context, recordID uuid.UUID, capabilityKey string) error {
+	if err := r.db.WithContext(ctx).Exec(
+		`UPDATE eo_timers SET status = 'cancelled'
+		 WHERE record_id = ? AND capability_key = ? AND status IN ('pending', 'claimed')`,
+		recordID, capabilityKey).Error; err != nil {
+		return fmt.Errorf("cancel %s timers for record: %w", capabilityKey, err)
 	}
 	return nil
 }

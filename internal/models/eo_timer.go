@@ -56,8 +56,9 @@ func (x *EOTimer) BeforeCreate(tx *gorm.DB) error {
 // IncidentID with an *Incident foreign key, and making it polymorphic would
 // change a table the incident product reads today (spec §7.8).
 //
-// As with EOTimer, this is the struct only — the table and the sweeper are
-// Task 18.
+// StepIndex is the policy step's StepOrder, which is stable when a policy is
+// edited, unlike a position in the list. BreachedAt is when the step was due
+// (its timer's fire_at), not when the handler happened to run.
 type EOEscalationEvent struct {
 	ID           uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
 	RecordID     uuid.UUID  `gorm:"type:uuid;not null" json:"record_id"`

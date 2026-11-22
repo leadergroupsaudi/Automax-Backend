@@ -14,6 +14,7 @@ import (
 	"github.com/automax/backend/internal/services/eoformula"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 // This is the EO workflow executor. It is a NEW implementation, not a refactor
@@ -131,6 +132,9 @@ type eoTransitionService struct {
 	eval      FormulaEvaluator
 	actions   EOTransitionActionDispatcher
 	caps      eoCapabilityResolver
+	// policies loads the escalation policy of a state being entered. Nil means
+	// SLA clocks are not wired: no timer is scheduled or cancelled.
+	policies repository.EscalationPolicyRepository
 }
 
 // NewEOTransitionService builds the executor. actions may be nil until Task 15
@@ -141,12 +145,27 @@ func NewEOTransitionService(
 	workflows repository.WorkflowRepository,
 	actions EOTransitionActionDispatcher,
 ) EOTransitionService {
+	return NewEOTransitionServiceWithSLA(records, types, workflows, actions, nil)
+}
+
+// NewEOTransitionServiceWithSLA is NewEOTransitionService plus SLA clocks: a
+// transition cancels the record's escalation timers (it has left the state they
+// belong to) and starts those of the state it enters, in the transition's own
+// transaction. policies loads the entered state's escalation policy.
+func NewEOTransitionServiceWithSLA(
+	records repository.EORecordRepository,
+	types repository.EORecordTypeRepository,
+	workflows repository.WorkflowRepository,
+	actions EOTransitionActionDispatcher,
+	policies repository.EscalationPolicyRepository,
+) EOTransitionService {
 	return &eoTransitionService{
 		records:   records,
 		types:     types,
 		workflows: workflows,
 		eval:      eoformula.New(0),
 		actions:   actions,
+		policies:  policies,
 	}
 }
 
@@ -261,10 +280,17 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	if err := eoCapabilitiesCheckConfig(caps, fields, wf, transition); err != nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
 	}
+	// The entered state's escalation policy is read here for the same reason:
+	// the state is fixed by the transition, and a pooled read inside the
+	// transaction waits forever for a connection if the pool is capped.
+	slaState, err := s.stateForSLA(ctx, toState)
+	if err != nil {
+		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
+	}
 	ctx = WithEOActor(ctx, actor)
 
 	var updated *models.EORecord
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository, timers repository.EOTimerRepository) error {
 		// The row lock is the FIRST statement in the transaction: a
 		// transaction alone does not serialise two transitions under READ
 		// COMMITTED, and a doubly-executed transition would dispatch its
@@ -398,6 +424,21 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			NewValues:     newJSON,
 		}); err != nil {
 			return err
+		}
+
+		// 9. the SLA clock. The record has left its old state, so that state's
+		// escalation timers stop; the state it entered starts its own. Both go
+		// through the transaction's timer handle, so a transition that rolls
+		// back leaves neither a cancelled clock nor a stray one behind.
+		if s.policies != nil {
+			if err := EOCancelStateSLA(ctx, fresh, timers); err != nil {
+				return err
+			}
+			if slaState != nil {
+				if err := ScheduleStateSLA(ctx, fresh, slaState, timers); err != nil {
+					return err
+				}
+			}
 		}
 		updated = fresh
 		return nil
@@ -839,4 +880,28 @@ func eoStateByID(wf *models.Workflow, id uuid.UUID) *models.WorkflowState {
 		}
 	}
 	return nil
+}
+
+// stateForSLA returns a copy of the state with its escalation policy loaded, or
+// nil when entering it starts no SLA clock: SLAs are not wired, the state has no
+// SLA or no policy, or it is terminal (a closed record does not escalate).
+//
+// A policy that has since been deleted is logged and skipped rather than
+// failing the transition: refusing every move into the state over a
+// configuration gap would stop the work the SLA exists to protect.
+func (s *eoTransitionService) stateForSLA(ctx context.Context, state *models.WorkflowState) (*models.WorkflowState, error) {
+	if s.policies == nil || IsTerminal(state) || state.SLADuration() <= 0 || state.EscalationPolicyID == nil {
+		return nil, nil
+	}
+	policy, err := s.policies.FindByID(ctx, *state.EscalationPolicyID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("eo: state %q references escalation policy %s, which no longer exists; no SLA clock started", state.Code, *state.EscalationPolicyID)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load escalation policy %s: %w", *state.EscalationPolicyID, err)
+	}
+	cp := *state
+	cp.EscalationPolicy = policy
+	return &cp, nil
 }

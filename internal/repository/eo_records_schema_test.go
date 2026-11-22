@@ -364,6 +364,11 @@ func TestMigrateEOPlatformDetectsShapeDrift(t *testing.T) {
 			drift:   `ALTER TABLE eo_record_history DROP COLUMN is_system_action`,
 			wantSub: []string{"eo_record_history", "is_system_action is missing"},
 		},
+		{
+			name:    "drift in the escalation log",
+			drift:   `ALTER TABLE eo_escalation_events ALTER COLUMN step_index TYPE BIGINT`,
+			wantSub: []string{"eo_escalation_events", "step_index is bigint", "integer NOT NULL"},
+		},
 	}
 
 	for _, tc := range cases {

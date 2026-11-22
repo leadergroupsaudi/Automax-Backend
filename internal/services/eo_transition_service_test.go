@@ -44,6 +44,9 @@ type eoTxRecordRepo struct {
 	// closure: the same data as the service's, but a distinct object.
 	txTypes      repository.EORecordTypeRepository
 	childrenInTx int
+	// txTimers is the transaction-bound timer repository Transaction hands its
+	// closure. Nil unless a test wires SLA clocks.
+	txTimers repository.EOTimerRepository
 	// getAnyTotal / getAnyInTx do the same for GetAnyByID, which is how an
 	// ancestor-scoped roll-up walks upwards — the other half of the same
 	// deadlock class.
@@ -132,7 +135,7 @@ func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.E
 }
 
 func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
-	if err := fn(&eoTxBoundRepo{f}, f.txTypes, nil); err != nil {
+	if err := fn(&eoTxBoundRepo{f}, f.txTypes, f.txTimers); err != nil {
 		return err
 	}
 	f.committed = true

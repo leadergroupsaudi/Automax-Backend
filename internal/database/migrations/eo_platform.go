@@ -46,8 +46,6 @@ import (
 // created, matching the rest of this codebase, which disables them during
 // migration. The only hand-written foreign keys are the ones inside the EO
 // record family, where the composite shape is the design point being enforced.
-//
-// eo_escalation_events (Task 18) is not created here.
 func MigrateEOPlatform(db *gorm.DB) error {
 	// A plain eo_records table cannot be upgraded in place: catch it loudly
 	// rather than letting CREATE TABLE IF NOT EXISTS silently accept it and
@@ -246,6 +244,39 @@ func MigrateEOPlatform(db *gorm.DB) error {
 		return err
 	}
 
+	// EO's own breach log (spec §7.8). The live one, escalation_slas, is typed
+	// on incident_id with a foreign key to incidents, and is read by the
+	// incident product today; it is not touched.
+	//
+	// The unique index is the once-per-step guarantee. breached_at is the fire_at
+	// of the timer that produced the event, so a timer delivered twice
+	// (at-least-once) collides with itself, while a record that re-enters the
+	// state and breaches again gets a new fire_at and so a new event.
+	escalationSQL := `
+	CREATE TABLE IF NOT EXISTS eo_escalation_events (
+		id             UUID NOT NULL,
+		record_id      UUID NOT NULL,
+		record_type_id UUID NOT NULL,
+		state_id       UUID NOT NULL,
+		policy_id      UUID NOT NULL,
+		step_index     INTEGER NOT NULL,
+		breached_at    TIMESTAMP WITH TIME ZONE NOT NULL,
+		notified_at    TIMESTAMP WITH TIME ZONE,
+		created_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+		CONSTRAINT pk_eo_escalation_events PRIMARY KEY (id)
+	);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_eo_escalation_events_step
+		ON eo_escalation_events (record_id, state_id, policy_id, step_index, breached_at);
+	CREATE INDEX IF NOT EXISTS idx_eo_escalation_events_record ON eo_escalation_events (record_id);
+	`
+	if err := db.Exec(escalationSQL).Error; err != nil {
+		return fmt.Errorf("eo platform: create eo_escalation_events: %w", err)
+	}
+	if err := assertColumns(db, "eo_escalation_events", eoEscalationEventsColumns); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -352,6 +383,18 @@ var (
 		{"claimed_at", "timestamp with time zone", 0, true},
 		{"attempts", "integer", 0, false},
 		{"last_error", "text", 0, false},
+		{"created_at", "timestamp with time zone", 0, false},
+	}
+
+	eoEscalationEventsColumns = []eoColumn{
+		{"id", "uuid", 0, false},
+		{"record_id", "uuid", 0, false},
+		{"record_type_id", "uuid", 0, false},
+		{"state_id", "uuid", 0, false},
+		{"policy_id", "uuid", 0, false},
+		{"step_index", "integer", 0, false},
+		{"breached_at", "timestamp with time zone", 0, false},
+		{"notified_at", "timestamp with time zone", 0, true},
 		{"created_at", "timestamp with time zone", 0, false},
 	}
 )
