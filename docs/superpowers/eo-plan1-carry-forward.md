@@ -179,6 +179,16 @@ with no values to choose. Get the client's list before the first Decision
 Record.
 
 **Task A4 owns the Referral deadline, and without it no Referral has one.**
+**CLOSED by Task A4 (`feat(eo): seed pilot link types …`).** `eo_referral_parent`
+carries `derive_deadline_from_parent` with a **3-day** offset, and
+`services.TestEoPilotReferralUnderALetterInheritsItsDeadline` creates a real
+Referral under a real letter through the whole save pipeline and reads the
+stored `due_date` back. **The offset is a READING, not a client figure** — the
+matrix gives no number, and 3 days is taken from its one quantity, the reply
+that goes out "two days inside the Ministry's deadline" (matrix:318). It is a
+§9 sign-off item, and it is the one value here that is safe to correct later: a
+link type is not a record type, so `ValidateTypeEdit` does not guard it and the
+offset is read at create time only. The original statement follows.
 Task A3 seeded Referral's `deadline` as a narrowing of the inherited `due_date`
 column with provenance `auto`, because the matrix marks it Derived and "not
 typed". The only mechanism that fills it is `services.DeriveDeadlineFromParent`,
@@ -211,6 +221,55 @@ any type in any subsystem. `eoEngineKeyDecisions` (`eo_task.parent_ticket`) and
 `eoChildConditionalDecisions` (`eo_decision_record.parent_ticket`) now say the
 same; until fix round 2 both still pointed at A4's link type as the answer,
 which is the kind of cross-reference a later task ticks off without reading.
+
+**Opened by Task A4: the matrix's SUB-REFERRAL cannot be a record child of a
+referral, under the client's own pattern.** The matrix gives Referral a
+`parent_referral` row ("a sub-referral stays visible in the parent letter's
+tree", matrix:304), and `services.RenderReference` refuses it: `IN-YYYY-NNNN-R#`
+is read as a three-segment parent reference plus one segment, so a referral
+created under `IN-2026-0001-R1` fails at `allocateReference` with "expects a
+parent reference of 3 segments, IN-2026-0001-R1 has 4" — **before** any link
+rule is consulted. A4 therefore seeded `eo_referral_parent` with the LETTER as
+its only target (a Referral target would have been a permission nothing could
+ever use) and pinned the refusal in
+`TestEoPilotReferralUnderALetterInheritsItsDeadline`. The consequence to put to
+the client: a sub-referral is carried by the `parent_referral` LINK FIELD and
+is a child of the letter, so its deadline counts back from the sender's
+deadline like every other referral — which is what matrix:300 says — rather
+than from the referral it branched from. This is the same shape as A3's
+Assignment-under-a-plan tension, one level down.
+
+**Opened by Task A4: `cascade_sensitivity` is OFF on every pilot link type, and
+the engine's cascade is not monotonic.** Spec §7.6 offers the flag ("a
+confidential parent's children inherit its label") and Plan 1's smoke link type
+sets it, but no paragraph of the client's matrix asks for it on any pilot type,
+and `services.applyLinkRules` assigns `rec.Sensitivity = parent.Sensitivity`
+outright — so a **Confidential child created under an Internal parent is
+silently DOWNGRADED**, which is the opposite of what the spec's sentence is
+for. A4 seeded it false on all eight and recorded the reasoning in
+`eoLinkRuleDecisions`. Two decisions are wanted: the client's (should a
+referral of a confidential letter be confidential?) and the engine's (should
+the cascade raise only?).
+
+**Opened by Task A4: the eight link-type LABELS await Arabic and nothing can
+record it.** `eo_link_types` has no `ar_untranslated` column, so
+`eoUntranslatedFields` — the §9 sign-off query — cannot see them. The English
+stands in both labels (`eoUntranslatedLinkLabel`) and
+`TestEoLinkLabelsAwaitArabicSignOff` keeps invented Arabic out, but the
+obligation is visible only in this document until the column exists.
+
+**For Task A5, from Task A4: the Objection's blocked transition is a shared
+constant.** `database.eoDraftRaiseToHETransitionCode` (`"raise_to_he"`) is what
+`eo_objection_parent.blocks_parent_transition_key` names, and
+`services.checkBlockingChildren` compares it with `transition.Code` by string
+equality. **A5 must seed the Draft Decision Study's raise-to-H.E. transition
+under that constant.** Under any other code the rule matches nothing and an
+objection is raised, recorded and silently ignored by the step it exists to
+hold up — no error anywhere, because an unmatched transition key is simply a
+comparison that never comes out true. `services.TestEoPilotOpenObjectionBlocks
+TheRaiseToHEAndNotTheClosure` proves the branch refuses, using a workflow of
+its own; it is the first time `blocks_parent_transition_key` has run on seeded
+configuration.
 
 **The matrix has five "one per parent" child types whose reference patterns
 cannot be rendered, and the fix is engine work, not five edits (owner: engine,
@@ -357,7 +416,9 @@ reads the column — but the comment and the data disagree. One line in
   timers (`decisions_base`, `referral_tree`), so this stops being theoretical.
 - **`BlocksParentTransitionKey` is implemented but never exercised.** It is a
   distinct rule from `BlocksParentClosure`; the seeded link type leaves it
-  empty, so that branch has never run.
+  empty, so that branch has never run. **CLOSED by Task A4**: `eo_objection_parent`
+  is its first producer, and the branch now runs against seeded configuration
+  (see the A5 note above).
 - **`TransitionAction` is unexercised by the acceptance gate.** The seeded
   transition carries none. Task 15's unit tests cover the executor.
 - **Two actions on one transition spawning the same target type via the same
@@ -366,7 +427,16 @@ reads the column — but the comment and the data disagree. One line in
   schema that Plan 1 did not add.
 - **`DeriveDeadlineFromParent` can return a deadline already in the past** when
   a child is created late under an old parent — and the SLA clock then arms on
-  it. Plan 2's real hierarchies will hit this.
+  it. Plan 2's real hierarchies will hit this. **Task A4 made this reachable**:
+  a Referral opened within 3 days of its letter's deadline is created already
+  overdue, logged and not clamped.
+- **Spec §7.5 ALSO lists the Referral's `deadline` as capability-backed**
+  ("`deadline` on a Referral (counted back from the parent letter's external
+  deadline)"), while §7.6 gives the same rule to the link type — which is what
+  the engine implements and what Task A4 seeded. If a later capability task
+  registers a `deadline` capability as well, **two mechanisms would write one
+  column**; whoever assigns capabilities should read §7.5 and §7.6 together
+  first.
 - **`ResolveEffectiveFields` does not filter inactive field definitions**, so
   deactivating a field in the designer does not remove it from any type.
 - **A latent association trap:** `EORecordType.Fields` is a GORM association and
