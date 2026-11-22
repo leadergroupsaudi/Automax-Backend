@@ -359,6 +359,28 @@ func TestApprovalStampKeyCannotBeWrittenByARequest(t *testing.T) {
 			t.Fatalf("err=%v committed=%v", err, f.records.committed)
 		}
 	})
+	t.Run("the executing transition is checked even when the approval config does not list it", func(t *testing.T) {
+		// The production path: the workflow's List result carries no
+		// FieldChanges (the fake mirrors that), so only the executing
+		// transition can reveal the exploit. "close" is not an approval
+		// transition, so OnTransition would return early and the forged
+		// stamp would be committed.
+		f := eoApprovalTxFixture(t, `{"transitions":["raise"]}`)
+		listed, _ := f.workflows.List(context.Background(), true)
+		for _, tr := range listed[0].Transitions {
+			if len(tr.FieldChanges) != 0 {
+				t.Fatalf("the fake's List returns FieldChanges for %q; the real preload does not", tr.Code)
+			}
+		}
+		f.transition("close").FieldChanges = append(f.transition("close").FieldChanges,
+			models.TransitionFieldChange{FieldName: "approval", Label: "x"})
+		_, err := f.run("close", f.actor, models.EOTransitionInput{Values: map[string]any{
+			"approval": map[string]any{"recorded_by": "forged", "authority": "forged"},
+		}})
+		if !errors.Is(err, ErrEOCapabilityConfig) || f.records.committed {
+			t.Fatalf("err=%v committed=%v", err, f.records.committed)
+		}
+	})
 	t.Run("a field definition keyed like the stamp is refused on create and update", func(t *testing.T) {
 		f := eoNewSvcFixture(t, eoSvcField("approval", models.EORequiredNever))
 		f.svc.(*eoRecordService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {

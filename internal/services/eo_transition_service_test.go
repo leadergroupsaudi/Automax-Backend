@@ -203,7 +203,12 @@ func (f *eoTxWorkflowRepo) List(_ context.Context, _ bool) ([]models.Workflow, e
 	wf := f.wf
 	wf.Transitions = nil
 	for _, tr := range f.transitions {
-		wf.Transitions = append(wf.Transitions, *tr)
+		// Mirrors workflowRepository.List, which preloads Transitions but not
+		// Transitions.FieldChanges. A fake more generous than the repository
+		// hid a guard that never ran in production.
+		cp := *tr
+		cp.FieldChanges = nil
+		wf.Transitions = append(wf.Transitions, cp)
 	}
 	sort.Slice(wf.Transitions, func(i, j int) bool { return wf.Transitions[i].Code < wf.Transitions[j].Code })
 	return []models.Workflow{wf}, nil

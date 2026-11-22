@@ -258,7 +258,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	if err != nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
 	}
-	if err := eoCapabilitiesCheckConfig(caps, fields, wf); err != nil {
+	if err := eoCapabilitiesCheckConfig(caps, fields, wf, transition); err != nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
 	}
 	ctx = WithEOActor(ctx, actor)

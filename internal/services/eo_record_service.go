@@ -421,7 +421,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
-	if err := eoCapabilitiesCheckConfig(caps, fields, nil); err != nil {
+	if err := eoCapabilitiesCheckConfig(caps, fields, nil, nil); err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
 	ctx = WithEOActor(ctx, actor)
@@ -564,7 +564,7 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 	if err != nil {
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
-	if err := eoCapabilitiesCheckConfig(caps, fields, nil); err != nil {
+	if err := eoCapabilitiesCheckConfig(caps, fields, nil, nil); err != nil {
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
 	ctx = WithEOActor(ctx, actor)

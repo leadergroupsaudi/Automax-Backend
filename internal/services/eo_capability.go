@@ -180,8 +180,13 @@ func eoCapabilitiesDerive(ctx context.Context, caps []EOEnabledCapability, rec *
 // eoCapabilitiesCheckConfig refuses a configuration a capability cannot work
 // with: a field definition or a transition field change that names one of its
 // reserved keys, or a config that references a transition the workflow does
-// not have. wf may be nil (the save path has no transition to check).
-func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFieldDef, wf *models.Workflow) error {
+// not have. wf and tr may be nil (the save path has no transition to check).
+//
+// tr is the EXECUTING transition, as FindTransitionByIDWithRelations loaded it:
+// that is the one whose FieldChanges applyFieldChanges admits, and the only
+// place they are reliably populated — the workflow's preloaded Transitions
+// carry no FieldChanges, so scanning wf.Transitions would never match.
+func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFieldDef, wf *models.Workflow, tr *models.WorkflowTransition) error {
 	for _, c := range caps {
 		reserved, err := c.ReservedKeys(c.Config)
 		if err != nil {
@@ -193,14 +198,12 @@ func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFie
 					return fmt.Errorf("capability %q: %w: field %q is written by the capability and must not be defined", c.Key(), ErrEOCapabilityConfig, key)
 				}
 			}
-			if wf == nil {
+			if tr == nil {
 				continue
 			}
-			for _, tr := range wf.Transitions {
-				for _, fc := range tr.FieldChanges {
-					if fc.FieldName == key {
-						return fmt.Errorf("capability %q: %w: transition %q lets a request write %q, which the capability owns", c.Key(), ErrEOCapabilityConfig, tr.Code, key)
-					}
+			for _, fc := range tr.FieldChanges {
+				if fc.FieldName == key {
+					return fmt.Errorf("capability %q: %w: transition %q lets a request write %q, which the capability owns", c.Key(), ErrEOCapabilityConfig, tr.Code, key)
 				}
 			}
 		}
