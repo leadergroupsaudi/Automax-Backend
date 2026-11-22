@@ -2,9 +2,11 @@ package migrations
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -620,6 +622,86 @@ func assertPartitionKey(db *gorm.DB, table, expected string) error {
 	}
 	if live != expected {
 		return fmt.Errorf("eo platform: %s is partitioned by %q, expected %q; repartitioning is a table rewrite and must be done deliberately", table, live, expected)
+	}
+	return nil
+}
+
+// ── per-type partitions ─────────────────────────────────────────────────────
+
+// eoPartitionKeyPattern is what a record type key may look like for its key to
+// name a partition. It is deliberately narrower than the column: the key is
+// interpolated into DDL, where it cannot be a bound parameter, and anything
+// outside this set is refused rather than quoted and hoped for. The upper
+// bound leaves room for the "eo_records_" prefix inside Postgres's 63-byte
+// identifier limit, which would otherwise TRUNCATE the name and silently
+// collide two types' partitions.
+var eoPartitionKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,50}$`)
+
+// EORecordPartitionName is the partition a record type's rows live in. It is a
+// function rather than a literal so the seed, the tests and any later tooling
+// name the same table.
+func EORecordPartitionName(typeKey string) string { return "eo_records_" + typeKey }
+
+// CreateEORecordPartition gives one concrete record type its own LIST
+// partition of eo_records, holding exactly the rows whose record_type_id is
+// typeID.
+//
+// WHY AT TYPE CREATION AND NOWHERE ELSE. eo_records has a DEFAULT partition,
+// and Postgres validates it when a new partition is created: it takes an
+// ACCESS EXCLUSIVE lock on eo_records_default and scans it to prove no
+// existing row would belong to the new partition. So this is free only while
+// the type has no records — and it ERRORS outright once it has any, after
+// which the type can be given a partition only by a data move under that lock
+// (create detached, copy, delete, attach). Spec §7.7 and
+// models.EORecordType.PartitionPending carry the full reasoning; the seed
+// calls this inside the same transaction that creates the type, which is the
+// one moment the cost is zero.
+//
+// Indexes are not created here and must not be: every index on eo_records is
+// declared on the PARENT above, and Postgres cascades those to partitions
+// present and future, so a partition created here is indexed on birth.
+//
+// It is NOT in eoAssertedTables and assertTable is deliberately not called on
+// it. That slice is a static checksum of the tables this file's CREATE TABLE
+// statements declare, and EOPreflightSQL renders the operator's pre-deploy
+// query from the very same slice; a partition has no column list of its own
+// (it carries the parent's by construction, and ALTERing the parent alters
+// every partition with it), and its name is per-type, so there is nothing for
+// a static list to check and a per-type entry could never be written down
+// ahead of time. What a partition CAN get wrong is which type it holds, and
+// that is what the bound check below asserts.
+func CreateEORecordPartition(db *gorm.DB, typeKey string, typeID uuid.UUID) error {
+	if !eoPartitionKeyPattern.MatchString(typeKey) {
+		return fmt.Errorf("eo platform: record type key %q cannot name a partition of eo_records; expected a lower-case identifier of at most 51 characters", typeKey)
+	}
+	if typeID == uuid.Nil {
+		return fmt.Errorf("eo platform: record type %q has no id, so a partition for it would hold nothing", typeKey)
+	}
+	name := EORecordPartitionName(typeKey)
+	// Neither half can be a bound parameter: an identifier and a partition
+	// bound are both parsed, not compared. typeKey is checked above and
+	// uuid.UUID renders as hex and dashes only.
+	if err := db.Exec(fmt.Sprintf(
+		`CREATE TABLE IF NOT EXISTS %q PARTITION OF eo_records FOR VALUES IN ('%s')`,
+		name, typeID.String())).Error; err != nil {
+		return fmt.Errorf("eo platform: create partition %s for record type %q: %w", name, typeKey, err)
+	}
+	// IF NOT EXISTS matches on the NAME alone. A partition left behind by a
+	// type that was deleted and recreated under the same key is still bound to
+	// the dead id, so the statement above succeeds, every new record goes to
+	// the default partition instead, and promotion stops being free the moment
+	// the first one lands there — silently. Read the bound back.
+	var bound string
+	if err := db.Raw(
+		`SELECT COALESCE(pg_get_expr(c.relpartbound, c.oid), '') FROM pg_class c WHERE c.oid = to_regclass(?)`,
+		name).Scan(&bound).Error; err != nil {
+		return fmt.Errorf("eo platform: inspect partition %s: %w", name, err)
+	}
+	want := fmt.Sprintf("FOR VALUES IN ('%s')", typeID.String())
+	if bound != want {
+		return fmt.Errorf(
+			"eo platform: partition %s already exists bound to %q, expected %q; it belongs to an earlier record type with the same key and must be dropped or renamed by hand before %q can have one",
+			name, bound, want, typeKey)
 	}
 	return nil
 }
