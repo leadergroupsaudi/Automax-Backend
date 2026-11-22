@@ -287,6 +287,7 @@ var eoPilotSteps = []eoPilotStep{
 	{"mark_base_labels_unsigned", func(tx *gorm.DB) (bool, error) { return true, eoMarkBaseLabelsUnsigned(tx) }},
 	{"seed_root_types", eoSeedRootTypes},
 	{"seed_child_types", eoSeedChildTypes},
+	{"seed_link_types", eoSeedLinkTypes},
 }
 
 // eoPilotSeedNeeded is the fast path: one count of applied-step rows.
@@ -525,6 +526,14 @@ func seedEOPilotWhenEnabled(db *gorm.DB, enabled bool) {
 	}
 	seedEOPilot(db)
 }
+
+// SeedEOPilot applies the EO pilot configuration to db, on top of the platform
+// seed. It is the exported entry point seedEOPilot backs, for the same reason
+// SeedEOPlatform exists: package services cannot be imported from here (it
+// imports this package), so the tests that put the pilot's LINK RULES in front
+// of the real save and transition pipelines live over there and need the REAL
+// seeded configuration rather than a hand-built copy that would drift from it.
+func SeedEOPilot(db *gorm.DB) { seedEOPilot(db) }
 
 // ── Task A2: the three root types of the pilot ──────────────────────────────
 
@@ -2067,4 +2076,473 @@ func eoPilotChildTypeKeys() []string {
 		out = append(out, spec.key)
 	}
 	return out
+}
+
+// ── Task A4: the link types and the rules the matrix states in prose ────────
+
+// The keys of the pilot's link types: ONE PER SUB TYPE, because a link type
+// carries the rules that apply to a child OF THAT TYPE and the client's matrix
+// states a different rule for each — an Execution Plan blocks its directive
+// from closing, an Objection blocks one named step, a Referral's deadline is
+// counted back from its letter's, a Decision Record closes its parent outright.
+//
+// LIKE A RECORD TYPE KEY THESE ARE PERMANENT IDENTIFIERS, and for a sharper
+// reason: models.EORecordLink stores the link type KEY itself rather than an
+// id, and models.EORecordCreateRequest.ParentLinkTypeKey names it. A renamed
+// key orphans every link already written (services.BlockingChildren looks the
+// type up by key and silently ignores a link whose type it cannot find, so a
+// rename turns every existing blocking child into a non-blocking one) and
+// breaks every client that creates a record under a parent.
+const (
+	eoExecutionPlanLinkKey = "eo_execution_plan_parent"
+	eoStageLinkKey         = "eo_execution_plan_stage_parent"
+	eoAssignmentLinkKey    = "eo_assignment_parent"
+	eoObjectionLinkKey     = "eo_objection_parent"
+	eoDecisionLinkKey      = "eo_decision_record_parent"
+	eoReferralLinkKey      = "eo_referral_parent"
+	eoOutgoingLinkKey      = "eo_outgoing_reply_parent"
+	eoTaskLinkKey          = "eo_task_parent"
+)
+
+// eoAnyTargetType is the sentinel a link type's endpoint list carries to mean
+// "a record of any type" — the matrix's "Hangs off anything, including across
+// subsystems" for the universal Task (matrix:520).
+//
+// IT IS NOT AN EMPTY LIST, and the difference is the whole of this task's
+// signature risk. services.eoTypeAllowed returns FALSE for an empty list and
+// the column's DB default is '[]'::jsonb, so a Task link type seeded without
+// targets would permit NOTHING while reading as the polymorphic rule the
+// client asked for: every attempt to hang a Task off anything refused at
+// validation, in configuration that looks right.
+//
+// THE CONSTANT IT MIRRORS IS UNEXPORTED (services.eoAnyType,
+// internal/services/eo_links.go) and package services imports package
+// database, so this package cannot import it back and the literal has to be
+// repeated. TestEoAnyTargetSentinelMatchesTheEngineConstant reads the other
+// side's source and compares, because nothing else ties the two together.
+//
+// services.eoTypeAllowed accepts it as a bare JSON string or inside the array;
+// the seed uses the ARRAY spelling for every link type, so one decoder reads
+// them all.
+const eoAnyTargetType = "any"
+
+// eoDraftRaiseToHETransitionCode is the workflow transition an open Objection
+// blocks: EO-DRF's raise-to-H.E. step. The matrix says an Objection "must be
+// resolved or dismissed before the parent can go to H.E. Blocks the raising
+// step, not closure" (matrix:154).
+//
+// TASK A5 MUST SEED THE DRAFT DECISION STUDY'S WORKFLOW WITH A TRANSITION
+// WHOSE Code IS THIS CONSTANT. It is the same arrangement A2 used for
+// eoAssignmentTypeKey, and for the same reason: the configuration that NAMES a
+// thing is seeded before the thing exists, so the name has to be one both
+// tasks read rather than one each task spells.
+//
+// WHAT IT IS COMPARED AGAINST, exactly: services.checkBlockingChildren passes
+// `transition.Code` — models.WorkflowTransition.Code, not its name, not a
+// state code — to services.BlockingChildren, which compares it with
+// BlocksParentTransitionKey by string equality. A transition seeded under any
+// other code leaves this rule matching nothing: an objection would be raised,
+// recorded, and silently ignored by the step it exists to hold up. Nothing
+// reports that, because an unknown transition key is not an error anywhere —
+// it is simply a comparison that never comes out true.
+//
+// UNTIL A5 RUNS, THE RULE CANNOT FIRE AT ALL: there is no workflow bound to
+// eo_draft_decision_study, so no transition can be executed on one. That is an
+// ordering fact, not an unarmed mechanism — the rule is complete on this side.
+const eoDraftRaiseToHETransitionCode = "raise_to_he"
+
+// eoReferralDeadlineOffsetDays is how many days before the LETTER'S OWN
+// deadline a Referral is due. services.DeriveDeadlineFromParent computes
+// parent.DueDate minus this many calendar days and writes the child's
+// rec.DueDate.
+//
+// THE CLIENT'S DOCUMENT GIVES NO NUMBER. It says only "Counted back from the
+// sender's deadline" (matrix:300) and "Deadlines are derived, not invented".
+// Three days is read from the one quantity the matrix does give: the reply
+// goes out "two days inside the Ministry's deadline" (matrix:318), and the
+// Office cannot send a consolidated answer it has not yet consolidated — so
+// the bodies' answers are due a day before the reply is prepared. It is a
+// reading, not a client instruction, and it is in the report as a §9 sign-off
+// item.
+//
+// It is also the one value here that is SAFE TO CORRECT LATER: a link type is
+// not a record type, so models.ValidateTypeEdit does not guard it, and the
+// offset is read at create time only — changing it moves no deadline already
+// derived. A zero offset is refused by eoLinkTypeRow, because "counted back"
+// with nothing counted back is the letter's own date copied onto every branch.
+const eoReferralDeadlineOffsetDays = 3
+
+// eoLinkTypeSpec is one link type of the pilot, written in record-type KEYS.
+// eoLinkTypeRow resolves them to ids and refuses a spec that would seed a rule
+// nothing can apply.
+//
+// DIRECTION. The save pipeline writes the link FROM the child TO the parent
+// (services.eoRecordService.applyLinkRules), so the CHILD's type is the source
+// and the parent's the target. Seeding them the other way round would make
+// every create fail validation with "does not allow a source record of type …".
+type eoLinkTypeSpec struct {
+	key   string
+	label string // English only; eoUntranslatedLinkLabel puts it in both labels
+	// childTypeKey is the sub type whose records carry this link.
+	childTypeKey string
+	// parentTypeKeys are the types a record of childTypeKey may hang off, or
+	// the single entry eoAnyTargetType for the universal Task.
+	parentTypeKeys []string
+	// cardinality is models.EOCardinalityOne or ...Many, counted PER SOURCE
+	// RECORD: "one" means a child may carry at most one outgoing link of this
+	// type. It is an UPPER bound and says nothing about a minimum — it cannot
+	// express "a record of this type must have a parent" (see the parentless
+	// child item, which this task deliberately leaves open).
+	cardinality string
+	// blocksClosure is the matrix's "Blocks the parent from closing".
+	blocksClosure bool
+	// blocksTransitionCode is the matrix's "Blocks the raising step, not
+	// closure": the Code of the one transition an open child holds up.
+	blocksTransitionCode string
+	// deriveDeadline and deadlineOffsetDays are the matrix's "Deadline
+	// derived from the parent, not typed … counted back from the sender's
+	// deadline".
+	deriveDeadline     bool
+	deadlineOffsetDays int
+}
+
+// eoPilotLinkTypes is the pilot's eight link types, in the matrix's order.
+//
+// WHAT IS NOT HERE, DELIBERATELY:
+//
+//	cascade_sensitivity. Spec §7.6 offers it ("a confidential parent's
+//	children inherit its label") and Plan 1's smoke link type sets it, but no
+//	paragraph of the client's matrix asks for it on any pilot type, and the
+//	engine's cascade is NOT monotonic: applyLinkRules assigns
+//	rec.Sensitivity = parent.Sensitivity outright, so a Confidential child
+//	created under an Internal parent is silently DOWNGRADED. Turning it on
+//	would be inventing client policy in the direction that loses
+//	classification. It is in the report as a question for the client, with
+//	that engine behaviour named. See eoLinkRuleDecisions.
+//
+//	a link type for the three ROOT types. They have no parent.
+var eoPilotLinkTypes = []eoLinkTypeSpec{
+	// ── EO-DIR ───────────────────────────────────────────────────────────
+	{
+		key: eoExecutionPlanLinkKey, label: "Parent directive",
+		childTypeKey: eoExecutionPlanTypeKey, parentTypeKeys: []string{eoDirectiveTypeKey},
+		cardinality: models.EOCardinalityOne,
+		// "Blocks the parent from closing." (matrix:88)
+		blocksClosure: true,
+	},
+	{
+		key: eoStageLinkKey, label: "Parent execution plan",
+		childTypeKey: eoStageTypeKey, parentTypeKeys: []string{eoExecutionPlanTypeKey},
+		cardinality: models.EOCardinalityOne,
+		// NO RULE: the eleventh type has no paragraph in the client's
+		// document, so there is no statement to implement. See
+		// eoLinkRuleDecisions.
+	},
+	{
+		key: eoAssignmentLinkKey, label: "Parent directive or execution plan",
+		childTypeKey: eoAssignmentTypeKey,
+		// "Sub of Execution Plan, or of Directive directly." (matrix:105)
+		// Both, in that order. The matrix's own tension — an Assignment
+		// numbered EO-DIR-YYYY-NNN-A# cannot be rendered under a five-segment
+		// plan reference — is A3's, is pinned by
+		// TestEoPilotReferencePatternsRenderAndRefuse, and is refused EARLIER
+		// than this rule (allocateReference runs before applyLinkRules). The
+		// link type states what the client's document states; narrowing it to
+		// the Directive alone would hide the tension rather than resolve it.
+		parentTypeKeys: []string{eoDirectiveTypeKey, eoExecutionPlanTypeKey},
+		cardinality:    models.EOCardinalityOne,
+		blocksClosure:  true,
+	},
+
+	// ── EO-DRF ───────────────────────────────────────────────────────────
+	{
+		key: eoObjectionLinkKey, label: "Parent draft decision study",
+		childTypeKey: eoObjectionTypeKey, parentTypeKeys: []string{eoDraftStudyTypeKey},
+		cardinality: models.EOCardinalityOne,
+		// "Blocks the raising step, not closure." (matrix:154) The two rules
+		// are distinct in services.BlockingChildren, which asks one question
+		// or the other and never both.
+		blocksTransitionCode: eoDraftRaiseToHETransitionCode,
+	},
+	{
+		key: eoDecisionLinkKey, label: "Parent draft decision study",
+		childTypeKey: eoDecisionTypeKey, parentTypeKeys: []string{eoDraftStudyTypeKey},
+		cardinality: models.EOCardinalityOne,
+		// "Closes the parent" (matrix:165) — the opposite of blocking it, and
+		// not a link-type rule at all: no field of models.EOLinkType closes
+		// anything. It is a workflow statement, and Task A5's. See
+		// eoLinkRuleDecisions.
+	},
+
+	// ── EO-COM ───────────────────────────────────────────────────────────
+	{
+		key: eoReferralLinkKey, label: "Parent letter or referral",
+		childTypeKey: eoReferralTypeKey,
+		// THE LETTER, AND ONLY THE LETTER — including for a SUB-REFERRAL.
+		//
+		// The matrix's sub-referral (`parent_referral`, "a sub-referral stays
+		// visible in the parent letter's tree", matrix:304) is a LINK FIELD
+		// on the referral, not a different record parent: the type's
+		// paragraph says "Sub of Incoming Correspondence" and nothing else,
+		// and the client's own sentence puts a sub-referral in THE PARENT
+		// LETTER'S tree rather than under the referral it branched from.
+		//
+		// The client's own reference pattern says the same thing and the
+		// engine enforces it: services.RenderReference reads IN-YYYY-NNNN-R#
+		// as "a three-segment parent reference plus one segment", so a
+		// referral created under another referral is refused at
+		// allocateReference — "expects a parent reference of 3 segments,
+		// IN-2026-0001-R1 has 4" — BEFORE any link rule is consulted.
+		// Permitting a Referral target here would therefore be a permission
+		// nothing could ever use: present, plausible and dead.
+		//
+		// The consequence for the deadline is the matrix's own wording:
+		// every referral, however deep the branch, counts back from THE
+		// SENDER'S deadline (matrix:300), not from a sibling referral's.
+		parentTypeKeys: []string{eoIncomingTypeKey},
+		cardinality:    models.EOCardinalityOne,
+		// "Blocks the parent from closing." (matrix:295)
+		blocksClosure: true,
+		// "Deadline derived from the parent, not typed … Counted back from
+		// the sender's deadline." (matrix:295, matrix:300) THIS IS THE ONLY
+		// THING THAT GIVES A REFERRAL A DEADLINE: A3 seeded the field `auto`
+		// so no clerk may type one, and services.DeriveDeadlineFromParent
+		// writes nothing unless this flag is set.
+		deriveDeadline:     true,
+		deadlineOffsetDays: eoReferralDeadlineOffsetDays,
+	},
+	{
+		key: eoOutgoingLinkKey, label: "Parent letter",
+		childTypeKey: eoOutgoingTypeKey, parentTypeKeys: []string{eoIncomingTypeKey},
+		cardinality: models.EOCardinalityOne,
+		// "Closes the parent." (matrix:311) See eo_decision_record above.
+	},
+
+	// ── Universal ────────────────────────────────────────────────────────
+	{
+		key: eoTaskLinkKey, label: "Parent record",
+		childTypeKey: eoTaskTypeKey,
+		// "Hangs off anything, including across subsystems." (matrix:520)
+		// The sentinel, NOT an empty list: see eoAnyTargetType.
+		parentTypeKeys: []string{eoAnyTargetType},
+		// One parent per task, which is what the universal type's own
+		// `parent_ticket` row means by "Link (any type)". The polymorphism is
+		// in the TARGET list, not in the count.
+		cardinality: models.EOCardinalityOne,
+		// "Always blocks its parent from closing." (matrix:520)
+		blocksClosure: true,
+	},
+}
+
+// eoUntranslatedLinkLabel puts ONE English string in both of a link type's
+// labels, the way eoUntranslatedLabel does for a field.
+//
+// IT CANNOT MARK THE ROW, and that is a gap rather than a decision:
+// eo_link_types has no ar_untranslated column, so eoUntranslatedFields — the
+// §9 sign-off query — cannot see these eight labels. Adding the column is a
+// migration this task does not own; the report carries the obligation, and
+// TestEoLinkLabelsAwaitArabicSignOff is what keeps invented Arabic out in the
+// meantime.
+func eoUntranslatedLinkLabel(lt models.EOLinkType, english string) models.EOLinkType {
+	lt.Label = english
+	lt.LabelAr = english
+	return lt
+}
+
+// eoLinkTypeRow turns one spec into the row to write, resolving record type
+// keys to ids. It is pure, so its refusals are testable without a database.
+//
+// EVERY GUARD HERE EXISTS BECAUSE THE FAILURE IT CATCHES IS SILENT. A link
+// type with no endpoints permits nothing and says so only at the first create;
+// a free-form cardinality is read as "not one" and so as unbounded; an offset
+// with no derivation flag is a number services.DeriveDeadlineFromParent
+// returns before ever reading; both block rules at once is a claim the
+// client's document makes for no type. None of them is an error to the engine
+// — each is configuration that looks complete and governs nothing.
+func eoLinkTypeRow(spec eoLinkTypeSpec, ids map[string]uuid.UUID) (models.EOLinkType, error) {
+	var lt models.EOLinkType
+	if strings.TrimSpace(spec.key) == "" {
+		return lt, fmt.Errorf("a link type with no key cannot be named by a create request or found by services.BlockingChildren")
+	}
+	if strings.TrimSpace(spec.label) == "" {
+		return lt, fmt.Errorf("link type %q has no label; it would render as a blank row in the designer and on the record", spec.key)
+	}
+	switch spec.cardinality {
+	case models.EOCardinalityOne, models.EOCardinalityMany:
+	default:
+		return lt, fmt.Errorf("link type %q has cardinality %q; it must be %q or %q, because the spec enumerates no values and services.ValidateLink reads anything else as unbounded",
+			spec.key, spec.cardinality, models.EOCardinalityOne, models.EOCardinalityMany)
+	}
+	if spec.childTypeKey == eoAnyTargetType {
+		return lt, fmt.Errorf("link type %q declares a polymorphic source; no row of the client's matrix asks for one, and %q as a source would let a record of ANY type carry this link type's rules",
+			spec.key, eoAnyTargetType)
+	}
+	childID, ok := ids[spec.childTypeKey]
+	if !ok || childID == uuid.Nil {
+		return lt, fmt.Errorf("link type %q names the child record type %q, which the pilot does not seed", spec.key, spec.childTypeKey)
+	}
+	if len(spec.parentTypeKeys) == 0 {
+		return lt, fmt.Errorf("link type %q names no parent record type, so it permits nothing: services.eoTypeAllowed refuses every target for an empty list, and the column's default is '[]'", spec.key)
+	}
+	targets := make([]string, 0, len(spec.parentTypeKeys))
+	for _, key := range spec.parentTypeKeys {
+		if key == eoAnyTargetType {
+			if len(spec.parentTypeKeys) != 1 {
+				return lt, fmt.Errorf("link type %q lists %q beside named parent types; %q already permits every type and the list would be two statements of different sizes",
+					spec.key, eoAnyTargetType, eoAnyTargetType)
+			}
+			targets = append(targets, eoAnyTargetType)
+			continue
+		}
+		id, ok := ids[key]
+		if !ok || id == uuid.Nil {
+			return lt, fmt.Errorf("link type %q names the parent record type %q, which the pilot does not seed", spec.key, key)
+		}
+		targets = append(targets, id.String())
+	}
+	if spec.blocksClosure && spec.blocksTransitionCode != "" {
+		return lt, fmt.Errorf("link type %q blocks closure AND names the blocked transition %q; the client's matrix states one or the other for every type, and services.BlockingChildren asks one question or the other",
+			spec.key, spec.blocksTransitionCode)
+	}
+	if spec.deriveDeadline != (spec.deadlineOffsetDays != 0) {
+		return lt, fmt.Errorf("link type %q: derive_deadline_from_parent is %v with an offset of %d days; a derivation with no offset copies the parent's own deadline onto the child and an offset without the flag is a number services.DeriveDeadlineFromParent never reads",
+			spec.key, spec.deriveDeadline, spec.deadlineOffsetDays)
+	}
+
+	source, err := json.Marshal([]string{childID.String()})
+	if err != nil {
+		return lt, fmt.Errorf("encode the source types of link type %q: %w", spec.key, err)
+	}
+	target, err := json.Marshal(targets)
+	if err != nil {
+		return lt, fmt.Errorf("encode the target types of link type %q: %w", spec.key, err)
+	}
+	lt = models.EOLinkType{
+		ID:                        uuid.New(),
+		Key:                       spec.key,
+		SourceTypeIDs:             datatypes.JSON(source),
+		TargetTypeIDs:             datatypes.JSON(target),
+		Cardinality:               spec.cardinality,
+		DeriveDeadlineFromParent:  spec.deriveDeadline,
+		DeadlineOffsetDays:        spec.deadlineOffsetDays,
+		BlocksParentClosure:       spec.blocksClosure,
+		BlocksParentTransitionKey: spec.blocksTransitionCode,
+		// CascadeSensitivity is left false on every pilot link type; see
+		// eoPilotLinkTypes and eoLinkRuleDecisions.
+	}
+	return eoUntranslatedLinkLabel(lt, spec.label), nil
+}
+
+// eoSeedLinkTypes is the pilot seed's "seed_link_types" step.
+//
+// A STEP OF ITS OWN, like A3's: the applied rows for seed_root_types and
+// seed_child_types already exist on every database that has booted Task A2 or
+// A3, so work folded into either would never run there (see eoPilotStep).
+//
+// It fails closed on a missing record type rather than skipping the link type:
+// a sub type with no link type cannot be created with a parent at all
+// (eoRecordService.Create refuses a parent given with no link type key, and
+// the five parent-derived types cannot be numbered without one), so a
+// half-seeded set of link types is a pilot that cannot record a referral.
+func eoSeedLinkTypes(tx *gorm.DB) (bool, error) {
+	var types []models.EORecordType
+	if err := tx.Where("key IN ?", eoPilotTypeKeys).Find(&types).Error; err != nil {
+		return false, fmt.Errorf("read the pilot record types: %w", err)
+	}
+	ids := make(map[string]uuid.UUID, len(types))
+	for _, ty := range types {
+		ids[ty.Key] = ty.ID
+	}
+	for _, key := range eoPilotTypeKeys {
+		if ids[key] == uuid.Nil {
+			return false, fmt.Errorf("record type %q is missing; the pilot's record types must be seeded before its link types", key)
+		}
+	}
+
+	for _, spec := range eoPilotLinkTypes {
+		lt, err := eoLinkTypeRow(spec, ids)
+		if err != nil {
+			return false, err
+		}
+		if err := tx.Create(&lt).Error; err != nil {
+			return false, fmt.Errorf("create link type %q: %w", spec.key, err)
+		}
+		log.Printf("EO pilot: seeded link type %q (%s -> %v, %s)", spec.key, spec.childTypeKey, spec.parentTypeKeys, spec.cardinality)
+	}
+	return true, nil
+}
+
+// eoLinkRuleDecision records what one link type does with the sentence the
+// client's matrix writes about its type — including the two types whose
+// answer is "no rule" and the one type the document does not mention.
+//
+// It exists for the same reason eoConditionalDecisions does: a rule that is
+// ABSENT and a rule that was deliberately NOT SEEDED look identical in a row
+// of configuration, and the engine reports neither. MatrixProse is checked
+// against the client's document and ChildTypeKey against the seeded spec by
+// TestEoLinkRuleDecisionsCoverEverySeededLinkType, so an entry cannot drift
+// from either.
+type eoLinkRuleDecision struct {
+	LinkKey      string
+	ChildTypeKey string
+	// MatrixProse is the client's own sentence, verbatim, from the paragraph
+	// under that type's heading. Empty ONLY for eo_execution_plan_stage,
+	// which has no section at all.
+	MatrixProse string
+	// Rule is what was seeded, in the engine's terms.
+	Rule string
+	// Mechanism names the code that reads the rule.
+	Mechanism string
+	Why       string
+}
+
+// eoLinkRuleDecisions is the registry, in the order the matrix states them.
+var eoLinkRuleDecisions = []eoLinkRuleDecision{
+	{eoExecutionPlanLinkKey, eoExecutionPlanTypeKey,
+		"Blocks the parent from closing.",
+		"blocks_parent_closure, no transition key",
+		"services.BlockingChildren with an empty transition key, from eoTransitionService.checkBlockingChildren on every move into a TERMINAL state",
+		"The matrix's \"partial closure is not closure\" (spec §7.6) for EO-DIR. An OPEN plan blocks; services.BlockingChildren drops a child whose closed_at is set, so closing the plan releases the directive without any further configuration."},
+
+	{eoStageLinkKey, eoStageTypeKey,
+		"",
+		"no rule: hierarchy only",
+		"services.ValidateLink (the endpoints and the cardinality) and eoRecordService.applyLinkRules, which needs A link type to create a child with a parent at all",
+		"THE ELEVENTH TYPE, which the client's matrix has no section for: it exists because spec §7.3 drops the `table` kind, so Execution Plan's `plan_stages` became a child record type (see eoMatrixFieldsNotSeeded). There is therefore no client sentence to implement, and a blocking rule invented for it would hold a plan open on the strength of nobody's instruction. It is seeded BECAUSE the type is parent-derived and so uncreatable without a link type — services.RenderReference refuses to number it with no parent, and Create refuses a parent given with no link type key — not because it carries a rule. If the client wants an unfinished stage to hold its plan open, this is the row that changes."},
+
+	{eoAssignmentLinkKey, eoAssignmentTypeKey,
+		"Sub of Execution Plan, or of Directive directly. Blocks the parent from closing.",
+		"blocks_parent_closure, with BOTH parent types permitted",
+		"services.BlockingChildren with an empty transition key; the endpoint list is read by services.eoTypeAllowed through ValidateLink",
+		"Two target types, because the client's sentence names two. The matrix's own tension — the single pattern EO-DIR-YYYY-NNN-A# cannot be rendered under a five-segment plan reference — is NOT resolved here and is not this rule's to resolve: services.RenderReference refuses it at allocateReference, which runs BEFORE applyLinkRules, so the link type never sees that create. Narrowing the targets to the Directive would make the configuration agree with the numbering and disagree with the client. A3 pinned the refusal; A4/A5 put the question to the client."},
+
+	{eoObjectionLinkKey, eoObjectionTypeKey,
+		"Must be resolved or dismissed before the parent can go to H.E. Blocks the raising step, not closure.",
+		"blocks_parent_transition_key = " + eoDraftRaiseToHETransitionCode + ", blocks_parent_closure FALSE",
+		"services.BlockingChildren with transition.Code, from checkBlockingChildren on EVERY transition that has a code",
+		"The first producer of blocks_parent_transition_key in this programme: Plan 1 implemented it and left it unseeded, so the branch has never run on seeded configuration. The two rules are not interchangeable — closure is asked only on a move into a terminal state, the named one on every coded transition — and the matrix is explicit that an objection blocks the raising step and NOT closure, so a study with an open objection may still be closed (returned, withdrawn) while it may not be put in front of H.E. THE ORDERING: the transition this names is Task A5's to seed, under eoDraftRaiseToHETransitionCode. Until it does, there is no workflow on the type at all, so nothing can be transitioned and the rule cannot fire — it is unreachable, not unarmed."},
+
+	{eoDecisionLinkKey, eoDecisionTypeKey,
+		"Closes the parent, then joins the base that checks the next draft.",
+		"no block of either kind",
+		"services.ValidateLink and applyLinkRules; the CLOSING is not a link-type rule and no field of models.EOLinkType expresses it",
+		"\"Closes the parent\" is the opposite of blocking it, and the engine's link types cannot say it: there is no close_parent flag, and nothing in the save or transition pipeline closes one record because another was created. It is a WORKFLOW statement — a transition on the Draft Decision Study that the Decision Record's creation drives — and so Task A5's, through a transition action (spec §7.8). Seeding blocks_parent_closure here would be the exact inversion of the client's sentence: a decision record that held its study open for ever."},
+
+	{eoReferralLinkKey, eoReferralTypeKey,
+		"Deadline derived from the parent, not typed. Blocks the parent from closing.",
+		fmt.Sprintf("derive_deadline_from_parent with an offset of %d days, and blocks_parent_closure", eoReferralDeadlineOffsetDays),
+		"services.DeriveDeadlineFromParent, called by applyLinkRules on create, writing the child's rec.DueDate column; and services.BlockingChildren for the closure half",
+		"THE RULE A3 LEFT UNARMED AND THIS TASK ARMS. Referral's `deadline` is the inherited due_date column, narrowed to provenance `auto` so no clerk may supply one (ValidateRecordValues refuses a submitted value for an auto field), and DeriveDeadlineFromParent is the only mechanism that fills it. Until this flag was seeded every Referral had an empty deadline and no way to acquire one — and an absent deadline is not an error anywhere in the engine, so nothing would have reported it. The offset is a READING of the matrix, not a client figure; see eoReferralDeadlineOffsetDays. The parent value it reads is populated because A2 made the letter's `sender_deadline` BE the due_date column and required it. THE TARGET IS THE LETTER ALONE, sub-referrals included: the client's pattern IN-YYYY-NNNN-R# cannot be rendered under a four-segment referral reference, so a referral under a referral is refused at allocateReference before this rule is reached, and the matrix carries the sub-referral on the `parent_referral` LINK FIELD instead. Every referral therefore counts back from the sender's deadline, which is what matrix:300 says."},
+
+	{eoOutgoingLinkKey, eoOutgoingTypeKey,
+		"Closes the parent. One per letter, however many rounds of direction it took.",
+		"no block of either kind",
+		"services.ValidateLink and applyLinkRules; see eo_decision_record_parent for the closing half",
+		"The same statement as the Decision Record's and the same answer. \"One per letter\" is NOT what Cardinality says — cardinality is counted per SOURCE record, so `one` here means one reply carries one parent link, not that one letter carries one reply. Nothing in the link-type model bounds the children of a parent; what makes a second reply visible is the OUT sequence, and holding the client to \"one per letter\" is a workflow matter."},
+
+	{eoTaskLinkKey, eoTaskTypeKey,
+		"Hangs off anything, including across subsystems. Always blocks its parent from closing.",
+		"target types = the \"" + eoAnyTargetType + "\" sentinel, blocks_parent_closure",
+		"services.eoTypeAllowed, which accepts the sentinel for any target type; services.BlockingChildren for the block",
+		"The polymorphic type, and the one place where leaving a field UNSET would have produced this programme's signature defect in its purest form: an empty target list permits nothing, so a Task \"hanging off anything\" would have been refused by everything. The sentinel is the literal string services.eoAnyType carries, repeated here because that constant is unexported in a package this one cannot import, and tied to it by TestEoAnyTargetSentinelMatchesTheEngineConstant. WHAT THIS DOES NOT CLOSE: nothing refuses a PARENTLESS Task. Cardinality is an upper bound and applyLinkRules returns early on a nil parent, so ValidateLink is never reached; the work is a create-path rule. That item stays OPEN — see eoEngineKeyDecisions (eo_task.parent_ticket)."},
 }

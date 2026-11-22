@@ -221,6 +221,11 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 	want := eoSnapshot{
 		types:  1 + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes)),
 		fields: 17 + eoRootFieldCount(t),
+		// Plan 1's one smoke link type goes; Task A4's eight replace it,
+		// counted from the specs for the same reason eoRootFieldCount is:
+		// this test is about the smoke REMOVAL and must not fail every time
+		// the pilot gains a link type.
+		links:  int64(len(eoPilotLinkTypes)),
 		grants: before.grants - 12,
 	}
 	want.perms = before.perms - 6
@@ -316,6 +321,9 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			want := snapBefore
 			want.types += int64(len(eoPilotRootTypes) + len(eoPilotChildTypes))
 			want.fields += eoRootFieldCount(t)
+			// The smoke link type is KEPT here (its types hold records), and
+			// the pilot's own link types are added beside it.
+			want.links += int64(len(eoPilotLinkTypes))
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != want {
 				t.Errorf("a populated database changed: %+v, want %+v (was %+v)", got, want, snapBefore)
@@ -3019,4 +3027,500 @@ func TestEoReferralVisibilityIsEnforcedByTheLiveClause(t *testing.T) {
 			t.Error("a record keyed `visibility` was restricted, so the engine does read that key after all and the rename is wrong")
 		}
 	})
+}
+
+// ── Task A4: the link types and the rules they carry ────────────────────────
+
+// eoSeededLinkTypes reads every link type in the database, by key. Fixture.
+func eoSeededLinkTypes(t *testing.T, db *gorm.DB) map[string]models.EOLinkType {
+	t.Helper()
+	var rows []models.EOLinkType
+	if err := db.Order("key").Find(&rows).Error; err != nil {
+		t.Fatalf("read the link types: %v", err)
+	}
+	out := make(map[string]models.EOLinkType, len(rows))
+	for _, lt := range rows {
+		out[lt.Key] = lt
+	}
+	return out
+}
+
+// eoLinkTypeIDs decodes a link type's jsonb endpoint list. It accepts both
+// spellings services.eoTypeAllowed accepts — a bare JSON string and an array —
+// so a test reading it cannot be fooled by the one the seed does not use.
+func eoLinkTypeIDs(t *testing.T, what string, raw []byte) []string {
+	t.Helper()
+	if len(raw) == 0 {
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return []string{single}
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err != nil {
+		t.Fatalf("%s is neither a JSON string nor an array of strings: %s", what, raw)
+	}
+	return list
+}
+
+// eoReadMatrixProse is the paragraph under each `### Type` heading of the
+// client's matrix — the sentences that state the GOVERNANCE RULES ("Blocks the
+// parent from closing", "Blocks the raising step, not closure", "Deadline
+// derived from the parent, not typed", "Closes the parent"). The field tables
+// say nothing about any of them, so the prose is the authority for everything
+// Task A4 seeds.
+//
+// It carries the same guard as the table parser: every section the pilot reads
+// must yield a paragraph, and every paragraph must carry the "Reference `...`"
+// the matrix ends each one with. A prose reader that quietly matched nothing
+// would make every expectation below vacuously true, which is the failure this
+// programme keeps shipping.
+func eoReadMatrixProse(t *testing.T) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(eoFieldMatrixPath)
+	if err != nil {
+		t.Fatalf("read the client field matrix: %v", err)
+	}
+	out := map[string]string{}
+	section := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if h := strings.TrimLeft(line, "#"); len(line)-len(h) == 3 {
+			section = strings.TrimSpace(h)
+			continue
+		}
+		if section == "" || line == "" || strings.HasPrefix(line, "|") {
+			continue
+		}
+		if _, ok := out[section]; !ok {
+			out[section] = line
+		}
+	}
+	for _, section := range eoMatrixSections {
+		prose, ok := out[section]
+		if !ok || !strings.Contains(prose, "Reference `") {
+			t.Fatalf("parsed no type paragraph under %q (got %q): the matrix's layout has changed and every rule read from its prose is now proving nothing", section, prose)
+		}
+	}
+	return out
+}
+
+// eoLinkProseRules is what the client's own paragraph says about one sub type,
+// read from the matrix rather than written out here.
+type eoLinkProseRules struct {
+	blocksClosure   bool
+	blocksRaiseStep bool
+	derivesDeadline bool
+	closesTheParent bool
+}
+
+func eoLinkRulesFromProse(prose string) eoLinkProseRules {
+	low := strings.ToLower(prose)
+	return eoLinkProseRules{
+		blocksClosure: strings.Contains(low, "blocks the parent from closing") ||
+			strings.Contains(low, "blocks its parent from closing"),
+		blocksRaiseStep: strings.Contains(low, "blocks the raising step, not closure"),
+		derivesDeadline: strings.Contains(low, "deadline derived from the parent"),
+		closesTheParent: strings.Contains(low, "closes the parent"),
+	}
+}
+
+// THE RULE TEST. Every seeded link type is compared with the CLIENT'S OWN
+// SENTENCE for its type, so a rule cannot be seeded that the matrix does not
+// state and a stated rule cannot be left off.
+//
+// Mutation: set `blocksClosure: false` on eoReferralLinkKey's spec (the matrix
+// says "Blocks the parent from closing"), or give eoObjectionLinkKey
+// `blocksClosure: true` (the matrix says "not closure").
+func TestEoLinkRulesMatchTheMatrixProse(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	seeded := eoSeededLinkTypes(t, db)
+	prose := eoReadMatrixProse(t)
+
+	for _, spec := range eoPilotLinkTypes {
+		t.Run(spec.childTypeKey, func(t *testing.T) {
+			lt, ok := seeded[spec.key]
+			if !ok {
+				t.Fatalf("link type %q was not seeded", spec.key)
+			}
+			// The stage type has no section in the client's document, so its
+			// link type must carry NO rule: an unstated rule is invented
+			// client policy. eoMatrixSections has no entry for it, and no
+			// section is named "", so want is the zero value.
+			want := eoLinkRulesFromProse(prose[eoMatrixSections[spec.childTypeKey]])
+
+			if lt.BlocksParentClosure != want.blocksClosure {
+				t.Errorf("blocks_parent_closure = %v, the matrix says %v: %q",
+					lt.BlocksParentClosure, want.blocksClosure, prose[eoMatrixSections[spec.childTypeKey]])
+			}
+			if named := lt.BlocksParentTransitionKey != ""; named != want.blocksRaiseStep {
+				t.Errorf("blocks_parent_transition_key = %q, the matrix names a blocked step: %v",
+					lt.BlocksParentTransitionKey, want.blocksRaiseStep)
+			}
+			if lt.DeriveDeadlineFromParent != want.derivesDeadline {
+				t.Errorf("derive_deadline_from_parent = %v, the matrix says %v",
+					lt.DeriveDeadlineFromParent, want.derivesDeadline)
+			}
+			// "Closes the parent" is the opposite of blocking it: a child
+			// that closes its parent cannot also hold it open.
+			if want.closesTheParent && (lt.BlocksParentClosure || lt.BlocksParentTransitionKey != "") {
+				t.Errorf("the matrix says this type CLOSES its parent, but the link type blocks it (closure %v, transition %q)",
+					lt.BlocksParentClosure, lt.BlocksParentTransitionKey)
+			}
+		})
+	}
+}
+
+// The two block semantics are DISTINCT rules (services.BlockingChildren asks
+// one question or the other, never both), so the closure blockers must leave
+// the transition key empty and the Objection must leave closure alone.
+//
+// This is the same statement as the prose test above made against the engine's
+// two fields directly, written out so that a change to either is caught by a
+// test naming the type rather than only by the parser.
+//
+// Mutation: in eoPilotLinkTypes, give eoObjectionLinkKey `blocksClosure: true`
+// alongside its transition code — the seed refuses it, which is the point.
+func TestEoBlockingLinkTypesCarryTheRightSemantic(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	seeded := eoSeededLinkTypes(t, db)
+
+	tests := []struct {
+		name       string
+		key        string
+		closure    bool
+		transition string
+	}{
+		{"an execution plan blocks its directive from closing", eoExecutionPlanLinkKey, true, ""},
+		{"an assignment blocks its parent from closing", eoAssignmentLinkKey, true, ""},
+		{"a referral blocks its letter from closing", eoReferralLinkKey, true, ""},
+		{"a task always blocks its parent from closing", eoTaskLinkKey, true, ""},
+		{"an objection blocks the raising step, not closure", eoObjectionLinkKey, false, eoDraftRaiseToHETransitionCode},
+		{"a decision record closes its parent, so it blocks nothing", eoDecisionLinkKey, false, ""},
+		{"an outgoing reply closes its parent, so it blocks nothing", eoOutgoingLinkKey, false, ""},
+		{"a plan stage carries no rule the client's document states", eoStageLinkKey, false, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lt, ok := seeded[tc.key]
+			if !ok {
+				t.Fatalf("link type %q was not seeded", tc.key)
+			}
+			if lt.BlocksParentClosure != tc.closure {
+				t.Errorf("blocks_parent_closure = %v, want %v", lt.BlocksParentClosure, tc.closure)
+			}
+			if lt.BlocksParentTransitionKey != tc.transition {
+				t.Errorf("blocks_parent_transition_key = %q, want %q", lt.BlocksParentTransitionKey, tc.transition)
+			}
+		})
+	}
+}
+
+// Only the Referral derives a deadline, and it derives it with an offset: a
+// derivation flag with a zero offset would copy the letter's own deadline onto
+// every referral, which is not "counted back" from anything.
+//
+// That a Referral CREATED UNDER A LETTER actually receives the derived date is
+// proved where the save pipeline lives, in
+// services.TestEoPilotReferralUnderALetterInheritsItsDeadline: package
+// database cannot import services (services imports database).
+//
+// Mutation: set `deriveDeadline: false` on eoReferralLinkKey's spec.
+func TestEoReferralLinkDerivesItsDeadlineFromTheLetter(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	seeded := eoSeededLinkTypes(t, db)
+
+	for key, lt := range seeded {
+		derives := key == eoReferralLinkKey
+		if lt.DeriveDeadlineFromParent != derives {
+			t.Errorf("link type %q derive_deadline_from_parent = %v, want %v", key, lt.DeriveDeadlineFromParent, derives)
+		}
+		if !derives && lt.DeadlineOffsetDays != 0 {
+			t.Errorf("link type %q carries an offset of %d days that nothing reads: services.DeriveDeadlineFromParent returns before it unless the flag is set",
+				key, lt.DeadlineOffsetDays)
+		}
+	}
+	if got := seeded[eoReferralLinkKey].DeadlineOffsetDays; got != eoReferralDeadlineOffsetDays || got <= 0 {
+		t.Errorf("the referral deadline offset is %d days, want %d: a zero or negative offset is not a deadline counted BACK from the letter's",
+			got, eoReferralDeadlineOffsetDays)
+	}
+}
+
+// Mutation: write `cardinality: "one"` instead of models.EOCardinalityOne on
+// any spec in eoPilotLinkTypes.
+func TestEoLinkCardinalityIsNamed(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	for key, lt := range eoSeededLinkTypes(t, db) {
+		if key == eoSmokeLinkTypeKey {
+			continue // Plan 1's, removed by the pilot seed; not under test here
+		}
+		switch lt.Cardinality {
+		case models.EOCardinalityOne, models.EOCardinalityMany:
+		default:
+			t.Errorf("link type %q has cardinality %q, which is neither %q nor %q: the spec enumerates no values, so a free-form spelling is one each consumer invents differently",
+				key, lt.Cardinality, models.EOCardinalityOne, models.EOCardinalityMany)
+		}
+	}
+
+	// The value test above cannot tell a named constant from a literal that
+	// happens to spell it the same way, so the source is read: every
+	// `cardinality:` in eoPilotLinkTypes must be a models.EOCardinality*
+	// selector.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "seed_eo_pilot.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse seed_eo_pilot.go: %v", err)
+	}
+	seen := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		kv, ok := n.(*ast.KeyValueExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := kv.Key.(*ast.Ident); !ok || id.Name != "cardinality" {
+			return true
+		}
+		seen++
+		sel, ok := kv.Value.(*ast.SelectorExpr)
+		if !ok || !strings.HasPrefix(sel.Sel.Name, "EOCardinality") {
+			t.Errorf("a cardinality is written as %T rather than a models.EOCardinality* constant", kv.Value)
+		}
+		return true
+	})
+	if seen != len(eoPilotLinkTypes) {
+		t.Errorf("read %d cardinality assignments from the source, %d link types are seeded", seen, len(eoPilotLinkTypes))
+	}
+}
+
+// Addendum 1, the defect this task is most likely to ship: an endpoint list
+// that permits NOTHING while looking correct. services.eoTypeAllowed returns
+// false for an empty list and the column's DB default is '[]'::jsonb, so a
+// link type seeded without endpoints refuses every link of its type.
+//
+// Mutation: drop `parentTypeKeys` from any spec in eoPilotLinkTypes.
+func TestEoLinkEndpointsNameSeededTypes(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	seeded := eoSeededLinkTypes(t, db)
+
+	byID := map[string]string{}
+	for _, key := range eoPilotTypeKeys {
+		byID[eoRootType(t, db, key).ID.String()] = key
+	}
+
+	for _, spec := range eoPilotLinkTypes {
+		t.Run(spec.key, func(t *testing.T) {
+			lt, ok := seeded[spec.key]
+			if !ok {
+				t.Fatalf("link type %q was not seeded", spec.key)
+			}
+			sources := eoLinkTypeIDs(t, "source_type_ids", lt.SourceTypeIDs)
+			if len(sources) != 1 || byID[sources[0]] != spec.childTypeKey {
+				t.Errorf("source types = %v, want exactly the id of %q", sources, spec.childTypeKey)
+			}
+			targets := eoLinkTypeIDs(t, "target_type_ids", lt.TargetTypeIDs)
+			if len(targets) == 0 {
+				t.Fatalf("target types are empty: services.eoTypeAllowed refuses EVERY target for an empty list, so this link type permits nothing")
+			}
+			for _, got := range targets {
+				if got == eoAnyTargetType {
+					continue
+				}
+				if _, ok := byID[got]; !ok {
+					t.Errorf("target type %q is not a seeded pilot record type", got)
+				}
+			}
+		})
+	}
+}
+
+// A parent-derived type with no link type is UNCREATABLE: it must be created
+// with a parent (services.RenderReference refuses to number it otherwise), and
+// eoRecordService.Create refuses a parent given with no link type key. So the
+// set of link types is not a matter of taste — one per sub type is what makes
+// the eight seeded types usable at all.
+//
+// Mutation: delete any entry from eoPilotLinkTypes.
+func TestEoEveryPilotChildTypeHasOneParentLinkType(t *testing.T) {
+	bySource := map[string][]string{}
+	for _, spec := range eoPilotLinkTypes {
+		bySource[spec.childTypeKey] = append(bySource[spec.childTypeKey], spec.key)
+	}
+	for _, key := range eoPilotChildTypeKeys() {
+		got := bySource[key]
+		if len(got) != 1 {
+			t.Errorf("record type %q has %d parent link types (%v), want exactly 1: with none it cannot be created with a parent at all, and with two the create request chooses which rules apply",
+				key, len(got), got)
+		}
+	}
+	if len(eoPilotLinkTypes) != len(eoPilotChildTypeKeys()) {
+		t.Errorf("%d link types for %d sub types", len(eoPilotLinkTypes), len(eoPilotChildTypeKeys()))
+	}
+}
+
+// The polymorphic target is the literal string services.eoAnyType carries, and
+// that constant is UNEXPORTED in a package this one cannot import — so the
+// seed repeats the literal and this test is the only thing tying the two
+// together. Renaming the sentinel on either side turns the universal Task's
+// link type into one that permits nothing.
+//
+// Mutation: change eoAnyTargetType to "ANY" (or to "*").
+func TestEoAnyTargetSentinelMatchesTheEngineConstant(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "../services/eo_links.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse services/eo_links.go: %v", err)
+	}
+	got := ""
+	ast.Inspect(file, func(n ast.Node) bool {
+		vs, ok := n.(*ast.ValueSpec)
+		if !ok || len(vs.Names) != 1 || vs.Names[0].Name != "eoAnyType" || len(vs.Values) != 1 {
+			return true
+		}
+		if lit, ok := vs.Values[0].(*ast.BasicLit); ok {
+			got = strings.Trim(lit.Value, `"`)
+		}
+		return true
+	})
+	if got == "" {
+		t.Fatalf("services.eoAnyType was not found; the sentinel the Task link type is seeded with is tied to nothing")
+	}
+	if got != eoAnyTargetType {
+		t.Errorf("services.eoAnyType = %q, the seed writes %q: the universal Task's link type permits nothing", got, eoAnyTargetType)
+	}
+}
+
+// The seed's own refusals, which are what stop an inert link type reaching the
+// database. No DB: eoLinkTypeRow is pure.
+//
+// Mutation: delete any one of the guards in eoLinkTypeRow.
+func TestEoLinkTypeRowRefusesAnIncoherentSpec(t *testing.T) {
+	ids := map[string]uuid.UUID{}
+	for _, key := range eoPilotTypeKeys {
+		ids[key] = uuid.New()
+	}
+	ok := eoLinkTypeSpec{
+		key: "eo_test_parent", label: "Parent", childTypeKey: eoTaskTypeKey,
+		parentTypeKeys: []string{eoDirectiveTypeKey}, cardinality: models.EOCardinalityOne,
+	}
+	with := func(f func(*eoLinkTypeSpec)) eoLinkTypeSpec {
+		s := ok
+		s.parentTypeKeys = append([]string{}, ok.parentTypeKeys...)
+		f(&s)
+		return s
+	}
+
+	tests := []struct {
+		name string
+		spec eoLinkTypeSpec
+		want string
+	}{
+		{"a free-form cardinality", with(func(s *eoLinkTypeSpec) { s.cardinality = "1" }), "cardinality"},
+		{"no cardinality at all", with(func(s *eoLinkTypeSpec) { s.cardinality = "" }), "cardinality"},
+		{"a child type that is not seeded", with(func(s *eoLinkTypeSpec) { s.childTypeKey = "eo_nonesuch" }), "eo_nonesuch"},
+		{"a parent type that is not seeded", with(func(s *eoLinkTypeSpec) { s.parentTypeKeys = []string{"eo_nonesuch"} }), "eo_nonesuch"},
+		{"no parent types, which permits nothing", with(func(s *eoLinkTypeSpec) { s.parentTypeKeys = nil }), "permits nothing"},
+		{"a polymorphic SOURCE, which no matrix row asks for", with(func(s *eoLinkTypeSpec) { s.childTypeKey = eoAnyTargetType }), "source"},
+		{"both block rules at once", with(func(s *eoLinkTypeSpec) {
+			s.blocksClosure = true
+			s.blocksTransitionCode = eoDraftRaiseToHETransitionCode
+		}), "one or the other"},
+		{"an offset nothing reads", with(func(s *eoLinkTypeSpec) { s.deadlineOffsetDays = 2 }), "offset"},
+		{"a derivation with no offset", with(func(s *eoLinkTypeSpec) { s.deriveDeadline = true }), "offset"},
+		{"an empty key", with(func(s *eoLinkTypeSpec) { s.key = "" }), "key"},
+		{"no label", with(func(s *eoLinkTypeSpec) { s.label = "" }), "label"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := eoLinkTypeRow(tc.spec, ids)
+			if err == nil {
+				t.Fatalf("the seed accepted %+v", tc.spec)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+
+	if _, err := eoLinkTypeRow(ok, ids); err != nil {
+		t.Errorf("a coherent spec was refused: %v", err)
+	}
+}
+
+// Every link type's rule is a reading of one sentence of the client's
+// document, and the registry is where that reading is written down —
+// including for the two types whose rule is "none" and the one type the
+// document does not mention at all. Without it a missing rule and a
+// deliberately absent one look identical.
+//
+// Mutation: delete any entry from eoLinkRuleDecisions, or change an entry's
+// MatrixProse to a sentence the matrix does not contain.
+func TestEoLinkRuleDecisionsCoverEverySeededLinkType(t *testing.T) {
+	prose := eoReadMatrixProse(t)
+	byKey := map[string]eoLinkRuleDecision{}
+	for _, d := range eoLinkRuleDecisions {
+		if _, dup := byKey[d.LinkKey]; dup {
+			t.Errorf("two decisions for link type %q", d.LinkKey)
+		}
+		byKey[d.LinkKey] = d
+	}
+	for _, spec := range eoPilotLinkTypes {
+		t.Run(spec.key, func(t *testing.T) {
+			d, ok := byKey[spec.key]
+			if !ok {
+				t.Fatalf("link type %q carries no stated decision", spec.key)
+			}
+			if d.ChildTypeKey != spec.childTypeKey {
+				t.Errorf("the decision names child type %q, the spec seeds %q", d.ChildTypeKey, spec.childTypeKey)
+			}
+			if strings.TrimSpace(d.Mechanism) == "" || strings.TrimSpace(d.Why) == "" {
+				t.Errorf("the decision names no mechanism (%q) or no reason (%q)", d.Mechanism, d.Why)
+			}
+			section := eoMatrixSections[spec.childTypeKey]
+			if section == "" {
+				// The stage type: the matrix has no section for it, so the
+				// decision must say so rather than quote a sentence.
+				if d.MatrixProse != "" {
+					t.Errorf("the decision quotes %q, but the client's matrix has no section for %q", d.MatrixProse, spec.childTypeKey)
+				}
+				return
+			}
+			if d.MatrixProse == "" {
+				t.Fatalf("the decision quotes nothing from the matrix's %q paragraph", section)
+			}
+			if !strings.Contains(prose[section], d.MatrixProse) {
+				t.Errorf("the decision quotes %q, which is not in the matrix's %q paragraph: %q", d.MatrixProse, section, prose[section])
+			}
+		})
+	}
+	if len(eoLinkRuleDecisions) != len(eoPilotLinkTypes) {
+		t.Errorf("%d decisions for %d link types", len(eoLinkRuleDecisions), len(eoPilotLinkTypes))
+	}
+}
+
+// The labels of the seeded link types await the client's Arabic exactly as the
+// field labels do — and there is nowhere to record it: eo_link_types has no
+// ar_untranslated column, so eoUntranslatedFields cannot see them. This test
+// is the only place the obligation is visible, so it states the rule it can:
+// no Arabic is invented.
+//
+// Mutation: write a real Arabic label into eoUntranslatedLinkLabel.
+func TestEoLinkLabelsAwaitArabicSignOff(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	for _, spec := range eoPilotLinkTypes {
+		lt := eoSeededLinkTypes(t, db)[spec.key]
+		if lt.Label == "" || lt.LabelAr == "" {
+			t.Errorf("link type %q has an empty label (%q/%q); it would render as a blank row", spec.key, lt.Label, lt.LabelAr)
+		}
+		if lt.LabelAr != lt.Label {
+			t.Errorf("link type %q carries Arabic (%q) the client has not signed off; the English stands in until it does", spec.key, lt.LabelAr)
+		}
+	}
 }
