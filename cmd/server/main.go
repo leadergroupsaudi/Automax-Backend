@@ -39,7 +39,17 @@ func main() {
 
 	log.Printf("GOAL_MANAGEMENT enabled: %v", cfg.GoalManagement.Enabled)
 	validation.InitValidatorRegistry()
-	services.RegisterEOCapabilities() // explicit, not an init(): see services/eo_capability.go
+	// Explicit, not an init(): see services/eo_capability.go. It stays BEFORE
+	// database.Connect and that ordering is load-bearing — with no *gorm.DB
+	// and no repository in scope here, a capability cannot be constructed
+	// holding a POOLED one. Three of a capability's four record hooks run
+	// inside a transaction that holds a FOR UPDATE row lock, and a pooled
+	// read taken there waits for a free connection forever on a capped pool.
+	// Capabilities read through the services.EOCapabilityReader the engine
+	// hands each hook, bound per call to the handles that are safe where the
+	// hook runs. services.TestRegistrationOrderAllowsARepositoryBackedCapability
+	// fails if these two lines are swapped.
+	services.RegisterEOCapabilities()
 	db, err := database.Connect(&cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)

@@ -496,7 +496,14 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		return nil, err
 	}
 	// The capabilities' save-time checks, over the record as it will be saved.
-	capErrs, err := eoCapabilitiesValidate(ctx, caps, rec)
+	// The capabilities' read path. This is the one place it is built on the
+	// POOLED handles, and it is safe because no transaction is open yet: the
+	// create pipeline validates and derives BEFORE it opens one, exactly as
+	// it resolves the capability list and the effective fields before it. The
+	// timer arming at the end of the transaction gets a transaction-bound
+	// reader of its own.
+	capRead := eoNewCapabilityReader(s.records, s.types)
+	capErrs, err := eoCapabilitiesValidate(ctx, capRead, caps, rec)
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
@@ -523,7 +530,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 
 	// 5. derived fields, over the values written above.
 	s.applyDerived(ctx, fields, rec)
-	if err := eoCapabilitiesDerive(ctx, caps, rec); err != nil {
+	if err := eoCapabilitiesDerive(ctx, capRead, caps, rec); err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
 
@@ -535,7 +542,12 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	if err != nil {
 		return nil, fmt.Errorf("create eo record %q: %w", rec.Reference, err)
 	}
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, timers repository.EOTimerRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository, timers repository.EOTimerRepository) error {
+		// Inside the transaction the capabilities read through ITS handles,
+		// never the pooled ones captured above: this closure holds a
+		// connection, and a second pooled read would wait for a free one
+		// forever on a capped pool.
+		txCapRead := eoNewCapabilityReader(r, rt)
 		if err := r.Create(ctx, rec); err != nil {
 			return err
 		}
@@ -563,7 +575,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		// Capability timers for the initial state, last, on the same handle.
 		// No cancel: a new record has no earlier timers.
 		for _, c := range caps {
-			if err := eoArmCapabilityTimers(ctx, c, rec, timers); err != nil {
+			if err := eoArmCapabilityTimers(ctx, txCapRead, c, rec, timers); err != nil {
 				return err
 			}
 		}
@@ -669,7 +681,12 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 		if err := eoValidationError(eoApplyValues(fresh, req.Values)); err != nil {
 			return err
 		}
-		capErrs, err := eoCapabilitiesValidate(ctx, caps, fresh)
+		// The capability hooks' read path, built on the TRANSACTION's handles
+		// for the same reason the dependency loader below is: a pooled read
+		// taken here would take a second connection while this transaction
+		// holds its own plus the row lock.
+		capRead := eoNewCapabilityReader(r, rt)
+		capErrs, err := eoCapabilitiesValidate(ctx, capRead, caps, fresh)
 		if err != nil {
 			return err
 		}
@@ -682,7 +699,7 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 		// take a second connection while this transaction holds its own plus
 		// the row lock.
 		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: rt})
-		if err := eoCapabilitiesDerive(ctx, caps, fresh); err != nil {
+		if err := eoCapabilitiesDerive(ctx, capRead, caps, fresh); err != nil {
 			return err
 		}
 

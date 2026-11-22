@@ -52,6 +52,10 @@ type eoTxRecordRepo struct {
 	// deadlock class.
 	getAnyTotal int
 	getAnyInTx  int
+	// linksTotal / linksInTx do the same for LinksFrom, which is how a
+	// capability reads a record's typed links (Task B1's read seam).
+	linksTotal int
+	linksInTx  int
 }
 
 func (f *eoTxRecordRepo) LockForUpdate(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
@@ -97,6 +101,7 @@ func (f *eoTxRecordRepo) Children(_ context.Context, parentID uuid.UUID, recordT
 }
 
 func (f *eoTxRecordRepo) LinksFrom(_ context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
+	f.linksTotal++
 	return f.links[recordID], nil
 }
 
@@ -132,6 +137,11 @@ func (b *eoTxBoundRepo) Children(ctx context.Context, parentID uuid.UUID, record
 func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.EORecord, error) {
 	b.eoTxRecordRepo.getAnyInTx++
 	return b.eoTxRecordRepo.GetAnyByID(ctx, id)
+}
+
+func (b *eoTxBoundRepo) LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
+	b.eoTxRecordRepo.linksInTx++
+	return b.eoTxRecordRepo.LinksFrom(ctx, recordID)
 }
 
 func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
@@ -1608,17 +1618,17 @@ func (c *eoBridgeCap) Key() string { return c.key }
 // embedded interface, so a hook the bridge starts using panics loudly.
 func (c *eoBridgeCap) ReservedKeys(datatypes.JSON) ([]string, error)           { return nil, nil }
 func (c *eoBridgeCap) ValidateWorkflow(datatypes.JSON, *models.Workflow) error { return nil }
-func (c *eoBridgeCap) Validate(context.Context, *models.EORecord, datatypes.JSON) (map[string]string, error) {
+func (c *eoBridgeCap) Validate(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) (map[string]string, error) {
 	return nil, nil
 }
-func (c *eoBridgeCap) Derive(context.Context, *models.EORecord, datatypes.JSON) (map[string]any, error) {
+func (c *eoBridgeCap) Derive(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) (map[string]any, error) {
 	return nil, nil
 }
-func (c *eoBridgeCap) OnTransition(context.Context, *models.EORecord, *models.WorkflowTransition, datatypes.JSON) error {
+func (c *eoBridgeCap) OnTransition(context.Context, EOCapabilityReader, *models.EORecord, *models.WorkflowTransition, datatypes.JSON) error {
 	return nil
 }
 
-func (c *eoBridgeCap) Timers(_ context.Context, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error) {
+func (c *eoBridgeCap) Timers(_ context.Context, _ EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error) {
 	c.calls++
 	c.seenState, c.seenCfg = rec.StateID, cfg
 	return c.timers, c.err

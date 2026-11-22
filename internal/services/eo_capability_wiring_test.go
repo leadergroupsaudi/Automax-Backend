@@ -29,7 +29,7 @@ func (c *eoWireCap) ReservedKeys(datatypes.JSON) ([]string, error) { return nil,
 
 func (c *eoWireCap) ValidateWorkflow(datatypes.JSON, *models.Workflow) error { return nil }
 
-func (c *eoWireCap) Validate(_ context.Context, rec *models.EORecord, _ datatypes.JSON) (map[string]string, error) {
+func (c *eoWireCap) Validate(_ context.Context, _ EOCapabilityReader, rec *models.EORecord, _ datatypes.JSON) (map[string]string, error) {
 	c.validateCalls++
 	c.valuesSeenByValidate = string(rec.Values)
 	return c.validateErrs, nil
@@ -37,16 +37,16 @@ func (c *eoWireCap) Validate(_ context.Context, rec *models.EORecord, _ datatype
 
 // Timers declares none. The transition bridge still cancels the capability's
 // timers on every transition, so the fixture needs a timer handle.
-func (c *eoWireCap) Timers(context.Context, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
+func (c *eoWireCap) Timers(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
 	return nil, nil
 }
 
-func (c *eoWireCap) Derive(context.Context, *models.EORecord, datatypes.JSON) (map[string]any, error) {
+func (c *eoWireCap) Derive(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) (map[string]any, error) {
 	c.deriveCalls++
 	return c.derived, nil
 }
 
-func (c *eoWireCap) OnTransition(ctx context.Context, rec *models.EORecord, t *models.WorkflowTransition, _ datatypes.JSON) error {
+func (c *eoWireCap) OnTransition(ctx context.Context, _ EOCapabilityReader, rec *models.EORecord, t *models.WorkflowTransition, _ datatypes.JSON) error {
 	c.transitionCalls++
 	c.transitionSeen = t.Code
 	c.actorSeen, _ = ctx.Value(eoActorCtxKey{}).(*models.User)
@@ -435,7 +435,7 @@ func TestApprovalSecondStampIsAUserReadableValidationError(t *testing.T) {
 
 func TestApprovalValidateRefusesAMalformedStoredStamp(t *testing.T) {
 	c, rec, _, ctx := eoApprovalFixture(t, map[string]any{"approval": "not an object"})
-	if _, err := c.Validate(ctx, rec, eoApprovalTestCfg); err == nil {
+	if _, err := c.Validate(ctx, nil, rec, eoApprovalTestCfg); err == nil {
 		t.Fatal("a present-but-malformed stamp was treated as absent")
 	}
 }

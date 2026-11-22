@@ -40,6 +40,10 @@ type eoSvcRecordRepo struct {
 	// does, so the fixture wires it to the same type repository the service
 	// holds.
 	txTypes repository.EORecordTypeRepository
+	// txRecords is the record repository Transaction hands its closure. Nil
+	// means the fake itself; a test that must tell a transaction-bound read
+	// from a pooled one sets a distinct object here.
+	txRecords repository.EORecordRepository
 	// lockCalls counts LockForUpdate. Update must take the row lock, not
 	// merely open a transaction: a transaction alone does not serialise two
 	// concurrent edits under READ COMMITTED.
@@ -132,8 +136,12 @@ func (f *eoSvcRecordRepo) EnteredStateIDs(_ context.Context, _, _ uuid.UUID) (ma
 	return f.entered, nil
 }
 
-func (f *eoSvcRecordRepo) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
-	return fn(f, f.txTypes, f.txTimers)
+func (f *eoSvcRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
+	records := repository.EORecordRepository(f)
+	if f.txRecords != nil {
+		records = f.txRecords
+	}
+	return fn(records, f.txTypes, f.txTimers)
 }
 
 type eoSvcTypeRepo struct {

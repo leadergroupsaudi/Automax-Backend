@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/repository"
+	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
 
@@ -19,18 +22,24 @@ import (
 //
 // OnSave from the spec's hook list is not here: nothing in the seven processes
 // needs it yet, and Validate already runs on the save path.
+//
+// Every record-facing hook is handed an EOCapabilityReader. It is the ONLY way
+// a capability reaches a record other than the one it was called about, and it
+// is never nil: the engine binds it to the handles that are safe on the path
+// the hook is running on. A capability must not hold a repository of its own —
+// see EOCapabilityReader.
 type Capability interface {
 	Key() string
 	// Derive returns engine-computed values to merge into the record.
-	Derive(ctx context.Context, rec *models.EORecord, cfg datatypes.JSON) (map[string]any, error)
+	Derive(ctx context.Context, read EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) (map[string]any, error)
 	// Validate returns field key -> message, in the shape the save pipeline's
 	// validation errors use. The error return is for a broken configuration.
-	Validate(ctx context.Context, rec *models.EORecord, cfg datatypes.JSON) (map[string]string, error)
+	Validate(ctx context.Context, read EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) (map[string]string, error)
 	// OnTransition runs inside the transition's transaction, after the field
 	// changes are applied and before the record is written, and may mutate rec.
 	// An error aborts the transition.
-	OnTransition(ctx context.Context, rec *models.EORecord, t *models.WorkflowTransition, cfg datatypes.JSON) error
-	Timers(ctx context.Context, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error)
+	OnTransition(ctx context.Context, read EOCapabilityReader, rec *models.EORecord, t *models.WorkflowTransition, cfg datatypes.JSON) error
+	Timers(ctx context.Context, read EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error)
 	// ReservedKeys lists the values keys this capability writes itself. A
 	// request must never be able to write them, so a record type whose fields
 	// or transition field changes name one is a misconfiguration the pipelines
@@ -146,10 +155,10 @@ func (r eoCapabilityResolver) resolve(t *models.EORecordType) ([]EOEnabledCapabi
 
 // eoCapabilitiesValidate runs every capability's Validate over rec and merges
 // the field errors. A returned error means a capability is misconfigured.
-func eoCapabilitiesValidate(ctx context.Context, caps []EOEnabledCapability, rec *models.EORecord) (map[string]string, error) {
+func eoCapabilitiesValidate(ctx context.Context, read EOCapabilityReader, caps []EOEnabledCapability, rec *models.EORecord) (map[string]string, error) {
 	out := map[string]string{}
 	for _, c := range caps {
-		errs, err := c.Validate(ctx, rec, c.Config)
+		errs, err := c.Validate(ctx, read, rec, c.Config)
 		if err != nil {
 			return nil, fmt.Errorf("capability %q: %w", c.Key(), err)
 		}
@@ -161,9 +170,9 @@ func eoCapabilitiesValidate(ctx context.Context, caps []EOEnabledCapability, rec
 // eoCapabilitiesDerive writes every capability's derived values onto rec. They
 // go through eoApplyValues, not the request path, so they need no field
 // definition — but they still cannot overwrite an engine-owned column.
-func eoCapabilitiesDerive(ctx context.Context, caps []EOEnabledCapability, rec *models.EORecord) error {
+func eoCapabilitiesDerive(ctx context.Context, read EOCapabilityReader, caps []EOEnabledCapability, rec *models.EORecord) error {
 	for _, c := range caps {
-		derived, err := c.Derive(ctx, rec, c.Config)
+		derived, err := c.Derive(ctx, read, rec, c.Config)
 		if err != nil {
 			return fmt.Errorf("capability %q: %w", c.Key(), err)
 		}
@@ -215,3 +224,120 @@ func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFie
 	}
 	return nil
 }
+
+// ── the read seam ───────────────────────────────────────────────────────────
+
+// EOCapabilityReader is how a capability hook reaches a record other than the
+// one it was called about: decisions_base reads records of a type other than
+// the draft's, referral_tree reads a letter's referrals, their sub-referrals
+// and the typed links between them. It is read-only on purpose — a capability
+// writes through the values it derives and through OnTransition's mutation of
+// rec, never behind the pipeline's back.
+//
+// WHY A HANDED-IN READER RATHER THAN A REPOSITORY ON THE CAPABILITY.
+// A capability is a process-wide singleton, registered at startup before any
+// database exists (cmd/server/main.go). If it carried a repository, that
+// repository would be the POOLED one, and three of its four hooks run INSIDE
+// EORecordRepository.Transaction while that transaction holds its connection
+// and a FOR UPDATE row lock. A second pooled read taken there waits for a free
+// connection forever on a capped pool — no timeout, no error, a hung request.
+// Plan 1 hit that in three separate tasks before fixing the class rather than
+// the instances.
+//
+// So the engine binds the reader per call, to the handles that are safe where
+// the hook actually runs:
+//
+//   - inside a transaction (Update, Execute, and the timer arming at the end
+//     of Create): the transaction's own record and type handles;
+//   - on the create path before the transaction opens, where the capability
+//     list and the effective fields are already read the same way: the pooled
+//     ones, because no transaction is open to starve.
+//
+// A capability therefore cannot take a pooled read inside a transaction
+// without first giving itself a repository, which registration order makes
+// impossible. Spec §7.7 forbids SQL outside the record repository, so a
+// capability that needs a query this interface does not expose gets a
+// repository method and one more method here — not a *gorm.DB.
+type EOCapabilityReader interface {
+	// Record returns any record by id, across every partition, or nil when
+	// there is none.
+	Record(ctx context.Context, id uuid.UUID) (*models.EORecord, error)
+	// RecordType resolves a record type by key, or nil when there is none.
+	RecordType(ctx context.Context, key string) (*models.EORecordType, error)
+	// Children returns the DIRECT children of parentID. An empty
+	// recordTypeKey means every type; a key that names no type is an error,
+	// never an empty result, because a typo must not look like "no children".
+	Children(ctx context.Context, parentID uuid.UUID, recordTypeKey string) ([]models.EORecord, error)
+	// Links returns the typed links declared FROM recordID — the direction a
+	// child uses to name its parent, which is how a referral tree is walked.
+	Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
+}
+
+// eoCapabilityReader binds the interface above to one pair of repository
+// handles. eoNewCapabilityReader is called with the TRANSACTION's handles
+// wherever a transaction is open, and with the pooled ones only where none is.
+type eoCapabilityReader struct {
+	records repository.EORecordRepository
+	types   repository.EORecordTypeRepository
+}
+
+func eoNewCapabilityReader(records repository.EORecordRepository, types repository.EORecordTypeRepository) EOCapabilityReader {
+	return &eoCapabilityReader{records: records, types: types}
+}
+
+func (d *eoCapabilityReader) Record(ctx context.Context, id uuid.UUID) (*models.EORecord, error) {
+	return d.records.GetAnyByID(ctx, id)
+}
+
+func (d *eoCapabilityReader) RecordType(ctx context.Context, key string) (*models.EORecordType, error) {
+	return d.types.GetByKey(ctx, key)
+}
+
+func (d *eoCapabilityReader) Children(ctx context.Context, parentID uuid.UUID, recordTypeKey string) ([]models.EORecord, error) {
+	if strings.TrimSpace(recordTypeKey) == "" {
+		return d.records.Children(ctx, parentID, nil)
+	}
+	t, err := d.types.GetByKey(ctx, recordTypeKey)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("no record type with key %q", recordTypeKey)
+	}
+	return d.records.Children(ctx, parentID, &t.ID)
+}
+
+func (d *eoCapabilityReader) Links(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
+	return d.records.LinksFrom(ctx, recordID)
+}
+
+// ── embeddable no-ops ───────────────────────────────────────────────────────
+//
+// ReservedKeys and ValidateWorkflow joined the interface late in Plan 1 and
+// most capabilities have nothing to say for either: §7.9 still owes
+// quorum_voting, calendar, agenda and numbering. These two save them writing
+// an empty method each.
+//
+// They are deliberately TWO structs rather than one base. A single
+// "eoCapabilityBase" would let a capability that genuinely owns a sealed values
+// key inherit "reserves nothing" without anyone writing the words — and
+// ReservedKeys is the whole of the approval stamp's forgery guard
+// (eoCapabilitiesCheckConfig). Split, embedding one is a claim in its own
+// right, visible at the embed site and reviewable there.
+
+// eoReservesNoKeys supplies ReservedKeys for a capability that writes no
+// values key of its own. Do NOT embed it in a capability that writes a key the
+// request path must never be able to set: that is what ReservedKeys exists to
+// declare, and inheriting "none" here silently removes the guard.
+type eoReservesNoKeys struct{}
+
+func (eoReservesNoKeys) ReservedKeys(datatypes.JSON) ([]string, error) { return nil, nil }
+
+// eoConstrainsNoWorkflow supplies ValidateWorkflow for a capability whose
+// config names nothing the workflow has to contain. Do not embed it in a
+// capability whose config names transition codes or state codes: the check is
+// what turns a typo into a startup-time refusal instead of a hook that never
+// fires.
+type eoConstrainsNoWorkflow struct{}
+
+func (eoConstrainsNoWorkflow) ValidateWorkflow(datatypes.JSON, *models.Workflow) error { return nil }

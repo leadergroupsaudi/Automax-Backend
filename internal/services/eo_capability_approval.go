@@ -94,11 +94,11 @@ func (c *eoApprovalCapability) parse(cfg datatypes.JSON) (eoApprovalConfig, erro
 	return out, nil
 }
 
-func (c *eoApprovalCapability) Derive(context.Context, *models.EORecord, datatypes.JSON) (map[string]any, error) {
+func (c *eoApprovalCapability) Derive(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) (map[string]any, error) {
 	return nil, nil
 }
 
-func (c *eoApprovalCapability) Timers(context.Context, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
+func (c *eoApprovalCapability) Timers(context.Context, EOCapabilityReader, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
 	return nil, nil
 }
 
@@ -109,7 +109,9 @@ func eoApprovalString(bag map[string]any, key string) string {
 
 // Validate holds the stamp immutable: once sealed, the input fields must still
 // match it.
-func (c *eoApprovalCapability) Validate(_ context.Context, rec *models.EORecord, cfg datatypes.JSON) (map[string]string, error) {
+// The reader is unused: the stamp is sealed from the record's own values and
+// the acting user, never from another record.
+func (c *eoApprovalCapability) Validate(_ context.Context, _ EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) (map[string]string, error) {
 	conf, err := c.parse(cfg)
 	if err != nil {
 		return nil, err
@@ -136,7 +138,7 @@ func (c *eoApprovalCapability) Validate(_ context.Context, rec *models.EORecord,
 	return errs, nil
 }
 
-func (c *eoApprovalCapability) OnTransition(ctx context.Context, rec *models.EORecord, t *models.WorkflowTransition, cfg datatypes.JSON) error {
+func (c *eoApprovalCapability) OnTransition(ctx context.Context, _ EOCapabilityReader, rec *models.EORecord, t *models.WorkflowTransition, cfg datatypes.JSON) error {
 	conf, err := c.parse(cfg)
 	if err != nil {
 		return err

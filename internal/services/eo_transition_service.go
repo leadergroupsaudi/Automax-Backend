@@ -356,7 +356,13 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// engine-owned values (the approval stamp). Both run before the derived
 		// step so a formula can read what they wrote, and an error from either
 		// rolls the transition back.
-		capErrs, err := eoCapabilitiesValidate(ctx, caps, fresh)
+		// The capability hooks' read path is built on the TRANSACTION's
+		// handles, for the reason the dependency loader below is: a read
+		// taken on the pooled ones would acquire a second connection while
+		// this transaction holds its own plus a FOR UPDATE row lock, and
+		// database/sql waits for a free one forever on a capped pool.
+		capRead := eoNewCapabilityReader(r, rt)
+		capErrs, err := eoCapabilitiesValidate(ctx, capRead, caps, fresh)
 		if err != nil {
 			return err
 		}
@@ -364,7 +370,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 		for _, c := range caps {
-			if err := c.OnTransition(ctx, fresh, transition, c.Config); err != nil {
+			if err := c.OnTransition(ctx, capRead, fresh, transition, c.Config); err != nil {
 				return err
 			}
 		}
@@ -395,7 +401,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// outside the transaction. (The save pipeline recomputes BEFORE
 		// opening its transaction, so it is no precedent for doing otherwise.)
 		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: rt})
-		if err := eoCapabilitiesDerive(ctx, caps, fresh); err != nil {
+		if err := eoCapabilitiesDerive(ctx, capRead, caps, fresh); err != nil {
 			return err
 		}
 
@@ -455,7 +461,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			if err := timers.CancelForRecordByCapability(ctx, fresh.ID, key); err != nil {
 				return err
 			}
-			if err := eoArmCapabilityTimers(ctx, c, fresh, timers); err != nil {
+			if err := eoArmCapabilityTimers(ctx, capRead, c, fresh, timers); err != nil {
 				return err
 			}
 		}
@@ -935,9 +941,9 @@ func eoStateForSLA(ctx context.Context, policies repository.EscalationPolicyRepo
 // refused, not silently rewritten: a timer is cancelled by its capability key,
 // so one carrying another capability's key would be cancelled by that
 // capability's state change while its owner never knew.
-func eoArmCapabilityTimers(ctx context.Context, c EOEnabledCapability, rec *models.EORecord, timers repository.EOTimerRepository) error {
+func eoArmCapabilityTimers(ctx context.Context, read EOCapabilityReader, c EOEnabledCapability, rec *models.EORecord, timers repository.EOTimerRepository) error {
 	key := c.Key()
-	capTimers, err := c.Timers(ctx, rec, c.Config)
+	capTimers, err := c.Timers(ctx, read, rec, c.Config)
 	if err != nil {
 		return fmt.Errorf("capability %q timers: %w", key, err)
 	}
