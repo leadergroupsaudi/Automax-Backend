@@ -19,7 +19,11 @@ const eoMaxInheritanceDepth = 32
 // is copied (spec §7.2).
 //
 // If a type redefines an ancestor's field key, the type's definition replaces
-// the ancestor's at the ancestor's position; the key appears once.
+// the ancestor's at the ancestor's position; the key appears once. The
+// overriding definition's own SortOrder has no effect on ordering. An override
+// narrows an inherited field (e.g. optional -> required, a relabel) rather than
+// adding a new one, and a field must sit in the same position on every record
+// type's form; do not "fix" this to position by the child's SortOrder.
 //
 // The ancestors slice is not trusted to be ordered or acyclic: the chain is
 // built by following ParentTypeID through it. A cycle, a chain deeper than

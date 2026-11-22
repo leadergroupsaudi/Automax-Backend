@@ -53,6 +53,8 @@ func TestResolveEffectiveFieldsOverrideByKey(t *testing.T) {
 
 	baseTitle := eoField(base.ID, "title", 0)
 	baseTitle.RequiredMode = models.EORequiredNever
+	// SortOrder 5 would place title after zeta (1) and own (0) if the child's
+	// value were honoured; it must be ignored and title keep the base slot.
 	childTitle := eoField(child.ID, "title", 5)
 	childTitle.RequiredMode = models.EORequiredAlways
 	defs := []models.EOFieldDef{
@@ -64,7 +66,7 @@ func TestResolveEffectiveFieldsOverrideByKey(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if eoKeys(got) != "title,zeta,own" {
-		t.Fatalf("keys = %s, want title,zeta,own (override keeps ancestor slot, once)", eoKeys(got))
+		t.Fatalf("keys = %s, want title,zeta,own (override keeps ancestor slot despite child SortOrder 5, once)", eoKeys(got))
 	}
 	if got[0].ID != childTitle.ID || got[0].RequiredMode != models.EORequiredAlways {
 		t.Errorf("title = %+v, want the child's definition", got[0])
