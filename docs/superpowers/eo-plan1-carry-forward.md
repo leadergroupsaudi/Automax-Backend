@@ -86,7 +86,31 @@ forms and the client-signed Arabic labels.
 ## Opened by Plan 2, recorded here so it survives the plan
 
 **Client sign-off: which "Yes" fields are really "Yes at closure"
-(named obligation, owner: Plan 2 Task A5).** The client's field matrix has a
+(named obligation, owner: Plan 2 Task A5).**
+**PARTLY ANSWERED by Task A5; three rows still need the client.** A5 resolved
+the seven "Yes" rows whose OWN `Why` cell names closing or verification as the
+moment, recorded each in `database.eoClosureArtefacts` with the matrix cell it
+quotes, and pointed them at the terminal state:
+`eo_directive.verification_notes` ("the Office records what it checked **before
+closing**"), `eo_draft_decision_study.he_decision` / `he_reason` /
+`decision_date` (Q3 and 5.1, the last steps of EO-DRF),
+`eo_assignment.verified_by` / `verified_on` (6.1, the verification step) and
+`eo_task.verified_by` ("**Verification is what closes it**, not the owner
+marking it done"). `always -> at_state` is recoverable in BOTH directions —
+`models.ValidateTypeEdit` refuses only `never -> required` — which is why this
+was safe and the `always -> never` softening was not.
+**STILL `always`, and recorded in `eoClosureArtefactsLeftForTheClient`:**
+`eo_draft_decision_study.recommendation` (Q2) and `study_report` (4.2), both of
+which precede the raise to H.E. rather than the closure, and
+`eo_incoming_correspondence.consolidated` (6.1, which names consolidation and
+not closing). **The consequence while those two stand: a Draft Decision Study
+still cannot be CREATED without the Office's recommendation and report**, so
+that root type is still unsubmittable in practice. The question for the client
+is narrower than it was — "required at creation, or required before the raise
+to H.E.?" — and the engine has no third answer today, because
+`required_at_state_ids` names states and `eoRequireAtClosureState` points a
+type's whole set at ONE of them.
+The original statement follows. The client's field matrix has a
 five-valued Required column and uses `Yes at closure` deliberately — Assignment's
 `evidence` carries it. Task A2 therefore seeded every `Yes` as
 `required_mode: always`, literally, for the three root types. The consequence is
@@ -259,7 +283,28 @@ stands in both labels (`eoUntranslatedLinkLabel`) and
 obligation is visible only in this document until the column exists.
 
 **For Task A5, from Task A4: TWO CLIENT-STATED RULES ARE IMPLEMENTED BY NOBODY
-UNTIL A5 WRITES A TRANSITION ACTION.** The matrix says a **Decision Record**
+UNTIL A5 WRITES A TRANSITION ACTION.**
+**CLOSED by Task A5, and it took ENGINE code as well as configuration.** Spec
+§7.8's action-type list (`notification`, `email`, `sms`, `webhook`,
+`field_update`, plus `spawn_record`, `require_approval`, `start_timer`,
+`recompute`) contains nothing that can close another record, so the action A4
+pointed at did not exist. A5 added a `close_parent` arm to
+`services.eoActionExecutor` and seeded it on the Decision Record's `issue` and
+the Outgoing Reply's `send`. **It runs a REAL transition on the parent through
+`EOTransitionService`**, so the parent's own blocking children, requirements,
+allowed roles, field changes, SLA clocks and history all apply — a letter with
+an open referral still refuses to be closed by its reply, which is both of A4's
+link rules holding at once. The construction cycle (the transition service
+holds the executor) is closed by `EOActionExecutor.SetTransitions`, called in
+`cmd/server/main.go` and guarded by
+`handlers.TestEOWiringUsesSLAConstructors`, which reads that file as text.
+**What a failed close_parent does NOT do is retry**: the action is dispatched
+post-commit, its error is logged and written to the CHILD's history, and
+nothing re-runs it. Closing the blocking referral later does not then close the
+letter — somebody must run the letter's own `close`, or re-run the reply's
+step. That is a real gap and it is the first thing to look at if the pilot
+reports letters that stayed open.
+The original statement follows. The matrix says a **Decision Record**
 "Closes the parent, then joins the base that checks the next draft"
 (matrix:165) and an **Outgoing Reply** "Closes the parent" (matrix:311). **No
 field of `models.EOLinkType` closes anything**, and nothing in the save or
@@ -283,7 +328,16 @@ workflow matter too. The same reading applies to Execution Plan's "One per
 directive", which A3 answered through the per-parent sequence scope.
 
 **For Task A5, from Task A4: the Objection's blocked transition is a shared
-constant.** `database.eoDraftRaiseToHETransitionCode` (`"raise_to_he"`) is what
+constant.**
+**CLOSED by Task A5.** The Draft Decision Study's raise is seeded under
+`eoDraftRaiseToHETransitionCode` itself, never a retyped literal.
+`database.TestEoBlockedTransitionNamesATransitionItsWorkflowHas` was vacuous
+and is now binding — verified by mutation, by renaming the seeded code and
+watching it fail with both strings — and
+`services.TestEoPilotOpenObjectionBlocksTheSeededRaiseToHE` drives the rule
+through the whole pipeline on the SEEDED workflow, where A4 could only use one
+of its own.
+The original statement follows. `database.eoDraftRaiseToHETransitionCode` (`"raise_to_he"`) is what
 `eo_objection_parent.blocks_parent_transition_key` names, and
 `services.checkBlockingChildren` compares it with `transition.Code` by string
 equality. **A5 must seed the Draft Decision Study's raise-to-H.E. transition
@@ -341,7 +395,15 @@ you want, and do you want it before the pilot?" It is cheap now and permanent
 later — `ValidateTypeEdit` makes a reference pattern destructive to change once
 records exist.
 
-**Task A5 must call `eoRequireAtClosureState` or delete it.** The matrix's
+**Task A5 must call `eoRequireAtClosureState` or delete it.**
+**CLOSED by Task A5 (`feat(eo): seed pilot workflows …`).** It is called once
+per type that declares a `closureState`, from `eoSeedOnePilotWorkflow`, with
+the id of the state the terminal transition enters. Both `evidence` fields now
+name a real state, and `services.TestEoPilotClosureIsRefusedWithoutItsClosure
+Artefacts` closes an assignment and a task both ways round — refused without
+the evidence, with the refusal naming the field, and accepted with it. The set
+it points at grew: see "the closure artefacts" below. The original statement
+follows. The matrix's
 fifth Required value, "Yes at closure", appears twice in the pilot:
 Assignment's and Task's `evidence`. Both are seeded `required_mode: at_state`
 with an EMPTY `required_at_state_ids`, which `ValidateRecordValues` reads as
@@ -417,7 +479,13 @@ row-level visibility stops depending on a derived value. Until one of those,
 the configuration is as tight as configuration can make it and the residual
 risk is in the engine.
 
-**Task A5 must call `eoLockDraftFieldsAfterState` or delete it.** The Draft
+**Task A5 must call `eoLockDraftFieldsAfterState` or delete it.**
+**CLOSED by Task A5.** It is called with the Draft Decision Study's
+`submitted` state — the matrix's "stamped and locked on receipt" —  and
+`services.TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit` shows the lock on
+both sides of that state: an edit before the stamp is accepted, a rewrite after
+it is refused naming `draft_text`, and an unchanged echo is still accepted. The
+original statement follows. The Draft
 Decision Study's `draft_text` and `draft_file` are the pilot's only field-level
 immutability (§7.12, "the original is never edited"). A2 seeded them unlocked,
 because `IsLockedAfterStateID` names a workflow state and no state for that type
@@ -434,6 +502,45 @@ base type is abstract and will never want a partition, and nothing in the engine
 reads the column — but the comment and the data disagree. One line in
 `eoSeedBaseType`: write the column explicitly after the create, the way
 `eoSeedRootTypes` does.
+
+**Opened by Task A5: the escalation ladder counts from STATE ENTRY, and the
+matrix counts from the DUE DATE.** The Directive's `escalation_level` is
+"at +3, +7 and +14 days **past the date**" (matrix:85). The engine's only
+per-state clock is `WorkflowState.SLAHours`, and `services.ScheduleStateSLA`
+writes each timer at `state entered + SLA + step.DelayHours`. A5 seeded the
+ladder as a 72-hour SLA on `in_execution` plus a three-step policy at 0/96/264
+hours, which lands on +3/+7/+14 **from the moment the directive enters
+execution**. For a directive whose due date is the day execution begins the two
+coincide; otherwise they do not. There is no due-date-relative SLA in the
+model, so closing this is engine work, not configuration. It is a §9 sign-off
+item.
+
+**Opened by Task A5: the eleven workflows' NAMES and STATE LABELS await
+Arabic, and the marker for that is the same one A4's link labels lack.**
+`workflows`, `workflow_states` and `workflow_transitions` have no
+`ar_untranslated` column, so `eoUntranslatedFields` cannot see them. English
+stands in `NameAr` and `DescriptionAr` on every row A5 seeds, and no Arabic is
+invented. What those rows DO carry is
+`eo_client_unconfirmed` — which is about the SHAPE of the machine, not its
+wording — so `eoUnconfirmedStateMachines` lists them and the Arabic obligation
+rides along with the sign-off round rather than having a query of its own.
+
+**Opened by Task A5: "One per letter, however many rounds of direction it
+took" is still bounded by nothing.** A4 recorded that link-type cardinality
+counts per SOURCE record and cannot express it. A5's workflows do not express
+it either: the Outgoing Reply's machine says what one reply does, not how many
+a letter may have. The first reply's `send` closes the letter, which makes a
+second reply's parent already closed — so in practice a second reply would be
+created under a closed letter and its own `close_parent` would be a no-op. That
+is an accident of the closure rule, not a cardinality guarantee, and the client
+should be told so rather than shown the number 1.
+
+**Opened by Task A5: `eo_execution_plan_stage`'s machine is invented, as its
+fields were.** The eleventh type has no section in the client's document, so
+there is no prose and no `Why` column to derive stages from. It is seeded
+`open -> closed`, one transition, marked client-unconfirmed like everything
+else and recorded as minimal in its own `derivation` string. It is the only
+pilot type whose machine is not derived from a client sentence.
 
 ---
 
