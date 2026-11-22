@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -349,7 +350,7 @@ func TestValidateRejectsWritesToDerivedAndAutoFields(t *testing.T) {
 func TestValidateRespectsIsLockedAfter(t *testing.T) {
 	submitted, other := uuid.New(), uuid.New()
 	f := []models.EOFieldDef{{Key: "draft_text", IsLockedAfterStateID: &submitted}}
-	rec := map[string]any{"draft_text": "original", "n": 3}
+	rec := map[string]any{"draft_text": "original", "n": float64(3)}
 	n := []models.EOFieldDef{{Key: "n", IsLockedAfterStateID: &submitted}}
 	passed := map[uuid.UUID]bool{submitted: true}
 	tests := []struct {
@@ -379,6 +380,53 @@ func TestValidateRespectsIsLockedAfter(t *testing.T) {
 	t.Run("no lock configured", func(t *testing.T) {
 		g := []models.EOFieldDef{{Key: "draft_text"}}
 		if errs := eoValidate(t, g, rec, map[string]any{"draft_text": "edited"}, nil, passed, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v", errs)
+		}
+	})
+}
+
+func TestValidateUnknownVocabularyFailsClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		f    models.EOFieldDef
+	}{
+		{"unknown required_mode", models.EOFieldDef{Key: "a", RequiredMode: "alway"}},
+		{"unknown at_state typo", models.EOFieldDef{Key: "a", RequiredMode: "at_stage"}},
+		{"unknown provenance", models.EOFieldDef{Key: "a", Provenance: "derrived"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ValidateRecordValues([]models.EOFieldDef{tc.f}, nil, map[string]any{"a": 1}, nil, nil, nil)
+			if err == nil || !strings.Contains(err.Error(), `"a"`) {
+				t.Fatalf("err = %v, want error naming the field", err)
+			}
+		})
+	}
+	t.Run("empty strings keep their defaults", func(t *testing.T) {
+		f := []models.EOFieldDef{{Key: "a"}}
+		if errs := eoValidate(t, f, nil, map[string]any{}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v", errs)
+		}
+	})
+}
+
+func TestValidateTypedNilStoredValuesAreEmpty(t *testing.T) {
+	var ptr *time.Time
+	var ids []string
+	var m map[string]any
+	for name, v := range map[string]any{"nil pointer": ptr, "nil slice": ids, "nil map": m, "empty slice": []string{}} {
+		t.Run(name, func(t *testing.T) {
+			f := []models.EOFieldDef{{Key: "due_date", RequiredMode: models.EORequiredAlways}}
+			errs := eoValidate(t, f, map[string]any{"due_date": v}, map[string]any{}, nil, nil, nil)
+			if _, ok := errs["due_date"]; !ok {
+				t.Fatalf("errs = %v, want due_date required", errs)
+			}
+		})
+	}
+	t.Run("non-nil pointer is a value", func(t *testing.T) {
+		now := time.Now()
+		f := []models.EOFieldDef{{Key: "due_date", RequiredMode: models.EORequiredAlways}}
+		if errs := eoValidate(t, f, map[string]any{"due_date": &now}, map[string]any{}, nil, nil, nil); len(errs) != 0 {
 			t.Fatalf("errs = %v", errs)
 		}
 	})

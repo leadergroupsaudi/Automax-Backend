@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -140,6 +141,19 @@ func ValidateRecordValues(
 		}
 		submitted, has := values[f.Key]
 
+		// Fail closed on vocabulary: a typo must not silently mean "never
+		// required" or "user-writable". Empty means the column defaults.
+		switch f.Provenance {
+		case "", models.EOProvenanceUser, models.EOProvenanceAuto, models.EOProvenanceDerived, models.EOProvenanceSystem:
+		default:
+			return nil, fmt.Errorf("validate record values: field %q has unknown provenance %q", f.Key, f.Provenance)
+		}
+		switch f.RequiredMode {
+		case "", models.EORequiredNever, models.EORequiredAlways, models.EORequiredAtState, models.EORequiredConditional:
+		default:
+			return nil, fmt.Errorf("validate record values: field %q has unknown required_mode %q", f.Key, f.RequiredMode)
+		}
+
 		if f.Provenance == models.EOProvenanceDerived || f.Provenance == models.EOProvenanceAuto {
 			if has {
 				errs[f.Key] = fmt.Sprintf("%s is set by the system and cannot be written", name)
@@ -218,6 +232,15 @@ func eoIsEmpty(v any) bool {
 		return strings.TrimSpace(x) == ""
 	case []any:
 		return len(x) == 0
+	}
+	// Typed nils: a NULL column flattened into stored arrives as a non-nil
+	// interface holding a nil pointer, slice or map.
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr:
+		return rv.IsNil()
+	case reflect.Slice, reflect.Map:
+		return rv.IsNil() || rv.Len() == 0
 	}
 	return false
 }
