@@ -215,9 +215,18 @@ type EOFieldDef struct {
 	SortOrder            int            `gorm:"default:0" json:"sort_order"`
 	HelpText             string         `gorm:"size:1000" json:"help_text"`
 	HelpTextAr           string         `gorm:"size:1000" json:"help_text_ar"`
-	CreatedAt            time.Time      `json:"created_at"`
-	UpdatedAt            time.Time      `json:"updated_at"`
-	DeletedAt            gorm.DeletedAt `gorm:"index" json:"-"`
+	// ArUntranslated marks a field whose Arabic wording has not been signed
+	// off by the client: either a placeholder (the English text standing in
+	// for Arabic) or wording an implementer wrote. It is a column of its own
+	// so that it survives an administrator editing ANY other attribute of
+	// the field: the designer's update path loads the stored row, applies the
+	// request's attributes onto it and saves the whole struct, and this
+	// column is not one the request carries. Nothing clears it automatically;
+	// see the pilot seed (internal/database/seed_eo_pilot.go).
+	ArUntranslated bool           `gorm:"not null;default:false;index" json:"ar_untranslated"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	DeletedAt      gorm.DeletedAt `gorm:"index" json:"-"`
 
 	RecordType *EORecordType `gorm:"foreignKey:RecordTypeID" json:"-"`
 }

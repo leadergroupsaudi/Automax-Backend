@@ -1163,6 +1163,12 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 	// regardless, by migrations.MigrateEOPlatform in Migrate.
 	seedEOPlatformWhenEnabled(db, cfg.EOPlatform.Enabled)
 
+	// The pilot configuration on top of it: removes Plan 1's smoke types and
+	// marks labels awaiting Arabic sign-off; later tasks add the Executive
+	// Office's real record types. After the platform seed, because it removes
+	// what that seed wrote. Same gate.
+	seedEOPilotWhenEnabled(db, cfg.EOPlatform.Enabled)
+
 	// KPI Owner and L1 Reviewer — global roles used by the KPI Workflow's
 	// Draft→Reviewed→Approved→Active→Closed lifecycle transitions
 	// (kpi_dictionary_workflow_seed.go's AllowedRoles). Granted kpi:view/

@@ -253,6 +253,9 @@ func eoBaseFieldDefs(typeID uuid.UUID) []models.EOFieldDef {
 			RequiredMode: required,
 			Config:       datatypes.JSON(`{}`),
 			SortOrder:    order,
+			// Written by an implementer, not supplied by the client: awaiting
+			// Arabic sign-off. See eoUntranslatedLabel.
+			ArUntranslated: true,
 		}
 	}
 	withOptions := func(d models.EOFieldDef, cfg string) models.EOFieldDef {
