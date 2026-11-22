@@ -661,6 +661,19 @@ findable but does not make them questions; these are the questions.
   its reference, without being entitled to the record. Decide there whether
   `related_refs` is filtered on read, filtered at derivation, or declared
   non-confidential by the client; do not decide it by default.
+  **DECIDED IN TASK B2: filtered at derivation, on the record's own declared
+  audience, and the base declared non-confidential as configured.** Filtering
+  on the SAVING USER was rejected: the value is stored, so the list would
+  become a function of whoever typed last and two officers saving the same
+  draft would record different answers to "what bears on the subject".
+  Filtering on read was rejected as not this capability's seam — it would be a
+  per-caller rewrite of one key inside the values blob every register query
+  returns whole. So the derivation excludes a base record carrying §7.11's
+  `visible_to`, and nothing else; the residual is stated in
+  `eo_capability_decisions_base.go` and in the Task B2 report. **Nothing in
+  the pilot carries `visible_to` except Referral, so that guard excludes
+  nothing today** — it exists so the answer does not have to be revisited if
+  the client marks part of the base confidential.
 - **`EOCapabilityReader.Children` resolves the record type key on every call**
   (`GetByKey` then `Children`). A referral-tree recursion therefore issues one
   `GetByKey` per node for a key it resolved at the root. Inside a transaction
@@ -669,6 +682,44 @@ findable but does not make them questions; these are the questions.
   with `EOCapabilityReader.RecordType` and, if the per-node cost matters, that
   is the point at which a type-id-taking reader method earns its place. Do not
   work around it with a pooled repository.
+
+### Opened by Task B2 (`decisions_base`)
+
+- **BLOCKING for whichever task enables `decisions_base` on Draft Decision
+  Study: the pilot seed DECLARES `related_refs`, and the capability RESERVES
+  it.** Task A3 seeds `related_refs` on `eo_draft_decision_study` as an Auto
+  `multi_link` field definition; `decisions_base` returns it from
+  `ReservedKeys`, and `eoCapabilitiesCheckConfig` refuses a type whose fields
+  declare a reserved key — *at the first request against the type*, not at seed
+  time. Enabling the capability without dropping that field definition makes
+  the type unusable. The field definition is what must go: a derived value
+  needs none (`eoCapabilitiesDerive` writes through `eoApplyValues`), which is
+  how the approval stamp's sealed key already works. The cost is that the
+  designer and any form built from the field definitions lose the label and
+  kind for `related_refs`; if the client wants it rendered, that is a
+  presentation decision for the UI, not a reason to keep a declaration that
+  disables the type. Pinned by
+  `TestDecisionsBaseReservesItsTargetKey/a_field_definition_may_not_declare_it`.
+- **The subject taxonomy is still missing, and `decisions_base` matches
+  nothing without it.** The capability matches on set overlap of one configured
+  values key — the matrix's `keywords`, "Subject taxonomy" — which A3 seeded as
+  an option *source* that nothing populates. Worse, **Draft Decision Study has
+  no subject-taxonomy field at all**: the matrix gives `keywords` to Decision
+  Record only, so even a populated taxonomy leaves the draft side empty. Two
+  things are owed before the conflict check does anything: the client's
+  vocabulary, and a `keywords` (or equivalent) field on the draft type, which
+  the capability then names as `subject_key`. Until both arrive the capability
+  writes an empty list on every save — deliberately, and said plainly rather
+  than papered over with a text-similarity fallback that would produce
+  plausible-but-wrong matches on a statutory register.
+- **`EORecordRepository.RecordsOfType` reads the whole type into memory.** It
+  is the type-scoped engine read Task B2 added (no paging, no row-level
+  visibility — `List` could not do the job, having no user). The pilot's
+  Decision Record sequence is `DEC-YYYY-NNN`, so the base is in the hundreds
+  and the matching is a set intersection in Go. If the base ever grows past
+  that, the fix is a predicate in the repository — the matching key is
+  configuration, so it would be a jsonb containment query — not a second
+  capability-side cache.
 
 ---
 
