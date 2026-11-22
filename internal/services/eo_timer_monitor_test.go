@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -388,5 +390,71 @@ func TestTimerMonitorOutcomeWritesCarryTheClaim(t *testing.T) {
 		if got.IsZero() {
 			t.Errorf("fail=%v: the outcome write carried no claimed_at", fail)
 		}
+	}
+}
+
+// ── the router ──────────────────────────────────────────────────────────────
+
+func TestEoTimerRouterRoutesByCapabilityKey(t *testing.T) {
+	cases := []struct {
+		name         string
+		key          string
+		wantA, wantB int
+	}{
+		{"key a reaches handler a only", "cap.a", 1, 0},
+		{"key b reaches handler b only", "cap.b", 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var a, b int
+			router := NewEOTimerRouter(map[string]EOTimerHandler{
+				"cap.a": func(context.Context, models.EOTimer) error { a++; return nil },
+				"cap.b": func(context.Context, models.EOTimer) error { b++; return nil },
+			})
+			if err := router(context.Background(), models.EOTimer{CapabilityKey: tc.key}); err != nil {
+				t.Fatalf("router: %v", err)
+			}
+			if a != tc.wantA || b != tc.wantB {
+				t.Errorf("calls a=%d b=%d, want a=%d b=%d", a, b, tc.wantA, tc.wantB)
+			}
+		})
+	}
+}
+
+func TestEoTimerRouterUnknownKeyIsAnError(t *testing.T) {
+	called := false
+	router := NewEOTimerRouter(map[string]EOTimerHandler{
+		"cap.a": func(context.Context, models.EOTimer) error { called = true; return nil },
+	})
+	err := router(context.Background(), models.EOTimer{CapabilityKey: "cap.unclaimed"})
+	if err == nil {
+		t.Fatal("an unclaimed key returned nil: the monitor would mark the timer fired and it would vanish")
+	}
+	if !strings.Contains(err.Error(), "cap.unclaimed") {
+		t.Errorf("error %q does not name the key", err)
+	}
+	if called {
+		t.Error("a handler ran for a key it does not own")
+	}
+}
+
+func TestEoTimerRouterPropagatesSentinel(t *testing.T) {
+	router := NewEOTimerRouter(map[string]EOTimerHandler{
+		"cap.a": func(context.Context, models.EOTimer) error {
+			return fmt.Errorf("load record: %w", ErrEOTimerRecordGone)
+		},
+	})
+	err := router(context.Background(), models.EOTimer{CapabilityKey: "cap.a"})
+	if !errors.Is(err, ErrEOTimerRecordGone) {
+		t.Errorf("err = %v, want it to wrap ErrEOTimerRecordGone", err)
+	}
+}
+
+func TestEoTimerRouterCopiesTheMap(t *testing.T) {
+	m := map[string]EOTimerHandler{"cap.a": eoNoopHandler}
+	router := NewEOTimerRouter(m)
+	delete(m, "cap.a")
+	if err := router(context.Background(), models.EOTimer{CapabilityKey: "cap.a"}); err != nil {
+		t.Errorf("mutating the caller's map changed routing: %v", err)
 	}
 }

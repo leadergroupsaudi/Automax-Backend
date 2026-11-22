@@ -255,3 +255,26 @@ func (m *eoTimerMonitor) fire(ctx, batchCtx context.Context, tm models.EOTimer) 
 		return fmt.Errorf("timer %s (%s) failed: %w", tm.ID, tm.CapabilityKey, err)
 	}
 }
+
+// NewEOTimerRouter dispatches a claimed timer to the handler registered for its
+// CapabilityKey. The map is copied, so a later mutation by the caller cannot
+// change routing under a running monitor.
+//
+// A key nobody claims is an ERROR, not a success: the monitor marks a timer
+// fired when its handler returns nil, so silently succeeding would make the
+// timer vanish with nothing done. An error takes the bounded-retry path
+// (EOTimerMaxAttempts), after which the timer is marked failed and logged.
+// Errors from a handler, ErrEOTimerRecordGone included, are returned as is.
+func NewEOTimerRouter(handlers map[string]EOTimerHandler) EOTimerHandler {
+	routes := make(map[string]EOTimerHandler, len(handlers))
+	for k, h := range handlers {
+		routes[k] = h
+	}
+	return func(ctx context.Context, timer models.EOTimer) error {
+		h, ok := routes[timer.CapabilityKey]
+		if !ok || h == nil {
+			return fmt.Errorf("eo timer %s: no handler for capability key %q", timer.ID, timer.CapabilityKey)
+		}
+		return h(ctx, timer)
+	}
+}

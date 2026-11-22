@@ -440,6 +440,41 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 				}
 			}
 		}
+
+		// 10. capability timers. Each enabled capability re-declares its
+		// timers for the state the record has just entered. The old ones are
+		// cancelled FIRST: a capability may legitimately re-arm a timer for the
+		// state it is entering, and cancelling after scheduling would destroy
+		// the timer just created. Both go through the transaction's timer
+		// handle (the closure's `timers`, never a field on the service), so a
+		// rollback leaves neither a cancelled clock nor a stray one, and no
+		// second pooled connection is taken while this transaction holds its
+		// own plus a row lock.
+		for _, c := range caps {
+			key := c.Key()
+			if err := timers.CancelForRecordByCapability(ctx, fresh.ID, key); err != nil {
+				return err
+			}
+			capTimers, err := c.Timers(ctx, fresh, c.Config)
+			if err != nil {
+				return fmt.Errorf("capability %q timers: %w", key, err)
+			}
+			for i := range capTimers {
+				t := capTimers[i]
+				// A timer is cancelled by its capability key, so one stamped
+				// with another capability's key would be cancelled by that
+				// capability's state change while its owner never knew.
+				if t.CapabilityKey != "" && t.CapabilityKey != key {
+					return fmt.Errorf("capability %q returned a timer keyed %q", key, t.CapabilityKey)
+				}
+				t.RecordID = fresh.ID
+				t.RecordTypeID = fresh.RecordTypeID
+				t.CapabilityKey = key
+				if err := timers.Schedule(ctx, &t); err != nil {
+					return err
+				}
+			}
+		}
 		updated = fresh
 		return nil
 	})

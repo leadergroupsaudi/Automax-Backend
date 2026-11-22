@@ -1571,3 +1571,165 @@ func eoTxFieldErrors(t *testing.T, err error) map[string]string {
 	}
 	return ve.Fields
 }
+
+// ── capability timer bridge ─────────────────────────────────────────────────
+
+// eoBridgeCap is a capability whose only live hook is Timers.
+type eoBridgeCap struct {
+	Capability
+	key    string
+	timers []models.EOTimer
+	err    error
+	calls  int
+}
+
+func (c *eoBridgeCap) Key() string { return c.key }
+
+// The hooks Execute calls around Timers. Everything else stays on the nil
+// embedded interface, so a hook the bridge starts using panics loudly.
+func (c *eoBridgeCap) ReservedKeys(datatypes.JSON) ([]string, error)           { return nil, nil }
+func (c *eoBridgeCap) ValidateWorkflow(datatypes.JSON, *models.Workflow) error { return nil }
+func (c *eoBridgeCap) Validate(context.Context, *models.EORecord, datatypes.JSON) (map[string]string, error) {
+	return nil, nil
+}
+func (c *eoBridgeCap) Derive(context.Context, *models.EORecord, datatypes.JSON) (map[string]any, error) {
+	return nil, nil
+}
+func (c *eoBridgeCap) OnTransition(context.Context, *models.EORecord, *models.WorkflowTransition, datatypes.JSON) error {
+	return nil
+}
+
+func (c *eoBridgeCap) Timers(context.Context, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
+	c.calls++
+	return c.timers, c.err
+}
+
+// eoBridgeTimers is the transaction-bound timer handle. ops keeps cancel and
+// schedule in the order they happened.
+type eoBridgeTimers struct {
+	repository.EOTimerRepository
+	ops         []string
+	scheduled   []models.EOTimer
+	cancelledID []uuid.UUID
+}
+
+func (f *eoBridgeTimers) CancelForRecordByCapability(_ context.Context, id uuid.UUID, key string) error {
+	f.ops = append(f.ops, "cancel:"+key)
+	f.cancelledID = append(f.cancelledID, id)
+	return nil
+}
+
+func (f *eoBridgeTimers) Schedule(_ context.Context, t *models.EOTimer) error {
+	f.ops = append(f.ops, "schedule:"+t.CapabilityKey)
+	f.scheduled = append(f.scheduled, *t)
+	return nil
+}
+
+func eoBridgeFixture(t *testing.T, caps ...Capability) (*eoTxFixture, *eoBridgeTimers) {
+	t.Helper()
+	f := eoNewTxFixture(t)
+	timers := &eoBridgeTimers{}
+	f.records.txTimers = timers
+	f.svc.(*eoTransitionService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {
+		out := make([]EOEnabledCapability, len(caps))
+		for i, c := range caps {
+			out[i] = EOEnabledCapability{Capability: c}
+		}
+		return out, nil
+	}
+	return f, timers
+}
+
+func TestEoTransitionSchedulesCapabilityTimers(t *testing.T) {
+	fireAt := time.Date(2026, 4, 1, 8, 0, 0, 0, time.UTC)
+	c := &eoBridgeCap{key: "eo.bridge", timers: []models.EOTimer{{FireAt: fireAt, Payload: datatypes.JSON(`{"n":1}`)}}}
+	f, timers := eoBridgeFixture(t, c)
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatalf("raise: %v", err)
+	}
+	if len(timers.scheduled) != 1 {
+		t.Fatalf("scheduled %d timers, want 1", len(timers.scheduled))
+	}
+	got := timers.scheduled[0]
+	if got.RecordID != f.rec.ID {
+		t.Errorf("RecordID = %v, want %v", got.RecordID, f.rec.ID)
+	}
+	if got.RecordTypeID != f.recordType.ID {
+		t.Errorf("RecordTypeID = %v, want %v", got.RecordTypeID, f.recordType.ID)
+	}
+	if got.CapabilityKey != "eo.bridge" {
+		t.Errorf("CapabilityKey = %q, want eo.bridge", got.CapabilityKey)
+	}
+	if !got.FireAt.Equal(fireAt) || string(got.Payload) != `{"n":1}` {
+		t.Errorf("FireAt/Payload not carried through: %v %s", got.FireAt, got.Payload)
+	}
+}
+
+func TestEoTransitionRejectsForeignCapabilityKey(t *testing.T) {
+	c := &eoBridgeCap{key: "eo.mine", timers: []models.EOTimer{{FireAt: time.Now(), CapabilityKey: "eo.other"}}}
+	f, timers := eoBridgeFixture(t, c)
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err == nil {
+		t.Fatal("a timer keyed to another capability was accepted")
+	}
+	if len(timers.scheduled) != 0 {
+		t.Errorf("scheduled %d timers, want none", len(timers.scheduled))
+	}
+	if f.records.committed {
+		t.Error("the transaction committed")
+	}
+}
+
+func TestEoTransitionCancelsLeftStateCapabilityTimers(t *testing.T) {
+	a := &eoBridgeCap{key: "eo.a", timers: []models.EOTimer{{FireAt: time.Now()}}}
+	b := &eoBridgeCap{key: "eo.b"}
+	f, timers := eoBridgeFixture(t, a, b)
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatalf("raise: %v", err)
+	}
+	want := []string{"cancel:eo.a", "schedule:eo.a", "cancel:eo.b"}
+	if len(timers.ops) != len(want) {
+		t.Fatalf("ops = %v, want %v", timers.ops, want)
+	}
+	for i := range want {
+		if timers.ops[i] != want[i] {
+			t.Errorf("ops[%d] = %q, want %q (all: %v)", i, timers.ops[i], want[i], timers.ops)
+		}
+	}
+	for _, id := range timers.cancelledID {
+		if id != f.rec.ID {
+			t.Errorf("cancelled for record %v, want %v", id, f.rec.ID)
+		}
+	}
+}
+
+func TestEoTransitionCapabilityTimersAreTxBound(t *testing.T) {
+	c := &eoBridgeCap{key: "eo.bridge", timers: []models.EOTimer{{FireAt: time.Now()}}}
+	f, timers := eoBridgeFixture(t, c)
+	// The service holds no timer source of its own: a bypass would have
+	// nowhere to go but a nil-pointer panic.
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatalf("raise: %v", err)
+	}
+	if len(timers.scheduled) != 1 || len(timers.ops) != 2 {
+		t.Errorf("tx handle saw ops %v, want one cancel and one schedule", timers.ops)
+	}
+}
+
+func TestEoTransitionCapabilityTimerErrorAbortsTransition(t *testing.T) {
+	boom := errors.New("timers broke")
+	c := &eoBridgeCap{key: "eo.bridge", err: boom}
+	f, timers := eoBridgeFixture(t, c)
+	rec, err := f.run("raise", f.actor, models.EOTransitionInput{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap %v", err, boom)
+	}
+	if rec != nil {
+		t.Error("a record was returned from an aborted transition")
+	}
+	if f.records.committed {
+		t.Error("the transaction committed, so the record would have moved")
+	}
+	if len(timers.scheduled) != 0 {
+		t.Errorf("scheduled %d timers", len(timers.scheduled))
+	}
+}

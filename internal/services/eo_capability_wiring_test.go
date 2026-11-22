@@ -35,6 +35,12 @@ func (c *eoWireCap) Validate(_ context.Context, rec *models.EORecord, _ datatype
 	return c.validateErrs, nil
 }
 
+// Timers declares none. The transition bridge still cancels the capability's
+// timers on every transition, so the fixture needs a timer handle.
+func (c *eoWireCap) Timers(context.Context, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
+	return nil, nil
+}
+
 func (c *eoWireCap) Derive(context.Context, *models.EORecord, datatypes.JSON) (map[string]any, error) {
 	c.deriveCalls++
 	return c.derived, nil
@@ -135,6 +141,7 @@ func TestCapabilityHooksFireOnSave(t *testing.T) {
 func TestCapabilityHooksFireOnTransition(t *testing.T) {
 	t.Run("Validate, OnTransition and Derive run, with the actor in ctx, and the result is committed", func(t *testing.T) {
 		f := eoNewTxFixture(t)
+		f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 		c := &eoWireCap{derived: map[string]any{"eo_wire_flag": true}}
 		f.svc.(*eoTransitionService).caps = eoWireResolver(c)
 		got, err := f.run("raise", f.actor, models.EOTransitionInput{})
@@ -153,6 +160,7 @@ func TestCapabilityHooksFireOnTransition(t *testing.T) {
 	})
 	t.Run("an OnTransition error rolls the transition back", func(t *testing.T) {
 		f := eoNewTxFixture(t)
+		f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 		f.svc.(*eoTransitionService).caps = eoWireResolver(&eoWireCap{transitionErr: errors.New("no")})
 		if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err == nil {
 			t.Fatal("want error")
@@ -163,6 +171,7 @@ func TestCapabilityHooksFireOnTransition(t *testing.T) {
 	})
 	t.Run("a Validate error rejects the transition", func(t *testing.T) {
 		f := eoNewTxFixture(t)
+		f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 		f.svc.(*eoTransitionService).caps = eoWireResolver(&eoWireCap{validateErrs: map[string]string{"x": "bad"}})
 		_, err := f.run("raise", f.actor, models.EOTransitionInput{})
 		if eoSvcFieldErrors(t, err)["x"] != "bad" || f.records.committed {
@@ -171,6 +180,7 @@ func TestCapabilityHooksFireOnTransition(t *testing.T) {
 	})
 	t.Run("an unknown capability on the type is an error before anything is written", func(t *testing.T) {
 		f := eoNewTxFixture(t)
+		f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 		f.recordType.Capabilities = datatypes.JSON(`[{"key":"eo_nonexistent_cap"}]`)
 		_, err := f.run("raise", f.actor, models.EOTransitionInput{})
 		if !errors.Is(err, ErrEOUnknownCapability) || f.records.committed {
@@ -183,6 +193,7 @@ func TestCapabilityHooksFireOnTransition(t *testing.T) {
 func TestApprovalStampThroughTransition(t *testing.T) {
 	setup := func(t *testing.T) *eoTxFixture {
 		f := eoNewTxFixture(t)
+		f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 		f.types.defs = append(f.types.defs,
 			eoTxField("approval_authority", models.EOKindText, models.EORequiredNever, f.recordType.ID),
 			eoTxField("approval_delegation_note", models.EOKindText, models.EORequiredNever, f.recordType.ID))
@@ -288,6 +299,7 @@ func (r eoInTxTypes) GetLinkTypeByKey(ctx context.Context, key string) (*models.
 // link types behind blocking children, and the type lookups of a roll-up.
 func TestTransitionReadsTypeAndFieldsBeforeTheTransaction(t *testing.T) {
 	f := eoNewTxFixture(t)
+	f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 	f.rec.StateID = &f.draft.ID
 	f.records.stored[f.rec.ID] = f.rec
 
@@ -336,6 +348,7 @@ func TestMergeFieldErrorsToleratesANilDestination(t *testing.T) {
 func eoApprovalTxFixture(t *testing.T, cfg string) *eoTxFixture {
 	t.Helper()
 	f := eoNewTxFixture(t)
+	f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 	f.types.defs = append(f.types.defs,
 		eoTxField("approval_authority", models.EOKindText, models.EORequiredNever, f.recordType.ID))
 	f.transition("raise").FieldChanges = []models.TransitionFieldChange{{FieldName: "approval_authority", Label: "Authority"}}
@@ -436,6 +449,7 @@ func TestPipelineResolvesAKnownCapabilityThroughTheRegistry(t *testing.T) {
 	RegisterEOCapabilities()
 
 	f := eoNewTxFixture(t)
+	f.records.txTimers = &eoBridgeTimers{} // the bridge cancels on every transition
 	f.types.defs = append(f.types.defs,
 		eoTxField("approval_authority", models.EOKindText, models.EORequiredNever, f.recordType.ID))
 	f.transition("raise").FieldChanges = []models.TransitionFieldChange{{FieldName: "approval_authority", Label: "Authority"}}
