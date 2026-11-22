@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -520,4 +522,115 @@ var _ = func() bool {
 	var f eoFakeTypeRepo
 	_, _ = f.ChildTypes(context.Background(), uuid.Nil)
 	return true
+}
+
+// ── closure item 3: RecordID is server-filled too ───────────────────────────
+
+// TestSearchEORecordsCannotSetRecordIDFromAFormBody covers the one
+// server-filled field eoScopeFilter did not re-zero.
+//
+// EORecordFilter.RecordID carries json:"-", so the JSON path above could never
+// set it — but POST /eo-records/search is the branch's only body-binding route
+// and Fiber's BodyParser decodes an x-www-form-urlencoded body with the `form`
+// tag, falling back to the Go FIELD NAME when there is none. `RecordID=<uuid>`
+// in a form body therefore did reach the filter. It can only narrow a result
+// set and applyEORecordVisibility still runs over whatever it narrows to, so
+// this is hardening, not a hole — but a block where three of four fields are
+// overwritten is the asymmetry that becomes one.
+//
+// The single-line mutation that makes this fail: remove
+// `filter.RecordID = nil` from eoScopeFilter.
+func TestSearchEORecordsCannotSetRecordIDFromAFormBody(t *testing.T) {
+	eoInitValidator(t)
+	user := &models.User{ID: uuid.New()} // not a super admin
+	forged := uuid.New()
+
+	repo := &eoFakeRecordRepo{listOut: []models.EORecord{}}
+	h := NewEORecordHandler(&eoFakeRecordService{}, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(user))
+	h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm)
+
+	// The server-filled fields a form body CAN carry, by their Go field name,
+	// which is what BodyParser falls back to when there is no `form` tag.
+	// VisibleToDepartmentIDs is deliberately absent: it is a []uuid.UUID and
+	// BodyParser cannot decode a form value into one at all — such a body is
+	// refused outright with 400, so there is nothing to defend there.
+	form := url.Values{}
+	form.Set("RecordID", forged.String())
+	form.Set("IsAdmin", "true")
+	form.Set("UserID", forged.String())
+
+	req := httptest.NewRequest("POST", "/eo-records/search", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	f := repo.listFilter
+	if f == nil {
+		t.Fatal("the register was never queried")
+	}
+	if f.RecordID != nil {
+		t.Errorf("filter.RecordID = %v, want nil: it is the single-record probe's field, not a caller's", f.RecordID)
+	}
+	if f.IsAdmin {
+		t.Error("filter.IsAdmin = true, want false (the session's answer)")
+	}
+	if f.UserID != user.ID {
+		t.Errorf("filter.UserID = %v, want the authenticated user %v", f.UserID, user.ID)
+	}
+	if len(f.VisibleToDepartmentIDs) != 0 {
+		t.Errorf("filter.VisibleToDepartmentIDs = %v, want the session's (empty) set", f.VisibleToDepartmentIDs)
+	}
+}
+
+// TestEOVisibilityProbeStillNarrowsToTheOneRecord is the other half of the
+// same change. eoScopeFilter now zeroes RecordID, so eoVisible has to set it
+// AFTER that call — and if it ever stops setting it, the probe silently
+// becomes "can this caller see ANY record of this type", which is true for
+// almost everyone and turns the §7.11 gate into a pass.
+//
+// The existing visibility tests catch the ordering mistake in the
+// can't-see-what-I-should direction; this one asserts the narrowing itself, so
+// a probe that drops RecordID is caught positively rather than by inference.
+func TestEOVisibilityProbeStillNarrowsToTheOneRecord(t *testing.T) {
+	user := &models.User{ID: uuid.New()} // not a super admin
+	rec := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-050"}
+
+	repo := &eoFakeRecordRepo{
+		byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
+		visibleIDs: map[uuid.UUID]bool{rec.ID: true},
+	}
+	h := NewEORecordHandler(&eoFakeRecordService{}, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(user))
+	app.Get("/eo-records/:id", h.Get)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+rec.ID.String(), nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	f := repo.listFilter
+	if f == nil {
+		t.Fatal("the visibility probe never reached the register")
+	}
+	if f.RecordID == nil {
+		t.Fatal("the probe carried no RecordID: it asked whether the caller can see ANY record of this type, not this one")
+	}
+	if *f.RecordID != rec.ID {
+		t.Errorf("probe RecordID = %v, want %v", *f.RecordID, rec.ID)
+	}
+	// And the scope is still the session's, not a default.
+	if f.UserID != user.ID {
+		t.Errorf("probe UserID = %v, want %v", f.UserID, user.ID)
+	}
 }

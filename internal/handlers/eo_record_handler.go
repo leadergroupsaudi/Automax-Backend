@@ -156,10 +156,25 @@ func eoServiceError(c *fiber.Ctx, err error) error {
 // visibility is decided from the session, not the query string. EORecordFilter
 // tags them query:"-" so ?IsAdmin=true cannot reach them, and they are
 // assigned here unconditionally so an absent tag could not open them either.
+//
+// RecordID is zeroed for the SAME reason, so that the block is uniform and no
+// server-filled field depends on a struct tag to stay out of a caller's reach.
+// It carries json:"-", but POST /eo-records/search is the one route that binds
+// a BODY, and Fiber's BodyParser decodes a form-encoded body with the `form`
+// tag and falls back to the Go FIELD NAME when there is none — so
+// `RecordID=<uuid>` in an x-www-form-urlencoded body did reach it. That is
+// hardening rather than a hole (RecordID can only narrow a result set, and
+// applyEORecordVisibility still runs over whatever it narrows to), but "the
+// three server-filled fields are overwritten and the fourth is not" is the
+// kind of asymmetry that becomes a hole when a field is added.
+//
+// Callers that legitimately set RecordID — eoVisible's single-record probe —
+// must therefore set it AFTER calling this.
 func eoScopeFilter(filter *models.EORecordFilter, user *models.User) {
 	filter.UserID = user.ID
 	filter.IsAdmin = user.IsSuperAdmin
 	filter.VisibleToDepartmentIDs = eoUserBodies(user)
+	filter.RecordID = nil
 }
 
 // eoUserBodies is every body the user belongs to: the primary department and
@@ -244,14 +259,19 @@ func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.
 // facts and must not share a status code.
 func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *models.User) (bool, error) {
 	filter := &models.EORecordFilter{
-		RecordID:     &rec.ID,
 		RecordTypeID: []string{rec.RecordTypeID.String()},
 		Limit:        1,
 	}
+	// Scope FIRST, record id second. eoScopeFilter zeroes RecordID along with
+	// the other server-filled fields, so a probe that set it before the call
+	// would ask "can this caller see ANY record of this type" — which is true
+	// for almost everyone, and would turn this gate into a pass. The order
+	// here is load-bearing, which is why it is stated rather than implied.
 	eoScopeFilter(filter, user)
 	if filter.IsAdmin {
 		return true, nil
 	}
+	filter.RecordID = &rec.ID
 	rows, _, err := h.records.List(c.UserContext(), filter)
 	if err != nil {
 		return false, err

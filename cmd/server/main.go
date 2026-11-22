@@ -1757,13 +1757,22 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 // os.Getenv here: EO_TIMER_INTERVAL_SECONDS is read by config.Load alongside
 // its sibling EO_PLATFORM, so the two settings of one feature are read the
 // same way and config.Load stays the one place that knows what this server
-// reads from the environment. A non-positive value (which is also what
-// getEnvAsInt yields for an unparseable one) falls back to the default.
+// reads from the environment.
+//
+// BOTH failure modes are named out loud. A value that is not a number at all
+// is the one that used to vanish: config's generic getEnvAsInt discards
+// strconv's error and returns the default, so a typo arrived here as an
+// ordinary positive 30 and nothing warned about anything. TimerIntervalUnparsed
+// carries the offending string out of config so it can be quoted here.
 func eoTimerInterval(cfg *config.Config) time.Duration {
-	const def = 30 * time.Second
+	const def = config.EOTimerIntervalDefaultSeconds * time.Second
+	if raw := cfg.EOPlatform.TimerIntervalUnparsed; raw != "" {
+		log.Printf("Warning: EO_TIMER_INTERVAL_SECONDS=%q is not a number, using default %s", raw, def)
+		return def
+	}
 	n := cfg.EOPlatform.TimerIntervalSeconds
 	if n <= 0 {
-		log.Printf("Warning: EO_TIMER_INTERVAL_SECONDS is %d, using default %s", n, def)
+		log.Printf("Warning: EO_TIMER_INTERVAL_SECONDS is %d, which is not a usable poll interval; using default %s", n, def)
 		return def
 	}
 	return time.Duration(n) * time.Second

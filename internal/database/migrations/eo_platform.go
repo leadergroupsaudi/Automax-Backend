@@ -25,12 +25,14 @@ import (
 //     command emits the migration that gives it its own partition later.
 //     THAT COMMAND DOES NOT EXIST IN PLAN 1: no per-type partition is ever
 //     created and every record of every type lives in eo_records_default.
-//     That is fully functional, but promotion is a ONE-WAY DOOR — Postgres
-//     scans the DEFAULT partition when a new partition is created and errors
-//     if any row would belong to it, so a type that already has records can
-//     only be promoted by moving its rows under an ACCESS EXCLUSIVE lock.
-//     Plan 2 must create each type's partition BEFORE its first record. See
-//     spec §7.7 and models.EORecordType.PartitionPending.
+//     That is fully functional, but promotion is a ONE-WAY DOOR — creating a
+//     partition makes Postgres take an ACCESS EXCLUSIVE lock on the DEFAULT
+//     partition and full-scan it to prove no row would belong to the new one,
+//     so promotion is a maintenance operation on a populated register even for
+//     a type that has no records, and a type that HAS records needs its rows
+//     moved on top of that. Plan 2 must create each type's partition BEFORE
+//     its first record. See spec §7.7 and
+//     models.EORecordType.PartitionPending.
 //   - eo_record_links and eo_record_history carry both the record id and the
 //     record type id of each endpoint, because a foreign key referencing a
 //     partitioned table must name the partition key (spec §7.6). AutoMigrate
@@ -135,7 +137,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(recordsSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_records: %w", err)
 	}
-	if err := assertColumns(db, "eo_records", eoRecordsColumns); err != nil {
+	if err := assertTable(db, "eo_records"); err != nil {
 		return err
 	}
 
@@ -183,7 +185,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(linksSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_record_links: %w", err)
 	}
-	if err := assertColumns(db, "eo_record_links", eoRecordLinksColumns); err != nil {
+	if err := assertTable(db, "eo_record_links"); err != nil {
 		return err
 	}
 
@@ -216,7 +218,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(historySQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_record_history: %w", err)
 	}
-	if err := assertColumns(db, "eo_record_history", eoRecordHistoryColumns); err != nil {
+	if err := assertTable(db, "eo_record_history"); err != nil {
 		return err
 	}
 
@@ -233,7 +235,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(sequencesSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_reference_sequences: %w", err)
 	}
-	if err := assertColumns(db, "eo_reference_sequences", eoReferenceSequencesColumns); err != nil {
+	if err := assertTable(db, "eo_reference_sequences"); err != nil {
 		return err
 	}
 
@@ -265,7 +267,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(timersSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_timers: %w", err)
 	}
-	if err := assertColumns(db, "eo_timers", eoTimersColumns); err != nil {
+	if err := assertTable(db, "eo_timers"); err != nil {
 		return err
 	}
 
@@ -298,7 +300,7 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	if err := db.Exec(escalationSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_escalation_events: %w", err)
 	}
-	if err := assertColumns(db, "eo_escalation_events", eoEscalationEventsColumns); err != nil {
+	if err := assertTable(db, "eo_escalation_events"); err != nil {
 		return err
 	}
 
@@ -423,6 +425,145 @@ var (
 		{"created_at", "timestamp with time zone", 0, false},
 	}
 )
+
+// eoAssertedTables is EVERY table MigrateEOPlatform creates and then checks
+// the shape of, paired with the shape it declares. Since C1 made this
+// migration's error fail the boot, each of these six is a condition that stops
+// the server, so the set has to be addressable from outside: assertTable
+// (boot) and EOPreflightSQL (pre-deploy) both read it, and the published
+// pre-deploy check therefore cannot claim fewer tables than the migration
+// actually gates on. A hand-copied list in a document would be a third place
+// to drift, which is the defect this whole file exists to prevent.
+var eoAssertedTables = []struct {
+	Name    string
+	Columns []eoColumn
+}{
+	{"eo_records", eoRecordsColumns},
+	{"eo_record_links", eoRecordLinksColumns},
+	{"eo_record_history", eoRecordHistoryColumns},
+	{"eo_reference_sequences", eoReferenceSequencesColumns},
+	{"eo_timers", eoTimersColumns},
+	{"eo_escalation_events", eoEscalationEventsColumns},
+}
+
+// EOAssertedTableNames is the six table names, for a caller that wants to
+// name them (the deploy note, a test).
+func EOAssertedTableNames() []string {
+	out := make([]string, 0, len(eoAssertedTables))
+	for _, t := range eoAssertedTables {
+		out = append(out, t.Name)
+	}
+	return out
+}
+
+// assertTable checks one table against the shape eoAssertedTables declares for
+// it. A table asserted here but absent from that slice is an error rather than
+// a silently skipped check.
+func assertTable(db *gorm.DB, table string) error {
+	for _, t := range eoAssertedTables {
+		if t.Name == table {
+			return assertColumns(db, t.Name, t.Columns)
+		}
+	}
+	return fmt.Errorf("eo platform: no expected column list is declared for %s; add it to eoAssertedTables", table)
+}
+
+// EOPreflightSQL returns a READ-ONLY query that reports every column on which
+// the live database and this migration disagree, for all six tables
+// MigrateEOPlatform asserts. Zero rows means no assertion will fire at boot.
+//
+// It exists because assertColumns can only be run by starting the server, and
+// since C1 starting the server is exactly what its failure prevents. An
+// operator upgrading a box that ran an intermediate commit of this branch
+// needs to find a column mismatch BEFORE the deployment, not diagnose it from
+// a boot that refused. The expected values are rendered from eoAssertedTables,
+// so this query cannot fall behind the assertion it previews.
+//
+// A table that does not exist yet is NOT reported: the migration creates it,
+// and a fresh database would otherwise look like a wall of problems. Only a
+// table that already exists and disagrees is a finding — which is precisely
+// the case assertColumns catches, because CREATE TABLE IF NOT EXISTS cannot
+// alter a table that is already there.
+//
+// The query is self-contained and takes no parameters, so it can be piped
+// straight into psql (see docs/eo-platform-deploying.md).
+func EOPreflightSQL() string {
+	var rows []string
+	for _, t := range eoAssertedTables {
+		for i, c := range t.Columns {
+			cast := ""
+			if len(rows) == 0 && i == 0 {
+				// The first VALUES row fixes the CTE's column types, so that
+				// the FULL JOIN against information_schema compares like
+				// with like.
+				cast = "::text, ::text, ::text, ::int, ::boolean"
+			}
+			rows = append(rows, eoPreflightRow(t.Name, c, cast))
+		}
+	}
+	// eoColumn.typeDesc, as SQL: the same "type(width) NOT NULL" rendering the
+	// boot-time assertion puts in its error, so a preflight finding and the
+	// startup failure it predicts read identically.
+	desc := func(q string) string {
+		return q + `.data_type || CASE WHEN ` + q + `.max_len > 0 THEN '(' || ` + q + `.max_len || ')' ELSE '' END` +
+			` || CASE WHEN ` + q + `.nullable THEN '' ELSE ' NOT NULL' END`
+	}
+	return `-- EO platform pre-deploy check. Read-only. Generated from
+-- migrations.EOPreflightSQL (internal/database/migrations/eo_platform.go),
+-- which renders it from the very column lists MigrateEOPlatform asserts.
+-- ZERO ROWS means no column assertion will fail at boot.
+WITH expected(tbl, col, data_type, max_len, nullable) AS (
+	VALUES
+		` + strings.Join(rows, ",\n\t\t") + `
+), live AS (
+	SELECT table_name::text AS tbl,
+	       column_name::text AS col,
+	       data_type::text AS data_type,
+	       COALESCE(character_maximum_length, 0)::int AS max_len,
+	       (is_nullable = 'YES')::boolean AS nullable
+	FROM information_schema.columns
+	WHERE table_schema = current_schema()
+	  AND table_name IN (SELECT DISTINCT tbl FROM expected)
+), present AS (
+	-- Only tables that ALREADY exist can drift; the migration creates the rest.
+	SELECT DISTINCT tbl FROM live
+)
+SELECT COALESCE(e.tbl, l.tbl) AS table_name,
+       COALESCE(e.col, l.col) AS column_name,
+       CASE
+         WHEN e.col IS NULL THEN 'exists in the database but is not declared in this migration'
+         WHEN l.col IS NULL THEN 'is missing; expected ' || ` + desc("e") + `
+         ELSE 'is ' || ` + desc("l") + ` || '; expected ' || ` + desc("e") + `
+       END AS problem
+FROM expected e
+FULL JOIN live l ON e.tbl = l.tbl AND e.col = l.col
+WHERE COALESCE(e.tbl, l.tbl) IN (SELECT tbl FROM present)
+  AND (e.col IS NULL
+       OR l.col IS NULL
+       OR e.data_type IS DISTINCT FROM l.data_type
+       OR e.max_len   IS DISTINCT FROM l.max_len
+       OR e.nullable  IS DISTINCT FROM l.nullable)
+ORDER BY table_name, column_name;
+`
+}
+
+// eoPreflightRow renders one VALUES row, quoting the two identifiers the same
+// way Postgres does. The column names here are this file's own literals, never
+// anything a caller supplies.
+func eoPreflightRow(table string, c eoColumn, cast string) string {
+	casts := strings.Split(cast, ", ")
+	for len(casts) < 5 {
+		casts = append(casts, "")
+	}
+	return fmt.Sprintf("('%s'%s, '%s'%s, '%s'%s, %d%s, %t%s)",
+		eoSQLQuote(table), casts[0],
+		eoSQLQuote(c.Name), casts[1],
+		eoSQLQuote(c.Type), casts[2],
+		c.MaxLen, casts[3],
+		c.Nullable, casts[4])
+}
+
+func eoSQLQuote(s string) string { return strings.ReplaceAll(s, "'", "''") }
 
 // assertColumns fails if the live table does not have exactly the expected
 // columns, with the expected types, widths and nullability.

@@ -214,6 +214,18 @@ type EOPlatformConfig struct {
 	// read the same way, and config.Load is the one place that knows which
 	// environment variables this server reads. env: EO_TIMER_INTERVAL_SECONDS
 	TimerIntervalSeconds int
+	// TimerIntervalUnparsed is EO_TIMER_INTERVAL_SECONDS exactly as the
+	// environment held it, and is non-empty ONLY when the variable was set and
+	// could not be parsed as an integer. Empty means it was either unset or
+	// valid.
+	//
+	// It exists because getEnvAsInt swallows strconv's error and returns the
+	// default, which would make a TYPO completely silent: the fallback is a
+	// perfectly ordinary 30, so the use site's "non-positive value" warning
+	// never fires and nothing anywhere names the bad string. Carrying the raw
+	// value out lets main.go warn and quote it, without config.Load — which
+	// logs nothing at all today — becoming a logging package.
+	TimerIntervalUnparsed string
 }
 
 type DocumentaConfig struct {
@@ -418,6 +430,7 @@ type LoginRateLimitConfig struct {
 }
 
 func Load() *Config {
+	eoTimerSeconds, eoTimerUnparsed := eoTimerIntervalFromEnv()
 	return &Config{
 		Env: getEnv("APP_ENV", "production"),
 		Server: ServerConfig{
@@ -559,8 +572,9 @@ func Load() *Config {
 			Enabled: getEnvAsBool("GOAL_MANAGEMENT", false),
 		},
 		EOPlatform: EOPlatformConfig{
-			Enabled:              getEnvAsBool("EO_PLATFORM", false),
-			TimerIntervalSeconds: getEnvAsInt("EO_TIMER_INTERVAL_SECONDS", 30),
+			Enabled:               getEnvAsBool("EO_PLATFORM", false),
+			TimerIntervalSeconds:  eoTimerSeconds,
+			TimerIntervalUnparsed: eoTimerUnparsed,
 		},
 		License: LicenseConfig{
 			EncryptionKey:     getEnv("LICENSE_ENCRYPTION_KEY", ""),
@@ -630,6 +644,38 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// EOTimerIntervalDefaultSeconds is the poll interval used when
+// EO_TIMER_INTERVAL_SECONDS is unset, unreadable or not positive.
+const EOTimerIntervalDefaultSeconds = 30
+
+// eoTimerIntervalFromEnv reads EO_TIMER_INTERVAL_SECONDS and SAYS when it
+// could not. getEnvAsInt, which every other numeric setting uses, discards
+// strconv's error and returns the default — so `EO_TIMER_INTERVAL_SECONDS=3O`
+// (letter O) would quietly become a perfectly ordinary 30 that no warning
+// anywhere mentions. unparsed carries the offending string out so the caller
+// can quote it; it is empty when the variable is unset or valid.
+//
+// It returns rather than logs because this package logs nothing: see
+// EOPlatformConfig.TimerIntervalUnparsed.
+func eoTimerIntervalFromEnv() (seconds int, unparsed string) {
+	raw, exists := os.LookupEnv("EO_TIMER_INTERVAL_SECONDS")
+	trimmed := strings.TrimSpace(raw)
+	// Absent, and present-but-blank, are the same intent: a .env file
+	// routinely carries `KEY=` for "not configured", and warning about it
+	// would train the operator to ignore the warning that matters.
+	if !exists || trimmed == "" {
+		return EOTimerIntervalDefaultSeconds, ""
+	}
+	n, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return EOTimerIntervalDefaultSeconds, raw
+	}
+	// A parsed but non-positive value is NOT reported here: it is readable,
+	// and the use site already refuses it by name. Reporting it as unparsed
+	// would make the two warnings say the wrong thing about each other.
+	return n, ""
 }
 
 func getEnvAsInt(key string, defaultValue int) int {
