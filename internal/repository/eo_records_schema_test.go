@@ -66,7 +66,7 @@ func TestEORecordsHasDefaultPartition(t *testing.T) {
 	}
 
 	// And it must actually accept a record of a type nobody has partitioned.
-	rec := newEOTestRecord(uuid.New(), "EO-UNPARTITIONED-2026-1")
+	rec := eoNewTestRecord(uuid.New(), "EO-UNPARTITIONED-2026-1")
 	if err := db.Create(rec).Error; err != nil {
 		t.Errorf("insert into DEFAULT partition: %v", err)
 	}
@@ -78,18 +78,18 @@ func TestEORecordsReferenceIsUniquePerPartition(t *testing.T) {
 	typeA, typeB := uuid.New(), uuid.New()
 	const ref = "EO-DIR-2026-001"
 
-	if err := db.Create(newEOTestRecord(typeA, ref)).Error; err != nil {
+	if err := db.Create(eoNewTestRecord(typeA, ref)).Error; err != nil {
 		t.Fatalf("insert under type A: %v", err)
 	}
 	// Postgres cannot enforce a unique constraint across partitions, so the
 	// same reference under a different record type is accepted. Global
 	// uniqueness rests on models.ValidateReferencePrefix keeping type prefixes
 	// from overlapping (spec §7.7), not on this constraint.
-	if err := db.Create(newEOTestRecord(typeB, ref)).Error; err != nil {
+	if err := db.Create(eoNewTestRecord(typeB, ref)).Error; err != nil {
 		t.Errorf("insert of the same reference under a second record type: %v, want it accepted", err)
 	}
 	// Within one record type the constraint does bite.
-	if err := eoQuiet(db).Create(newEOTestRecord(typeA, ref)).Error; err == nil {
+	if err := eoQuiet(db).Create(eoNewTestRecord(typeA, ref)).Error; err == nil {
 		t.Errorf("duplicate reference within one record type was accepted, want a unique violation")
 	}
 }
@@ -98,7 +98,7 @@ func TestEORecordRoundTripsThroughGORM(t *testing.T) {
 	db := eoMigratedDB(t)
 
 	typeID := uuid.New()
-	rec := newEOTestRecord(typeID, "EO-DIR-2026-777")
+	rec := eoNewTestRecord(typeID, "EO-DIR-2026-777")
 	rec.Values = datatypes.JSON([]byte(`{"directive_origin":"weekly_meeting"}`))
 	if err := db.Create(rec).Error; err != nil {
 		t.Fatalf("create: %v", err)
@@ -165,8 +165,8 @@ func TestEORecordsHasItsQueryIndexes(t *testing.T) {
 func TestEORecordLinkRequiresBothEndpointsToExist(t *testing.T) {
 	db := eoMigratedDB(t)
 
-	from := newEOTestRecord(uuid.New(), "EO-DIR-2026-010")
-	to := newEOTestRecord(uuid.New(), "EO-TSK-2026-010")
+	from := eoNewTestRecord(uuid.New(), "EO-DIR-2026-010")
+	to := eoNewTestRecord(uuid.New(), "EO-TSK-2026-010")
 	if err := db.Create(from).Error; err != nil {
 		t.Fatalf("create from: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestEORecordLinkRequiresBothEndpointsToExist(t *testing.T) {
 func TestEORecordHistoryIsTiedToARecord(t *testing.T) {
 	db := eoMigratedDB(t)
 
-	rec := newEOTestRecord(uuid.New(), "EO-DIR-2026-020")
+	rec := eoNewTestRecord(uuid.New(), "EO-DIR-2026-020")
 	if err := db.Create(rec).Error; err != nil {
 		t.Fatalf("create record: %v", err)
 	}
@@ -217,6 +217,192 @@ func TestEORecordHistoryIsTiedToARecord(t *testing.T) {
 	orphan := &models.EORecordHistory{RecordID: uuid.New(), RecordTypeID: uuid.New()}
 	if err := eoQuiet(db).Create(orphan).Error; err == nil {
 		t.Errorf("history for a non-existent record was accepted, want a foreign key violation")
+	}
+}
+
+func TestEORecordsNullabilityMatchesTheFieldMatrix(t *testing.T) {
+	db := eoMigratedDB(t)
+
+	type col struct {
+		ColumnName string
+		IsNullable string
+	}
+	var cols []col
+	if err := db.Raw(`
+		SELECT column_name, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'eo_records'`).Scan(&cols).Error; err != nil {
+		t.Fatalf("read columns: %v", err)
+	}
+	nullable := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		nullable[c.ColumnName] = c.IsNullable == "YES"
+	}
+
+	// The field matrix is the authority: subject_ar is Required Yes ("the
+	// record's display name"), subject_en Required No ("secondary display
+	// name"), and created_by is Auto on every record. created_by_id must be
+	// NOT NULL because the Go field is a value type and could otherwise only
+	// ever store the zero UUID.
+	want := map[string]bool{
+		"subject_ar":    false,
+		"subject_en":    true,
+		"created_by_id": false,
+		"reference":     false,
+		"due_date":      true,
+		"closed_at":     true,
+	}
+	for name, wantNullable := range want {
+		got, ok := nullable[name]
+		if !ok {
+			t.Errorf("column %s is missing", name)
+			continue
+		}
+		if got != wantNullable {
+			t.Errorf("column %s nullable = %v, want %v", name, got, wantNullable)
+		}
+	}
+}
+
+func TestEORecordHistoryBlocksHardDeleteOfItsRecord(t *testing.T) {
+	db := eoMigratedDB(t)
+
+	rec := eoNewTestRecord(uuid.New(), "EO-DIR-2026-030")
+	if err := db.Create(rec).Error; err != nil {
+		t.Fatalf("create record: %v", err)
+	}
+	if err := db.Create(&models.EORecordHistory{
+		RecordID: rec.ID, RecordTypeID: rec.RecordTypeID, Comment: "created",
+	}).Error; err != nil {
+		t.Fatalf("create history: %v", err)
+	}
+
+	// ON DELETE RESTRICT: the audit trail outlives any attempt to hard-delete
+	// the record, which is what "every CFF requires a traceable path" means.
+	err := eoQuiet(db).Unscoped().
+		Where("id = ? AND record_type_id = ?", rec.ID, rec.RecordTypeID).
+		Delete(&models.EORecord{}).Error
+	if err == nil {
+		t.Errorf("hard delete of a record with history succeeded, want it blocked by ON DELETE RESTRICT")
+	}
+
+	// Soft delete, the normal path, is unaffected.
+	if err := db.Where("id = ? AND record_type_id = ?", rec.ID, rec.RecordTypeID).
+		Delete(&models.EORecord{}).Error; err != nil {
+		t.Errorf("soft delete: %v", err)
+	}
+}
+
+func TestEORecordLinksAreRemovedWithTheirRecord(t *testing.T) {
+	db := eoMigratedDB(t)
+
+	from := eoNewTestRecord(uuid.New(), "EO-DIR-2026-040")
+	to := eoNewTestRecord(uuid.New(), "EO-TSK-2026-040")
+	if err := db.Create(from).Error; err != nil {
+		t.Fatalf("create from: %v", err)
+	}
+	if err := db.Create(to).Error; err != nil {
+		t.Fatalf("create to: %v", err)
+	}
+	if err := db.Create(&models.EORecordLink{
+		FromRecordID: from.ID, FromRecordTypeID: from.RecordTypeID,
+		ToRecordID: to.ID, ToRecordTypeID: to.RecordTypeID,
+		LinkTypeKey: "spawned_task",
+	}).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+
+	// A link to a record that no longer exists is meaningless, so links
+	// CASCADE where history RESTRICTs.
+	if err := db.Unscoped().
+		Where("id = ? AND record_type_id = ?", to.ID, to.RecordTypeID).
+		Delete(&models.EORecord{}).Error; err != nil {
+		t.Fatalf("hard delete of a linked record: %v", err)
+	}
+	var links int64
+	if err := db.Model(&models.EORecordLink{}).Count(&links).Error; err != nil {
+		t.Fatalf("count links: %v", err)
+	}
+	if links != 0 {
+		t.Errorf("links after deleting an endpoint = %d, want 0", links)
+	}
+}
+
+// TestMigrateEOPlatformDetectsShapeDrift covers the structural hole in
+// CREATE TABLE IF NOT EXISTS: on a database where the table already exists,
+// editing the column list in eo_platform.go is a silent no-op, and every test
+// starts from an empty schema so nothing would notice. The migration asserts
+// the live shape after creating it; these cases prove the assertion fires.
+func TestMigrateEOPlatformDetectsShapeDrift(t *testing.T) {
+	cases := []struct {
+		name    string
+		drift   string
+		wantSub []string
+	}{
+		{
+			name:    "narrowed column",
+			drift:   `ALTER TABLE eo_records ALTER COLUMN reference TYPE VARCHAR(80)`,
+			wantSub: []string{"reference is character varying(80)", "character varying(100) NOT NULL"},
+		},
+		{
+			name:    "dropped column",
+			drift:   `ALTER TABLE eo_records DROP COLUMN delay_reason`,
+			wantSub: []string{"delay_reason is missing"},
+		},
+		{
+			name:    "undeclared column",
+			drift:   `ALTER TABLE eo_records ADD COLUMN legacy_note TEXT`,
+			wantSub: []string{"legacy_note exists but is not declared"},
+		},
+		{
+			name:    "relaxed nullability",
+			drift:   `ALTER TABLE eo_records ALTER COLUMN created_by_id DROP NOT NULL`,
+			wantSub: []string{"created_by_id is uuid,", "uuid NOT NULL"},
+		},
+		{
+			name:    "drift in a sibling table",
+			drift:   `ALTER TABLE eo_record_history DROP COLUMN is_system_action`,
+			wantSub: []string{"eo_record_history", "is_system_action is missing"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := eoMigratedDB(t)
+			if err := db.Exec(tc.drift).Error; err != nil {
+				t.Fatalf("apply drift: %v", err)
+			}
+			err := migrations.MigrateEOPlatform(db)
+			if err == nil {
+				t.Fatalf("migration accepted a drifted table, want an error")
+			}
+			t.Logf("%s: %v", tc.name, err)
+			for _, sub := range tc.wantSub {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error = %q, want it to contain %q", err, sub)
+				}
+			}
+		})
+	}
+}
+
+func TestMigrateEOPlatformRejectsAWrongPartitionKey(t *testing.T) {
+	db := eoTestDB(t)
+
+	// Partitioned, so the relkind guard is satisfied — but on the wrong key.
+	// Repartitioning is a table rewrite, so this has to be refused rather than
+	// quietly accepted.
+	if err := db.Exec(`
+		CREATE TABLE eo_records (id uuid NOT NULL, record_type_id uuid NOT NULL)
+		PARTITION BY HASH (id)`).Error; err != nil {
+		t.Fatalf("create decoy table: %v", err)
+	}
+	err := migrations.MigrateEOPlatform(db)
+	if err == nil {
+		t.Fatalf("migration accepted a table partitioned on the wrong key, want an error")
+	}
+	if !strings.Contains(err.Error(), "HASH (id)") || !strings.Contains(err.Error(), "LIST (record_type_id)") {
+		t.Errorf("error = %q, want it to name both the live and the expected partition key", err)
 	}
 }
 
@@ -339,7 +525,7 @@ func eoQuiet(db *gorm.DB) *gorm.DB {
 	return db.Session(&gorm.Session{Logger: logger.Discard})
 }
 
-func newEOTestRecord(recordTypeID uuid.UUID, reference string) *models.EORecord {
+func eoNewTestRecord(recordTypeID uuid.UUID, reference string) *models.EORecord {
 	return &models.EORecord{
 		RecordTypeID: recordTypeID,
 		Reference:    reference,

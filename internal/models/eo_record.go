@@ -35,7 +35,9 @@ type EORecord struct {
 
 	Reference string `gorm:"size:100;not null" json:"reference"`
 	SubjectAr string `gorm:"size:500;not null" json:"subject_ar"`
-	SubjectEn string `gorm:"size:500;not null" json:"subject_en"`
+	// SubjectEn is the secondary display name and is nullable: the field
+	// matrix marks subject_ar Required Yes and subject_en Required No.
+	SubjectEn string `gorm:"size:500" json:"subject_en"`
 
 	ParentRecordID *uuid.UUID `gorm:"type:uuid" json:"parent_record_id"`
 	StateID        *uuid.UUID `gorm:"type:uuid" json:"state_id"`
@@ -54,17 +56,22 @@ type EORecord struct {
 	DueDate  *time.Time `json:"due_date"`
 	ClosedAt *time.Time `json:"closed_at"`
 
-	CreatedByID uuid.UUID `gorm:"type:uuid" json:"created_by_id"`
+	// CreatedByID is a value type, never a pointer: every record has a
+	// creator, so the column is NOT NULL.
+	CreatedByID uuid.UUID `gorm:"type:uuid;not null" json:"created_by_id"`
 
 	ChangeReason string `gorm:"type:text;not null" json:"change_reason"`
 	DelayReason  string `gorm:"type:text;not null" json:"delay_reason"`
 
 	// Values holds the type-specific fields, served by a GIN index.
+	// "values" is a Postgres reserved word. GORM quotes it when it builds a
+	// statement from this tag, but it will NOT quote it inside a raw fragment:
+	// Where(`"values" @> ?`) and Order(`"values"->>'key'`) must quote it by hand.
 	Values datatypes.JSON `gorm:"column:values;type:jsonb;not null;default:'{}'::jsonb" json:"values"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
-	DeletedAt gorm.DeletedAt `json:"-"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 func (EORecord) TableName() string { return "eo_records" }
