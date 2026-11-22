@@ -47,7 +47,7 @@ import (
 // migration. The only hand-written foreign keys are the ones inside the EO
 // record family, where the composite shape is the design point being enforced.
 //
-// eo_timers (Task 17) and eo_escalation_events (Task 18) are not created here.
+// eo_escalation_events (Task 18) is not created here.
 func MigrateEOPlatform(db *gorm.DB) error {
 	// A plain eo_records table cannot be upgraded in place: catch it loudly
 	// rather than letting CREATE TABLE IF NOT EXISTS silently accept it and
@@ -214,6 +214,36 @@ func MigrateEOPlatform(db *gorm.DB) error {
 		return err
 	}
 
+	// Durable timers (spec §7.10). No foreign key to eo_records: records are
+	// soft-deleted, so a cascade would never fire, and the worker treats a
+	// timer whose record is gone as cancelled (see services.EOTimerMonitor).
+	// The partial index is what ClaimDue scans; fired and cancelled rows, which
+	// only accumulate, are kept out of it.
+	timersSQL := `
+	CREATE TABLE IF NOT EXISTS eo_timers (
+		id             UUID NOT NULL,
+		record_id      UUID NOT NULL,
+		record_type_id UUID NOT NULL,
+		fire_at        TIMESTAMP WITH TIME ZONE NOT NULL,
+		capability_key VARCHAR(100) NOT NULL,
+		payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+		status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+		claimed_at     TIMESTAMP WITH TIME ZONE,
+		created_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+		CONSTRAINT pk_eo_timers PRIMARY KEY (id),
+		CONSTRAINT chk_eo_timers_status CHECK (status IN ('pending', 'claimed', 'fired', 'cancelled'))
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_eo_timers_due ON eo_timers (fire_at) WHERE status IN ('pending', 'claimed');
+	CREATE INDEX IF NOT EXISTS idx_eo_timers_record ON eo_timers (record_id);
+	`
+	if err := db.Exec(timersSQL).Error; err != nil {
+		return fmt.Errorf("eo platform: create eo_timers: %w", err)
+	}
+	if err := assertColumns(db, "eo_timers", eoTimersColumns); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -307,6 +337,18 @@ var (
 	eoReferenceSequencesColumns = []eoColumn{
 		{"scope", "character varying", 500, false},
 		{"seq", "bigint", 0, false},
+	}
+
+	eoTimersColumns = []eoColumn{
+		{"id", "uuid", 0, false},
+		{"record_id", "uuid", 0, false},
+		{"record_type_id", "uuid", 0, false},
+		{"fire_at", "timestamp with time zone", 0, false},
+		{"capability_key", "character varying", 100, false},
+		{"payload", "jsonb", 0, false},
+		{"status", "character varying", 20, false},
+		{"claimed_at", "timestamp with time zone", 0, true},
+		{"created_at", "timestamp with time zone", 0, false},
 	}
 )
 

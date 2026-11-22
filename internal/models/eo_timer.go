@@ -21,8 +21,7 @@ const (
 // deferred capability call.
 //
 // The struct is declared here, with the record models, because the capability
-// interface returns []EOTimer. Its table, repository and worker are built in
-// Task 17 — eo_timers is deliberately NOT created by MigrateEOPlatform yet and
+// interface returns []EOTimer. The table is created by MigrateEOPlatform and
 // EOTimer is not in the AutoMigrate list.
 type EOTimer struct {
 	ID            uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
