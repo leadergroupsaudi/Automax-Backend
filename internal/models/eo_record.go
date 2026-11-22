@@ -69,6 +69,12 @@ type EORecord struct {
 	// Where(`"values" @> ?`) and Order(`"values"->>'key'`) must quote it by hand.
 	Values datatypes.JSON `gorm:"column:values;type:jsonb;not null;default:'{}'::jsonb" json:"values"`
 
+	// DocumentaFolderID is the id of the record's Documenta folder, or "" when
+	// it has none. Empty is a legible state, not an error: the column is NOT
+	// NULL DEFAULT '', and every record created before its folder existed has
+	// an empty one. Nothing may treat "" as a folder id.
+	DocumentaFolderID string `gorm:"column:documenta_folder_id;size:100;not null;default:''" json:"documenta_folder_id"`
+
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`

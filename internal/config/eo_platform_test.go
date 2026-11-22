@@ -85,3 +85,67 @@ func TestEOTimerIntervalDefaultIsShared(t *testing.T) {
 		t.Errorf("EOTimerIntervalDefaultSeconds = %d, want 30", EOTimerIntervalDefaultSeconds)
 	}
 }
+
+// TestEODocumentaConfigIsSeparateFromTheOthers: EO records get their own
+// Documenta client, default OFF, read from EO_DOCUMENTA_* variables that no
+// other block reads. Reusing Documenta or KpiDocumenta would put EO records in
+// another module's workspace.
+//
+// The single-line change that makes each case fail: point the EODocumenta
+// block's getEnv/getEnvAsBool keys at DOCUMENTA_* or KPI_DOCUMENTA_* names
+// (the "reads its own variables" and "other blocks unaffected" cases), or flip
+// the Enabled default to true (the "default off" case).
+func TestEODocumentaConfigIsSeparateFromTheOthers(t *testing.T) {
+	envs := []string{
+		"EO_DOCUMENTA_BASE_URL", "EO_DOCUMENTA_CLIENT_ID", "EO_DOCUMENTA_CLIENT_SECRET",
+		"EO_DOCUMENTA_WORKSPACE_NAME", "EO_DOCUMENTA_ENABLED",
+		"DOCUMENTA_ENABLED", "DOCUMENTA_CLIENT_ID", "KPI_DOCUMENTA_ENABLED", "KPI_DOCUMENTA_CLIENT_ID",
+	}
+	clear := func(t *testing.T) {
+		for _, k := range envs {
+			t.Setenv(k, "")
+			os.Unsetenv(k)
+		}
+	}
+
+	t.Run("default off with no endpoint", func(t *testing.T) {
+		clear(t)
+		// The other two being enabled must not enable this one.
+		t.Setenv("DOCUMENTA_ENABLED", "true")
+		t.Setenv("KPI_DOCUMENTA_ENABLED", "true")
+		cfg := Load()
+		if cfg.EODocumenta.Enabled {
+			t.Errorf("EODocumenta.Enabled = true with EO_DOCUMENTA_ENABLED unset, want false")
+		}
+		if cfg.EODocumenta.BaseURL != "" || cfg.EODocumenta.ClientID != "" {
+			t.Errorf("EODocumenta defaults = %+v, want no endpoint and no credentials inherited", cfg.EODocumenta)
+		}
+	})
+
+	t.Run("reads its own variables", func(t *testing.T) {
+		clear(t)
+		t.Setenv("EO_DOCUMENTA_BASE_URL", "https://eo.example")
+		t.Setenv("EO_DOCUMENTA_CLIENT_ID", "eo-id")
+		t.Setenv("EO_DOCUMENTA_CLIENT_SECRET", "eo-secret")
+		t.Setenv("EO_DOCUMENTA_WORKSPACE_NAME", "eo-workspace")
+		t.Setenv("EO_DOCUMENTA_ENABLED", "true")
+		got := Load().EODocumenta
+		want := DocumentaConfig{BaseURL: "https://eo.example", ClientID: "eo-id", ClientSecret: "eo-secret", WorkspaceName: "eo-workspace", Enabled: true}
+		if got != want {
+			t.Errorf("EODocumenta = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("other blocks are unaffected", func(t *testing.T) {
+		clear(t)
+		t.Setenv("EO_DOCUMENTA_ENABLED", "true")
+		t.Setenv("EO_DOCUMENTA_CLIENT_ID", "eo-id")
+		cfg := Load()
+		if cfg.Documenta.Enabled || cfg.KpiDocumenta.Enabled {
+			t.Errorf("enabling EO Documenta enabled another block: documenta=%v kpi=%v", cfg.Documenta.Enabled, cfg.KpiDocumenta.Enabled)
+		}
+		if cfg.Documenta.ClientID == "eo-id" || cfg.KpiDocumenta.ClientID == "eo-id" {
+			t.Errorf("EO credentials leaked into another block")
+		}
+	})
+}

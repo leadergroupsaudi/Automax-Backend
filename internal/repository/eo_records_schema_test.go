@@ -568,3 +568,106 @@ func eoIndexNames(m map[string]string) []string {
 	}
 	return out
 }
+
+// TestEORecordsHasADocumentaFolderColumn pins the column's shape and, more to
+// the point, what "no folder" is: NOT NULL with an empty-string default, so a record created
+// before the folder exists reads back as an empty string rather than failing
+// the scan or needing a pointer.
+//
+// The single-line change that makes this fail: drop the column from the
+// CREATE TABLE and from the ALTER TABLE in MigrateEOPlatform (the assertion
+// then reports it missing and the migration errors before this test reads it).
+func TestEORecordsHasADocumentaFolderColumn(t *testing.T) {
+	db := eoMigratedDB(t)
+
+	type col struct {
+		DataType string
+		MaxLen   int
+		Nullable string
+		Default  string
+	}
+	var c col
+	if err := db.Raw(`
+		SELECT data_type, COALESCE(character_maximum_length, 0) AS max_len,
+		       is_nullable AS nullable, COALESCE(column_default, '') AS "default"
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'eo_records'
+		  AND column_name = 'documenta_folder_id'`).Scan(&c).Error; err != nil {
+		t.Fatalf("read column: %v", err)
+	}
+	if c.DataType != "character varying" || c.MaxLen != 100 {
+		t.Errorf("documenta_folder_id is %s(%d), want character varying(100)", c.DataType, c.MaxLen)
+	}
+	if c.Nullable != "NO" {
+		t.Errorf("documenta_folder_id nullable = %s, want NO: an empty string is the 'no folder' state", c.Nullable)
+	}
+	if !strings.HasPrefix(c.Default, "''") {
+		t.Errorf("documenta_folder_id default = %q, want an empty string", c.Default)
+	}
+
+	// Through GORM: a record created without a folder reads back empty, and a
+	// folder id written through the struct field survives a round trip.
+	typeID := uuid.New()
+	bare := eoNewTestRecord(typeID, "EO-DOC-2026-001")
+	if err := db.Create(bare).Error; err != nil {
+		t.Fatalf("create without folder: %v", err)
+	}
+	withFolder := eoNewTestRecord(typeID, "EO-DOC-2026-002")
+	withFolder.DocumentaFolderID = "folder-abc"
+	if err := db.Create(withFolder).Error; err != nil {
+		t.Fatalf("create with folder: %v", err)
+	}
+	for ref, want := range map[string]string{"EO-DOC-2026-001": "", "EO-DOC-2026-002": "folder-abc"} {
+		var got models.EORecord
+		if err := db.Where("record_type_id = ? AND reference = ?", typeID, ref).First(&got).Error; err != nil {
+			t.Fatalf("read %s: %v", ref, err)
+		}
+		if got.DocumentaFolderID != want {
+			t.Errorf("%s: DocumentaFolderID = %q, want %q", ref, got.DocumentaFolderID, want)
+		}
+	}
+}
+
+// TestMigrateEOPlatformStillPassesAssertColumns is the upgrade path, which no
+// fresh-schema test exercises: a database whose eo_records predates the column
+// and already holds rows. The migration must add the column, back-fill the
+// empty string, and then pass its own drift assertion — and the operator's
+// generated pre-deploy query must have been rendered from the same list, so it
+// names the column.
+//
+// The single-line change that makes this fail: delete the
+// `ALTER TABLE eo_records ADD COLUMN IF NOT EXISTS documenta_folder_id` line.
+// The assertion then reports the column missing and the migration errors.
+func TestMigrateEOPlatformStillPassesAssertColumns(t *testing.T) {
+	db := eoMigratedDB(t)
+
+	typeID := uuid.New()
+	if err := db.Create(eoNewTestRecord(typeID, "EO-DOC-2026-100")).Error; err != nil {
+		t.Fatalf("seed a record: %v", err)
+	}
+	// Put the table back into its pre-C1 shape.
+	if err := db.Exec(`ALTER TABLE eo_records DROP COLUMN documenta_folder_id`).Error; err != nil {
+		t.Fatalf("drop the column: %v", err)
+	}
+
+	if err := migrations.MigrateEOPlatform(db); err != nil {
+		t.Fatalf("migrating a pre-column database: %v", err)
+	}
+
+	var folder string
+	if err := db.Raw(`SELECT documenta_folder_id FROM eo_records WHERE reference = 'EO-DOC-2026-100'`).Scan(&folder).Error; err != nil {
+		t.Fatalf("read back the pre-existing row: %v", err)
+	}
+	if folder != "" {
+		t.Errorf("pre-existing row folder = %q, want empty", folder)
+	}
+
+	// Idempotent: a second run on the upgraded table is still clean.
+	if err := migrations.MigrateEOPlatform(db); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+
+	if !strings.Contains(migrations.EOPreflightSQL(), "'documenta_folder_id'") {
+		t.Errorf("EOPreflightSQL does not mention documenta_folder_id; the operator's pre-deploy check would not cover it")
+	}
+}

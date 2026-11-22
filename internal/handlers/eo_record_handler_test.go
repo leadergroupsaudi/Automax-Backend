@@ -542,6 +542,11 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 	for _, want := range []string{
 		"services.RegisterEOCapabilities()",
 		"repository.NewEOEscalationEventRepository(",
+		// Task C1's third Documenta client: its own config block, default off.
+		// C2 consumes it; until then this pins that it is built from the EO
+		// block and not from cfg.Documenta / cfg.KpiDocumenta.
+		"storage.NewHTTPDocumentaClient(cfg.EODocumenta,",
+		"cfg.EODocumenta.Enabled",
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
 		"services.NewEOTransitionServiceWithSLA(",

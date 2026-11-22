@@ -113,12 +113,20 @@ func MigrateEOPlatform(db *gorm.DB) error {
 		change_reason      TEXT NOT NULL DEFAULT '',
 		delay_reason       TEXT NOT NULL DEFAULT '',
 		"values"           JSONB NOT NULL DEFAULT '{}'::jsonb,
+		-- The record's Documenta folder; '' means it has none (see ALTER below).
+		documenta_folder_id VARCHAR(100) NOT NULL DEFAULT '',
 		created_at         TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 		updated_at         TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 		deleted_at         TIMESTAMP WITH TIME ZONE,
 		CONSTRAINT pk_eo_records PRIMARY KEY (id, record_type_id),
 		CONSTRAINT uq_eo_records_type_reference UNIQUE (record_type_id, reference)
 	) PARTITION BY LIST (record_type_id);
+
+	-- CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
+	-- exists, so the column above reaches an existing database only through
+	-- this. Existing rows get '' (no folder), which is a legible state. The
+	-- column must also be in eoRecordsColumns or the assertion refuses it.
+	ALTER TABLE eo_records ADD COLUMN IF NOT EXISTS documenta_folder_id VARCHAR(100) NOT NULL DEFAULT '';
 
 	-- Every record type without a partition of its own lands here and is
 	-- fully functional; without it an unpartitioned type could not insert.
@@ -365,6 +373,7 @@ var (
 		{"change_reason", "text", 0, false},
 		{"delay_reason", "text", 0, false},
 		{"values", "jsonb", 0, false},
+		{"documenta_folder_id", "character varying", 100, false},
 		{"created_at", "timestamp with time zone", 0, false},
 		{"updated_at", "timestamp with time zone", 0, false},
 		{"deleted_at", "timestamp with time zone", 0, true},

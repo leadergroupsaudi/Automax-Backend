@@ -28,6 +28,8 @@ type Config struct {
 	SmsFeedback                 SmsFeedbackConfig
 	Documenta                   DocumentaConfig
 	KpiDocumenta                DocumentaConfig
+	// EODocumenta is the third, separate Documenta client: EO record folders.
+	EODocumenta DocumentaConfig
 	AIQuality                   AIQualityConfig
 	Nasaq                       NasaqConfig
 	AutoAssign                  AutoAssignConfig
@@ -541,6 +543,21 @@ func Load() *Config {
 			ClientSecret:  getEnv("KPI_DOCUMENTA_CLIENT_SECRET", ""),
 			WorkspaceName: getEnv("KPI_DOCUMENTA_WORKSPACE_NAME", "automax"),
 			Enabled:       getEnvAsBool("KPI_DOCUMENTA_ENABLED", false),
+		},
+		// EODocumenta is the THIRD Documenta client, for the folder each EO
+		// record owns. It is separate from both blocks above for the same
+		// reason they are separate from each other: its own credentials and
+		// its own workspace, so EO records never land in Goals' or KPI's.
+		// Every default is empty/off on purpose — no inherited URL, no
+		// inherited workspace — so an unconfigured deployment gets the stub
+		// (see cmd/server/main.go) instead of writing into another module's
+		// Documenta. Read by cmd/server/main.go.
+		EODocumenta: DocumentaConfig{
+			BaseURL:       getEnv("EO_DOCUMENTA_BASE_URL", ""),
+			ClientID:      getEnv("EO_DOCUMENTA_CLIENT_ID", ""),
+			ClientSecret:  getEnv("EO_DOCUMENTA_CLIENT_SECRET", ""),
+			WorkspaceName: getEnv("EO_DOCUMENTA_WORKSPACE_NAME", ""),
+			Enabled:       getEnvAsBool("EO_DOCUMENTA_ENABLED", false),
 		},
 		ReadyToClose: ReadyToCloseConfig{
 			DefaultDurationOptions:     getEnvAsStringSlice("READY_TO_CLOSE_DURATION_OPTIONS", []string{"1 Day", "2 Days", "1 Week", "2 Weeks", "1 Month", "3 Months"}),

@@ -229,6 +229,26 @@ func main() {
 		log.Println("KPI Documenta stub client (KPI_DOCUMENTA_ENABLED=false)")
 	}
 
+	// EO record folders use a THIRD Documenta client/config, separate from both
+	// above (own credentials, own workspace): without one, EO records would be
+	// filed inside Goals' or KPI's workspace. Disabled by default, in which
+	// case the stub keeps the engine fully runnable with no Documenta at all.
+	//
+	// NOT CONSUMED YET: nothing takes this client until Task C2 (a folder per
+	// record). It is built here so C2 adds one argument, not a construction.
+	// redisClient is deliberately nil: the HTTP client's Redis keys (token and
+	// folder cache) carry no client identity, so sharing Redis would serve this
+	// client another client's token and cached folder ids.
+	var eoDocumentaClient storage.DocumentaClient
+	if cfg.EODocumenta.Enabled {
+		eoDocumentaClient = storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)
+		log.Println("EO Documenta HTTP client enabled")
+	} else {
+		eoDocumentaClient = storage.NewStubDocumentaClient()
+		log.Println("EO Documenta stub client (EO_DOCUMENTA_ENABLED=false)")
+	}
+	_ = eoDocumentaClient // C2 passes this to the record service
+
 	// Ready-to-Close service
 	readyToCloseRepo := repository.NewReadyToCloseRepository(db)
 	readyToCloseService := services.NewReadyToCloseService(readyToCloseRepo, incidentRepo, workflowRepo, notificationService, cfg.ReadyToClose, db)
