@@ -543,13 +543,23 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		"services.RegisterEOCapabilities()",
 		"repository.NewEOEscalationEventRepository(",
 		// Task C1's third Documenta client: its own config block, default off.
-		// C2 consumes it; until then this pins that it is built from the EO
-		// block and not from cfg.Documenta / cfg.KpiDocumenta.
 		// The FULL call, including the nil Redis client: the HTTP client's
 		// Redis token and folder-cache keys carry no client identity, so
 		// passing redisClient here would serve EO another client's token.
 		"storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)",
 		"cfg.EODocumenta.Enabled",
+		// Task C2 consumes that client: without this option the record
+		// service is built exactly as before and every EO record is created
+		// folderless, which nothing else in the suite would notice. The
+		// workspace name is part of the pin because the client constructor
+		// ignores cfg.WorkspaceName — the per-call argument is the only way
+		// EO_DOCUMENTA_WORKSPACE_NAME reaches Documenta.
+		"services.EOWithDocumentaFolders(eoDocumentaClient, cfg.EODocumenta.WorkspaceName)",
+		// The boot guard: EO_DOCUMENTA_ENABLED=true with no base URL builds a
+		// client pointed at the relative path "/api/v1". A folder failure does
+		// not block a record, so without this the deployment would file
+		// nothing and say so only in the history of each record.
+		`log.Fatalf("EO_DOCUMENTA_ENABLED=true but EO_DOCUMENTA_BASE_URL is empty`,
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
 		"services.NewEOTransitionServiceWithSLA(",

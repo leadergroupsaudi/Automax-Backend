@@ -8,11 +8,13 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/internal/services/eoformula"
+	"github.com/automax/backend/internal/storage"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
@@ -351,6 +353,154 @@ func (d *eoRecordDeps) Ancestor(ctx context.Context, rec *models.EORecord, direc
 	return nil, nil
 }
 
+// ── the Documenta folder every record owns ──────────────────────────────────
+
+// eoFolderNameMax bounds the subject part of a folder name. A subject column
+// holds 500 characters and a folder name that long is neither browsable nor
+// safely accepted by every storage backend behind Documenta.
+const eoFolderNameMax = 120
+
+// eoFolderFailureNote prefixes the history row written when a record is
+// created without its folder. It is a fixed string so an operator (or a
+// backfill) can find every affected record by it, beside the column query for
+// an empty documenta_folder_id.
+const eoFolderFailureNote = "documenta folder not created"
+
+// eoDocumentaFolders creates the Documenta folder an EO record owns: one
+// folder per record, under a per-type anchor folder at the workspace root.
+//
+// It calls CreateFolder and ListFiles directly and NEVER EnsureFolder, which
+// is the wrong instrument here twice over:
+//
+//   - For the record's own folder there is nothing to ensure. The name
+//     carries the record's reference, which is unique per type, and no second
+//     record ever wants that folder. EnsureFolder would list the whole anchor
+//     folder — a listing that pages nothing — on every single create, so the
+//     cost of creating a record would grow with the number of records already
+//     filed under its type.
+//
+//   - For the anchor, EnsureFolder SWALLOWS its ListFiles error
+//     (`result, err := c.ListFiles(...)` then `if err == nil {`) and falls
+//     through to create. Its first tier, the Redis lookup that would normally
+//     hide that, does not exist for EO: cmd/server/main.go builds this client
+//     with a nil Redis client on purpose, because the shipped client caches
+//     its OAuth token and folder ids under keys that carry no client
+//     identity. With no cache to short-circuit it, a flapping Documenta would
+//     produce a NEW anchor on every failed listing and split the type's tree.
+//     Here the listing error is returned instead: a failed listing says
+//     nothing about what exists, so nothing is created on the strength of it.
+//     (And had Redis been passed, EnsureFolder's two Set calls use TTL 0, so
+//     a folder per record would leave one immortal cache entry per record.)
+//
+// The anchor is resolved once per record type per process and remembered, so
+// the extra listing is paid once rather than per record.
+type eoDocumentaFolders struct {
+	client        storage.DocumentaClient
+	workspaceName string
+
+	mu sync.Mutex
+	// anchors maps a record type id to its anchor folder id. Keyed by id, not
+	// by name, so renaming a type does not strand the records already filed
+	// under the anchor this process is using.
+	anchors map[uuid.UUID]string
+}
+
+// createFor creates the record's own folder and returns its id. The context
+// must already carry the acting user (storage.ContextWithOnBehalf).
+func (f *eoDocumentaFolders) createFor(ctx context.Context, t *models.EORecordType, rec *models.EORecord) (string, error) {
+	anchorID, err := f.anchorFor(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	folderID, err := f.client.CreateFolder(ctx, f.workspaceName, anchorID, eoRecordFolderName(rec))
+	if err != nil {
+		return "", fmt.Errorf("create the documenta folder for %s: %w", rec.Reference, err)
+	}
+	// "" is the record's no-folder sentinel. Storing a blank id as though it
+	// were a folder would make a folderless record look filed, so a response
+	// that carries no uuid is a failure, not a folder.
+	if strings.TrimSpace(folderID) == "" {
+		return "", fmt.Errorf("documenta returned an empty folder id for %s", rec.Reference)
+	}
+	return folderID, nil
+}
+
+// anchorFor returns the folder every record of this type is filed under,
+// creating it only when the workspace root has been listed successfully and
+// shown not to contain it.
+func (f *eoDocumentaFolders) anchorFor(ctx context.Context, t *models.EORecordType) (string, error) {
+	f.mu.Lock()
+	cached, ok := f.anchors[t.ID]
+	f.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	name := eoAnchorFolderName(t)
+	// The parent listing, with its error RETURNED. This is the one call
+	// EnsureFolder ignores the failure of.
+	listing, err := f.client.ListFiles(ctx, f.workspaceName, "")
+	if err != nil {
+		return "", fmt.Errorf("list the workspace root for the %q folder: %w", name, err)
+	}
+	anchorID := ""
+	if listing != nil {
+		for _, file := range listing.Files {
+			if file.Type == "folder" && file.Name == name {
+				anchorID = file.UUID
+				break
+			}
+		}
+	}
+	if anchorID == "" {
+		anchorID, err = f.client.CreateFolder(ctx, f.workspaceName, "", name)
+		if err != nil {
+			return "", fmt.Errorf("create the %q folder: %w", name, err)
+		}
+		if strings.TrimSpace(anchorID) == "" {
+			return "", fmt.Errorf("documenta returned an empty folder id for %q", name)
+		}
+	}
+
+	f.mu.Lock()
+	f.anchors[t.ID] = anchorID
+	f.mu.Unlock()
+	return anchorID, nil
+}
+
+// eoAnchorFolderName is the per-type anchor's name: the type's display name,
+// or its key when the name is blank, so the folder is never nameless.
+func eoAnchorFolderName(t *models.EORecordType) string {
+	if name := strings.TrimSpace(t.Name); name != "" {
+		return eoClipFolderName(name)
+	}
+	return eoClipFolderName(strings.TrimSpace(t.Key))
+}
+
+// eoRecordFolderName names a record's folder "<reference> - <subject>". The
+// reference comes first because it is what the register, the history and
+// every notification call the record by, and it is unique per type.
+func eoRecordFolderName(rec *models.EORecord) string {
+	subject := strings.TrimSpace(rec.SubjectEn)
+	if subject == "" {
+		subject = strings.TrimSpace(rec.SubjectAr)
+	}
+	if subject == "" {
+		return rec.Reference
+	}
+	return rec.Reference + " - " + eoClipFolderName(subject)
+}
+
+// eoClipFolderName clips on a RUNE boundary: subjects are Arabic, and cutting
+// a multi-byte rune in half produces an invalid name rather than a short one.
+func eoClipFolderName(s string) string {
+	runes := []rune(s)
+	if len(runes) <= eoFolderNameMax {
+		return s
+	}
+	return strings.TrimSpace(string(runes[:eoFolderNameMax])) + "\u2026"
+}
+
 // ── the save pipeline ───────────────────────────────────────────────────────
 
 // EORecordService is the create/update path for records of any configured
@@ -376,6 +526,38 @@ type eoRecordService struct {
 	// policies loads the initial state's escalation policy. Nil means SLA
 	// clocks are not wired: creation schedules no timer.
 	policies repository.EscalationPolicyRepository
+	// folders gives every created record its Documenta folder. Nil means no
+	// Documenta client is wired and records are created folderless — which is
+	// a legible state, not a broken one: documenta_folder_id is NOT NULL
+	// DEFAULT '' and every record made before this existed has it.
+	folders *eoDocumentaFolders
+}
+
+// EORecordOption configures the record service at construction. It exists so
+// that wiring a Documenta client is additive: the two constructors below keep
+// the signatures everything already calls.
+type EORecordOption func(*eoRecordService)
+
+// EOWithDocumentaFolders gives every record this service creates a folder in
+// Documenta (see eoDocumentaFolders). workspaceName is passed into every
+// folder call because NewHTTPDocumentaClient IGNORES cfg.WorkspaceName — the
+// per-call argument is the only way a configured workspace name can reach
+// Documenta at all, and even then it is a fallback the OAuth token's
+// workspace_uuid claim overrides (storage.resolveWorkspace).
+//
+// A nil client is the same as not passing the option: nothing is wired and
+// records are created folderless.
+func EOWithDocumentaFolders(client storage.DocumentaClient, workspaceName string) EORecordOption {
+	return func(s *eoRecordService) {
+		if client == nil {
+			return
+		}
+		s.folders = &eoDocumentaFolders{
+			client:        client,
+			workspaceName: workspaceName,
+			anchors:       map[uuid.UUID]string{},
+		}
+	}
 }
 
 func NewEORecordService(
@@ -383,8 +565,9 @@ func NewEORecordService(
 	types repository.EORecordTypeRepository,
 	sequences repository.EOSequenceRepository,
 	workflows repository.WorkflowRepository,
+	opts ...EORecordOption,
 ) EORecordService {
-	return NewEORecordServiceWithSLA(records, types, sequences, workflows, nil)
+	return NewEORecordServiceWithSLA(records, types, sequences, workflows, nil, opts...)
 }
 
 // NewEORecordServiceWithSLA is NewEORecordService plus SLA clocks: a record is
@@ -397,8 +580,9 @@ func NewEORecordServiceWithSLA(
 	sequences repository.EOSequenceRepository,
 	workflows repository.WorkflowRepository,
 	policies repository.EscalationPolicyRepository,
+	opts ...EORecordOption,
 ) EORecordService {
-	return &eoRecordService{
+	s := &eoRecordService{
 		policies:  policies,
 		records:   records,
 		types:     types,
@@ -407,6 +591,12 @@ func NewEORecordServiceWithSLA(
 		eval:      eoformula.New(0),
 		deps:      &eoRecordDeps{records: records, types: types},
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
 func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreateRequest, actor *models.User) (*models.EORecord, error) {
@@ -535,7 +725,22 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
 
-	// 6. persist. The record, its parent link and the history row that says
+	// 6. the record's Documenta folder, BEFORE the transaction is opened and
+	// never inside it. The call is HTTP to another system behind a 30-second
+	// client timeout; making it inside the transaction would hold a pooled
+	// database connection — and an open Postgres transaction — for the length
+	// of a remote round trip, on every create.
+	//
+	// A failure here does NOT lose the record (Review Focus 4). The record is
+	// written with an empty documenta_folder_id, which C1 made a legible
+	// value rather than a null, and a history row on THIS record says why, in
+	// the same transaction as the record itself. The alternative — failing the
+	// create — would make an outage of the document store an outage of the
+	// Executive Office, and would strand the reference this record has
+	// already burned.
+	folderErr := s.createRecordFolder(ctx, t, rec, actor)
+
+	// 7. persist. The record, its parent link and the history row that says
 	// it entered its initial state are one write.
 	// The initial state's policy is read before the transaction: a pooled read
 	// inside it would take a second connection.
@@ -566,6 +771,22 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		}); err != nil {
 			return err
 		}
+		// The folder failure is recorded ON THE RECORD IT HAPPENED TO, in the
+		// same write as the record: the row cannot be lost the way a
+		// post-commit log line can, and it cannot be filed against another
+		// record the way A5's close_parent note was. documenta_folder_id
+		// stays '' beside it, so the record is findable both ways.
+		if folderErr != nil {
+			if err := r.CreateHistory(ctx, &models.EORecordHistory{
+				RecordID:       rec.ID,
+				RecordTypeID:   rec.RecordTypeID,
+				PerformedByID:  &actor.ID,
+				IsSystemAction: true,
+				Comment:        eoFolderFailureComment(rec, folderErr),
+			}); err != nil {
+				return err
+			}
+		}
 		// The SLA clock starts with the record, on the transaction's timer
 		// handle, so a failed create leaves no timer behind.
 		if slaState != nil {
@@ -586,6 +807,33 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		return nil, fmt.Errorf("create eo record %q: %w", rec.Reference, err)
 	}
 	return rec, nil
+}
+
+// createRecordFolder fills in rec.DocumentaFolderID, or returns the reason it
+// could not. It returns nil when no Documenta client is wired, which is the
+// default deployment (EO_DOCUMENTA_ENABLED=false): a record with no folder is
+// then the expected state and nothing is reported.
+func (s *eoRecordService) createRecordFolder(ctx context.Context, t *models.EORecordType, rec *models.EORecord, actor *models.User) error {
+	if s.folders == nil {
+		return nil
+	}
+	// The acting user travels with the call. Without this every EO folder is
+	// owned by system@automax.local and the Documenta audit trail cannot say
+	// who filed what.
+	folderID, err := s.folders.createFor(storage.ContextWithOnBehalf(ctx, actor.Email), t, rec)
+	if err != nil {
+		log.Printf("[EO] record %s (%s) created without a documenta folder: %v", rec.Reference, rec.ID, err)
+		return err
+	}
+	rec.DocumentaFolderID = folderID
+	return nil
+}
+
+// eoFolderFailureComment is the history row an operator reads to find out why
+// a record has no folder, and which record it is.
+func eoFolderFailureComment(rec *models.EORecord, err error) string {
+	return fmt.Sprintf("%s for %s: %v. The record was created without one (documenta_folder_id is empty) and can be backfilled.",
+		eoFolderFailureNote, rec.Reference, err)
 }
 
 func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.EORecordUpdateRequest, actor *models.User) (*models.EORecord, error) {

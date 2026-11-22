@@ -234,20 +234,30 @@ func main() {
 	// filed inside Goals' or KPI's workspace. Disabled by default, in which
 	// case the stub keeps the engine fully runnable with no Documenta at all.
 	//
-	// NOT CONSUMED YET: nothing takes this client until Task C2 (a folder per
-	// record). It is built here so C2 adds one argument, not a construction.
+	// Consumed by the EO record service below (Task C2): every record gets a
+	// folder of its own under a per-type anchor.
 	// redisClient is deliberately nil: the HTTP client's Redis keys (token and
 	// folder cache) carry no client identity, so sharing Redis would serve this
 	// client another client's token and cached folder ids.
 	var eoDocumentaClient storage.DocumentaClient
 	if cfg.EODocumenta.Enabled {
+		// NewHTTPDocumentaClient appends "/api/v1" to whatever it is given, so
+		// an empty base URL builds a client whose every request goes to the
+		// relative path "/api/v1" and fails. The other two Documenta blocks
+		// have a default URL that hides this; the EO block deliberately has
+		// none. Refusing at boot is the only loud failure available: a record
+		// folder that cannot be created does not block the record (see
+		// EOWithDocumentaFolders), so a misconfigured deployment would
+		// otherwise run for months filing nothing.
+		if strings.TrimSpace(cfg.EODocumenta.BaseURL) == "" {
+			log.Fatalf("EO_DOCUMENTA_ENABLED=true but EO_DOCUMENTA_BASE_URL is empty: set the URL or disable EO Documenta")
+		}
 		eoDocumentaClient = storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)
 		log.Println("EO Documenta HTTP client enabled")
 	} else {
 		eoDocumentaClient = storage.NewStubDocumentaClient()
 		log.Println("EO Documenta stub client (EO_DOCUMENTA_ENABLED=false)")
 	}
-	_ = eoDocumentaClient // C2 passes this to the record service
 
 	// Ready-to-Close service
 	readyToCloseRepo := repository.NewReadyToCloseRepository(db)
@@ -513,7 +523,12 @@ func main() {
 	eoTypeRepo := repository.NewEORecordTypeRepository(db)
 	eoSequenceRepo := repository.NewEOSequenceRepository(db)
 
-	eoRecordService := services.NewEORecordServiceWithSLA(eoRecordRepo, eoTypeRepo, eoSequenceRepo, workflowRepo, escalationPolicyRepo)
+	// The workspace name is passed per call because NewHTTPDocumentaClient
+	// ignores cfg.WorkspaceName; it is the only route EO_DOCUMENTA_WORKSPACE_NAME
+	// has to Documenta, and even then the OAuth token's workspace_uuid claim
+	// takes precedence over it.
+	eoRecordService := services.NewEORecordServiceWithSLA(eoRecordRepo, eoTypeRepo, eoSequenceRepo, workflowRepo, escalationPolicyRepo,
+		services.EOWithDocumentaFolders(eoDocumentaClient, cfg.EODocumenta.WorkspaceName))
 	eoActionExecutor := services.NewEOActionExecutor(eoRecordService, eoRecordRepo, eoTypeRepo, userRepo, departmentRepo, notificationService)
 	eoTransitionService := services.NewEOTransitionServiceWithSLA(eoRecordRepo, eoTypeRepo, workflowRepo, eoActionExecutor, escalationPolicyRepo)
 	// Closes the construction cycle the two services make: the transition

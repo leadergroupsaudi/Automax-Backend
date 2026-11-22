@@ -5,14 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/automax/backend/internal/config"
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/internal/services/eoformula"
+	"github.com/automax/backend/internal/storage"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
@@ -54,6 +58,15 @@ type eoSvcRecordRepo struct {
 	onLock func(stored *models.EORecord)
 	// historyErr fails CreateHistory, to test what a failed create leaves.
 	historyErr error
+	// historyErrFrom limits historyErr to that call onwards (1-based; 0 means
+	// every call), so a test can fail the SECOND history row a create writes
+	// while letting the first through.
+	historyErrFrom int
+	historyCalls   int
+	// inTx is true for as long as Transaction's closure is running, so a test
+	// can tell whether something the pipeline did happened while a database
+	// connection was held.
+	inTx bool
 }
 
 func eoNewSvcRecordRepo() *eoSvcRecordRepo {
@@ -135,7 +148,8 @@ func (f *eoSvcRecordRepo) LinksFrom(_ context.Context, _ uuid.UUID) ([]models.EO
 }
 
 func (f *eoSvcRecordRepo) CreateHistory(_ context.Context, entry *models.EORecordHistory) error {
-	if f.historyErr != nil {
+	f.historyCalls++
+	if f.historyErr != nil && f.historyCalls >= f.historyErrFrom {
 		return f.historyErr
 	}
 	f.history = append(f.history, *entry)
@@ -151,6 +165,8 @@ func (f *eoSvcRecordRepo) Transaction(_ context.Context, fn func(repository.EORe
 	if f.txRecords != nil {
 		records = f.txRecords
 	}
+	f.inTx = true
+	defer func() { f.inTx = false }()
 	return fn(records, f.txTypes, f.txTimers)
 }
 
@@ -1099,5 +1115,556 @@ func TestEoCreateRejectsForeignCapabilityKey(t *testing.T) {
 	}
 	if len(timers.scheduled) != 0 {
 		t.Errorf("scheduled %d timers, want none", len(timers.scheduled))
+	}
+}
+
+// ── the Documenta folder every record owns (Task C2) ────────────────────────
+
+// eoFolderCall is one folder call the create pipeline made, as the fake saw it.
+type eoFolderCall struct {
+	workspace string
+	parent    string
+	name      string
+}
+
+// eoFakeDocumenta is a DocumentaClient that records the folder calls the
+// create pipeline makes. It embeds the interface and overrides ONLY
+// CreateFolder and ListFiles: every other method is a nil interface call, so
+// a pipeline that reached for EnsureFolder — the client whose swallowed
+// ListFiles error makes a duplicate folder on every transient failure — would
+// panic here rather than quietly pass.
+//
+// Its ids are stable ("folder-1", "folder-2", …) ON PURPOSE. The shipped stub
+// (storage.NewStubDocumentaClient) returns a fresh random uuid per call, so a
+// test asserting a particular id against the stub proves nothing; these ids
+// are the fake's, and asserting them is an assertion about which call's id
+// landed on the record.
+type eoFakeDocumenta struct {
+	storage.DocumentaClient
+
+	// root is what ListFiles answers for the workspace root.
+	root []storage.DmsFile
+	// listErr fails ListFiles, standing in for a transient Documenta outage
+	// in the middle of anchor resolution.
+	listErr error
+	// createErr fails CreateFolder from createErrFrom onwards (1-based; 0
+	// means every call). The anchor is created first, so failing only the
+	// second call is the only way to reach the record folder's own error.
+	createErr     error
+	createErrFrom int
+	// emptyIDFrom makes CreateFolder succeed with a blank id from that call
+	// onwards (1-based; 0 never), which is what Documenta returns when its
+	// response envelope carries no uuid. "" is the no-folder sentinel on the
+	// record, so it must never be stored as one — and the anchor and the
+	// record folder each need their own guard, hence the call number.
+	emptyIDFrom int
+	// onCall runs on entry to every call, so a test can observe what was true
+	// of the service at the moment it reached out.
+	onCall func()
+
+	lists   []eoFolderCall
+	creates []eoFolderCall
+	n       int
+}
+
+func (c *eoFakeDocumenta) ListFiles(_ context.Context, workspace, parent string) (*storage.DmsListResult, error) {
+	if c.onCall != nil {
+		c.onCall()
+	}
+	c.lists = append(c.lists, eoFolderCall{workspace: workspace, parent: parent})
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+	return &storage.DmsListResult{Files: c.root}, nil
+}
+
+func (c *eoFakeDocumenta) CreateFolder(_ context.Context, workspace, parent, name string) (string, error) {
+	if c.onCall != nil {
+		c.onCall()
+	}
+	c.creates = append(c.creates, eoFolderCall{workspace: workspace, parent: parent, name: name})
+	if c.createErr != nil && len(c.creates) >= c.createErrFrom {
+		return "", c.createErr
+	}
+	c.n++
+	if c.emptyIDFrom > 0 && c.n >= c.emptyIDFrom {
+		return "", nil
+	}
+	return "folder-" + strconv.Itoa(c.n), nil
+}
+
+// eoFoldersFixture is eoNewSvcFixture with the record service rebuilt around a
+// Documenta client, and an actor who has an email to be acted on behalf of.
+func eoFoldersFixture(t *testing.T, client storage.DocumentaClient) *eoSvcFixture {
+	t.Helper()
+	f := eoNewSvcFixture(t)
+	f.actor.Email = "eo.officer@example.gov"
+	f.svc = NewEORecordService(f.records, f.types, f.sequences, f.workflows,
+		EOWithDocumentaFolders(client, "eo-workspace"))
+	return f
+}
+
+// eoCreateForFolder creates one record through the fixture's service.
+func eoCreateForFolder(t *testing.T, f *eoSvcFixture, subjectEn string) (*models.EORecord, error) {
+	t.Helper()
+	return f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+		RecordTypeID: f.recordType.ID,
+		Values:       map[string]any{"subject_ar": "توجيه", "subject_en": subjectEn},
+	}, f.actor)
+}
+
+// eoFolderNotes returns the history rows that report a missing folder.
+func eoFolderNotes(history []models.EORecordHistory) []models.EORecordHistory {
+	var out []models.EORecordHistory
+	for _, h := range history {
+		if strings.Contains(h.Comment, eoFolderFailureNote) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func TestCreateGivesTheRecordADocumentaFolder(t *testing.T) {
+	t.Run("the folder id is stored on the record and on the row that is inserted", func(t *testing.T) {
+		client := &eoFakeDocumenta{}
+		f := eoFoldersFixture(t, client)
+
+		rec, err := eoCreateForFolder(t, f, "Directive one")
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		// Two creates: the per-type anchor first (nothing in the root), then
+		// the record's own folder under it. The record gets the SECOND id.
+		if rec.DocumentaFolderID != "folder-2" {
+			t.Errorf("rec.DocumentaFolderID = %q, want the record folder's id %q", rec.DocumentaFolderID, "folder-2")
+		}
+		if len(f.records.created) != 1 {
+			t.Fatalf("records created = %d, want 1", len(f.records.created))
+		}
+		// The INSERTED row, not just the returned struct: the folder id has to
+		// be on the record before it is written, or the column stays '' until
+		// something updates it and a crash in between loses the folder.
+		if saved := f.records.created[0]; saved.DocumentaFolderID != "folder-2" {
+			t.Errorf("inserted documenta_folder_id = %q, want %q", saved.DocumentaFolderID, "folder-2")
+		}
+		if notes := eoFolderNotes(f.records.history); len(notes) != 0 {
+			t.Errorf("history carries %d folder-failure notes, want none on a successful create: %+v", len(notes), notes)
+		}
+	})
+
+	t.Run("the folder is created under a per-type anchor, in the configured workspace", func(t *testing.T) {
+		client := &eoFakeDocumenta{}
+		f := eoFoldersFixture(t, client)
+
+		rec, err := eoCreateForFolder(t, f, "Directive one")
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(client.creates) != 2 {
+			t.Fatalf("CreateFolder calls = %+v, want 2 (the anchor, then the record)", client.creates)
+		}
+		anchor, folder := client.creates[0], client.creates[1]
+		if anchor.parent != "" || anchor.name != f.recordType.Name {
+			t.Errorf("anchor call = %+v, want it at the workspace root named %q", anchor, f.recordType.Name)
+		}
+		if folder.parent != "folder-1" {
+			t.Errorf("record folder parent = %q, want the anchor %q", folder.parent, "folder-1")
+		}
+		wantName := rec.Reference + " - Directive one"
+		if folder.name != wantName {
+			t.Errorf("record folder name = %q, want %q", folder.name, wantName)
+		}
+		// EO_DOCUMENTA_WORKSPACE_NAME reaches Documenta only as this per-call
+		// argument; the client constructor ignores cfg.WorkspaceName.
+		for _, c := range append(append([]eoFolderCall{}, client.creates...), client.lists...) {
+			if c.workspace != "eo-workspace" {
+				t.Errorf("call %+v used workspace %q, want the configured %q", c, c.workspace, "eo-workspace")
+			}
+		}
+	})
+
+	t.Run("the folder call is made outside the create transaction", func(t *testing.T) {
+		client := &eoFakeDocumenta{}
+		f := eoFoldersFixture(t, client)
+		var sawTx []bool
+		client.onCall = func() { sawTx = append(sawTx, f.records.inTx) }
+
+		if _, err := eoCreateForFolder(t, f, "Directive one"); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(sawTx) == 0 {
+			t.Fatalf("the pipeline made no Documenta call")
+		}
+		for i, in := range sawTx {
+			if in {
+				t.Errorf("Documenta call %d ran inside the create transaction; a remote call must not hold a pooled connection", i)
+			}
+		}
+	})
+
+	t.Run("no Documenta client wired leaves the record folderless and says nothing", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			svc  func(f *eoSvcFixture) EORecordService
+		}{
+			{
+				name: "the option is not passed at all",
+				svc: func(f *eoSvcFixture) EORecordService {
+					return NewEORecordService(f.records, f.types, f.sequences, f.workflows)
+				},
+			},
+			{
+				// main.go always passes a client, but a nil one must not turn
+				// every create into a nil-pointer panic.
+				name: "the option is passed a nil client",
+				svc: func(f *eoSvcFixture) EORecordService {
+					return NewEORecordService(f.records, f.types, f.sequences, f.workflows,
+						EOWithDocumentaFolders(nil, "eo-workspace"))
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := eoNewSvcFixture(t)
+				f.svc = tc.svc(f)
+				rec, err := eoCreateForFolder(t, f, "Directive one")
+				if err != nil {
+					t.Fatalf("create: %v", err)
+				}
+				if rec.DocumentaFolderID != "" {
+					t.Errorf("documenta_folder_id = %q, want empty when no client is wired", rec.DocumentaFolderID)
+				}
+				if notes := eoFolderNotes(f.records.history); len(notes) != 0 {
+					t.Errorf("history carries %d folder notes, want none when folders are not configured", len(notes))
+				}
+			})
+		}
+	})
+}
+
+// TestEOAFolderNoteThatCannotBeWrittenFailsTheCreate pins the other half of
+// the Review Focus 4 decision: the record survives a Documenta outage only
+// BECAUSE the reason is recorded with it. If that row cannot be written, the
+// create fails and the real repository's transaction rolls the record back,
+// rather than committing a folderless record that explains nothing.
+func TestEOAFolderNoteThatCannotBeWrittenFailsTheCreate(t *testing.T) {
+	client := &eoFakeDocumenta{listErr: errors.New("documenta: connection refused")}
+	f := eoFoldersFixture(t, client)
+	// The creation row goes through; the folder note, the second row, does not.
+	f.records.historyErr = errors.New("write eo record history: deadlock detected")
+	f.records.historyErrFrom = 2
+
+	if _, err := eoCreateForFolder(t, f, "Directive one"); err == nil {
+		t.Fatal("create succeeded although the folder note could not be written")
+	} else if !strings.Contains(err.Error(), "deadlock detected") {
+		t.Errorf("create error = %v, want it to carry the history failure", err)
+	}
+}
+
+func TestFolderCreationFailureDoesNotLoseTheRecord(t *testing.T) {
+	// The decision this task had to make (Review Focus 4): a Documenta outage
+	// during a create does NOT block the record. The record is written with an
+	// empty documenta_folder_id — which C1 made a legible value rather than a
+	// null — and is backfillable. What makes that honest rather than silent is
+	// the history row: it is written in the SAME transaction as the record, on
+	// the record it happened to, so it cannot be lost and cannot be filed
+	// against the wrong record the way A5's close_parent note was.
+	cases := []struct {
+		name    string
+		client  *eoFakeDocumenta
+		wantErr string
+		// creates is how many CreateFolder calls the failure should leave.
+		creates int
+	}{
+		{
+			name:    "the anchor folder cannot be created",
+			client:  &eoFakeDocumenta{createErr: errors.New("documenta: request failed (503)"), createErrFrom: 1},
+			wantErr: "503",
+			creates: 1,
+		},
+		{
+			// The anchor is made first, so only failing the SECOND call
+			// reaches the record folder's own failure.
+			name:    "the record folder cannot be created",
+			client:  &eoFakeDocumenta{createErr: errors.New("documenta: request failed (507)"), createErrFrom: 2},
+			wantErr: "507",
+			creates: 2,
+		},
+		{
+			name:    "the workspace cannot be listed, so the anchor cannot be resolved",
+			client:  &eoFakeDocumenta{listErr: errors.New("documenta: dial tcp: connection refused")},
+			wantErr: "connection refused",
+			creates: 0, // nothing is created on a listing failure — see the retry test
+		},
+		{
+			name:    "documenta answers with a blank id for the anchor",
+			client:  &eoFakeDocumenta{emptyIDFrom: 1},
+			wantErr: `empty folder id for "Directive"`,
+			creates: 1,
+		},
+		{
+			name:    "documenta answers with a blank id for the record folder",
+			client:  &eoFakeDocumenta{emptyIDFrom: 2},
+			wantErr: "empty folder id for EO-DIR-",
+			creates: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := eoFoldersFixture(t, tc.client)
+
+			rec, err := eoCreateForFolder(t, f, "Directive one")
+			if err != nil {
+				t.Fatalf("create failed on a Documenta failure: %v; the decision is that the record survives", err)
+			}
+			if rec.DocumentaFolderID != "" {
+				t.Errorf("documenta_folder_id = %q, want empty: there is no folder", rec.DocumentaFolderID)
+			}
+			if len(f.records.created) != 1 {
+				t.Fatalf("records created = %d, want the record to be written anyway", len(f.records.created))
+			}
+			if saved := f.records.created[0]; saved.Reference == "" || saved.DocumentaFolderID != "" {
+				t.Errorf("inserted row = {reference:%q folder:%q}, want a referenced record with no folder", saved.Reference, saved.DocumentaFolderID)
+			}
+			if len(tc.client.creates) != tc.creates {
+				t.Errorf("CreateFolder calls = %d (%+v), want %d", len(tc.client.creates), tc.client.creates, tc.creates)
+			}
+
+			notes := eoFolderNotes(f.records.history)
+			if len(notes) != 1 {
+				t.Fatalf("folder-failure history rows = %d, want exactly 1: %+v", len(notes), f.records.history)
+			}
+			note := notes[0]
+			// On the record it happened to — the A5 lesson.
+			if note.RecordID != rec.ID || note.RecordTypeID != rec.RecordTypeID {
+				t.Errorf("note is on %s/%s, want the record it happened to, %s/%s", note.RecordID, note.RecordTypeID, rec.ID, rec.RecordTypeID)
+			}
+			// Operators find the affected record by its reference, so the note
+			// has to name it, and it has to carry the reason.
+			if !strings.Contains(note.Comment, rec.Reference) {
+				t.Errorf("note %q does not name the record %q", note.Comment, rec.Reference)
+			}
+			if !strings.Contains(note.Comment, tc.wantErr) {
+				t.Errorf("note %q does not carry the failure %q", note.Comment, tc.wantErr)
+			}
+			if !note.IsSystemAction {
+				t.Errorf("note is not marked a system action; nobody performed it")
+			}
+			// It must not read as a state entry, or "has this record been in
+			// state X" starts counting a folder failure as a transition.
+			if note.ToStateID != nil || note.FromStateID != nil {
+				t.Errorf("note carries states %v -> %v, want none", note.FromStateID, note.ToStateID)
+			}
+			// And the creation row is still there, unchanged.
+			if len(f.records.history) != 2 {
+				t.Errorf("history rows = %d, want the creation row and the note", len(f.records.history))
+			}
+		})
+	}
+}
+
+func TestNoDuplicateFolderOnRetry(t *testing.T) {
+	t.Run("a second record reuses the anchor instead of making another", func(t *testing.T) {
+		client := &eoFakeDocumenta{}
+		f := eoFoldersFixture(t, client)
+
+		first, err := eoCreateForFolder(t, f, "Directive one")
+		if err != nil {
+			t.Fatalf("create 1: %v", err)
+		}
+		second, err := eoCreateForFolder(t, f, "Directive two")
+		if err != nil {
+			t.Fatalf("create 2: %v", err)
+		}
+		if len(client.creates) != 3 {
+			t.Fatalf("CreateFolder calls = %+v, want 3 (one anchor, two records)", client.creates)
+		}
+		anchors := 0
+		for _, c := range client.creates {
+			if c.parent == "" {
+				anchors++
+			}
+		}
+		if anchors != 1 {
+			t.Errorf("root-level folders created = %d, want exactly 1 anchor", anchors)
+		}
+		if first.DocumentaFolderID == second.DocumentaFolderID {
+			t.Errorf("both records got folder %q; each record owns its own", first.DocumentaFolderID)
+		}
+		// The anchor is resolved once per type and remembered, so the second
+		// create does not list the workspace root again.
+		if len(client.lists) != 1 {
+			t.Errorf("ListFiles calls = %d, want 1: the anchor is resolved once per type", len(client.lists))
+		}
+	})
+
+	t.Run("a restarted process adopts the anchor that is already there", func(t *testing.T) {
+		// The decoy FILE is listed first, and shares the anchor's name: an
+		// anchor lookup that matched on name alone would adopt it and file
+		// every record of this type under a file id.
+		client := &eoFakeDocumenta{root: []storage.DmsFile{
+			{UUID: "a-file", Name: "Directive", Type: "file"},
+			{UUID: "existing-anchor", Name: "Directive", Type: "folder"},
+		}}
+		f := eoFoldersFixture(t, client)
+
+		rec, err := eoCreateForFolder(t, f, "Directive one")
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(client.creates) != 1 {
+			t.Fatalf("CreateFolder calls = %+v, want 1: the anchor already exists", client.creates)
+		}
+		if client.creates[0].parent != "existing-anchor" {
+			t.Errorf("record folder parent = %q, want the anchor already in the workspace", client.creates[0].parent)
+		}
+		if rec.DocumentaFolderID != "folder-1" {
+			t.Errorf("documenta_folder_id = %q, want the id of the one folder that was created", rec.DocumentaFolderID)
+		}
+	})
+
+	t.Run("a transient listing failure creates nothing at all", func(t *testing.T) {
+		// This is the trap EnsureFolder walks into: it swallows its ListFiles
+		// error and falls through to create, and the EO client has no Redis
+		// tier to short-circuit it, so a flapping Documenta would leave one
+		// orphan anchor per failed create and split the tree. Here the error
+		// is returned, and the NEXT create — once Documenta answers again —
+		// adopts the anchor that was there all along.
+		client := &eoFakeDocumenta{listErr: errors.New("documenta: connection refused")}
+		f := eoFoldersFixture(t, client)
+
+		if _, err := eoCreateForFolder(t, f, "Directive one"); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(client.creates) != 0 {
+			t.Fatalf("CreateFolder calls = %+v, want none: a failed listing says nothing about what exists", client.creates)
+		}
+
+		client.listErr = nil
+		client.root = []storage.DmsFile{{UUID: "existing-anchor", Name: "Directive", Type: "folder"}}
+		rec, err := eoCreateForFolder(t, f, "Directive two")
+		if err != nil {
+			t.Fatalf("create after recovery: %v", err)
+		}
+		if len(client.creates) != 1 || client.creates[0].parent != "existing-anchor" {
+			t.Errorf("after recovery CreateFolder calls = %+v, want one record folder under the existing anchor", client.creates)
+		}
+		if rec.DocumentaFolderID == "" {
+			t.Errorf("the recovered create got no folder")
+		}
+	})
+}
+
+func TestEOFolderNamesAreLegibleAndBounded(t *testing.T) {
+	// 120 is written out rather than taken from eoFolderNameMax: a test that
+	// derives its expectation from the constant moves with it and would hold
+	// any new limit, however wrong, in place.
+	long := strings.Repeat("ت", 400)
+	cases := []struct {
+		name string
+		rec  models.EORecord
+		want string
+	}{
+		{
+			name: "reference and english subject",
+			rec:  models.EORecord{Reference: "EO-DIR-2026-001", SubjectAr: "توجيه", SubjectEn: "Safety directive"},
+			want: "EO-DIR-2026-001 - Safety directive",
+		},
+		{
+			name: "arabic subject when there is no english one",
+			rec:  models.EORecord{Reference: "EO-DIR-2026-002", SubjectAr: "توجيه"},
+			want: "EO-DIR-2026-002 - توجيه",
+		},
+		{
+			name: "the reference alone when there is no subject",
+			rec:  models.EORecord{Reference: "EO-DIR-2026-003"},
+			want: "EO-DIR-2026-003",
+		},
+		{
+			name: "a long subject is clipped on a rune boundary",
+			rec:  models.EORecord{Reference: "EO-DIR-2026-004", SubjectEn: long},
+			want: "EO-DIR-2026-004 - " + strings.Repeat("ت", 120) + "…",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := eoRecordFolderName(&tc.rec); got != tc.want {
+				t.Errorf("eoRecordFolderName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("the anchor falls back to the type key when the name is blank", func(t *testing.T) {
+		if got := eoAnchorFolderName(&models.EORecordType{Key: "eo_directive", Name: "  "}); got != "eo_directive" {
+			t.Errorf("eoAnchorFolderName() = %q, want the key", got)
+		}
+		if got := eoAnchorFolderName(&models.EORecordType{Key: "eo_directive", Name: "Directive"}); got != "Directive" {
+			t.Errorf("eoAnchorFolderName() = %q, want the name", got)
+		}
+	})
+}
+
+// TestEOFolderCallCarriesTheActingUserAndWorkspace drives the REAL HTTP client
+// against an httptest server, because the two things it checks are only
+// observable on the wire: X-On-Behalf-Of is set from a context value whose key
+// is unexported, and the workspace reaches Documenta inside the request body.
+// Without the first, every EO folder is owned by system@automax.local and the
+// Documenta audit trail cannot say who filed what.
+func TestEOFolderCallCarriesTheActingUserAndWorkspace(t *testing.T) {
+	type seen struct {
+		onBehalf  string
+		workspace string
+	}
+	var got []seen
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/oauth/token"):
+			// Not a JWT, so the client resolves no workspace_uuid claim and
+			// falls back to the per-call workspace name — which is the only
+			// way EO_DOCUMENTA_WORKSPACE_NAME can reach Documenta at all.
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"access_token":"opaque-token","expires_in":3600}`)
+		case strings.HasSuffix(r.URL.Path, "/files/folder"):
+			var body map[string]string
+			json.NewDecoder(r.Body).Decode(&body)
+			got = append(got, seen{onBehalf: r.Header.Get("X-On-Behalf-Of"), workspace: body["workspaceUuid"]})
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"success":true,"data":{"uuid":"real-folder"}}`)
+		case strings.HasSuffix(r.URL.Path, "/files"):
+			got = append(got, seen{onBehalf: r.Header.Get("X-On-Behalf-Of"), workspace: r.URL.Query().Get("workspace")})
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"success":true,"data":{"files":[]}}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client := storage.NewHTTPDocumentaClient(config.DocumentaConfig{
+		BaseURL: srv.URL, ClientID: "eo", ClientSecret: "secret", WorkspaceName: "ignored-by-the-constructor",
+	}, nil)
+
+	f := eoNewSvcFixture(t)
+	f.actor.Email = "eo.officer@example.gov"
+	f.svc = NewEORecordService(f.records, f.types, f.sequences, f.workflows,
+		EOWithDocumentaFolders(client, "eo-workspace"))
+
+	rec, err := eoCreateForFolder(t, f, "Directive one")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if rec.DocumentaFolderID != "real-folder" {
+		t.Errorf("documenta_folder_id = %q, want the id the server returned", rec.DocumentaFolderID)
+	}
+	if len(got) == 0 {
+		t.Fatalf("the server saw no folder requests")
+	}
+	for i, g := range got {
+		if g.onBehalf != f.actor.Email {
+			t.Errorf("request %d X-On-Behalf-Of = %q, want the acting user %q", i, g.onBehalf, f.actor.Email)
+		}
+		if g.workspace != "eo-workspace" {
+			t.Errorf("request %d workspace = %q, want the per-call workspace name %q", i, g.workspace, "eo-workspace")
+		}
 	}
 }
