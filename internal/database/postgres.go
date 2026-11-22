@@ -150,8 +150,8 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		&models.MOMRAStatusMapping{},
 		// EO platform models (parents before children). EORecord is NOT listed:
 		// it is created by raw SQL as a partitioned table, by
-		// migrations.MigrateEOPlatform below, which also creates eo_timers.
-		// EOEscalationEvent is declared but has no table yet.
+		// migrations.MigrateEOPlatform below, which also creates eo_timers and
+		// eo_escalation_events.
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},

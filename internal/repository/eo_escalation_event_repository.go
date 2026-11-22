@@ -43,8 +43,8 @@ func (r *eoEscalationEventRepository) Record(ctx context.Context, ev *models.EOE
 
 func (r *eoEscalationEventRepository) ListForRecord(ctx context.Context, recordID uuid.UUID) ([]models.EOEscalationEvent, error) {
 	var out []models.EOEscalationEvent
-	if err := r.db.WithContext(ctx).Where("record_id = ?", recordID).
-		Order("breached_at, step_index").Find(&out).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("eo_escalation_events.record_id = ?", recordID).
+		Order("eo_escalation_events.breached_at, eo_escalation_events.step_index").Find(&out).Error; err != nil {
 		return nil, fmt.Errorf("list escalation events: %w", err)
 	}
 	return out, nil

@@ -42,6 +42,8 @@ type eoEscalationPayload struct {
 // deadline would fire at once. DelayHours is hours and has no unit field, so a
 // step cannot be placed less than an hour apart from another.
 //
+// A terminal state schedules nothing.
+//
 // Inside a transition, timers must be the transaction-bound handle
 // (EORecordRepository.Transaction hands one out), so that a transition that
 // rolls back leaves no timer behind.
@@ -50,7 +52,8 @@ func ScheduleStateSLA(ctx context.Context, rec *models.EORecord, state *models.W
 		return errors.New("schedule state sla: record, state and timer repository are required")
 	}
 	sla := state.SLADuration()
-	if sla <= 0 || state.EscalationPolicyID == nil {
+	// A terminal state closes the record, and a closed record does not escalate.
+	if IsTerminal(state) || sla <= 0 || state.EscalationPolicyID == nil {
 		return nil
 	}
 	policy := state.EscalationPolicy

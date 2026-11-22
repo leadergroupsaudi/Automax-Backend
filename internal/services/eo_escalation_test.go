@@ -207,6 +207,7 @@ func TestEscalationLadderStepsInOrder(t *testing.T) {
 // ── the handler ─────────────────────────────────────────────────────────────
 
 type eoFakeEventStore struct {
+	repository.EOEscalationEventRepository
 	mu     sync.Mutex
 	events []models.EOEscalationEvent
 	err    error
@@ -227,10 +228,6 @@ func (f *eoFakeEventStore) Record(_ context.Context, ev *models.EOEscalationEven
 	}
 	f.events = append(f.events, *ev)
 	return true, nil
-}
-
-func (f *eoFakeEventStore) ListForRecord(context.Context, uuid.UUID) ([]models.EOEscalationEvent, error) {
-	return f.events, nil
 }
 
 type eoFakeRecordLookup struct {
@@ -350,11 +347,11 @@ func (f *eoFakePolicies) FindByID(context.Context, uuid.UUID) (*models.Escalatio
 
 // eoSLAWiredFixture is the transition fixture with SLA clocks switched on: the
 // "review" state has a 3-day SLA and a three-step policy.
-func eoSLAWiredFixture(t *testing.T) (*eoTxFixture, *eoSLATimers, *eoFakePolicies) {
+func eoSLAWiredFixture(t *testing.T) (*eoTxFixture, *eoSLAStatefulTimers, *eoFakePolicies) {
 	t.Helper()
 	eoSLAFreezeClock(t)
 	f := eoNewTxFixture(t)
-	timers := &eoSLATimers{}
+	timers := &eoSLAStatefulTimers{}
 	f.records.txTimers = timers
 	sla := eoSLAState(eoSLAInt(3), "days", 0, 96, 264)
 	policies := &eoFakePolicies{policy: sla.EscalationPolicy}
@@ -375,16 +372,21 @@ func TestTransitionStartsTheEnteredStatesSLAClockOnTheTransactionHandle(t *testi
 	if _, err := f.run("submit", f.actor, models.EOTransitionInput{Values: map[string]any{"he_reason": "r", "priority": "p"}}); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if len(timers.scheduled) != 3 {
-		t.Fatalf("scheduled %d timers entering a state with a three-step ladder, want 3", len(timers.scheduled))
+	if len(timers.timers) != 3 {
+		t.Fatalf("scheduled %d timers entering a state with a three-step ladder, want 3", len(timers.timers))
 	}
-	for _, tm := range timers.scheduled {
+	for _, tm := range timers.timers {
 		if tm.RecordID != f.rec.ID {
 			t.Errorf("timer for record %s, want %s", tm.RecordID, f.rec.ID)
 		}
 	}
-	if len(timers.cancelled) != 1 || timers.cancelled[0] != EOEscalationCapabilityKey {
-		t.Errorf("cancelled = %v, want the previous state's escalation timers only", timers.cancelled)
+	if len(timers.cancelCalls) != 1 || timers.cancelCalls[0] != EOEscalationCapabilityKey {
+		t.Errorf("cancelled = %v, want the previous state's escalation timers only", timers.cancelCalls)
+	}
+	// Order matters: cancel-then-schedule leaves the new state's clock running;
+	// schedule-then-cancel would destroy the timers just scheduled.
+	if got := len(timers.pending()); got != 3 {
+		t.Errorf("%d timers pending after the transition, want the entered state's 3", got)
 	}
 }
 
@@ -394,11 +396,11 @@ func TestTransitionOutOfASLAStateCancelsItsClockAndStartsNone(t *testing.T) {
 	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
 		t.Fatalf("raise: %v", err)
 	}
-	if len(timers.scheduled) != 0 {
-		t.Errorf("scheduled %d timers entering a state with no SLA, want 0", len(timers.scheduled))
+	if len(timers.timers) != 0 {
+		t.Errorf("scheduled %d timers entering a state with no SLA, want 0", len(timers.timers))
 	}
-	if len(timers.cancelled) != 1 {
-		t.Errorf("cancelled %d times, want 1: leaving the state ends its clock", len(timers.cancelled))
+	if len(timers.cancelCalls) != 1 {
+		t.Errorf("cancelled %d times, want 1: leaving the state ends its clock", len(timers.cancelCalls))
 	}
 }
 
@@ -407,8 +409,8 @@ func TestTransitionIntoATerminalStateStartsNoClock(t *testing.T) {
 	if _, err := f.run("close", f.actor, models.EOTransitionInput{Values: map[string]any{"closure_note": "done"}}); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if len(timers.scheduled) != 0 || policies.loads != 0 {
-		t.Errorf("closing scheduled %d timers (policy loads %d), want none: a closed record does not escalate", len(timers.scheduled), policies.loads)
+	if len(timers.timers) != 0 || policies.loads != 0 {
+		t.Errorf("closing scheduled %d timers (policy loads %d), want none: a closed record does not escalate", len(timers.timers), policies.loads)
 	}
 }
 
@@ -420,8 +422,8 @@ func TestTransitionFailureLeavesTheSLAClockAlone(t *testing.T) {
 	if _, err := f.run("close", f.actor, models.EOTransitionInput{}); err == nil {
 		t.Fatal("close from draft succeeded")
 	}
-	if len(timers.scheduled) != 0 || len(timers.cancelled) != 0 {
-		t.Errorf("a refused transition touched timers: scheduled %d, cancelled %d", len(timers.scheduled), len(timers.cancelled))
+	if len(timers.timers) != 0 || len(timers.cancelCalls) != 0 {
+		t.Errorf("a refused transition touched timers: scheduled %d, cancelled %d", len(timers.timers), len(timers.cancelCalls))
 	}
 }
 
@@ -451,8 +453,8 @@ func TestTransitionSkipsAMissingPolicyInsteadOfBlockingTheMove(t *testing.T) {
 	if _, err := f.run("submit", f.actor, models.EOTransitionInput{Values: map[string]any{"he_reason": "r", "priority": "p"}}); err != nil {
 		t.Fatalf("a deleted policy blocked the transition: %v", err)
 	}
-	if len(timers.scheduled) != 0 {
-		t.Errorf("scheduled %d timers from a policy that does not exist", len(timers.scheduled))
+	if len(timers.timers) != 0 {
+		t.Errorf("scheduled %d timers from a policy that does not exist", len(timers.timers))
 	}
 }
 
@@ -462,10 +464,15 @@ func TestTransitionSkipsAMissingPolicyInsteadOfBlockingTheMove(t *testing.T) {
 // transition can share one and the test can ask what is still pending.
 type eoSLAStatefulTimers struct {
 	repository.EOTimerRepository
-	timers []models.EOTimer
+	timers      []models.EOTimer
+	cancelCalls []string
+	scheduleErr error
 }
 
 func (f *eoSLAStatefulTimers) Schedule(_ context.Context, t *models.EOTimer) error {
+	if f.scheduleErr != nil {
+		return f.scheduleErr
+	}
 	c := *t
 	c.Status = models.EOTimerPending
 	f.timers = append(f.timers, c)
@@ -473,6 +480,7 @@ func (f *eoSLAStatefulTimers) Schedule(_ context.Context, t *models.EOTimer) err
 }
 
 func (f *eoSLAStatefulTimers) CancelForRecordByCapability(_ context.Context, id uuid.UUID, key string) error {
+	f.cancelCalls = append(f.cancelCalls, key)
 	for i := range f.timers {
 		if f.timers[i].RecordID == id && f.timers[i].CapabilityKey == key && f.timers[i].Status == models.EOTimerPending {
 			f.timers[i].Status = models.EOTimerCancelled
@@ -626,5 +634,18 @@ func TestTransitionOutOfTheInitialStateCancelsTheClockCreationStarted(t *testing
 		if tm.Status != models.EOTimerCancelled {
 			t.Errorf("timer status = %q, want cancelled", tm.Status)
 		}
+	}
+}
+
+func TestScheduleStateSLASchedulesNothingForATerminalState(t *testing.T) {
+	eoSLAFreezeClock(t)
+	state := eoSLAState(eoSLAInt(3), "days", 0, 96)
+	state.StateType = "terminal"
+	timers := &eoSLATimers{}
+	if err := ScheduleStateSLA(context.Background(), eoSLARecord(), state, timers); err != nil {
+		t.Fatalf("ScheduleStateSLA: %v", err)
+	}
+	if len(timers.scheduled) != 0 {
+		t.Errorf("scheduled %d timers on a terminal state, want 0", len(timers.scheduled))
 	}
 }
