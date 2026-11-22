@@ -1,8 +1,11 @@
 package services
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -89,4 +92,141 @@ func ResolveEffectiveFields(t *models.EORecordType, ancestors []models.EORecordT
 		}
 	}
 	return out, nil
+}
+
+// FormulaEvaluator evaluates a boolean expression against an environment. The
+// timeout is the implementation's concern, not part of the interface.
+type FormulaEvaluator interface {
+	EvalBool(expression string, env map[string]any) (bool, error)
+}
+
+// ValidateRecordValues checks submitted values against the effective fields
+// (spec §7.4, §7.12). It returns field key -> message; an empty map means
+// valid. The error return is for failures of the machinery itself (an
+// evaluator error, a malformed field definition), never for invalid input.
+//
+// values is the submitted payload, possibly partial. rec is the stored record,
+// or nil on create. For requiredness a field's effective value is the
+// submitted one if its key is present, else the stored one. An explicit nil
+// (or a blank string, or an empty list) is empty, exactly as an absent key
+// with nothing stored is.
+//
+// A value supplied for a derived or auto field is an error whether or not it
+// is nil; such fields are also exempt from requiredness since the system
+// fills them. A locked field (IsLockedAfterStateID in enteredStateIDs) may be
+// resubmitted unchanged, so a client can echo a whole form, but not altered.
+// enteredStateIDs is every state the record has ever entered, from history.
+func ValidateRecordValues(
+	fields []models.EOFieldDef,
+	rec *models.EORecord,
+	values map[string]any,
+	targetStateID *uuid.UUID,
+	enteredStateIDs map[uuid.UUID]bool,
+	eval FormulaEvaluator,
+) (map[string]string, error) {
+	var stored map[string]any
+	if rec != nil && len(rec.Values) > 0 {
+		if err := json.Unmarshal(rec.Values, &stored); err != nil {
+			return nil, fmt.Errorf("validate record values: decode stored values: %w", err)
+		}
+	}
+
+	errs := map[string]string{}
+	var env map[string]any // built lazily, only if a rule needs it
+
+	for _, f := range fields {
+		name := f.Label
+		if name == "" {
+			name = f.Key
+		}
+		submitted, has := values[f.Key]
+
+		if f.Provenance == models.EOProvenanceDerived || f.Provenance == models.EOProvenanceAuto {
+			if has {
+				errs[f.Key] = fmt.Sprintf("%s is set by the system and cannot be written", name)
+			}
+			continue
+		}
+
+		if has && f.IsLockedAfterStateID != nil && enteredStateIDs[*f.IsLockedAfterStateID] {
+			if !eoValuesEqual(submitted, stored[f.Key]) {
+				errs[f.Key] = fmt.Sprintf("%s can no longer be changed", name)
+				continue
+			}
+		}
+
+		effective := stored[f.Key]
+		if has {
+			effective = submitted
+		}
+		if !eoIsEmpty(effective) {
+			continue
+		}
+
+		required := false
+		switch f.RequiredMode {
+		case models.EORequiredAlways:
+			required = true
+		case models.EORequiredAtState:
+			if targetStateID != nil {
+				var ids []uuid.UUID
+				if len(f.RequiredAtStateIDs) > 0 {
+					if err := json.Unmarshal(f.RequiredAtStateIDs, &ids); err != nil {
+						return nil, fmt.Errorf("validate record values: field %q required_at_state_ids: %w", f.Key, err)
+					}
+				}
+				for _, id := range ids {
+					if id == *targetStateID {
+						required = true
+						break
+					}
+				}
+			}
+		case models.EORequiredConditional:
+			if strings.TrimSpace(f.RequiredRule) == "" {
+				return nil, fmt.Errorf("validate record values: field %q is conditional but has no required_rule", f.Key)
+			}
+			if eval == nil {
+				return nil, fmt.Errorf("validate record values: field %q needs a formula evaluator", f.Key)
+			}
+			if env == nil {
+				env = make(map[string]any, len(stored)+len(values))
+				for k, v := range stored {
+					env[k] = v
+				}
+				for k, v := range values {
+					env[k] = v
+				}
+			}
+			ok, err := eval.EvalBool(f.RequiredRule, env)
+			if err != nil {
+				return nil, fmt.Errorf("validate record values: field %q required_rule: %w", f.Key, err)
+			}
+			required = ok
+		}
+		if required {
+			errs[f.Key] = fmt.Sprintf("%s is required", name)
+		}
+	}
+	return errs, nil
+}
+
+func eoIsEmpty(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	case []any:
+		return len(x) == 0
+	}
+	return false
+}
+
+// eoValuesEqual compares two values by their JSON encoding, so a submitted
+// int and a stored float64 (as decoded from jsonb) compare equal.
+func eoValuesEqual(a, b any) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
 }
