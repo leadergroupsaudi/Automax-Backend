@@ -18,17 +18,18 @@ import (
 // monitor did with them. Claim semantics are the repository's job and are
 // tested against Postgres; this only drives the monitor.
 type eoFakeTimerRepo struct {
-	mu        sync.Mutex
-	queue     []models.EOTimer
-	fired     []uuid.UUID
-	cancelled []uuid.UUID
-	claims    int
-	claimErr  error
-	fireErr   error
-	batches   []int
-	failures  map[uuid.UUID]string
-	failedNow bool
-	released  []uuid.UUID
+	mu         sync.Mutex
+	queue      []models.EOTimer
+	fired      []uuid.UUID
+	cancelled  []uuid.UUID
+	claims     int
+	claimErr   error
+	fireErr    error
+	batches    []int
+	failures   map[uuid.UUID]string
+	failedNow  bool
+	released   []uuid.UUID
+	releasedAt []time.Time
 }
 
 func (f *eoFakeTimerRepo) Schedule(context.Context, *models.EOTimer) error { return nil }
@@ -45,12 +46,19 @@ func (f *eoFakeTimerRepo) ClaimDue(_ context.Context, _ time.Time, limit int) ([
 	if n > len(f.queue) {
 		n = len(f.queue)
 	}
-	out := f.queue[:n]
+	out := append([]models.EOTimer(nil), f.queue[:n]...)
 	f.queue = f.queue[n:]
+	now := time.Now()
+	for i := range out {
+		out[i].ClaimedAt = &now
+	}
 	return out, nil
 }
 
-func (f *eoFakeTimerRepo) MarkFired(_ context.Context, id uuid.UUID) error {
+func (f *eoFakeTimerRepo) MarkFired(ctx context.Context, id uuid.UUID) error {
+	if err := ctx.Err(); err != nil { // like a real database
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fireErr != nil {
@@ -60,7 +68,7 @@ func (f *eoFakeTimerRepo) MarkFired(_ context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (f *eoFakeTimerRepo) RecordFailure(_ context.Context, id uuid.UUID, msg string) (bool, error) {
+func (f *eoFakeTimerRepo) RecordFailure(ctx context.Context, id uuid.UUID, msg string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failures == nil {
@@ -70,10 +78,14 @@ func (f *eoFakeTimerRepo) RecordFailure(_ context.Context, id uuid.UUID, msg str
 	return f.failedNow, nil
 }
 
-func (f *eoFakeTimerRepo) Release(_ context.Context, id uuid.UUID) error {
+func (f *eoFakeTimerRepo) Release(ctx context.Context, id uuid.UUID, claimedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, id)
+	f.releasedAt = append(f.releasedAt, claimedAt)
 	return nil
 }
 
@@ -294,5 +306,54 @@ func TestTimerMonitorShutdownMidBatchReleasesTheRest(t *testing.T) {
 	}
 	if len(repo.failures) != 0 {
 		t.Error("a shutdown recorded failures")
+	}
+}
+
+// A handler that succeeds just as Stop arrives must still be recorded as fired:
+// MarkFired on the cancelled run context would fail against a real database
+// (the fake now honours the context) and leave the attempt counted.
+func TestTimerMonitorRecordsASuccessThatRacesShutdown(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	h := func(context.Context, models.EOTimer) error {
+		cancel()
+		return nil
+	}
+	err := NewEOTimerMonitor(repo, h, time.Hour).RunOnce(ctx)
+	if err != nil {
+		t.Errorf("err = %v", err)
+	}
+	if len(repo.fired) != 1 {
+		t.Fatalf("fired %d, want the finished timer recorded despite the cancelled context", len(repo.fired))
+	}
+}
+
+// Handlers run one after another, so the lease must be enforced across the
+// batch: once the budget is spent the unrun tail is released, never run.
+func TestTimerMonitorBatchBudgetStopsTheTail(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(3)}
+	ran := 0
+	m := NewEOTimerMonitor(repo, func(ctx context.Context, _ models.EOTimer) error {
+		ran++
+		<-ctx.Done()
+		return ctx.Err()
+	}, time.Hour).(*eoTimerMonitor)
+	m.budget = 20 * time.Millisecond
+	_ = m.RunOnce(context.Background())
+	if ran != 1 {
+		t.Errorf("handlers run = %d, want 1: the tail ran past the budget", ran)
+	}
+	if len(repo.released) != 2 {
+		t.Errorf("released %d, want the 2 unrun timers", len(repo.released))
+	}
+}
+
+func TestTimerMonitorReleasesWithTheClaimItWasIssued(t *testing.T) {
+	repo := &eoFakeTimerRepo{queue: eoTimers(2)}
+	ctx, cancel := context.WithCancel(context.Background())
+	h := func(context.Context, models.EOTimer) error { cancel(); return nil }
+	_ = NewEOTimerMonitor(repo, h, time.Hour).RunOnce(ctx)
+	if len(repo.released) != 1 || len(repo.releasedAt) != 1 || repo.releasedAt[0].IsZero() {
+		t.Fatalf("released %v at %v: Release must carry the claimed_at the claim returned", repo.released, repo.releasedAt)
 	}
 }

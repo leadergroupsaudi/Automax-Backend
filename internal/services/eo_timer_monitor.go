@@ -17,10 +17,17 @@ const (
 	// negative. Unlike the five-minute polls (spec §7.10) it is short, because
 	// a timer is only as punctual as the poll that finds it.
 	eoTimerDefaultInterval = 30 * time.Second
-	// eoTimerHandlerTimeout bounds one handler call to just inside the claim
-	// lease. A handler still running when the lease expires would be
-	// re-delivered and run concurrently with itself.
+	// eoTimerHandlerTimeout bounds one handler call, and eoTimerBatchBudget
+	// bounds the whole claimed batch, to just inside the claim lease. Handlers
+	// run one after another, so a per-call limit alone would let timer n of 50
+	// start long after the lease expired and another replica re-claimed it.
+	// Once the budget is spent the unrun tail is released, not run.
 	eoTimerHandlerTimeout = repository.EOTimerClaimLease - time.Minute
+	eoTimerBatchBudget    = repository.EOTimerClaimLease - time.Minute
+	// eoTimerBookkeepingTimeout bounds the writes that record an outcome. They
+	// run on a context detached from the run's, so a shutdown cannot lose the
+	// record of a timer that already fired.
+	eoTimerBookkeepingTimeout = 5 * time.Second
 	// eoTimerBatchSize is how many timers one ClaimDue call takes. RunOnce keeps
 	// claiming until a batch comes back short.
 	eoTimerBatchSize = 50
@@ -59,6 +66,7 @@ type eoTimerMonitor struct {
 	interval time.Duration
 	now      func() time.Time
 	timeout  time.Duration
+	budget   time.Duration
 
 	mu      sync.Mutex
 	running bool
@@ -72,7 +80,7 @@ func NewEOTimerMonitor(repo repository.EOTimerRepository, handler EOTimerHandler
 	if interval <= 0 {
 		interval = eoTimerDefaultInterval
 	}
-	return &eoTimerMonitor{repo: repo, handler: handler, interval: interval, now: time.Now, timeout: eoTimerHandlerTimeout}
+	return &eoTimerMonitor{repo: repo, handler: handler, interval: interval, now: time.Now, timeout: eoTimerHandlerTimeout, budget: eoTimerBatchBudget}
 }
 
 // Start runs once immediately and then every interval, until Stop or ctx is
@@ -147,18 +155,30 @@ func (m *eoTimerMonitor) RunOnce(ctx context.Context) error {
 		if err != nil {
 			return errors.Join(append(errs, err)...)
 		}
+		batchCtx, cancelBatch := context.WithTimeout(ctx, m.budget)
+		budgetSpent := false
 		for i, tm := range timers {
 			if ctx.Err() != nil {
 				// Shutting down: the rest were claimed (an attempt counted)
 				// but never run, so give them back instead of failing them.
+				cancelBatch()
 				m.release(timers[i:])
 				return errors.Join(append(errs, ctx.Err())...)
 			}
-			if err := m.fire(ctx, tm); err != nil {
+			if batchCtx.Err() != nil {
+				// The lease is nearly up: another replica may legitimately
+				// re-claim the rest. Hand them back (only while the claim is
+				// still ours, see Release) and pick them up on the next pass.
+				m.release(timers[i:])
+				budgetSpent = true
+				break
+			}
+			if err := m.fire(ctx, batchCtx, tm); err != nil {
 				errs = append(errs, err)
 			}
 		}
-		if len(timers) < eoTimerBatchSize {
+		cancelBatch()
+		if !budgetSpent && len(timers) < eoTimerBatchSize {
 			return errors.Join(errs...)
 		}
 	}
@@ -167,22 +187,36 @@ func (m *eoTimerMonitor) RunOnce(ctx context.Context) error {
 // release returns unprocessed timers on a fresh, bounded context, since the
 // run's own is already cancelled.
 func (m *eoTimerMonitor) release(timers []models.EOTimer) {
-	rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rctx, cancel := m.bookkeepingCtx(context.Background())
 	defer cancel()
 	for _, tm := range timers {
-		if err := m.repo.Release(rctx, tm.ID); err != nil {
+		if tm.ClaimedAt == nil {
+			continue
+		}
+		if err := m.repo.Release(rctx, tm.ID, *tm.ClaimedAt); err != nil {
 			log.Printf("[EOTimerMonitor] release timer %s: %v", tm.ID, err)
 		}
 	}
 }
 
-func (m *eoTimerMonitor) fire(ctx context.Context, tm models.EOTimer) error {
-	hctx, cancel := context.WithTimeout(ctx, m.timeout)
-	defer cancel()
+// bookkeepingCtx detaches from parent's cancellation but keeps a deadline.
+func (m *eoTimerMonitor) bookkeepingCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), eoTimerBookkeepingTimeout)
+}
+
+// fire runs one timer. The handler gets batchCtx (so it cannot outlive the
+// batch budget) under its own per-call timeout; every outcome write uses a
+// detached context, so a shutdown that arrives as the handler returns still
+// records the result.
+func (m *eoTimerMonitor) fire(ctx, batchCtx context.Context, tm models.EOTimer) error {
+	hctx, cancelHandler := context.WithTimeout(batchCtx, m.timeout)
+	defer cancelHandler()
 	err := m.handler(hctx, tm)
+	bctx, cancel := m.bookkeepingCtx(ctx)
+	defer cancel()
 	switch {
 	case err == nil:
-		if err := m.repo.MarkFired(ctx, tm.ID); err != nil {
+		if err := m.repo.MarkFired(bctx, tm.ID); err != nil {
 			// Cancelled while the handler ran: nothing to record.
 			if errors.Is(err, repository.ErrEOTimerNotClaimed) {
 				return nil
@@ -191,7 +225,7 @@ func (m *eoTimerMonitor) fire(ctx context.Context, tm models.EOTimer) error {
 		}
 		return nil
 	case errors.Is(err, ErrEOTimerRecordGone):
-		if cerr := m.repo.CancelForRecord(ctx, tm.RecordID); cerr != nil {
+		if cerr := m.repo.CancelForRecord(bctx, tm.RecordID); cerr != nil {
 			return fmt.Errorf("timer %s: record gone, cancel failed: %w", tm.ID, cerr)
 		}
 		return nil
@@ -202,7 +236,7 @@ func (m *eoTimerMonitor) fire(ctx context.Context, tm models.EOTimer) error {
 	default:
 		// Stays claimed and is re-delivered after the lease, until it has used
 		// its attempts, when the repository marks it failed.
-		failed, rerr := m.repo.RecordFailure(ctx, tm.ID, err.Error())
+		failed, rerr := m.repo.RecordFailure(bctx, tm.ID, err.Error())
 		if rerr != nil && !errors.Is(rerr, repository.ErrEOTimerNotClaimed) {
 			err = errors.Join(err, rerr)
 		}

@@ -46,10 +46,13 @@ type EOTimerRepository interface {
 	// after the lease. It returns whether the timer is now failed.
 	RecordFailure(ctx context.Context, id uuid.UUID, msg string) (failed bool, err error)
 	// Release hands a claimed-but-unprocessed timer back (pending, the attempt
-	// uncounted). A worker that is shutting down uses it for the timers it
+	// uncounted), but only while the caller still holds the claim: claimedAt
+	// is the claimed_at that ClaimDue returned. If the lease expired and
+	// another worker re-claimed the timer, its claimed_at differs and Release
+	// does nothing, so it can never hand a live claim to a third worker. A worker that is shutting down uses it for the timers it
 	// claimed and never ran, so an orderly stop cannot walk a healthy timer
 	// towards failed.
-	Release(ctx context.Context, id uuid.UUID) error
+	Release(ctx context.Context, id uuid.UUID, claimedAt time.Time) error
 	// CancelForRecord cancels every timer of the record that has not fired.
 	CancelForRecord(ctx context.Context, recordID uuid.UUID) error
 	// WithTx returns a repository whose every call runs on tx. Schedule and
@@ -72,10 +75,10 @@ func (r *eoTimerRepository) WithTx(tx *gorm.DB) EOTimerRepository {
 	return &eoTimerRepository{db: tx}
 }
 
-func (r *eoTimerRepository) Release(ctx context.Context, id uuid.UUID) error {
+func (r *eoTimerRepository) Release(ctx context.Context, id uuid.UUID, claimedAt time.Time) error {
 	if err := r.db.WithContext(ctx).Exec(
 		`UPDATE eo_timers SET status = 'pending', claimed_at = NULL, attempts = GREATEST(attempts - 1, 0)
-		 WHERE id = ? AND status = 'claimed'`, id).Error; err != nil {
+		 WHERE id = ? AND status = 'claimed' AND claimed_at = ?`, id, claimedAt).Error; err != nil {
 		return fmt.Errorf("release timer: %w", err)
 	}
 	return nil

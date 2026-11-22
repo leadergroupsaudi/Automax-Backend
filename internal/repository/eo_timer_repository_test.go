@@ -539,7 +539,7 @@ func TestScheduleResetsAttemptsAndReleaseGivesTheAttemptBack(t *testing.T) {
 	if len(got) != 1 || got[0].Attempts != 1 {
 		t.Fatalf("claim: %v", got)
 	}
-	if err := repo.Release(ctx, tm.ID); err != nil {
+	if err := repo.Release(ctx, tm.ID, *got[0].ClaimedAt); err != nil {
 		t.Fatal(err)
 	}
 	var attempts int
@@ -605,5 +605,49 @@ func TestTransactionHandsOutATxBoundTimerRepository(t *testing.T) {
 	db.Raw(`SELECT count(*) FROM eo_timers WHERE id = ?`, committed.ID).Scan(&n)
 	if n != 1 {
 		t.Error("a timer scheduled in a committed transaction is missing")
+	}
+}
+
+// Release must prove it still holds the claim. After the lease expires and a
+// second worker re-claims, the first worker's Release must leave the live claim
+// alone, or a third worker could claim and run the timer alongside the second.
+func TestReleaseCannotStealAReclaimedTimer(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	clock := time.Now()
+	tm := eoNewTimer(clock.Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	first := eoTimerRound(t, repo, &clock) // worker A claims
+	if len(first) != 1 {
+		t.Fatalf("A claim: %d", len(first))
+	}
+	second := eoTimerRound(t, repo, &clock) // lease expires; worker B re-claims
+	if len(second) != 1 {
+		t.Fatalf("B claim: %d", len(second))
+	}
+
+	if err := repo.Release(ctx, tm.ID, *first[0].ClaimedAt); err != nil { // A, stale
+		t.Fatal(err)
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerClaimed {
+		t.Fatalf("a stale Release returned B's live claim: status %q", s)
+	}
+	var attempts int
+	db.Raw(`SELECT attempts FROM eo_timers WHERE id = ?`, tm.ID).Scan(&attempts)
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (the stale release refunded one)", attempts)
+	}
+	if third, _ := repo.ClaimDue(ctx, clock, 10); len(third) != 0 {
+		t.Error("a third worker claimed a timer B still holds")
+	}
+
+	if err := repo.Release(ctx, tm.ID, *second[0].ClaimedAt); err != nil { // B, current
+		t.Fatal(err)
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerPending {
+		t.Errorf("the owner's Release did not work: status %q", s)
 	}
 }
