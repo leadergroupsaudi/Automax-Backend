@@ -170,6 +170,7 @@ func CapabilitiesFor(t *models.EORecordType) ([]EOEnabledCapability, error) {
 func RegisterEOCapabilities() {
 	RegisterCapability(NewEOApprovalCapability())
 	RegisterCapability(NewEODecisionsBaseCapability())
+	RegisterCapability(NewEOReferralTreeCapability())
 	eoDefaultCapabilities.seal()
 }
 
