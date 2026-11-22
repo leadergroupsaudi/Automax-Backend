@@ -30,6 +30,34 @@ type EORecordTypeRepository interface {
 	// read time and nothing is copied (spec §7.2).
 	FieldDefs(ctx context.Context, recordTypeIDs []uuid.UUID) ([]models.EOFieldDef, error)
 	GetLinkTypeByKey(ctx context.Context, key string) (*models.EOLinkType, error)
+
+	// ── the designer's writes ────────────────────────────────────────────
+	//
+	// The metamodel is configuration, not a register: these are plain soft
+	// -deleting CRUD. The GUARD RAILS of spec §7.14 (what may be changed once
+	// records exist) are models.ValidateTypeEdit's, applied by the caller
+	// BEFORE it writes — the repository does not re-check them, exactly as
+	// the record repository does not re-run field validation.
+
+	// List returns every configured record type, ordered by key.
+	List(ctx context.Context) ([]models.EORecordType, error)
+	Create(ctx context.Context, t *models.EORecordType) error
+	Update(ctx context.Context, t *models.EORecordType) error
+	// Delete soft-deletes a record type. Its field definitions are left
+	// alone: a mistaken delete stays recoverable, which is the same reason
+	// ValidateTypeEdit never removes a field's stored data.
+	Delete(ctx context.Context, id uuid.UUID) error
+
+	GetFieldDef(ctx context.Context, id uuid.UUID) (*models.EOFieldDef, error)
+	CreateFieldDef(ctx context.Context, f *models.EOFieldDef) error
+	UpdateFieldDef(ctx context.Context, f *models.EOFieldDef) error
+	DeleteFieldDef(ctx context.Context, id uuid.UUID) error
+
+	ListLinkTypes(ctx context.Context) ([]models.EOLinkType, error)
+	GetLinkTypeByID(ctx context.Context, id uuid.UUID) (*models.EOLinkType, error)
+	CreateLinkType(ctx context.Context, lt *models.EOLinkType) error
+	UpdateLinkType(ctx context.Context, lt *models.EOLinkType) error
+	DeleteLinkType(ctx context.Context, id uuid.UUID) error
 }
 
 type eoRecordTypeRepository struct {
@@ -115,4 +143,144 @@ func (r *eoRecordTypeRepository) GetLinkTypeByKey(ctx context.Context, key strin
 		return nil, nil
 	}
 	return &out[0], nil
+}
+
+// ── metamodel writes ────────────────────────────────────────────────────────
+
+func (r *eoRecordTypeRepository) List(ctx context.Context) ([]models.EORecordType, error) {
+	var out []models.EORecordType
+	if err := r.db.WithContext(ctx).
+		Model(&models.EORecordType{}).
+		Order("eo_record_types.key ASC").
+		Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("list eo record types: %w", err)
+	}
+	return out, nil
+}
+
+func (r *eoRecordTypeRepository) Create(ctx context.Context, t *models.EORecordType) error {
+	if t == nil {
+		return fmt.Errorf("create eo record type: nil record type")
+	}
+	if err := r.db.WithContext(ctx).Create(t).Error; err != nil {
+		return fmt.Errorf("create eo record type %q: %w", t.Key, err)
+	}
+	return nil
+}
+
+// Update writes every column with Save rather than a field map: the caller has
+// already built the full after-state and had models.ValidateTypeEdit pass on
+// it, so a partial write would store something nothing validated.
+func (r *eoRecordTypeRepository) Update(ctx context.Context, t *models.EORecordType) error {
+	if t == nil {
+		return fmt.Errorf("update eo record type: nil record type")
+	}
+	if err := r.db.WithContext(ctx).Save(t).Error; err != nil {
+		return fmt.Errorf("update eo record type %q: %w", t.Key, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	if err := r.db.WithContext(ctx).
+		Where("eo_record_types.id = ?", id).
+		Delete(&models.EORecordType{}).Error; err != nil {
+		return fmt.Errorf("delete eo record type %s: %w", id, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) GetFieldDef(ctx context.Context, id uuid.UUID) (*models.EOFieldDef, error) {
+	var out []models.EOFieldDef
+	if err := r.db.WithContext(ctx).
+		Where("eo_field_defs.id = ?", id).
+		Limit(1).Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("read eo field def %s: %w", id, err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+func (r *eoRecordTypeRepository) CreateFieldDef(ctx context.Context, f *models.EOFieldDef) error {
+	if f == nil {
+		return fmt.Errorf("create eo field def: nil field def")
+	}
+	if err := r.db.WithContext(ctx).Create(f).Error; err != nil {
+		return fmt.Errorf("create eo field def %q: %w", f.Key, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) UpdateFieldDef(ctx context.Context, f *models.EOFieldDef) error {
+	if f == nil {
+		return fmt.Errorf("update eo field def: nil field def")
+	}
+	if err := r.db.WithContext(ctx).Save(f).Error; err != nil {
+		return fmt.Errorf("update eo field def %q: %w", f.Key, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) DeleteFieldDef(ctx context.Context, id uuid.UUID) error {
+	if err := r.db.WithContext(ctx).
+		Where("eo_field_defs.id = ?", id).
+		Delete(&models.EOFieldDef{}).Error; err != nil {
+		return fmt.Errorf("delete eo field def %s: %w", id, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) ListLinkTypes(ctx context.Context) ([]models.EOLinkType, error) {
+	var out []models.EOLinkType
+	if err := r.db.WithContext(ctx).
+		Model(&models.EOLinkType{}).
+		Order("eo_link_types.key ASC").
+		Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("list eo link types: %w", err)
+	}
+	return out, nil
+}
+
+func (r *eoRecordTypeRepository) GetLinkTypeByID(ctx context.Context, id uuid.UUID) (*models.EOLinkType, error) {
+	var out []models.EOLinkType
+	if err := r.db.WithContext(ctx).
+		Where("eo_link_types.id = ?", id).
+		Limit(1).Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("read eo link type %s: %w", id, err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+func (r *eoRecordTypeRepository) CreateLinkType(ctx context.Context, lt *models.EOLinkType) error {
+	if lt == nil {
+		return fmt.Errorf("create eo link type: nil link type")
+	}
+	if err := r.db.WithContext(ctx).Create(lt).Error; err != nil {
+		return fmt.Errorf("create eo link type %q: %w", lt.Key, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) UpdateLinkType(ctx context.Context, lt *models.EOLinkType) error {
+	if lt == nil {
+		return fmt.Errorf("update eo link type: nil link type")
+	}
+	if err := r.db.WithContext(ctx).Save(lt).Error; err != nil {
+		return fmt.Errorf("update eo link type %q: %w", lt.Key, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) DeleteLinkType(ctx context.Context, id uuid.UUID) error {
+	if err := r.db.WithContext(ctx).
+		Where("eo_link_types.id = ?", id).
+		Delete(&models.EOLinkType{}).Error; err != nil {
+		return fmt.Errorf("delete eo link type %s: %w", id, err)
+	}
+	return nil
 }

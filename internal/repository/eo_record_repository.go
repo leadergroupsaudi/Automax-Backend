@@ -357,6 +357,9 @@ func eoOrderClause(filter *models.EORecordFilter) (string, error) {
 func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error) {
 	q = applyEORecordVisibility(q, f)
 
+	if f.RecordID != nil {
+		q = q.Where("eo_records.id = ?", *f.RecordID)
+	}
 	if len(f.RecordTypeID) > 0 {
 		q = q.Where("eo_records.record_type_id IN ?", f.RecordTypeID)
 	}

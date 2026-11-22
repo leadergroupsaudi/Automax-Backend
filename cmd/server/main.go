@@ -449,6 +449,55 @@ func main() {
 	// Wire settings repo into user service to gate login token issuance on totp_enabled
 	userService.SetSettingsRepo(settingsRepo)
 
+	// ── Executive Office (EO) platform ──────────────────────────────────
+	//
+	// The construction ORDER is forced by the graph: the action executor takes
+	// the record service and the transition service takes the action executor,
+	// so it is record service -> action executor -> transition service.
+	//
+	// The WithSLA constructors are the ones to use. The plain
+	// services.NewEORecordService / services.NewEOTransitionService delegate
+	// here with a nil escalation-policy repository, which compiles, runs, and
+	// silently never starts an SLA clock. handlers.TestEOWiringUsesSLAConstructors
+	// reads this file as text and fails if they come back.
+	// services.RegisterEOCapabilities() is called once at startup, at the top
+	// of main: it panics on a duplicate key, so it must not be called twice.
+	eoEscalationEventRepo := repository.NewEOEscalationEventRepository(db)
+	eoTimerRepo := repository.NewEOTimerRepository(db)
+	eoRecordRepo := repository.NewEORecordRepository(db)
+	eoTypeRepo := repository.NewEORecordTypeRepository(db)
+	eoSequenceRepo := repository.NewEOSequenceRepository(db)
+
+	eoRecordService := services.NewEORecordServiceWithSLA(eoRecordRepo, eoTypeRepo, eoSequenceRepo, workflowRepo, escalationPolicyRepo)
+	eoActionExecutor := services.NewEOActionExecutor(eoRecordService, eoRecordRepo, eoTypeRepo, userRepo, departmentRepo, notificationService)
+	eoTransitionService := services.NewEOTransitionServiceWithSLA(eoRecordRepo, eoTypeRepo, workflowRepo, eoActionExecutor, escalationPolicyRepo)
+
+	eoRecordHandler := handlers.NewEORecordHandler(eoRecordService, eoTransitionService, eoRecordRepo, eoTypeRepo)
+	eoRecordTypeHandler := handlers.NewEORecordTypeHandler(eoTypeRepo, eoRecordRepo)
+
+	// The timer worker's handler is the ROUTER, not the escalation handler.
+	// The escalation handler rejects every timer whose capability key is not
+	// eo.escalation, so handing it to the monitor directly would make a
+	// capability timer burn its retry budget and end up marked failed.
+	eoTimerMonitor := services.NewEOTimerMonitor(
+		eoTimerRepo,
+		services.NewEOTimerRouter(map[string]services.EOTimerHandler{
+			services.EOEscalationCapabilityKey: services.NewEOEscalationHandler(eoEscalationEventRepo, eoRecordRepo),
+		}),
+		eoTimerInterval(),
+	)
+	// The worker runs OUTSIDE the HTTP path, so the licence middleware on the
+	// route groups does not reach it: it asks the licence service itself.
+	// This is read once, at startup — activating the feature on a running
+	// server starts serving the routes immediately but does not start the
+	// timer worker until the next restart.
+	if licenseService.IsEnabled() && !licenseService.IsFeatureLicensed(string(licensing.FeatureEOPlatform)) {
+		log.Printf("EO platform: %s is not licensed, the durable-timer worker is not started", licensing.FeatureEOPlatform)
+	} else {
+		eoTimerMonitor.Start(ctx)
+		defer eoTimerMonitor.Stop()
+	}
+
 	// Initialize GIS handler
 	gisService := services.NewGISService()
 	gisHandler := handlers.NewGISHandler(gisService)
@@ -723,8 +772,25 @@ func main() {
 	queries.Delete("/:id/attachments/:attachment_id", authMiddleware.RequirePermission("queries:update"), incidentHandler.DeleteAttachment)
 	queries.Get("/:id/revisions", authMiddleware.RequirePermission("queries:view"), incidentHandler.ListRevisions)
 
+	// Executive Office records. The route SET and its ORDER live in
+	// handlers.EORecordHandler.RegisterRoutes, not here: Fiber matches in
+	// registration order, so /eo-records/my-assigned must be registered
+	// before /eo-records/:id, and handlers.TestEORecordRoutesOrderStaticBeforeParam
+	// registers that same function on a bare app to prove it still is.
+	eoRecords := v1.Group("/eo-records", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)))
+	eoRecordHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission)
+
 	// Admin routes
 	admin := v1.Group("/admin", authMiddleware.Authenticate(), licenseMiddleware.LicenseGate())
+
+	// Executive Office record-type designer: types, their field definitions
+	// and the link types between them, all behind eo:types:manage.
+	eoRecordTypes := admin.Group("/eo-record-types", licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)), middleware.ActionLogger(middleware.ActionLoggerConfig{
+		Enabled:     true,
+		LogService:  actionLogService,
+		SkipMethods: []string{"GET"},
+	}))
+	eoRecordTypeHandler.RegisterRoutes(eoRecordTypes, authMiddleware.RequirePermission)
 
 	// User management (action logging handled by service layer for detailed old/new values)
 	usersGroup := admin.Group("/users")
@@ -1678,4 +1744,22 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 		"success": false,
 		"error":   message,
 	})
+}
+
+// eoTimerInterval is how often the EO durable-timer worker polls for due
+// timers, from EO_TIMER_INTERVAL_SECONDS. It is deliberately short next to the
+// five-minute incident sweeps: a timer is only as punctual as the poll that
+// finds it. A zero or unreadable value leaves the monitor's own default.
+func eoTimerInterval() time.Duration {
+	const def = 30 * time.Second
+	v := os.Getenv("EO_TIMER_INTERVAL_SECONDS")
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("Warning: invalid EO_TIMER_INTERVAL_SECONDS=%q, using default %s", v, def)
+		return def
+	}
+	return time.Duration(n) * time.Second
 }

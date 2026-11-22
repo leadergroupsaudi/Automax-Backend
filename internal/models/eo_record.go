@@ -226,6 +226,12 @@ type EORecordFilter struct {
 	Page    int    `query:"page" json:"page" validate:"omitempty,min=1"`
 	Limit   int    `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`
 
+	// RecordID narrows the register to ONE record. It is how a single-record
+	// read (GET /eo-records/:id) asks the §7.11 visibility rule about that
+	// record instead of re-implementing it: the rule lives in exactly one
+	// WHERE clause and a second copy would drift. Handler-set only.
+	RecordID *uuid.UUID `query:"-" json:"-"`
+
 	// Set by the handler. VisibleToDepartmentIDs are the bodies the caller
 	// belongs to; UserID is the caller, who always sees records they created;
 	// IsAdmin bypasses row-level visibility.
