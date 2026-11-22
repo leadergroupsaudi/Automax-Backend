@@ -295,8 +295,11 @@ type eoReadCap struct {
 
 func (c *eoReadCap) Key() string { return eoReadCapKey }
 
-// reach exercises all four reader methods, so every one of them is proved
-// against the handle the engine chose.
+// reach exercises EVERY reader method, so every one of them is proved against
+// the handle the engine chose. Keep it total: a method added to
+// EOCapabilityReader and not called here is a method whose binding nothing
+// checks on any pipeline — which is what happened when Task B2 added
+// RecordsOfType and this comment went on claiming four.
 func (c *eoReadCap) reach(ctx context.Context, hook string, read EOCapabilityReader, rec *models.EORecord) (int, error) {
 	if c.readsBy == nil {
 		c.readsBy = map[string]int{}
@@ -318,6 +321,9 @@ func (c *eoReadCap) reach(ctx context.Context, hook string, read EOCapabilityRea
 		return 0, err
 	}
 	if _, err := read.RecordType(ctx, c.childTypeKey); err != nil {
+		return 0, err
+	}
+	if _, err := read.RecordsOfType(ctx, c.childTypeKey); err != nil {
 		return 0, err
 	}
 	c.readsBy[hook] = len(kids)
@@ -387,6 +393,11 @@ func (r eoReadPooledRecords) Children(ctx context.Context, parentID uuid.UUID, r
 func (r eoReadPooledRecords) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.EORecord, error) {
 	r.note("GetAnyByID")
 	return r.eoSvcRecordRepo.GetAnyByID(ctx, id)
+}
+
+func (r eoReadPooledRecords) RecordsOfType(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	r.note("RecordsOfType")
+	return r.eoSvcRecordRepo.RecordsOfType(ctx, recordTypeID)
 }
 
 func (r eoReadPooledRecords) LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
@@ -500,6 +511,13 @@ func TestCapabilityReadsGoThroughTheTransactionBoundHandle(t *testing.T) {
 		if f.records.linksInTx != f.records.linksTotal {
 			t.Errorf("link reads: %d of %d went through the transaction",
 				f.records.linksInTx, f.records.linksTotal)
+		}
+		if f.records.recordsOfTypeTotal == 0 {
+			t.Error("the probe never took the type-scoped read, so nothing here proves where it would have gone")
+		}
+		if f.records.recordsOfTypeInTx != f.records.recordsOfTypeTotal {
+			t.Errorf("type-scoped reads: %d of %d went through the transaction — the rest loaded a whole record type on a second pooled connection while this one holds a row lock",
+				f.records.recordsOfTypeInTx, f.records.recordsOfTypeTotal)
 		}
 	})
 

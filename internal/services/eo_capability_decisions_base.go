@@ -86,6 +86,17 @@ const eoDecisionsBaseVisibleToKey = "visible_to"
 // bites wants a narrower taxonomy, not a bigger number.
 const eoDecisionsBaseDefaultMaxRefs = 50
 
+// eoDecisionsBaseForbiddenTargets are values keys this capability may never
+// own, whatever a configuration says. The matrix puts a USER dropdown beside
+// the list written here — how the draft sits against what was pulled up — and
+// the client reserved that judgement for a person. A config naming it as
+// target_key would have the engine both write it and RESERVE it against the
+// very officer who is supposed to fill it. Today such a config is caught only
+// by accident, because the pilot seed declares that dropdown as a field
+// definition and eoCapabilitiesCheckConfig refuses a declared reserved key —
+// an accident in another task's file. The rule belongs here.
+var eoDecisionsBaseForbiddenTargets = []string{"conflict_verdict"}
+
 type eoDecisionsBaseConfig struct {
 	// BaseTypeKey is the record type of the standing base. Required: a
 	// capability with no base would read nothing.
@@ -157,6 +168,11 @@ func (c *eoDecisionsBaseCapability) parse(cfg datatypes.JSON) (eoDecisionsBaseCo
 	}
 	if out.TargetKey == out.SubjectKey {
 		return out, fmt.Errorf("decisions_base: target_key %q is also the subject_key; the capability owns the target, so the officer could never fill it", out.TargetKey)
+	}
+	for _, forbidden := range eoDecisionsBaseForbiddenTargets {
+		if out.TargetKey == forbidden {
+			return out, fmt.Errorf("decisions_base: target_key %q is the officer's own judgement to record; the capability pulls up what bears on the subject and judges nothing", out.TargetKey)
+		}
 	}
 	if out.StandingKey == "" && len(out.StandingValues) > 0 {
 		return out, fmt.Errorf("decisions_base: standing_values are given with no standing_key to read them from")
@@ -260,6 +276,10 @@ func (c *eoDecisionsBaseCapability) ReservedKeys(cfg datatypes.JSON) ([]string, 
 // eoDecisionsBaseTerms reads one values entry as a set of subject terms,
 // trimmed and case-folded. A single term may be stored unwrapped; anything
 // that is not a string is not a term.
+//
+// The list case is []any and not also []string on purpose: every caller feeds
+// this eoDecodeValues output, and json.Unmarshal into a map[string]any yields
+// []any. A []string case would be a branch nothing can reach.
 func eoDecisionsBaseTerms(raw any) map[string]bool {
 	out := map[string]bool{}
 	add := func(v any) {
@@ -276,10 +296,6 @@ func eoDecisionsBaseTerms(raw any) map[string]bool {
 	case string:
 		add(x)
 	case []any:
-		for _, v := range x {
-			add(v)
-		}
-	case []string:
 		for _, v := range x {
 			add(v)
 		}

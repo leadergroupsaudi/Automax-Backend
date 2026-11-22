@@ -672,8 +672,18 @@ findable but does not make them questions; these are the questions.
   `visible_to`, and nothing else; the residual is stated in
   `eo_capability_decisions_base.go` and in the Task B2 report. **Nothing in
   the pilot carries `visible_to` except Referral, so that guard excludes
-  nothing today** — it exists so the answer does not have to be revisited if
-  the client marks part of the base confidential.
+  nothing today.** It is FORWARD COMPATIBILITY, not live protection, and it is
+  incomplete on purpose: **the day any Decision Record carries `visible_to`,
+  the exclusion silently shrinks a statutory base.** It drops the record for
+  every reader — including an officer fully entitled to read it — and nothing
+  records that anything was withheld, so the officer's `conflict_verdict`
+  would be judged against a base the platform truncated without saying so. The
+  output looks complete, which makes it harder to see than a plain no-match.
+  So on that day the derivation must either **record that references were
+  withheld — a second reserved key, written beside the list** — or this
+  decision reopens. Whoever first marks part of the base confidential owns
+  that; it is not a thing to discover afterwards from a verdict that was
+  recorded against half a register.
 - **`EOCapabilityReader.Children` resolves the record type key on every call**
   (`GetByKey` then `Children`). A referral-tree recursion therefore issues one
   `GetByKey` per node for a key it resolved at the root. Inside a transaction

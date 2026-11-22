@@ -113,6 +113,16 @@ func (f *eoSvcRecordRepo) Children(_ context.Context, parentID uuid.UUID, record
 	return out, nil
 }
 
+func (f *eoSvcRecordRepo) RecordsOfType(_ context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	var out []models.EORecord
+	for _, rec := range f.stored {
+		if rec.RecordTypeID == recordTypeID {
+			out = append(out, *rec)
+		}
+	}
+	return out, nil
+}
+
 func (f *eoSvcRecordRepo) CreateLink(_ context.Context, link *models.EORecordLink) error {
 	f.createdLinks = append(f.createdLinks, *link)
 	return nil

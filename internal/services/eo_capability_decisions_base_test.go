@@ -131,6 +131,15 @@ func eoDecBaseRefs(t *testing.T, derived map[string]any, target string, base []m
 	return out
 }
 
+func eoDecBaseHas(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 func eoDecBaseKeys(m map[string]any) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -152,7 +161,9 @@ func TestDecisionsBasePopulatesRelatedRefs(t *testing.T) {
 	restricted := uuid.New().String()
 	base := []models.EORecord{
 		eoDecBaseRec(t, "DEC-2026-001", map[string]any{"keywords": []string{"water_tariff", "utilities"}, "standing": "in_force"}),
-		eoDecBaseRec(t, "DEC-2026-002", map[string]any{"keywords": []string{"roads"}, "standing": "in_force"}),
+		// A list with a number in it: jsonb holds whatever was written, and a
+		// non-string is not a term — but it must not poison the terms beside it.
+		eoDecBaseRec(t, "DEC-2026-002", map[string]any{"keywords": []any{"roads", 7}, "standing": "in_force"}),
 		// Case and surrounding space are the officer's typing, not a
 		// different subject.
 		eoDecBaseRec(t, "DEC-2026-003", map[string]any{"keywords": []string{" Water_Tariff "}, "standing": "in_force"}),
@@ -242,6 +253,31 @@ func TestDecisionsBasePopulatesRelatedRefs(t *testing.T) {
 		}
 		if refs := eoDecBaseRefs(t, got, "related_refs", base); !reflect.DeepEqual(refs, []string{"DEC-2026-001"}) {
 			t.Errorf("related_refs = %v, want the first match only", refs)
+		}
+	})
+
+	// The standing filter is OPTIONAL, and "no filter" is a documented mode
+	// on a statutory register: a base whose records are all in force, or one
+	// whose standing is recorded somewhere this capability cannot read. The
+	// branch is three lines, and three lines nothing runs are three lines
+	// nobody has checked.
+	t.Run("with no standing filter, every record of the base is standing", func(t *testing.T) {
+		read := &eoDecBaseReader{base: map[string][]models.EORecord{eoDecBaseTypeKey: base}}
+		rec := eoDecBaseRec(t, "DRF-2026-014", map[string]any{"keywords": []string{"water_tariff"}})
+		got, err := capability.Derive(ctx, read, &rec, eoDecBaseConfig(t, map[string]any{
+			"base_type_key": eoDecBaseTypeKey,
+			"subject_key":   "keywords",
+		}))
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		// The superseded decision and the one with no standing at all now
+		// come too — that is what "no standing filter" means. The RESTRICTED
+		// one (DEC-2026-005) still does not: confidentiality is not part of
+		// the standing filter and must not switch off with it.
+		want := []string{"DEC-2026-001", "DEC-2026-003", "DEC-2026-004", "DEC-2026-007"}
+		if refs := eoDecBaseRefs(t, got, "related_refs", base); !reflect.DeepEqual(refs, want) {
+			t.Errorf("related_refs = %v, want %v", refs, want)
 		}
 	})
 
@@ -362,21 +398,49 @@ func TestDecisionsBaseNeverWritesTheVerdict(t *testing.T) {
 	// eo_capability_test.go. The behavioural test above can only catch a write
 	// on the paths it drives; this catches the key being named at all —
 	// including on a path nothing yet calls.
-	t.Run("the capability's source never names the verdict", func(t *testing.T) {
+	t.Run("the capability's source names the verdict once, to refuse it", func(t *testing.T) {
 		const src = "eo_capability_decisions_base.go"
+		const denyList = "eoDecisionsBaseForbiddenTargets"
 		fset := token.NewFileSet()
 		file, err := parser.ParseFile(fset, src, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", src, err)
 		}
+		// Every string literal of the deny-list declaration, by position: the
+		// one place the engine is allowed to name a key it must never write,
+		// because naming it there is how it is refused.
+		refusals := map[token.Pos]bool{}
+		var denied []string
+		ast.Inspect(file, func(n ast.Node) bool {
+			spec, ok := n.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			for i, name := range spec.Names {
+				if name.Name != denyList || i >= len(spec.Values) {
+					continue
+				}
+				ast.Inspect(spec.Values[i], func(n ast.Node) bool {
+					if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						refusals[lit.Pos()] = true
+						denied = append(denied, lit.Value)
+					}
+					return true
+				})
+			}
+			return true
+		})
+		if !eoDecBaseHas(denied, `"conflict_verdict"`) {
+			t.Errorf("%s = %v; the key the client reserved for a person must be refused by name, not left to another file's field definitions", denyList, denied)
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			lit, ok := n.(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
+			if !ok || lit.Kind != token.STRING || refusals[lit.Pos()] {
 				return true
 			}
 			if strings.Contains(strings.ToLower(lit.Value), "verdict") {
-				t.Errorf("%s names %s in code at %s; conflict_verdict is the officer's judgement and the engine must not reach it",
-					src, lit.Value, fset.Position(lit.Pos()))
+				t.Errorf("%s names %s in code at %s, outside %s; conflict_verdict is the officer's judgement and the engine must not reach it",
+					src, lit.Value, fset.Position(lit.Pos()), denyList)
 			}
 			return true
 		})
@@ -432,6 +496,14 @@ func TestDecisionsBaseIsEmptyWhenNothingMatches(t *testing.T) {
 				eoDecBaseRec(t, "DEC-2026-001", map[string]any{"keywords": []string{"water_tariff"}, "standing": "in_force"}),
 			},
 			draft: map[string]any{"keywords": []string{"  ", ""}},
+			reads: 0,
+		},
+		{
+			name: "a draft whose terms are not strings at all",
+			base: []models.EORecord{
+				eoDecBaseRec(t, "DEC-2026-001", map[string]any{"keywords": []string{"water_tariff"}, "standing": "in_force"}),
+			},
+			draft: map[string]any{"keywords": []any{42, nil, true}},
 			reads: 0,
 		},
 	} {
@@ -507,6 +579,9 @@ func TestDecisionsBaseConfigIsStrict(t *testing.T) {
 		{"a standing key with no value, so every record is filtered out", `{"base_type_key":"eo_decision_record","subject_key":"keywords","standing_key":"standing"}`},
 		{"a negative cap", `{"base_type_key":"eo_decision_record","subject_key":"keywords","max_refs":-1}`},
 		{"the target key is also the subject key the officer fills", `{"base_type_key":"eo_decision_record","subject_key":"related_refs","target_key":"related_refs"}`},
+		// The brief's hardest rule, enforced by this file rather than by
+		// another task's field definitions happening to collide with it.
+		{"the target key is the officer's own dropdown", `{"base_type_key":"eo_decision_record","subject_key":"keywords","target_key":"conflict_verdict"}`},
 		{"a malformed blob", `{"base_type_key":`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -630,9 +705,13 @@ func (r *eoDecBaseRecordsRepo) RecordsOfType(_ context.Context, typeID uuid.UUID
 type eoDecBaseTypesRepo struct {
 	repository.EORecordTypeRepository
 	byKey map[string]*models.EORecordType
+	err   error
 }
 
 func (r *eoDecBaseTypesRepo) GetByKey(_ context.Context, key string) (*models.EORecordType, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
 	return r.byKey[key], nil
 }
 
@@ -667,5 +746,15 @@ func TestCapabilityReaderRecordsOfTypeResolvesTheKeyOnItsOwnHandles(t *testing.T
 		if _, err := read.RecordsOfType(ctx, key); err == nil {
 			t.Errorf("RecordsOfType(%q) returned no error; a typo must not look like an empty base", key)
 		}
+	}
+
+	// A failure resolving the type is the caller's to see, AND it must be
+	// that failure: swallowing it would turn a broken database into "nothing
+	// bears on the subject", and replacing it with "no record type with key"
+	// would send the reader hunting a typo that is not there.
+	lookupFailed := errors.New("eo decisions base: type lookup failed")
+	broken := eoNewCapabilityReader(records, &eoDecBaseTypesRepo{err: lookupFailed})
+	if _, err := broken.RecordsOfType(ctx, eoDecBaseTypeKey); !errors.Is(err, lookupFailed) {
+		t.Errorf("RecordsOfType on a broken type repository returned %v, want the repository's own error", err)
 	}
 }

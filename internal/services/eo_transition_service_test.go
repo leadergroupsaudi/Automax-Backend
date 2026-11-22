@@ -47,6 +47,12 @@ type eoTxRecordRepo struct {
 	// txTimers is the transaction-bound timer repository Transaction hands its
 	// closure. Nil unless a test wires SLA clocks.
 	txTimers repository.EOTimerRepository
+	// recordsOfTypeTotal / recordsOfTypeInTx do the same for RecordsOfType,
+	// the type-scoped read decisions_base checks a draft against: it loads a
+	// whole record type, so taking it on a pooled connection inside the
+	// transaction would be the largest of these reads, not the smallest.
+	recordsOfTypeTotal int
+	recordsOfTypeInTx  int
 	// getAnyTotal / getAnyInTx do the same for GetAnyByID, which is how an
 	// ancestor-scoped roll-up walks upwards — the other half of the same
 	// deadlock class.
@@ -100,6 +106,18 @@ func (f *eoTxRecordRepo) Children(_ context.Context, parentID uuid.UUID, recordT
 	return out, nil
 }
 
+func (f *eoTxRecordRepo) RecordsOfType(_ context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	f.calls = append(f.calls, "RecordsOfType")
+	f.recordsOfTypeTotal++
+	var out []models.EORecord
+	for _, r := range f.stored {
+		if r.RecordTypeID == recordTypeID {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
 func (f *eoTxRecordRepo) LinksFrom(_ context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
 	f.linksTotal++
 	return f.links[recordID], nil
@@ -137,6 +155,11 @@ func (b *eoTxBoundRepo) Children(ctx context.Context, parentID uuid.UUID, record
 func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.EORecord, error) {
 	b.eoTxRecordRepo.getAnyInTx++
 	return b.eoTxRecordRepo.GetAnyByID(ctx, id)
+}
+
+func (b *eoTxBoundRepo) RecordsOfType(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	b.eoTxRecordRepo.recordsOfTypeInTx++
+	return b.eoTxRecordRepo.RecordsOfType(ctx, recordTypeID)
 }
 
 func (b *eoTxBoundRepo) LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error) {
