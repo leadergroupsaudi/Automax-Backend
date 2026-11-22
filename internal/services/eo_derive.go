@@ -120,6 +120,10 @@ func RecomputeDerived(ctx context.Context, fields []models.EOFieldDef, rec *mode
 		}
 		var depErr error
 		for _, d := range parsed[key] {
+			if deps == nil && d.Scope != eoScopeOwn {
+				depErr = errors.New("no dependency loader configured for a child or ancestor dependency")
+				break
+			}
 			switch d.Scope {
 			case eoScopeChild:
 				kids, ok := children[d.Type]

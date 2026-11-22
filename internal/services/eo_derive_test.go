@@ -68,24 +68,61 @@ func TestRecomputeOwnFields(t *testing.T) {
 
 func TestRecomputeChildAggregate(t *testing.T) {
 	parent := eoRec(`{}`)
-	deps := &eoFakeDeps{children: map[string][]models.EORecord{
-		"execution_plan_stage": {eoRec(`{"weeks":2}`), eoRec(`{"weeks":3.5}`), eoRec(`{"weeks":null}`), eoRec(`{}`)},
-	}}
-	on := []map[string]any{{"scope": "child", "type": "execution_plan_stage", "field": "weeks", "aggregates": []string{"sum", "max"}}}
+	on := []map[string]any{{"scope": "child", "type": "execution_plan_stage", "field": "weeks", "aggregates": []string{"sum", "min", "max", "avg"}}}
 	fields := []models.EOFieldDef{
 		eoDerivedField("total_weeks", "children_execution_plan_stage_sum_weeks", on),
+		eoDerivedField("shortest", "children_execution_plan_stage_min_weeks", on),
 		eoDerivedField("longest", "children_execution_plan_stage_max_weeks", on),
+		eoDerivedField("average", "children_execution_plan_stage_avg_weeks", on),
 		eoDerivedField("stage_count", "children_execution_plan_stage_count", on),
 	}
-	got, err := RecomputeDerived(context.Background(), fields, &parent, deps)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	for key, want := range map[string]float64{"total_weeks": 5.5, "longest": 3.5, "stage_count": 4} {
-		if got[key] != want {
-			t.Errorf("%s = %v, want %v", key, got[key], want)
+
+	t.Run("numeric children, null and missing skipped", func(t *testing.T) {
+		deps := &eoFakeDeps{children: map[string][]models.EORecord{
+			"execution_plan_stage": {eoRec(`{"weeks":2}`), eoRec(`{"weeks":3.5}`), eoRec(`{"weeks":null}`), eoRec(`{}`)},
+		}}
+		got, err := RecomputeDerived(context.Background(), fields, &parent, deps)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-	}
+		want := map[string]float64{"total_weeks": 5.5, "shortest": 2, "longest": 3.5, "average": 2.75, "stage_count": 4}
+		for key, w := range want {
+			if got[key] != w {
+				t.Errorf("%s = %v, want %v", key, got[key], w)
+			}
+		}
+	})
+
+	t.Run("no numeric children: count resolves, aggregates unresolved", func(t *testing.T) {
+		deps := &eoFakeDeps{children: map[string][]models.EORecord{
+			"execution_plan_stage": {eoRec(`{}`), eoRec(`{"weeks":null}`)},
+		}}
+		got, err := RecomputeDerived(context.Background(), fields, &parent, deps)
+		if !errors.Is(err, eoformula.ErrUnresolvedReference) {
+			t.Fatalf("err = %v, want ErrUnresolvedReference", err)
+		}
+		if got["stage_count"] != 2.0 {
+			t.Errorf("stage_count = %v, want 2", got["stage_count"])
+		}
+		for _, k := range []string{"total_weeks", "shortest", "longest", "average"} {
+			if _, set := got[k]; set {
+				t.Errorf("%s must be unset, got %v", k, got[k])
+			}
+		}
+	})
+
+	t.Run("no children at all", func(t *testing.T) {
+		got, err := RecomputeDerived(context.Background(), fields, &parent, &eoFakeDeps{})
+		if !errors.Is(err, eoformula.ErrUnresolvedReference) {
+			t.Fatalf("err = %v, want ErrUnresolvedReference", err)
+		}
+		if got["stage_count"] != 0.0 {
+			t.Errorf("stage_count = %v, want 0", got["stage_count"])
+		}
+		if _, set := got["average"]; set {
+			t.Errorf("average must be unset, got %v", got["average"])
+		}
+	})
 }
 
 func TestRecomputeAncestorField(t *testing.T) {
@@ -118,24 +155,27 @@ func TestRecomputeAncestorField(t *testing.T) {
 
 func TestRecomputeSkipsFieldWithUnresolvedReference(t *testing.T) {
 	// "notice_days" is JSON null and "other" is absent: neither may reach the
-	// env as a nil key, or the formula would be treated as resolved.
+	// env as a nil key, or the formula would be treated as resolved. Each bad
+	// field runs alone beside a good one so its own error is what is asserted.
 	rec := eoRec(`{"visit_date":"2026-03-10","notice_days":null}`)
-	fields := []models.EOFieldDef{
-		eoDerivedField("bad_null", "notice_days + 1", eoOwn("notice_days")),
-		eoDerivedField("bad_absent", "other * 2", eoOwn("other")),
-		eoDerivedField("freeze_date", "visit_date - days(2)", eoOwn("visit_date")),
+	good := eoDerivedField("freeze_date", "visit_date - days(2)", eoOwn("visit_date"))
+	cases := map[string]models.EOFieldDef{
+		"json null value": eoDerivedField("bad", "notice_days + 1", eoOwn("notice_days")),
+		"absent value":    eoDerivedField("bad", "other * 2", eoOwn("other")),
 	}
-	got, err := RecomputeDerived(context.Background(), fields, &rec, &eoFakeDeps{})
-	if !errors.Is(err, eoformula.ErrUnresolvedReference) {
-		t.Fatalf("err = %v, want ErrUnresolvedReference", err)
-	}
-	for _, k := range []string{"bad_null", "bad_absent"} {
-		if _, set := got[k]; set {
-			t.Errorf("%s must be unset, got %v", k, got[k])
-		}
-	}
-	if _, ok := got["freeze_date"]; !ok {
-		t.Errorf("freeze_date should still be computed, got %v", got)
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := RecomputeDerived(context.Background(), []models.EOFieldDef{bad, good}, &rec, &eoFakeDeps{})
+			if !errors.Is(err, eoformula.ErrUnresolvedReference) {
+				t.Fatalf("err = %v, want ErrUnresolvedReference", err)
+			}
+			if _, set := got["bad"]; set {
+				t.Errorf("bad must be unset, got %v", got["bad"])
+			}
+			if _, ok := got["freeze_date"]; !ok {
+				t.Errorf("freeze_date should still be computed, got %v", got)
+			}
+		})
 	}
 }
 
@@ -165,6 +205,19 @@ func TestRecomputeReportsLoaderAndConfigErrors(t *testing.T) {
 				t.Errorf("no field should be set, got %v", got)
 			}
 		})
+	}
+}
+
+func TestRecomputeNilLoaderIsAnErrorNotAPanic(t *testing.T) {
+	rec := eoRec(`{}`)
+	on := []map[string]any{{"scope": "ancestor", "type": "office_direction", "field": "x"}}
+	fields := []models.EOFieldDef{eoDerivedField("a", "ancestor_office_direction_x", on)}
+	got, err := RecomputeDerived(context.Background(), fields, &rec, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(got) != 0 {
+		t.Errorf("no field should be set, got %v", got)
 	}
 }
 
