@@ -42,8 +42,8 @@ type eoTxRecordRepo struct {
 	childrenTotal int
 	// txTypes is the transaction-bound type repository Transaction hands its
 	// closure: the same data as the service's, but a distinct object.
-	txTypes repository.EORecordTypeRepository
-	childrenInTx  int
+	txTypes      repository.EORecordTypeRepository
+	childrenInTx int
 	// getAnyTotal / getAnyInTx do the same for GetAnyByID, which is how an
 	// ancestor-scoped roll-up walks upwards — the other half of the same
 	// deadlock class.

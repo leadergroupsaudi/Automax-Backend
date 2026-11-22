@@ -31,12 +31,25 @@ type Capability interface {
 	// An error aborts the transition.
 	OnTransition(ctx context.Context, rec *models.EORecord, t *models.WorkflowTransition, cfg datatypes.JSON) error
 	Timers(ctx context.Context, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error)
+	// ReservedKeys lists the values keys this capability writes itself. A
+	// request must never be able to write them, so a record type whose fields
+	// or transition field changes name one is a misconfiguration the pipelines
+	// refuse (a field change needs no definition to be admitted, so "do not
+	// declare it" is not enough on its own).
+	ReservedKeys(cfg datatypes.JSON) ([]string, error)
+	// ValidateWorkflow checks cfg against the workflow it will run in, for
+	// references the config cannot check alone (transition codes).
+	ValidateWorkflow(cfg datatypes.JSON, wf *models.Workflow) error
 }
 
 // ErrEOUnknownCapability is returned when a record type enables a capability
 // key that nothing registered. Configuration that names a capability which
 // will never run must fail loudly, not appear to work.
 var ErrEOUnknownCapability = errors.New("unknown capability")
+
+// ErrEOCapabilityConfig marks a record type whose configuration conflicts with
+// an enabled capability.
+var ErrEOCapabilityConfig = errors.New("capability configuration conflict")
 
 // EOEnabledCapability is a registered capability bound to the config the
 // record type gave it.
@@ -159,6 +172,42 @@ func eoCapabilitiesDerive(ctx context.Context, caps []EOEnabledCapability, rec *
 		}
 		if errs := eoApplyValues(rec, derived); len(errs) > 0 {
 			return fmt.Errorf("capability %q derived values could not be stored: %v", c.Key(), errs)
+		}
+	}
+	return nil
+}
+
+// eoCapabilitiesCheckConfig refuses a configuration a capability cannot work
+// with: a field definition or a transition field change that names one of its
+// reserved keys, or a config that references a transition the workflow does
+// not have. wf may be nil (the save path has no transition to check).
+func eoCapabilitiesCheckConfig(caps []EOEnabledCapability, fields []models.EOFieldDef, wf *models.Workflow) error {
+	for _, c := range caps {
+		reserved, err := c.ReservedKeys(c.Config)
+		if err != nil {
+			return fmt.Errorf("capability %q: %w", c.Key(), err)
+		}
+		for _, key := range reserved {
+			for _, f := range fields {
+				if f.Key == key {
+					return fmt.Errorf("capability %q: %w: field %q is written by the capability and must not be defined", c.Key(), ErrEOCapabilityConfig, key)
+				}
+			}
+			if wf == nil {
+				continue
+			}
+			for _, tr := range wf.Transitions {
+				for _, fc := range tr.FieldChanges {
+					if fc.FieldName == key {
+						return fmt.Errorf("capability %q: %w: transition %q lets a request write %q, which the capability owns", c.Key(), ErrEOCapabilityConfig, tr.Code, key)
+					}
+				}
+			}
+		}
+		if wf != nil {
+			if err := c.ValidateWorkflow(c.Config, wf); err != nil {
+				return fmt.Errorf("capability %q: %w", c.Key(), err)
+			}
 		}
 	}
 	return nil

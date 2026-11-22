@@ -30,6 +30,11 @@ const EOApprovalKey = "approval"
 //     declares it, a request cannot write it — recorded_by and recorded_at
 //     cannot be forged by the very people they audit.
 //
+// The stamp key MUST NOT be declared: no field definition may use it and no
+// transition field change may name it. Either one lets a request write the
+// sealed object. ReservedKeys exposes it and the pipelines refuse such a
+// configuration (eoCapabilitiesCheckConfig).
+//
 // Immutability. A stamp that exists cannot be replaced: OnTransition refuses to
 // stamp again, and Validate rejects any change to the input fields afterwards
 // (they must keep matching the sealed stamp). The request path cannot touch the
@@ -110,9 +115,16 @@ func (c *eoApprovalCapability) Validate(_ context.Context, rec *models.EORecord,
 		return nil, err
 	}
 	bag := eoDecodeValues(rec.Values)
-	sealed, ok := bag[conf.StampKey].(map[string]any)
-	if !ok {
+	raw, present := bag[conf.StampKey]
+	if !present {
 		return nil, nil
+	}
+	// Present but not an object: OnTransition treats presence as sealed, so
+	// treating this as "absent" would silently switch the immutability check
+	// off. It is corruption, and it is loud.
+	sealed, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("approval %q on record %s: the stored stamp is malformed (%T), expected an object", conf.StampKey, rec.Reference, raw)
 	}
 	errs := map[string]string{}
 	if eoApprovalString(bag, conf.StampKey+"_authority") != eoApprovalString(sealed, "authority") {
@@ -134,7 +146,9 @@ func (c *eoApprovalCapability) OnTransition(ctx context.Context, rec *models.EOR
 	}
 	bag := eoDecodeValues(rec.Values)
 	if _, sealed := bag[conf.StampKey]; sealed {
-		return fmt.Errorf("approval %q on record %s is already recorded and cannot be replaced", conf.StampKey, rec.Reference)
+		return eoValidationError(map[string]string{
+			conf.StampKey + "_authority": "this approval is already recorded on " + rec.Reference + " and cannot be recorded again",
+		})
 	}
 	actor, _ := ctx.Value(eoActorCtxKey{}).(*models.User)
 	if actor == nil {
@@ -168,4 +182,31 @@ func eoApprovalHasCode(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func (c *eoApprovalCapability) ReservedKeys(cfg datatypes.JSON) ([]string, error) {
+	conf, err := c.parse(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return []string{conf.StampKey}, nil
+}
+
+// ValidateWorkflow refuses a config naming a transition code the workflow does
+// not have: it would never stamp, and nothing would say so.
+func (c *eoApprovalCapability) ValidateWorkflow(cfg datatypes.JSON, wf *models.Workflow) error {
+	conf, err := c.parse(cfg)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for _, tr := range wf.Transitions {
+		have[tr.Code] = true
+	}
+	for _, code := range conf.Transitions {
+		if !have[code] {
+			return fmt.Errorf("approval: transition %q is not a transition of workflow %q, so it would never stamp", code, wf.Code)
+		}
+	}
+	return nil
 }

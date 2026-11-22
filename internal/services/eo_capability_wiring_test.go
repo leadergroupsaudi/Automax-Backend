@@ -25,6 +25,10 @@ type eoWireCap struct {
 
 func (c *eoWireCap) Key() string { return "eo_wire" }
 
+func (c *eoWireCap) ReservedKeys(datatypes.JSON) ([]string, error) { return nil, nil }
+
+func (c *eoWireCap) ValidateWorkflow(datatypes.JSON, *models.Workflow) error { return nil }
+
 func (c *eoWireCap) Validate(_ context.Context, rec *models.EORecord, _ datatypes.JSON) (map[string]string, error) {
 	c.validateCalls++
 	c.valuesSeenByValidate = string(rec.Values)
@@ -324,5 +328,102 @@ func TestMergeFieldErrorsToleratesANilDestination(t *testing.T) {
 	}
 	if got := eoMergeFieldErrors(nil, nil); got == nil {
 		t.Error("want a usable map back, not nil")
+	}
+}
+
+// ── the approval capability's guards in the pipelines ──────────────────────
+
+func eoApprovalTxFixture(t *testing.T, cfg string) *eoTxFixture {
+	t.Helper()
+	f := eoNewTxFixture(t)
+	f.types.defs = append(f.types.defs,
+		eoTxField("approval_authority", models.EOKindText, models.EORequiredNever, f.recordType.ID))
+	f.transition("raise").FieldChanges = []models.TransitionFieldChange{{FieldName: "approval_authority", Label: "Authority"}}
+	f.svc.(*eoTransitionService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {
+		return []EOEnabledCapability{{Capability: NewEOApprovalCapability(), Config: datatypes.JSON(cfg)}}, nil
+	}
+	return f
+}
+
+func TestApprovalStampKeyCannotBeWrittenByARequest(t *testing.T) {
+	t.Run("a transition field change naming the stamp key is refused", func(t *testing.T) {
+		f := eoApprovalTxFixture(t, `{"transitions":["raise"]}`)
+		// The attack: no field definition at all, just a field change.
+		f.transition("raise").FieldChanges = append(f.transition("raise").FieldChanges,
+			models.TransitionFieldChange{FieldName: "approval", Label: "x"})
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{Values: map[string]any{
+			"approval_authority": "H.E.",
+			"approval":           map[string]any{"recorded_by": "forged", "authority": "forged"},
+		}})
+		if !errors.Is(err, ErrEOCapabilityConfig) || f.records.committed {
+			t.Fatalf("err=%v committed=%v", err, f.records.committed)
+		}
+	})
+	t.Run("a field definition keyed like the stamp is refused on create and update", func(t *testing.T) {
+		f := eoNewSvcFixture(t, eoSvcField("approval", models.EORequiredNever))
+		f.svc.(*eoRecordService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {
+			return []EOEnabledCapability{{Capability: NewEOApprovalCapability(), Config: datatypes.JSON(`{"transitions":["x"]}`)}}, nil
+		}
+		_, err := f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+			RecordTypeID: f.recordType.ID,
+			Values:       map[string]any{"subject_ar": "x", "approval": map[string]any{"authority": "forged"}},
+		}, f.actor)
+		if !errors.Is(err, ErrEOCapabilityConfig) || len(f.records.created) != 0 {
+			t.Fatalf("create: err=%v created=%d", err, len(f.records.created))
+		}
+		rec := eoSvcExisting(f, nil)
+		_, err = f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
+			RecordTypeID: rec.RecordTypeID, Values: map[string]any{"approval": map[string]any{"authority": "forged"}},
+		}, f.actor)
+		if !errors.Is(err, ErrEOCapabilityConfig) || len(f.records.updated) != 0 {
+			t.Fatalf("update: err=%v updated=%d", err, len(f.records.updated))
+		}
+	})
+}
+
+func TestApprovalConfigNamingAMissingTransitionIsRefused(t *testing.T) {
+	f := eoApprovalTxFixture(t, `{"transitions":["raize"]}`)
+	_, err := f.run("raise", f.actor, models.EOTransitionInput{Values: map[string]any{"approval_authority": "H.E."}})
+	if err == nil || f.records.committed {
+		t.Fatalf("a typo'd transition code was accepted: err=%v committed=%v", err, f.records.committed)
+	}
+}
+
+func TestApprovalSecondStampIsAUserReadableValidationError(t *testing.T) {
+	f := eoApprovalTxFixture(t, `{"transitions":["raise"]}`)
+	f.setValues(t, map[string]any{"approval": map[string]any{"authority": "H.E.", "recorded_by": "x"}, "approval_authority": "H.E."})
+	_, err := f.run("raise", f.actor, models.EOTransitionInput{Values: map[string]any{"approval_authority": "H.E."}})
+	if eoSvcFieldErrors(t, err)["approval_authority"] == "" || f.records.committed {
+		t.Fatalf("err=%v committed=%v", err, f.records.committed)
+	}
+}
+
+func TestApprovalValidateRefusesAMalformedStoredStamp(t *testing.T) {
+	c, rec, _, ctx := eoApprovalFixture(t, map[string]any{"approval": "not an object"})
+	if _, err := c.Validate(ctx, rec, eoApprovalTestCfg); err == nil {
+		t.Fatal("a present-but-malformed stamp was treated as absent")
+	}
+}
+
+// The pipelines resolve through the REAL registry: a registered key resolves
+// and stamps, so the unknown-key error cannot be "every key errors".
+func TestPipelineResolvesAKnownCapabilityThroughTheRegistry(t *testing.T) {
+	saved := eoDefaultCapabilities
+	eoDefaultCapabilities = newEOCapabilityRegistry()
+	defer func() { eoDefaultCapabilities = saved }()
+	RegisterEOCapabilities()
+
+	f := eoNewTxFixture(t)
+	f.types.defs = append(f.types.defs,
+		eoTxField("approval_authority", models.EOKindText, models.EORequiredNever, f.recordType.ID))
+	f.transition("raise").FieldChanges = []models.TransitionFieldChange{{FieldName: "approval_authority", Label: "Authority"}}
+	f.recordType.Capabilities = datatypes.JSON(`[{"key":"approval","config":{"transitions":["raise"]}}]`)
+
+	got, err := f.run("raise", f.actor, models.EOTransitionInput{Values: map[string]any{"approval_authority": "H.E."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := eoSvcValues(t, got.Values)["approval"]; !ok {
+		t.Fatal("a registered capability resolved but did not run")
 	}
 }
