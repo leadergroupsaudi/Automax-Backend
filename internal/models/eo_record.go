@@ -168,3 +168,48 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 	}
 	return nil
 }
+
+// EORecordFilter selects and pages the records of one register (spec §7.7).
+//
+// The query-tagged fields are client-settable. The json:"-" fields are filled
+// by the handler from the authenticated session and are never read from a
+// request body, following IncidentFilter. A zero-value filter is the most
+// restrictive one: IsAdmin false and an empty VisibleToDepartmentIDs hide every
+// record that is restricted to a body (§7.11).
+type EORecordFilter struct {
+	// Search matches reference, subject_ar and subject_en, case-insensitively.
+	Search       string   `query:"search" json:"search" validate:"omitempty,max=200"`
+	RecordTypeID []string `query:"record_type_id" json:"record_type_id" validate:"omitempty,dive,uuid"`
+	StateID      []string `query:"state_id" json:"state_id" validate:"omitempty,dive,uuid"`
+	OwningBodyID []string `query:"owning_body_id" json:"owning_body_id" validate:"omitempty,dive,uuid"`
+	AssignedUser []string `query:"assigned_user_id" json:"assigned_user_id" validate:"omitempty,dive,uuid"`
+	ParentID     *string  `query:"parent_record_id" json:"parent_record_id" validate:"omitempty,uuid"`
+	Priority     []string `query:"priority" json:"priority" validate:"omitempty,dive,max=50"`
+	Sensitivity  []string `query:"sensitivity" json:"sensitivity" validate:"omitempty,dive,max=50"`
+	Source       []string `query:"source" json:"source" validate:"omitempty,dive,max=50"`
+
+	// Values filters on type-specific fields: every key must hold the given
+	// value (jsonb containment, served by the GIN index). Request body only.
+	Values map[string]any `query:"-" json:"values"`
+
+	// The two periods a register is searched by. Request body only.
+	CreatedFrom *time.Time `query:"-" json:"created_from"`
+	CreatedTo   *time.Time `query:"-" json:"created_to"`
+	DueFrom     *time.Time `query:"-" json:"due_from"`
+	DueTo       *time.Time `query:"-" json:"due_to"`
+
+	// SortBy is one of the repository's allow-listed keys; any other value is
+	// rejected. SortDir is "asc" or "desc" (default desc).
+	SortBy  string `query:"sort_by" json:"sort_by" validate:"omitempty,max=50"`
+	SortDir string `query:"sort_dir" json:"sort_dir" validate:"omitempty,oneof=asc desc"`
+	Page    int    `query:"page" json:"page" validate:"omitempty,min=1"`
+	Limit   int    `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`
+
+	// Set by the handler. VisibleToDepartmentIDs are the bodies the caller
+	// belongs to; IsAdmin bypasses row-level visibility. UserID and
+	// UserRoleIDs are carried for later filters and are not consulted yet.
+	UserID                 uuid.UUID   `json:"-"`
+	UserRoleIDs            []uuid.UUID `json:"-"`
+	IsAdmin                bool        `json:"-"`
+	VisibleToDepartmentIDs []uuid.UUID `json:"-"`
+}

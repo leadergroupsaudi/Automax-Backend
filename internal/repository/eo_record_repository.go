@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -46,6 +47,10 @@ type EORecordRepository interface {
 	// links whose endpoints are both inside it, so a transitive set would
 	// silently stop blocking.
 	Children(ctx context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error)
+	// List is the register query: filtered, row-level-visible, sorted and
+	// paged. It returns the page and the total across all pages. filter is
+	// not modified. An unknown filter.SortBy is an error.
+	List(ctx context.Context, filter *models.EORecordFilter) ([]models.EORecord, int64, error)
 	CreateLink(ctx context.Context, link *models.EORecordLink) error
 	LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
 	CreateHistory(ctx context.Context, entry *models.EORecordHistory) error
@@ -233,3 +238,161 @@ func (r *eoRecordRepository) Transaction(ctx context.Context, fn func(EORecordRe
 		return fn(&eoRecordRepository{db: tx})
 	})
 }
+
+// eoSortColumns maps the sort_by keys a client may send to the qualified
+// column each orders by. Only the mapped value reaches SQL, never the key.
+var eoSortColumns = map[string]string{
+	"created_at": "eo_records.created_at",
+	"updated_at": "eo_records.updated_at",
+	"due_date":   "eo_records.due_date",
+	"reference":  "eo_records.reference",
+}
+
+const (
+	eoDefaultLimit = 20
+	eoMaxLimit     = 100
+)
+
+// eoVisibleToKey is the values key a record carries when it is restricted to
+// one body ("the referred body only", §7.11).
+const eoVisibleToKey = "visible_to"
+
+func (r *eoRecordRepository) List(ctx context.Context, filter *models.EORecordFilter) ([]models.EORecord, int64, error) {
+	if filter == nil {
+		filter = &models.EORecordFilter{}
+	}
+	order, err := eoOrderClause(filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Page and limit are resolved into locals; the caller's struct is left alone.
+	page, limit := filter.Page, filter.Limit
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > eoMaxLimit {
+		limit = eoDefaultLimit
+	}
+
+	var total int64
+	countQ, err := applyEORecordFilters(r.db.WithContext(ctx).Model(&models.EORecord{}), filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("count eo records: %w", err)
+	}
+
+	listQ, err := applyEORecordFilters(r.db.WithContext(ctx).Model(&models.EORecord{}), filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	var out []models.EORecord
+	if err := listQ.Order(order).Offset((page - 1) * limit).Limit(limit).Find(&out).Error; err != nil {
+		return nil, 0, fmt.Errorf("list eo records: %w", err)
+	}
+	return out, total, nil
+}
+
+// eoOrderClause builds ORDER BY from the allow-list. eo_records.id breaks ties
+// so pages never repeat or skip a row.
+func eoOrderClause(filter *models.EORecordFilter) (string, error) {
+	key := filter.SortBy
+	if key == "" {
+		key = "created_at"
+	}
+	col, ok := eoSortColumns[key]
+	if !ok {
+		return "", fmt.Errorf("list eo records: unsupported sort_by %q", filter.SortBy)
+	}
+	dir := "DESC"
+	switch strings.ToLower(filter.SortDir) {
+	case "", "desc":
+	case "asc":
+		dir = "ASC"
+	default:
+		return "", fmt.Errorf("list eo records: unsupported sort_dir %q", filter.SortDir)
+	}
+	return col + " " + dir + ", eo_records.id ASC", nil
+}
+
+// applyEORecordFilters is the one place a register's WHERE clause is built, so
+// List and any later count or summary query cannot drift. Row-level visibility
+// is applied here, unconditionally: no filter field can switch it off.
+func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error) {
+	q = applyEORecordVisibility(q, f)
+
+	if len(f.RecordTypeID) > 0 {
+		q = q.Where("eo_records.record_type_id IN ?", f.RecordTypeID)
+	}
+	if len(f.StateID) > 0 {
+		q = q.Where("eo_records.state_id IN ?", f.StateID)
+	}
+	if len(f.OwningBodyID) > 0 {
+		q = q.Where("eo_records.owning_body_id IN ?", f.OwningBodyID)
+	}
+	if len(f.AssignedUser) > 0 {
+		q = q.Where("eo_records.assigned_user_id IN ?", f.AssignedUser)
+	}
+	if f.ParentID != nil {
+		q = q.Where("eo_records.parent_record_id = ?", *f.ParentID)
+	}
+	if len(f.Priority) > 0 {
+		q = q.Where("eo_records.priority IN ?", f.Priority)
+	}
+	if len(f.Sensitivity) > 0 {
+		q = q.Where("eo_records.sensitivity IN ?", f.Sensitivity)
+	}
+	if len(f.Source) > 0 {
+		q = q.Where("eo_records.source IN ?", f.Source)
+	}
+	if f.Search != "" {
+		like := "%" + eoLikeEscaper.Replace(f.Search) + "%"
+		q = q.Where("(eo_records.reference ILIKE ? OR eo_records.subject_ar ILIKE ? OR eo_records.subject_en ILIKE ?)", like, like, like)
+	}
+	if f.CreatedFrom != nil {
+		q = q.Where("eo_records.created_at >= ?", *f.CreatedFrom)
+	}
+	if f.CreatedTo != nil {
+		q = q.Where("eo_records.created_at <= ?", *f.CreatedTo)
+	}
+	if f.DueFrom != nil {
+		q = q.Where("eo_records.due_date >= ?", *f.DueFrom)
+	}
+	if f.DueTo != nil {
+		q = q.Where("eo_records.due_date <= ?", *f.DueTo)
+	}
+	if len(f.Values) > 0 {
+		want, err := json.Marshal(f.Values)
+		if err != nil {
+			return nil, fmt.Errorf("list eo records: encode values filter: %w", err)
+		}
+		// "values" is a reserved word that GORM does not quote in a raw
+		// fragment, so it is quoted by hand.
+		q = q.Where(`eo_records."values" @> ?::jsonb`, string(want))
+	}
+	return q, nil
+}
+
+// applyEORecordVisibility enforces §7.11 row-level visibility. A record with a
+// visible_to value is shown only to an admin or to a caller whose bodies
+// include that body; a record with none is unrestricted. A caller with no
+// bodies therefore sees unrestricted records only. The sensitivity label is
+// deliberately not consulted: there is no clearance policy.
+func applyEORecordVisibility(q *gorm.DB, f *models.EORecordFilter) *gorm.DB {
+	if f.IsAdmin {
+		return q
+	}
+	const restrictedTo = `eo_records."values"->>'` + eoVisibleToKey + `'`
+	if len(f.VisibleToDepartmentIDs) == 0 {
+		return q.Where(restrictedTo + " IS NULL")
+	}
+	bodies := make([]string, len(f.VisibleToDepartmentIDs))
+	for i, id := range f.VisibleToDepartmentIDs {
+		bodies[i] = id.String()
+	}
+	return q.Where("("+restrictedTo+" IS NULL OR "+restrictedTo+" IN ?)", bodies)
+}
+
+// eoLikeEscaper makes a search term match literally inside ILIKE.
+var eoLikeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
