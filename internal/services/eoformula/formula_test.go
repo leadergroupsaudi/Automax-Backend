@@ -117,10 +117,16 @@ func TestEvaluateRejectsNonFinite(t *testing.T) {
 		{"negative over zero", "-a / b"},
 		{"zero over zero", "b / b"},
 		{"int of infinity", "int(a / b)"},
+		{"int out of range", "int(1e300)"},
+		{"int just out of range", "int(1e19)"},
+		{"days of infinity", "days(a / b)"},
+		{"date offset by infinity", "d + days(a / b)"},
+		{"weeks of huge power", "weeks(9 ** 9 ** 9)"},
+		{"hours out of duration range", "hours(1e300)"},
 		{"int of huge power", "int(9 ** 9 ** 9)"},
 		{"float of infinity", "float(a / b)"},
 	}
-	env := map[string]any{"a": 1.0, "b": 0.0}
+	env := map[string]any{"a": 1.0, "b": 0.0, "d": time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := New(time.Second).Eval(tt.expr, env)

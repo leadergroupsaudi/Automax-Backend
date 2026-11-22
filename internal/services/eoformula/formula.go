@@ -53,7 +53,8 @@ const maxNodes = 500
 // other builtin is disabled at compile time.
 var allowedBuiltins = []string{"abs", "ceil", "floor", "round", "min", "max", "date"}
 
-// Evaluator evaluates formulas. The zero value has no timeout; use New.
+// Evaluator evaluates formulas. A non-positive Timeout (including the zero
+// value) falls back to DefaultTimeout; New is the usual constructor.
 type Evaluator struct {
 	Timeout time.Duration
 }
@@ -92,8 +93,8 @@ func compileOptions(env map[string]any) []expr.Option {
 		expr.Function("days_between", daysBetween),
 		// int/float replace the builtins: the builtin int() turns +-Inf/NaN into
 		// a Go int, which would slip past the non-finite result check.
-		expr.Function("int", convFn("int", func(f float64) any { return int(f) })),
-		expr.Function("float", convFn("float", func(f float64) any { return f })),
+		expr.Function("int", convFn("int", func(f float64) any { return int(f) }, true)),
+		expr.Function("float", convFn("float", func(f float64) any { return f }, false)),
 	)
 }
 
@@ -102,25 +103,46 @@ func unitFn(name string, unit time.Duration) func(params ...any) (any, error) {
 		if len(params) != 1 {
 			return nil, fmt.Errorf("%s() takes 1 argument, got %d", name, len(params))
 		}
-		n, ok := toFloat(params[0])
-		if !ok {
-			return nil, fmt.Errorf("%s() needs a number, got %T", name, params[0])
+		n, err := finiteNumber(name, params[0])
+		if err != nil {
+			return nil, err
 		}
-		return time.Duration(n * float64(unit)), nil
+		d := n * float64(unit)
+		if math.Abs(d) >= maxInt64Float {
+			return nil, fmt.Errorf("%s() of %v is out of range", name, n)
+		}
+		return time.Duration(d), nil
 	}
 }
 
-func convFn(name string, conv func(float64) any) func(params ...any) (any, error) {
+// maxInt64Float is 2^63, the first float64 magnitude that no longer fits int64.
+const maxInt64Float = 9223372036854775808.0
+
+// finiteNumber returns v as a float64, rejecting non-numbers, NaN and Inf. It
+// guards every conversion that would otherwise turn a non-finite float into an
+// integer sentinel the final float64 check cannot see.
+func finiteNumber(name string, v any) (float64, error) {
+	f, ok := toFloat(v)
+	if !ok {
+		return 0, fmt.Errorf("%s() needs a number, got %T", name, v)
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("%s() of a non-finite value", name)
+	}
+	return f, nil
+}
+
+func convFn(name string, conv func(float64) any, toInt bool) func(params ...any) (any, error) {
 	return func(params ...any) (any, error) {
 		if len(params) != 1 {
 			return nil, fmt.Errorf("%s() takes 1 argument, got %d", name, len(params))
 		}
-		f, ok := toFloat(params[0])
-		if !ok {
-			return nil, fmt.Errorf("%s() needs a number, got %T", name, params[0])
+		f, err := finiteNumber(name, params[0])
+		if err != nil {
+			return nil, err
 		}
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			return nil, fmt.Errorf("%s() of a non-finite value", name)
+		if toInt && math.Abs(f) >= maxInt64Float {
+			return nil, fmt.Errorf("%s() of %v is out of range", name, f)
 		}
 		return conv(f), nil
 	}
