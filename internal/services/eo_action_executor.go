@@ -905,36 +905,72 @@ type eoCloseParentConfig struct {
 // open is precisely the failure this action exists to prevent, and the person
 // looking at the record is the one who needs to know.
 func (e *eoActionExecutor) executeCloseParent(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User) error {
-	err := e.closeParent(ctx, action, rec, by)
-	if err != nil {
-		log.Printf("eo: record %s (%s): close_parent %q DID NOT CLOSE THE PARENT: %v", rec.Reference, rec.ID, action.Name, err)
-		e.recordActionFailure(ctx, action, rec, transition, by,
-			fmt.Sprintf("close_parent action %q did not close the parent record: %v", action.Name, err))
+	parent, err := e.closeParent(ctx, action, rec, by)
+	if err == nil {
+		return nil
+	}
+	log.Printf("eo: record %s (%s): close_parent %q DID NOT CLOSE THE PARENT: %v", rec.Reference, rec.ID, action.Name, err)
+	e.recordActionFailure(ctx, action, rec, transition, by,
+		fmt.Sprintf("close_parent action %q did not close the parent record: %v", action.Name, err))
+	// AND ON THE PARENT, which is the record that wrongly stayed open and the
+	// one a clerk later opens asking why. A note on the child alone leaves
+	// the failure where nobody is looking: the child reached its terminal
+	// state and looks finished. This is the difference between "silently
+	// open" and "visibly failed", and it is the only thing standing in for
+	// the retry this action does not have.
+	//
+	// It is written only when a parent was actually found — when the failure
+	// is "this record carries no such link" there is no parent to annotate,
+	// and the child's note is the whole of what can be said.
+	if parent != nil {
+		e.recordActionFailure(ctx, action, parent, nil, by,
+			fmt.Sprintf("%s ran its close_parent action %q and THIS RECORD WAS NOT CLOSED: %v. It is still open and nothing will retry; close it by hand once the cause is gone.",
+				rec.Reference, action.Name, err))
 	}
 	return err
 }
 
-func (e *eoActionExecutor) closeParent(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, by *models.User) error {
+// closeParent returns the parent it found, so the caller can write its failure
+// note against that record too. A nil parent means none was found at all.
+//
+// IT PASSES NO `Values`, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT. The
+// child's values belong to a different record type and a different form;
+// mapping them onto the parent would be spawn_record's field-map problem
+// inverted, and would let a child write arbitrary keys onto its parent's
+// record. The rule that follows for CONFIGURATION is that a requirement at a
+// state an action closes into must be satisfiable from what is ALREADY STORED
+// on the parent — which services.ValidateRecordValues permits, because it
+// validates the record's effective values rather than only the submitted ones.
+//
+// The one place that rule bites today is the Draft Decision Study, whose
+// `he_decision`, `he_reason` and `decision_date` are required at the state its
+// `close` enters (database.eoClosureArtefacts). A clerk records H.E.'s
+// decision while the study is `with_he`, before the Decision Record is issued;
+// if they do not, THE ISSUE STILL SUCCEEDS AND THE STUDY STAYS OPEN. Nothing
+// retries. What stands in for the retry is that the failure is now written to
+// BOTH records, and services.TestEoPilotCloseParentFailureIsVisibleOnTheParent
+// leaves those fields blank on purpose and reads the note back off the study.
+func (e *eoActionExecutor) closeParent(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, by *models.User) (*models.EORecord, error) {
 	var cfg eoCloseParentConfig
 	if err := json.Unmarshal([]byte(action.Config), &cfg); err != nil {
-		return fmt.Errorf("invalid close_parent config: %w", err)
+		return nil, fmt.Errorf("invalid close_parent config: %w", err)
 	}
 	if strings.TrimSpace(cfg.LinkType) == "" {
-		return errors.New("close_parent config names no link type, so it cannot say which parent")
+		return nil, errors.New("close_parent config names no link type, so it cannot say which parent")
 	}
 	if strings.TrimSpace(cfg.Transition) == "" {
-		return errors.New("close_parent config names no transition")
+		return nil, errors.New("close_parent config names no transition")
 	}
 	if e.transitions == nil {
-		return errors.New("close_parent needs the transition service and none is set; cmd/server/main.go must call SetTransitions after building it")
+		return nil, errors.New("close_parent needs the transition service and none is set; cmd/server/main.go must call SetTransitions after building it")
 	}
 	if by == nil {
-		return errors.New("close_parent has no actor, and a transition on a statutory register records who ran it")
+		return nil, errors.New("close_parent has no actor, and a transition on a statutory register records who ran it")
 	}
 
 	links, err := e.records.LinksFrom(ctx, rec.ID)
 	if err != nil {
-		return fmt.Errorf("read the links of %s: %w", rec.Reference, err)
+		return nil, fmt.Errorf("read the links of %s: %w", rec.Reference, err)
 	}
 	var parentID, parentTypeID uuid.UUID
 	for _, l := range links {
@@ -944,38 +980,44 @@ func (e *eoActionExecutor) closeParent(ctx context.Context, action *models.Trans
 		}
 	}
 	if parentID == uuid.Nil {
-		return fmt.Errorf("carries no %q link, so there is no parent to close", cfg.LinkType)
+		return nil, fmt.Errorf("carries no %q link, so there is no parent to close", cfg.LinkType)
 	}
 	parent, err := e.records.GetByID(ctx, parentID, parentTypeID)
 	if err != nil {
-		return fmt.Errorf("read the parent %s: %w", parentID, err)
+		return nil, fmt.Errorf("read the parent %s: %w", parentID, err)
 	}
 	if parent == nil {
-		return fmt.Errorf("the parent %s no longer exists", parentID)
+		return nil, fmt.Errorf("the parent %s no longer exists", parentID)
 	}
 	if parent.ClosedAt != nil {
 		log.Printf("eo: record %s: close_parent %q skipped, the parent %s is already closed", rec.Reference, action.Name, parent.Reference)
-		return nil
+		return parent, nil
 	}
 
 	available, err := e.transitions.AvailableTransitions(ctx, parent, by)
 	if err != nil {
-		return fmt.Errorf("list the transitions out of %s's current state: %w", parent.Reference, err)
+		return parent, fmt.Errorf("list the transitions out of %s's current state: %w", parent.Reference, err)
 	}
 	for i := range available {
 		if available[i].Code != cfg.Transition {
 			continue
 		}
 		if _, err := e.transitions.Execute(ctx, parent, available[i].ID, by, models.EOTransitionInput{
+			// A non-empty comment, which is what satisfies the mandatory-note
+			// requirement the parent's closing transition carries like every
+			// other terminal transition in the pilot. The seed used to EXEMPT
+			// those two transitions from that requirement on the false ground
+			// that an action could not supply one; this line is why that was
+			// false.
 			Comment: fmt.Sprintf("Closed by %s (%s): the client's field matrix says this record closes its parent.", rec.Reference, action.Name),
 		}); err != nil {
-			return fmt.Errorf("run transition %q on the parent %s: %w", cfg.Transition, parent.Reference, err)
+			return parent, fmt.Errorf("run transition %q on the parent %s: %w", cfg.Transition, parent.Reference, err)
 		}
-		return nil
+		return parent, nil
 	}
 	codes := make([]string, len(available))
 	for i := range available {
 		codes[i] = available[i].Code
 	}
-	return fmt.Errorf("the parent %s offers this actor %v out of its current state and not %q", parent.Reference, codes, cfg.Transition)
+	return parent, fmt.Errorf("the parent %s offers this actor %v out of its current state and not %q", parent.Reference, codes, cfg.Transition)
 }

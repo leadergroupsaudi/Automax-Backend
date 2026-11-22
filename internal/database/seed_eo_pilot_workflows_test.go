@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -22,6 +23,11 @@ import (
 // cannot import package services (services imports database). A test over here
 // can only assert that a column holds the value somebody typed into the seed.
 // That is Task A4's precedent and this task follows it.
+
+// eoStepMarker is a CFF step marker as the matrix's Why column writes one:
+// "6.1", "5.1", "Q3". A decision recorded on eoClosureBasisStep must quote one
+// of these ALONE, so that an inference cannot be dressed up as a quotation.
+var eoStepMarker = regexp.MustCompile(`^(Q\d+|\d+\.\d+)$`)
 
 // eoSeededWorkflow is one workflow read back with its states and transitions.
 type eoSeededWorkflow struct {
@@ -435,15 +441,83 @@ func TestEoClosureArtefactDecisionsMatchTheMatrix(t *testing.T) {
 			if r.Required != "Yes" {
 				t.Errorf("only a \"Yes\" row is this registry's business; %q is %q and belongs elsewhere", a.FieldKey, r.Required)
 			}
-			if !strings.Contains(r.Why, strings.TrimSuffix(a.MatrixWhy, ".")) {
+			if !strings.Contains(r.Why, a.MatrixWhy) {
 				t.Errorf("the decision quotes the Why cell as %q; the matrix says %q", a.MatrixWhy, r.Why)
 			}
 			if strings.TrimSpace(a.Why) == "" {
 				t.Errorf("no reason is recorded")
 			}
+			// THE CHECK ABOVE CANNOT FAIL ON ITS OWN when MatrixWhy is a
+			// bare step marker like "6.1" — every Why cell of that row
+			// contains it by construction. The basis is what makes the two
+			// kinds of claim separable, and each gets the check it needs.
+			switch a.Basis {
+			case eoClosureBasisPhrase:
+				// A phrase must actually SAY the moment. A step marker
+				// filed as a phrase fails here, which is the whole point.
+				low := strings.ToLower(a.MatrixWhy)
+				if !strings.Contains(low, "clos") && !strings.Contains(low, "verif") {
+					t.Errorf("%q is recorded as naming the moment in words and names neither closing nor verification; it is an inference from the step marker and belongs under %q", a.MatrixWhy, eoClosureBasisStep)
+				}
+				if len([]rune(a.MatrixWhy)) < 12 {
+					t.Errorf("%q is too short to be the client's own phrase", a.MatrixWhy)
+				}
+			case eoClosureBasisStep:
+				// A step entry quotes the marker ALONE — not a sentence that
+				// happens to contain one — and the marker must be the one
+				// this row's cell opens with.
+				if !eoStepMarker.MatchString(a.MatrixWhy) {
+					t.Errorf("%q is recorded as a step marker and is not one (want Q<n> or <n>.<n>); quote the marker alone, so the claim is visibly an inference", a.MatrixWhy)
+				}
+				if !strings.HasPrefix(r.Why, a.MatrixWhy) {
+					t.Errorf("the decision claims step %q and the matrix row's Why cell is %q, which does not begin with it", a.MatrixWhy, r.Why)
+				}
+			default:
+				t.Errorf("basis is %q, want %q or %q: the registry must say which kind of claim this is", a.Basis, eoClosureBasisPhrase, eoClosureBasisStep)
+			}
 			def := eoEffectiveField(t, db, a.TypeKey, a.FieldKey)
 			if def.RequiredMode != models.EORequiredAtState {
 				t.Errorf("seeded %q, a resolved closure artefact must be %q", def.RequiredMode, models.EORequiredAtState)
+			}
+		})
+	}
+
+	// THE CHECK THAT MAKES A STEP-NUMBER INFERENCE FALSIFIABLE. The matrix
+	// lists a type's rows in CFF order, so "this field belongs to the type's
+	// last step" is the claim that it sits at the END of the type's section.
+	// Every step-inferred artefact of a type must therefore form a CONTIGUOUS
+	// RUN ENDING AT THE SECTION'S LAST ROW. Filing a mid-process row (say
+	// `study_report`, four rows from the end) on a step basis breaks this.
+	for _, typeKey := range eoPilotTypeKeys {
+		var inferred []string
+		for _, a := range eoClosureArtefacts {
+			if a.TypeKey == typeKey && a.Basis == eoClosureBasisStep {
+				inferred = append(inferred, a.FieldKey)
+			}
+		}
+		if len(inferred) == 0 {
+			continue
+		}
+		t.Run("the step-inferred run of "+typeKey+" ends the section", func(t *testing.T) {
+			rows := matrix[eoMatrixSections[typeKey]]
+			if len(rows) == 0 {
+				t.Fatalf("the matrix has no section for %q, so a step inference has nothing to rest on", typeKey)
+			}
+			want := map[string]bool{}
+			for _, k := range inferred {
+				want[k] = true
+			}
+			// Walk back from the last row: exactly len(inferred) rows, all
+			// declared, and nothing declared above them.
+			for i := len(rows) - 1; i >= 0; i-- {
+				declared := want[rows[i].Key]
+				inRun := i >= len(rows)-len(inferred)
+				if inRun && !declared {
+					t.Errorf("row %d of the section is %q and is NOT a step-inferred artefact, so the run %v does not end the section; the inference \"these are the type's last steps\" is not what the document shows", i, rows[i].Key, inferred)
+				}
+				if !inRun && declared {
+					t.Errorf("%q is step-inferred and sits %d rows from the end of the section; a step inference only holds for the rows the matrix lists last", rows[i].Key, len(rows)-1-i)
+				}
 			}
 		})
 	}
@@ -702,15 +776,31 @@ func TestEoDirectiveEscalationLadderIsThreeSevenFourteen(t *testing.T) {
 	}
 }
 
-// Every terminal transition carries a mandatory comment requirement, so a
-// statutory register never closes a record with no note saying why — except
-// the two a close_parent ACTION runs, where there is no person at a form to
-// type one and the requirement would make the client's "Closes the parent"
-// fail every time.
+// EVERY terminal transition carries a mandatory comment requirement, with no
+// exception, so a statutory register never closes a record with no note
+// saying why.
 //
-// Mutation: drop `requireComment` from any terminal transition; or add it to
-// the Draft Decision Study's or Incoming Correspondence's `close`.
-func TestEoTerminalTransitionsRequireANoteUnlessAnActionRunsThem(t *testing.T) {
+// THE EARLIER VERSION OF THIS TEST EXEMPTED THE TWO A close_parent ACTION
+// RUNS, and actively forbade the fix: it errored if an action-run closure
+// required a note, on the stated ground that "no action can supply one". That
+// ground was false. services.eoActionExecutor.closeParent always passes a
+// non-empty Comment and services.eoCheckRequirements only tests for an empty
+// one, so the requirement is satisfied by the action — and the exemption
+// meant the Draft Decision Study's and the Incoming Correspondence's `close`,
+// both runnable by hand by anyone holding either seeded role, closed a
+// statutory record with no note. A false reason inside a passing test is
+// worse than no test, because the next person to notice reads it and moves
+// on.
+//
+// The action-run pair is still identified here, but to assert that it is
+// INCLUDED rather than excused — and the fact that the action really does
+// supply a comment is proved on the other side, by
+// services.TestEoPilotChildrenThatCloseTheirParent, which now closes a parent
+// whose closing transition carries this requirement.
+//
+// Mutation: drop `requireComment` from any terminal transition, the two
+// action-run ones included.
+func TestEoTerminalTransitionsRequireANote(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 	got := eoSeededWorkflows(t, db)
@@ -752,10 +842,10 @@ func TestEoTerminalTransitionsRequireANoteUnlessAnActionRunsThem(t *testing.T) {
 		}
 	}
 	if len(actionRun) == 0 {
-		t.Fatalf("no transition is run by an action, so the exemption below is untested")
+		t.Fatalf("no transition is run by an action, so the clause below is untested")
 	}
 
-	checked := 0
+	checked, ranByAction := 0, 0
 	for _, typeKey := range eoPilotTypeKeys {
 		w := got[typeKey]
 		for _, tr := range w.transitions {
@@ -769,17 +859,22 @@ func TestEoTerminalTransitionsRequireANoteUnlessAnActionRunsThem(t *testing.T) {
 				Where("transition_id = ? AND requirement_type = ?", tr.ID, "comment").Count(&n).Error; err != nil {
 				t.Fatalf("count the requirements of %q: %v", tr.Code, err)
 			}
-			exempt := actionRun[typeKey+"."+tr.Code]
-			if exempt && n > 0 {
-				t.Errorf("%s.%s is run by a close_parent action and requires a comment, which no action can supply", typeKey, tr.Code)
-			}
-			if !exempt && n == 0 {
+			if n == 0 {
 				t.Errorf("%s.%s ends a record in a statutory register and requires no note", typeKey, tr.Code)
+			}
+			if actionRun[typeKey+"."+tr.Code] {
+				ranByAction++
+				if n == 0 {
+					t.Errorf("%s.%s is the transition a close_parent action runs and requires no note; the action supplies one, so there is no reason to exempt it and a person running it by hand would close the record silently", typeKey, tr.Code)
+				}
 			}
 		}
 	}
 	if checked == 0 {
 		t.Fatalf("no terminal transition was found")
+	}
+	if ranByAction != len(actionRun) {
+		t.Errorf("%d of the %d action-run transitions were reached by the loop; the rest are not terminal, so the clause above checked less than it claims", ranByAction, len(actionRun))
 	}
 }
 
@@ -793,8 +888,6 @@ func TestEoTerminalTransitionsRequireANoteUnlessAnActionRunsThem(t *testing.T) {
 func TestEoWorkflowSeedingIsAStepOfThePilotSeed(t *testing.T) {
 	found := ""
 	for _, st := range eoPilotSteps {
-		var zero models.EORecordType
-		_ = zero
 		if st.key == eoSeedWorkflowsStepKey {
 			found = st.key
 		}
@@ -832,7 +925,9 @@ func TestEoWorkflowSeedingConvergesWithoutItsAppliedRow(t *testing.T) {
 	}
 }
 
-type eoWorkflowCount struct{ workflows, states, transitions, requirements, actions, policySteps int64 }
+type eoWorkflowCount struct {
+	workflows, states, transitions, requirements, fieldChanges, actions, policySteps int64
+}
 
 func eoWorkflowCounts(t *testing.T, db *gorm.DB) eoWorkflowCount {
 	t.Helper()
@@ -841,6 +936,10 @@ func eoWorkflowCounts(t *testing.T, db *gorm.DB) eoWorkflowCount {
 		states:       eoCountRows(t, db, &models.WorkflowState{}),
 		transitions:  eoCountRows(t, db, &models.WorkflowTransition{}),
 		requirements: eoCountRows(t, db, &models.TransitionRequirement{}),
+		// The one row kind whose idempotency lives in a code path of its own
+		// (eoDeclareClosureArtefacts), so it is the one most likely to double
+		// on a re-run and the one worth counting here.
+		fieldChanges: eoCountRows(t, db, &models.TransitionFieldChange{}),
 		actions:      eoCountRows(t, db, &models.TransitionAction{}),
 		policySteps:  eoCountRows(t, db, &models.EscalationPolicyStep{}),
 	}

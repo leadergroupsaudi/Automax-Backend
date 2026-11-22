@@ -610,3 +610,132 @@ func TestEoPilotDirectiveArmsItsEscalationLadder(t *testing.T) {
 		}
 	}
 }
+
+// THE FAILURE THE RETRY GAP MAKES EXPENSIVE, AND WHAT STANDS IN FOR IT.
+// `close_parent` passes no `Values` (see services.closeParent's note on why),
+// and this same task made the Draft Decision Study's `he_decision`,
+// `he_reason` and `decision_date` required AT the state its `close` enters. So
+// issuing a Decision Record against a study whose decision fields are blank
+// refuses the parent's closure — the `issue` still succeeds, because actions
+// run after the commit and never fail the transition, and the study stays
+// open. Nothing retries it.
+//
+// TestEoPilotChildrenThatCloseTheirParent pre-fills those three fields and so
+// never meets this; this test leaves them blank ON PURPOSE. What it pins is
+// that the failure is VISIBLE on both records — including the parent, which is
+// the one a clerk later opens asking why it is still open, and which got
+// nothing at all before this fix round.
+//
+// Mutation: delete the `if parent != nil { e.recordActionFailure(... parent
+// ...) }` block from eoActionExecutor.executeCloseParent.
+func TestEoPilotCloseParentFailureIsVisibleOnTheParent(t *testing.T) {
+	f := eoWfNewFixture(t)
+
+	// No he_decision / he_reason / decision_date: all three are required at
+	// the state `close` enters.
+	study := f.create(t, eoPilotDraftTypeKey, nil, "", nil)
+	study = f.move(t, study, "submit", models.EOTransitionInput{})
+	study = f.move(t, f.reread(t, study), "begin_study", models.EOTransitionInput{})
+	study = f.move(t, f.reread(t, study), eoPilotRaiseToHECode, models.EOTransitionInput{})
+
+	decision := f.create(t, eoPilotDecisionTypeKey, f.reread(t, study), eoPilotDecisionLinkKey, nil)
+	// The child's own step SUCCEEDS: an action's failure never fails the
+	// transition that dispatched it, which is the engine's contract and not
+	// this task's choice.
+	issued := f.move(t, decision, "issue", models.EOTransitionInput{Comment: "issued"})
+	if issued.ClosedAt == nil {
+		t.Fatalf("the decision record did not reach its terminal state, so this test is not exercising what it claims")
+	}
+
+	stillOpen := f.reread(t, study)
+	if stillOpen.ClosedAt != nil {
+		t.Fatalf("the study closed although three fields required at that state are blank; the at-closure rule did not apply to the action's transition")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		recordID uuid.UUID
+		like     string
+	}{
+		{"the child says its action did not close the parent", decision.ID, "close_parent action%"},
+		{"THE PARENT says why it is still open", study.ID, "%close_parent%NOT CLOSED%"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var notes []string
+			if err := f.db.Model(&models.EORecordHistory{}).
+				Where("record_id = ? AND comment LIKE ?", tc.recordID, tc.like).
+				Pluck("comment", &notes).Error; err != nil {
+				t.Fatalf("read the history: %v", err)
+			}
+			if len(notes) == 0 {
+				t.Fatalf("no history note matching %q; the failure is invisible on this record", tc.like)
+			}
+			// The note has to name the field that blocked it, or the clerk
+			// reading it learns only that something went wrong.
+			if !strings.Contains(notes[0], "he_decision") {
+				t.Errorf("the note does not name the field that blocked the closure: %q", notes[0])
+			}
+		})
+	}
+}
+
+// The idempotency the doc comment on executeCloseParent claims: an
+// already-closed parent is a no-op rather than an error, so a transition
+// dispatched twice does not fail the second time. Nothing tested this, which
+// is the defect class this programme keeps catching — a claim in a comment
+// with no caller behind it.
+//
+// Mutation: delete the `if parent.ClosedAt != nil { … return parent, nil }`
+// early return from eoActionExecutor.closeParent — the second dispatch then
+// fails, because the letter offers no `close` out of its terminal state.
+func TestEoPilotCloseParentOnAnAlreadyClosedParentIsANoOp(t *testing.T) {
+	f := eoWfNewFixture(t)
+
+	letter := f.create(t, eoPilotIncomingTypeKey, nil, "", nil)
+	for _, code := range []string{"analyse", "brief", "direct", "consolidate"} {
+		letter = f.move(t, f.reread(t, letter), code, models.EOTransitionInput{})
+	}
+	reply := f.create(t, eoPilotOutgoingTypeKey, f.reread(t, letter), eoPilotOutgoingLinkKey, nil)
+	reply = f.move(t, reply, "approve", models.EOTransitionInput{})
+	reply = f.move(t, f.reread(t, reply), "send", models.EOTransitionInput{Comment: "sent"})
+
+	closed := f.reread(t, letter)
+	if closed.ClosedAt == nil {
+		t.Fatalf("the letter did not close, so the second dispatch below proves nothing")
+	}
+	closedAt := *closed.ClosedAt
+
+	// Dispatch the same action a second time by hand, as a redelivery would.
+	exec := NewEOActionExecutor(f.records, f.repo, f.types, repository.NewUserRepository(f.db), repository.NewDepartmentRepository(f.db), nil)
+	exec.SetTransitions(f.transits)
+	var action models.TransitionAction
+	if err := f.db.Where("action_type = ?", "close_parent").
+		Joins("JOIN workflow_transitions t ON t.id = transition_actions.transition_id").
+		Where("t.code = ?", "send").Limit(1).Find(&action).Error; err != nil {
+		t.Fatalf("read the reply's close_parent action: %v", err)
+	}
+	if action.ID == uuid.Nil {
+		t.Fatalf("the Outgoing Reply's `send` carries no close_parent action")
+	}
+	var owner models.WorkflowTransition
+	if err := f.db.Preload("Actions").Where("id = ?", action.TransitionID).Limit(1).Find(&owner).Error; err != nil {
+		t.Fatalf("read the transition: %v", err)
+	}
+	if err := exec.ExecuteActions(context.Background(), f.reread(t, reply), &owner, f.actor); err != nil {
+		t.Fatalf("the second dispatch returned an error: %v", err)
+	}
+
+	again := f.reread(t, letter)
+	if again.ClosedAt == nil || !again.ClosedAt.Equal(closedAt) {
+		t.Errorf("closed_at moved from %v to %v; the second dispatch was not a no-op", closedAt, again.ClosedAt)
+	}
+	// And it said nothing was wrong: no failure note was written for it.
+	var notes int64
+	if err := f.db.Model(&models.EORecordHistory{}).
+		Where("record_id = ? AND comment LIKE ?", letter.ID, "%close_parent%NOT CLOSED%").Count(&notes).Error; err != nil {
+		t.Fatalf("read the letter's history: %v", err)
+	}
+	if notes != 0 {
+		t.Errorf("the second dispatch wrote %d failure notes on a letter that was already correctly closed", notes)
+	}
+}

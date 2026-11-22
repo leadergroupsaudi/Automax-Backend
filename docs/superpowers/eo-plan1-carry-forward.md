@@ -299,11 +299,25 @@ holds the executor) is closed by `EOActionExecutor.SetTransitions`, called in
 `cmd/server/main.go` and guarded by
 `handlers.TestEOWiringUsesSLAConstructors`, which reads that file as text.
 **What a failed close_parent does NOT do is retry**: the action is dispatched
-post-commit, its error is logged and written to the CHILD's history, and
-nothing re-runs it. Closing the blocking referral later does not then close the
-letter — somebody must run the letter's own `close`, or re-run the reply's
-step. That is a real gap and it is the first thing to look at if the pilot
-reports letters that stayed open.
+post-commit, its error is logged and written to the history of BOTH records —
+the child that ran it and the parent that wrongly stayed open — and nothing
+re-runs it. Closing the blocking referral later does not then close the letter;
+somebody must run the letter's own `close`, or re-run the reply's step. **The
+note on the PARENT is what stands in for the retry**, because the child reaches
+its terminal state and looks finished, so a note there alone leaves the failure
+where nobody is looking. **The retry itself is a recorded ENGINE item for the
+whole-branch review** — `models.EOTimer` already has a router, a delay and a
+retry budget, so it is closer to configuration than it first appears, but it
+was ruled out of Task A5's fix round deliberately rather than forgotten.
+**There is a second, likelier way for it to fail than the referral case**: the
+action passes no `Values`, and the Draft Decision Study's `he_decision`,
+`he_reason` and `decision_date` are required AT the state its `close` enters,
+so a Decision Record issued against a study whose decision fields are blank
+leaves the study open. The rule that follows for configuration is that **a
+requirement at a state an action closes into must be satisfiable from what is
+already STORED on the parent** — which `ValidateRecordValues` permits.
+`services.TestEoPilotCloseParentFailureIsVisibleOnTheParent` pins that exact
+scenario and reads the note back off the study.
 The original statement follows. The matrix says a **Decision Record**
 "Closes the parent, then joins the base that checks the next draft"
 (matrix:165) and an **Outgoing Reply** "Closes the parent" (matrix:311). **No
@@ -541,6 +555,40 @@ there is no prose and no `Why` column to derive stages from. It is seeded
 `open -> closed`, one transition, marked client-unconfirmed like everything
 else and recorded as minimal in its own `derivation` string. It is the only
 pilot type whose machine is not derived from a client sentence.
+
+**Opened by Task A5, for §9 sign-off: THREE THINGS THE CLIENT'S MATRIX SAYS
+THAT THE SEEDED MACHINES DO NOT EXPRESS.** All three are marked
+`eo_client_unconfirmed` like everything else A5 seeded, which makes them
+findable but does not make them questions; these are the questions.
+
+- **Repeated rounds of direction are unrepresentable.** The matrix gives
+  Incoming Correspondence a `direction_round` field, "Q3 — successive numbered
+  rounds inside the same letter" (matrix:290), and says of the Outgoing Reply
+  "One per letter, **however many rounds of direction it took**" (matrix:311).
+  The seeded machine is strictly linear — received → analysis → briefed →
+  directed → consolidating → closed — with **no path back to `directed`**, so
+  a second round of direction has no state to return to and `direction_round`
+  can only ever read 1. Either the machine gains a loop or the field means
+  something the workflow does not carry.
+- **There are no return or rejection paths, and the matrix's own option lists
+  name them.** `he_decision` includes "Returned for further study" and
+  `recommendation` includes "Return for clarification" and "Reject"
+  (matrix:148, :150). The only exit from the Draft Decision Study's `with_he`
+  is `close`, so **a decision of "returned for further study" still closes the
+  record** — the opposite of what that option means. Task A5's design note
+  said the matrix describes no such paths; those two Options cells contradict
+  it, and the correction is recorded here rather than guessed at in the seed.
+  The same question applies to every pilot type: none has a rejection or
+  withdrawal path.
+- **The lock window: the matrix gives two different answers.** The Draft
+  Decision Study's prose says "Locked on arrival so the original can never be
+  edited" (matrix:126) and its `draft_text` row says "Long text, **locked after
+  submit**" (matrix:134). Those are not the same rule — the first has no
+  editable window at all, the second has one between creation and the submit
+  stamp. A5 implemented the second, and
+  `services.TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit` asserts that
+  the editable window EXISTS, so the two readings are now distinguishable by a
+  test. Only one of them is implemented and the client has confirmed neither.
 
 ---
 

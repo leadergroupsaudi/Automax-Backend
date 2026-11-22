@@ -133,8 +133,17 @@ type eoTransitionSpec struct {
 	from, to   string
 	why        string
 	// requireComment adds a mandatory-comment TransitionRequirement. It is on
-	// the transitions that END a record, so a statutory register never closes
-	// a record with no note saying why.
+	// EVERY transition that ends a record, with no exception, so a statutory
+	// register never closes one with no note saying why.
+	//
+	// THE TWO CLOSURES AN ACTION RUNS ARE NOT EXEMPT, and the first version of
+	// this seed wrongly exempted them on the ground that "an action has no
+	// person at a form to type a comment". That was false:
+	// services.eoActionExecutor.executeCloseParent always passes a non-empty
+	// Comment, and services.eoCheckRequirements only tests for an empty one —
+	// so the requirement is satisfied by the action, and leaving it off meant
+	// a human holding either seeded role could close a draft study or an
+	// incoming letter with no note at all.
 	requireComment bool
 	// closesParentLinkType and closesParentTransition carry the matrix's
 	// "Closes the parent": when this transition runs, the record's parent
@@ -261,7 +270,7 @@ var eoPilotWorkflows = []eoWorkflowSpec{
 	// ── EO-DRF ───────────────────────────────────────────────────────────
 	{
 		typeKey: eoDraftStudyTypeKey, name: "EO Draft Decision Study lifecycle",
-		derivation: "Derived from the Draft Decision Study's Why column and its prose. 1.3/1.4 receive the draft — \"stamped and locked on receipt\", which is the `submitted` state the §7.12 field lock points at. 2.1/2.2/2.3 are the study: the decisions base is pulled up, the conflict verdict and the feasibility are recorded. 3.1 is where objections are raised, and the prose says an objection \"must be resolved or dismissed before the parent can go to H.E. Blocks the raising step, not closure\" — so the raise is a transition of its own, seeded under database.eoDraftRaiseToHETransitionCode, which Task A4's eo_objection_parent names by string equality. Q3/5.1 are H.E.'s decision. Closure is the Decision Record's (matrix:165), which is why `close` carries no comment requirement: an action runs it, not a person at a form.",
+		derivation: "Derived from the Draft Decision Study's Why column and its prose. 1.3/1.4 receive the draft — \"stamped and locked on receipt\", which is the `submitted` state the §7.12 field lock points at. 2.1/2.2/2.3 are the study: the decisions base is pulled up, the conflict verdict and the feasibility are recorded. 3.1 is where objections are raised, and the prose says an objection \"must be resolved or dismissed before the parent can go to H.E. Blocks the raising step, not closure\" — so the raise is a transition of its own, seeded under database.eoDraftRaiseToHETransitionCode, which Task A4's eo_objection_parent names by string equality. Q3/5.1 are H.E.'s decision. Closure is the Decision Record's (matrix:165), run through a close_parent action — which supplies its own comment, so `close` carries the same mandatory note every other terminal transition does.",
 		states: []eoStateSpec{
 			{code: "received", name: "Received", stateType: eoStateInitial,
 				why: "1.3/1.4 — proposer, proposing body, claimed urgency, grounds and the original draft."},
@@ -282,7 +291,8 @@ var eoPilotWorkflows = []eoWorkflowSpec{
 			{code: eoDraftRaiseToHETransitionCode, name: "Raise to H.E.", from: "under_study", to: "with_he",
 				why: "Q2 — the Office recommends and raises it. AN OPEN OBJECTION BLOCKS THIS STEP AND NOT THE CLOSURE (matrix:154); Task A4's eo_objection_parent names this transition's CODE, through the shared constant, and services.checkBlockingChildren compares the two by string equality."},
 			{code: "close", name: "Close", from: "with_he", to: "closed",
-				why: "5.1/6.3 — the decision is recorded and the study closes. The Decision Record's `issue` transition runs this through a close_parent action, so no comment is required of it: there is no person at a form."},
+				why:            "5.1/6.3 — the decision is recorded and the study closes. The Decision Record's `issue` transition runs this through a close_parent action, which SUPPLIES a comment of its own — so the note requirement holds here exactly as it does on every other terminal transition, and a person running this step by hand must type one too.",
+				requireComment: true},
 		},
 		lockDraftFieldsAfter: "submitted",
 		closureState:         "closed",
@@ -348,7 +358,8 @@ var eoPilotWorkflows = []eoWorkflowSpec{
 			{code: "consolidate", name: "Consolidate the answers", from: "directed", to: "consolidating",
 				why: "6.1 — many inputs, one answer."},
 			{code: "close", name: "Close", from: "consolidating", to: "closed",
-				why: "6.3 — the reply has gone out. The Outgoing Reply's `send` transition runs this through a close_parent action, so no comment is required of it."},
+				why:            "6.3 — the reply has gone out. The Outgoing Reply's `send` transition runs this through a close_parent action, which supplies a comment of its own; the note requirement therefore holds here as it does everywhere else.",
+				requireComment: true},
 		},
 	},
 	{
@@ -443,34 +454,72 @@ type eoClosureArtefact struct {
 	// against the parsed matrix, so a row that is not actually "Yes" cannot
 	// be smuggled in here.
 	MatrixRequired string
-	// MatrixWhy is the Why cell's words that make this a closure artefact.
+	// MatrixWhy is the Why cell's words that make this a closure artefact —
+	// either the phrase that names the moment, or the bare CFF step marker.
 	MatrixWhy string
-	Why       string
+	// Basis says WHAT KIND OF CLAIM this entry is, and it exists because the
+	// two are not equally strong and a registry that hid the difference would
+	// read as if they were. See eoClosureBasisPhrase / eoClosureBasisStep.
+	// It is empty on eoClosureArtefactsLeftForTheClient, which records rows
+	// that were NOT resolved.
+	Basis string
+	Why   string
 }
+
+// The two bases a resolved closure artefact can rest on.
+//
+// THEY ARE CHECKED DIFFERENTLY, because the weaker one needs the stronger
+// check. TestEoClosureArtefactDecisionsMatchTheMatrix requires a `phrase`
+// entry's quoted words to contain "clos" or "verif" — so a bare step marker
+// can never be filed as one — and requires the `step` entries of a type to
+// form a CONTIGUOUS RUN ENDING AT THE LAST ROW of that type's matrix section,
+// which is the document's own statement that they are its last steps. The
+// first version of that test compared the quoted Why with strings.Contains
+// alone, which for a MatrixWhy of "6.1" is a check that cannot fail.
+const (
+	// eoClosureBasisPhrase — the matrix's Why cell names closing or
+	// verification IN WORDS. The strongest claim available: the client's
+	// document says when the field arrives.
+	eoClosureBasisPhrase = "phrase"
+	// eoClosureBasisStep — the Why cell gives only a CFF step marker, so the
+	// claim rests on WHERE THE ROW SITS in the type's chain and not on what
+	// the cell says. Defensible, and an INFERENCE: it is the reading that
+	// the matrix lists a type's rows in CFF order and that the last of them
+	// are its last steps. Every entry on this basis is a client question in
+	// a way a `phrase` entry is not.
+	eoClosureBasisStep = "step"
+)
 
 // eoClosureArtefacts is what A5 resolved. eoRequireAtClosureState points these
 // AND eoAtClosureFields at the type's closing state.
+//
+// TWO OF THE SEVEN REST ON AN EXPLICIT PHRASE AND FIVE ON A STEP NUMBER. That
+// is the honest split and it is in the data, not only in the report: only
+// eo_directive.verification_notes ("before closing") and eo_task.verified_by
+// ("Verification is what closes it") have a Why cell that names the moment in
+// words. The other five are inferences from where the row sits in the
+// matrix's CFF ordering, and the client should be asked about them as a group.
 var eoClosureArtefacts = []eoClosureArtefact{
 	{eoDirectiveTypeKey, "verification_notes", "Yes",
-		"6.1 — the Office records what it checked before closing",
+		"the Office records what it checked before closing", eoClosureBasisPhrase,
 		"The Why cell says \"before closing\" in so many words. A directive is opened with an instruction and an outcome; what the Office checked cannot exist until the work does. Required at `closed`, which is the state the `close` transition enters."},
 	{eoDraftStudyTypeKey, "he_decision", "Yes",
-		"Q3 — the decision is his alone",
-		"Q3 is the LAST question of EO-DRF, after Q2's recommendation and the raise to H.E. A draft study is created to be decided; requiring the decision to create it is the matrix read backwards. Required at `closed`."},
+		"Q3", eoClosureBasisStep,
+		"INFERRED FROM THE STEP MARKER, not from the cell's words: \"the decision is his alone\" says whose it is, not when it arrives. Q3 is the LAST question of EO-DRF, after Q2's recommendation and the raise to H.E., and the three rows Q3/5.1/5.1 are the final run of this type's section. A draft study is created to be decided; requiring the decision to create it is the matrix read backwards. Required at `closed`."},
 	{eoDraftStudyTypeKey, "he_reason", "Yes",
-		"5.1 — recorded with the decision",
-		"\"Recorded WITH the decision\": it arrives when he_decision does, at step 5.1, which follows Q3. Required at `closed`."},
+		"5.1", eoClosureBasisStep,
+		"INFERRED FROM THE STEP MARKER. The cell adds \"recorded with the decision\", which ties it to he_decision but still does not name closing. 5.1 is the last numbered step of this type's section. Required at `closed`."},
 	{eoDraftStudyTypeKey, "decision_date", "Yes",
-		"5.1",
-		"Step 5.1, with he_decision and he_reason — the date the decision was taken, which cannot precede the study it decides. Required at `closed`."},
+		"5.1", eoClosureBasisStep,
+		"INFERRED FROM THE STEP MARKER, and the cell says nothing else at all — it is the bare \"5.1\". The date the decision was taken, which cannot precede the study it decides. Required at `closed`."},
 	{eoAssignmentTypeKey, "verified_by", "Yes",
-		"6.1",
-		"Step 6.1 is EO-DIR's verification step, the same one the Directive's verification_notes belongs to, and it is what the terminal transition does. An assignment is created at 3.1 by a body that is not the verifier. Required at `closed`, beside the `evidence` the matrix already marks \"Yes at closure\" on this type — which is the strongest evidence that the two belong to the same moment."},
+		"6.1", eoClosureBasisStep,
+		"INFERRED FROM THE STEP MARKER, which is the whole of the cell. 6.1 is EO-DIR's verification step, the same one the Directive's verification_notes belongs to, and the last marker this type's section carries. An assignment is created at 3.1 by a body that is not the verifier. Required at `closed`, beside the `evidence` the matrix already marks \"Yes at closure\" on this type — which is the strongest circumstantial support the document gives, and is still not a sentence about closing."},
 	{eoAssignmentTypeKey, "verified_on", "Yes",
-		"6.1",
-		"The date half of the same 6.1 verification; see verified_by."},
+		"6.1", eoClosureBasisStep,
+		"INFERRED FROM THE STEP MARKER; the date half of the same 6.1 verification. See verified_by."},
 	{eoTaskTypeKey, "verified_by", "Yes",
-		"Verification is what closes it, not the owner marking it done",
+		"Verification is what closes it, not the owner marking it done", eoClosureBasisPhrase,
 		"The Why cell states the rule outright: verification CLOSES the task. On this type the matrix gives one row (\"Verified by and on\", kind \"User + Date\"), so this is the single models.EOKindUserDate field A3 seeded. Required at `closed`, beside this type's \"Yes at closure\" `evidence`."},
 }
 
@@ -482,13 +531,13 @@ var eoClosureArtefacts = []eoClosureArtefact{
 // all".
 var eoClosureArtefactsLeftForTheClient = []eoClosureArtefact{
 	{eoDraftStudyTypeKey, "recommendation", "Yes",
-		"Q2 — the Office recommends; it does not bind him",
+		"Q2 — the Office recommends; it does not bind him", "",
 		"Q2 comes BEFORE the raise to H.E., not at closure: the recommendation is what the Office raises. Requiring it at `closed` would be weaker than the truth and requiring it at `with_he` is a fourth requiredness shape the engine does not have (required_at_state names states, and eoRequireAtClosureState points a type's whole set at ONE state). Left `always` and put to the client as \"required at creation, or required before the raise?\"."},
 	{eoDraftStudyTypeKey, "study_report", "Yes",
-		"4.2 — summary, comparison, evidence, objections",
+		"4.2 — summary, comparison, evidence, objections", "",
 		"Step 4.2 precedes Q2, so this is the same question as `recommendation` and gets the same answer. Note the consequence while it stands: with these two `always`, a Draft Decision Study still cannot be CREATED without them, so the root type remains unsubmittable in practice until the client answers."},
 	{eoIncomingTypeKey, "consolidated", "Yes",
-		"6.1 — many inputs, one answer",
+		"6.1 — many inputs, one answer", "",
 		"Step 6.1 is late, but the Why cell names consolidation rather than closing, and the letter is closed by its Outgoing Reply rather than by a form. Left `always` rather than guessed."},
 }
 
