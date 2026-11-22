@@ -34,6 +34,13 @@ type eoTxRecordRepo struct {
 	// calls records the repository methods the executor used, in order, so a
 	// test can pin that the row lock is taken before anything is read.
 	calls []string
+	// childrenTotal counts every Children read; childrenInTx counts the
+	// subset that went through the transaction's own handle. A read taken
+	// outside the transaction while it holds a connection and a row lock is
+	// a pool-starvation deadlock waiting to happen, and the two counters are
+	// what makes that visible.
+	childrenTotal int
+	childrenInTx  int
 }
 
 func (f *eoTxRecordRepo) LockForUpdate(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
@@ -67,6 +74,7 @@ func (f *eoTxRecordRepo) GetAnyByID(_ context.Context, id uuid.UUID) (*models.EO
 
 func (f *eoTxRecordRepo) Children(_ context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error) {
 	f.calls = append(f.calls, "Children")
+	f.childrenTotal++
 	var out []models.EORecord
 	for _, c := range f.children[parentID] {
 		if recordTypeID == nil || c.RecordTypeID == *recordTypeID {
@@ -97,8 +105,20 @@ func (f *eoTxRecordRepo) CreateHistory(_ context.Context, entry *models.EORecord
 	return nil
 }
 
+// eoTxBoundRepo is what Transaction hands its closure: the same store, but a
+// distinct object, so a read taken on the service's own non-transactional
+// repository can be told apart from one taken through the transaction.
+type eoTxBoundRepo struct {
+	*eoTxRecordRepo
+}
+
+func (b *eoTxBoundRepo) Children(ctx context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error) {
+	b.eoTxRecordRepo.childrenInTx++
+	return b.eoTxRecordRepo.Children(ctx, parentID, recordTypeID)
+}
+
 func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository) error) error {
-	if err := fn(f); err != nil {
+	if err := fn(&eoTxBoundRepo{f}); err != nil {
 		return err
 	}
 	f.committed = true
@@ -141,6 +161,15 @@ func (f *eoTxTypeRepo) FieldDefs(_ context.Context, recordTypeIDs []uuid.UUID) (
 		}
 	}
 	return out, nil
+}
+
+func (f *eoTxTypeRepo) GetByKey(_ context.Context, key string) (*models.EORecordType, error) {
+	for _, t := range f.types {
+		if t.Key == key {
+			return t, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *eoTxTypeRepo) GetLinkTypeByKey(_ context.Context, key string) (*models.EOLinkType, error) {
@@ -1163,6 +1192,145 @@ func TestExecuteRecomputesDerivedFields(t *testing.T) {
 	if got := eoTxValues(t, f.records.updated[0].Values)["total_days"]; got != 21.0 {
 		t.Errorf("persisted total_days = %v, want 21 — derived fields run before the write", got)
 	}
+}
+
+func TestExecuteLockedFieldIsComparedAgainstThePreTransitionValue(t *testing.T) {
+	// The static assignment writes assigned_user_id before the field changes
+	// are validated. If the locked-field check then compares a submitted
+	// value against the record AS MUTATED, the lock inverts: the value the
+	// transition just wrote looks unchanged and is accepted, while the
+	// record's genuine assignee looks like an edit and is refused. The
+	// comparand has to be the pre-transition snapshot.
+	original := uuid.New()
+	static := uuid.New()
+
+	build := func(t *testing.T) *eoTxFixture {
+		t.Helper()
+		f := eoNewTxFixture(t)
+		f.rec.AssignedUserID = &original
+		f.records.stored[f.rec.ID] = f.rec
+		f.records.entered = map[uuid.UUID]bool{f.draft.ID: true, f.review.ID: true}
+
+		locked := eoTxField("assigned_user_id", models.EOKindUser, models.EORequiredNever, f.recordType.ID)
+		locked.IsLockedAfterStateID = &f.draft.ID
+		f.types.defs = append(f.types.defs, locked)
+
+		raise := f.transition("raise")
+		raise.AssignUserID = &static
+		raise.FieldChanges = []models.TransitionFieldChange{{FieldName: "assigned_user_id"}}
+		return f
+	}
+
+	t.Run("the static value is still an edit and the lock refuses it", func(t *testing.T) {
+		f := build(t)
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{
+			Values: map[string]any{"assigned_user_id": static.String()},
+		})
+		if err == nil {
+			t.Fatal("a locked field was changed, because the baseline had already been overwritten")
+		}
+		if fields := eoTxFieldErrors(t, err); fields["assigned_user_id"] == "" {
+			t.Fatalf("field errors = %v, want assigned_user_id locked", fields)
+		}
+	})
+
+	t.Run("re-submitting the record's own assignee is a no-op and is allowed", func(t *testing.T) {
+		f := build(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{
+			Values: map[string]any{"assigned_user_id": original.String()},
+		}); err != nil {
+			t.Fatalf("echoing the stored assignee was refused as a locked-field change: %v", err)
+		}
+	})
+}
+
+func TestExecuteRecomputesDerivedThroughTheTransaction(t *testing.T) {
+	// A roll-up's child read must go through the transaction's own handle.
+	// Taken on the service's pooled repository it would acquire a SECOND
+	// connection while this transaction holds one plus a FOR UPDATE row
+	// lock, and database/sql waits for a free connection indefinitely unless
+	// the context carries a deadline — lock_timeout does not bound it.
+	f := eoNewTxFixture(t)
+	f.rec.StateID = &f.draft.ID
+	f.records.stored[f.rec.ID] = f.rec
+
+	stage := &models.EORecordType{ID: uuid.New(), Key: "eo_stage", Name: "Stage", IsActive: true}
+	f.types.types[stage.ID] = stage
+	f.records.children[f.rec.ID] = []models.EORecord{
+		{ID: uuid.New(), RecordTypeID: stage.ID, Values: datatypes.JSON(`{"weeks":2}`)},
+		{ID: uuid.New(), RecordTypeID: stage.ID, Values: datatypes.JSON(`{"weeks":3}`)},
+	}
+
+	total := eoDerivedField("total_weeks", "children_eo_stage_sum_weeks",
+		[]map[string]any{{"scope": "child", "type": "eo_stage", "field": "weeks", "aggregates": []string{"sum"}}})
+	total.ID, total.RecordTypeID, total.Kind = uuid.New(), f.recordType.ID, models.EOKindNumber
+	f.types.defs = append(f.types.defs, total)
+
+	rec, err := f.run("submit", f.actor, models.EOTransitionInput{})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got := eoTxValues(t, rec.Values)["total_weeks"]; got != 5.0 {
+		t.Fatalf("total_weeks = %v, want 5 rolled up from the children", got)
+	}
+	if f.records.childrenTotal == 0 {
+		t.Fatal("no child read happened at all; the roll-up did not run")
+	}
+	if f.records.childrenInTx != f.records.childrenTotal {
+		t.Errorf("child reads: %d of %d went through the transaction — the rest took a second pooled connection while this one holds a row lock",
+			f.records.childrenInTx, f.records.childrenTotal)
+	}
+}
+
+func TestExecuteRefusesUnsupportedAssignmentConfiguration(t *testing.T) {
+	// A flag the engine cannot honour must not pass quietly: a transition
+	// seeded with auto_match_user assigning nobody and saying nothing is the
+	// same silent no-op as an unevaluated requirement type.
+	for _, tc := range []struct {
+		name string
+		set  func(*models.WorkflowTransition)
+	}{
+		{"auto_match_user", func(tr *models.WorkflowTransition) { tr.AutoMatchUser = true }},
+		{"auto_detect_department", func(tr *models.WorkflowTransition) { tr.AutoDetectDepartment = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := eoNewTxFixture(t)
+			tc.set(f.transition("raise"))
+			_, err := f.run("raise", f.actor, models.EOTransitionInput{})
+			if err == nil {
+				t.Fatalf("a transition configured with %s ran and assigned nobody", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("err = %v, want it to name %s", err, tc.name)
+			}
+			if len(f.records.updated) != 0 {
+				t.Error("the record was written despite the refusal")
+			}
+		})
+	}
+
+	t.Run("manual_select_user is supported and does not refuse", func(t *testing.T) {
+		// It needs no engine code: the transition declares assigned_user_id
+		// as a field change and the actor's choice goes through the field
+		// rules like any other value.
+		f := eoNewTxFixture(t)
+		chosen := uuid.New()
+		raise := f.transition("raise")
+		raise.ManualSelectUser = true
+		raise.FieldChanges = []models.TransitionFieldChange{{FieldName: "assigned_user_id"}}
+		f.types.defs = append(f.types.defs,
+			eoTxField("assigned_user_id", models.EOKindUser, models.EORequiredNever, f.recordType.ID))
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{
+			Values: map[string]any{"assigned_user_id": chosen.String()},
+		})
+		if err != nil {
+			t.Fatalf("manual selection was refused: %v", err)
+		}
+		if rec.AssignedUserID == nil || *rec.AssignedUserID != chosen {
+			t.Errorf("assigned_user_id = %v, want the actor's choice %s", rec.AssignedUserID, chosen)
+		}
+	})
 }
 
 // ── terminal states ─────────────────────────────────────────────────────────

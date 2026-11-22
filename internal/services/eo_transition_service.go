@@ -129,7 +129,6 @@ type eoTransitionService struct {
 	types     repository.EORecordTypeRepository
 	workflows repository.WorkflowRepository
 	eval      FormulaEvaluator
-	deps      DependencyLoader
 	actions   EOTransitionActionDispatcher
 }
 
@@ -146,7 +145,6 @@ func NewEOTransitionService(
 		types:     types,
 		workflows: workflows,
 		eval:      eoformula.New(0),
-		deps:      &eoRecordDeps{records: records, types: types},
 		actions:   actions,
 	}
 }
@@ -288,9 +286,18 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// assigned_user_id the transition DECLARES as a field change beats
 		// the static assignment it carries — the order the incident path
 		// uses, and the one that makes the actor's own choice win.
-		eoApplyTransitionAssignment(fresh, transition)
+		if err := eoApplyTransitionAssignment(fresh, transition); err != nil {
+			return err
+		}
 
-		if err := s.applyFieldChanges(ctx, r, fields, fresh, transition, input); err != nil {
+		// `before`, not the record as the assignment has just mutated it, is
+		// the baseline the field rules compare against: the locked-field
+		// check asks "is this value different from the stored one", and a
+		// baseline that already holds the static assignment inverts it —
+		// the value the transition just wrote would look unchanged and pass
+		// the lock, while the record's genuine assignee would look like an
+		// edit and be refused.
+		if err := s.applyFieldChanges(ctx, r, fields, before, fresh, transition, input); err != nil {
 			return err
 		}
 
@@ -310,7 +317,16 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// moment the record moves. It runs AFTER the state and closed_at are
 		// set, so a formula reading them sees the new ones, and BEFORE the
 		// write, so the row the database receives is already current.
-		eoApplyDerived(ctx, fields, fresh, s.deps)
+		//
+		// The dependency loader is built on the TRANSACTION's repository, not
+		// on the service's. A child or ancestor read taken on the pooled one
+		// would acquire a second connection while this transaction holds its
+		// own plus a FOR UPDATE row lock, and database/sql waits for a free
+		// connection indefinitely unless the context carries a deadline —
+		// lock_timeout does not bound that. It would also put those reads
+		// outside the transaction. (The save pipeline recomputes BEFORE
+		// opening its transaction, so it is no precedent for doing otherwise.)
+		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: s.types})
 
 		// 8. the record and its journal entry are one write.
 		if err := r.Update(ctx, fresh); err != nil {
@@ -476,20 +492,39 @@ func eoFieldNamesUser(v any, id uuid.UUID) bool {
 // ── assignment ──────────────────────────────────────────────────────────────
 
 // eoApplyTransitionAssignment resolves the assignment the transition carries
-// (spec §7.8 lists assignment resolution as part of this path). Only the
-// STATIC half is EO's: AssignUserID names the user and AssignDepartmentID the
-// owning body.
+// (spec §7.8 lists assignment resolution as part of this path). The STATIC
+// half is implemented: AssignUserID names the user and AssignDepartmentID the
+// owning body. A transition carrying neither leaves the record's own alone;
+// it is not a way to clear an assignee.
 //
-// AutoDetectDepartment and AutoMatchUser are deliberately not implemented:
-// they match on an incident's classification and location, which EO records
-// do not have. ManualSelectUser needs no code either — a transition that lets
-// the actor choose declares assigned_user_id as a field change, so the choice
-// goes through the field rules like any other value, and because field
-// changes are applied after this, it wins.
+// ManualSelectUser needs no engine code — a transition that lets the actor
+// choose declares assigned_user_id as a field change, so the choice goes
+// through the field rules like any other value, and because field changes are
+// applied after this, it wins.
 //
-// A transition carrying no assignment leaves the record's own alone; it is
-// not a way to clear an assignee.
-func eoApplyTransitionAssignment(rec *models.EORecord, transition *models.WorkflowTransition) {
+// AutoDetectDepartment and AutoMatchUser are REFUSED rather than ignored.
+//
+// Refusing, not implementing, is the deliberate part. AutoDetectDepartment
+// matches on an incident's classification and location, which EO records
+// genuinely do not have. AutoMatchUser is the subtler case: its role-only
+// fallback (incident_service.go:3753 matches on assignment roles alone) needs
+// nothing an EO record lacks, so it COULD be implemented — but it wants a
+// user repository this service does not have, and that wiring belongs with
+// the seeding work, not here.
+//
+// What is not acceptable either way is silence. A transition seeded with
+// AutoMatchUser that assigns nobody and says nothing is the same silent no-op
+// as a mandatory requirement the engine never evaluates, so it fails the same
+// way: loudly, naming the flag.
+func eoApplyTransitionAssignment(rec *models.EORecord, transition *models.WorkflowTransition) error {
+	if transition.AutoMatchUser {
+		return fmt.Errorf("transition %q sets auto_match_user, which the EO engine does not resolve; name the user with assign_user_id, or declare assigned_user_id as a field change",
+			transition.Code)
+	}
+	if transition.AutoDetectDepartment {
+		return fmt.Errorf("transition %q sets auto_detect_department, which matches on an incident's classification and location and has no EO equivalent; name the body with assign_department_id",
+			transition.Code)
+	}
 	if transition.AssignUserID != nil {
 		id := *transition.AssignUserID
 		rec.AssignedUserID = &id
@@ -498,6 +533,7 @@ func eoApplyTransitionAssignment(rec *models.EORecord, transition *models.Workfl
 		id := *transition.AssignDepartmentID
 		rec.OwningBodyID = &id
 	}
+	return nil
 }
 
 // ── requirements ────────────────────────────────────────────────────────────
@@ -658,10 +694,15 @@ func eoBlockedError(code string, blocked []models.EORecord) error {
 // about the state being entered, and against the states the record has EVER
 // entered, read from eo_record_history: is_locked_after asks a question only
 // the history can answer, since EO workflows have return and exception paths.
+// stored is the record's values as they were BEFORE this transition touched
+// anything. It is passed in rather than re-flattened from rec, because by the
+// time this runs the static assignment has already been applied and rec is no
+// longer the baseline the field rules must compare against.
 func (s *eoTransitionService) applyFieldChanges(
 	ctx context.Context,
 	r repository.EORecordRepository,
 	fields []models.EOFieldDef,
+	stored map[string]any,
 	rec *models.EORecord,
 	transition *models.WorkflowTransition,
 	input models.EOTransitionInput,
@@ -697,7 +738,7 @@ func (s *eoTransitionService) applyFieldChanges(
 	if err != nil {
 		return err
 	}
-	fieldErrs, err := ValidateRecordValues(fields, eoFlattenStored(rec), input.Values, &transition.ToStateID, entered, s.eval)
+	fieldErrs, err := ValidateRecordValues(fields, stored, input.Values, &transition.ToStateID, entered, s.eval)
 	if err != nil {
 		return err
 	}
