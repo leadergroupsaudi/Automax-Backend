@@ -684,6 +684,27 @@ findable but does not make them questions; these are the questions.
   decision reopens. Whoever first marks part of the base confidential owns
   that; it is not a thing to discover afterwards from a verdict that was
   recorded against half a register.
+  **AND IN TASK B3, FOR THE CAPABILITY THAT ACTUALLY CROSSES BODIES.**
+  `referral_tree` reads Referrals, and every pilot Referral carries
+  `visible_to` (derived from `referred_body`, Required Always), so B2's rule —
+  exclude a record that declares an audience — would have excluded EVERY
+  branch of EVERY letter and called the empty result a consolidation. B3
+  therefore split the question in two, which is the shape the next
+  record-crossing capability should copy:
+  **READING is unfiltered and that is correct** — the issuing Office must see
+  every branch to consolidate, which is the case `applyEORecordVisibility`'s
+  creator exemption is written for, and no branch is ever omitted from the
+  output for any reason.
+  **WRITING carries no branch content.** The value stored on the letter is
+  structure and status only (branch id, reference, parent, depth, answered,
+  and an anomaly where the declared parent could not be honoured). The letter
+  carries no `visible_to` of its own, so a `response` or an `instruction`
+  copied onto it would be readable by every reader of the letter — §7.11
+  routed around by the engine meant to enforce it. The residual, stated:
+  a reader entitled to the letter learns that branch `IN-YYYY-NNNN-R3` exists
+  and whether it has answered, without being entitled to open it. If the
+  client holds even the SHAPE of the tree confidential, the answer is not to
+  trim the list silently — it is to stop storing it on the letter.
 - **`EOCapabilityReader.Children` resolves the record type key on every call**
   (`GetByKey` then `Children`). A referral-tree recursion therefore issues one
   `GetByKey` per node for a key it resolved at the root. Inside a transaction
@@ -730,6 +751,73 @@ findable but does not make them questions; these are the questions.
   that, the fix is a predicate in the repository — the matching key is
   configuration, so it would be a jsonb containment query — not a second
   capability-side cache.
+
+### Opened by Task B3 (`referral_tree`)
+
+- **The stored tree is a SNAPSHOT, and nothing re-computes it when a branch
+  answers.** `Derive` runs when the LETTER is saved or transitioned; a capability
+  has no child-scope recompute trigger (§7.5's `recompute_on` scopes belong to
+  derived FIELDS, and the capability hooks are not in that mechanism). So a
+  letter whose branches all answered after its last save still stores
+  `complete: false` until it is saved again. This cannot let a letter close with
+  a branch outstanding — closure is `BlockingChildren`'s, over live rows, inside
+  the transition — but a UI that reads the stored value is reading the letter's
+  last save, not this minute. The fix, if the client needs it live, is either a
+  capability-visible equivalent of `recompute_on: child` or a read-time
+  projection; it is NOT a second write path from the branch to the letter.
+- **Two seed comments disagree about where a sub-referral's parentage lives, and
+  one of them is wrong.** `seed_eo_pilot.go:~2074` says "the structure lives in
+  `eo_record_links`, not in a value on the record"; `seed_eo_pilot.go:~2582` says
+  "the matrix carries the sub-referral on the `parent_referral` LINK FIELD
+  instead". **The second is the one that matches the code**: no link type with
+  key `parent_referral` is seeded (the eight pilot link types are all
+  `<child>_parent` types to a RECORD parent), `EORecordHandler.CreateLink`
+  refuses a link type that does not exist, so no `eo_record_links` row of that
+  key can ever be written. B3 therefore reads the `parent_referral` values key.
+  The comment at ~2074 should be corrected by whoever next touches that block.
+- **`EOCapabilityReader.Links` still has no production consumer.** B1 added it
+  "the direction a child uses to name its parent, which is how a referral tree is
+  walked", and B3 — the task it was added for — does not call it, for the reason
+  above: the typed link it would read cannot exist. It is exercised only by
+  `eoReadCap`. Either a later task seeds a `parent_referral` LINK TYPE and moves
+  the shape onto `eo_record_links` (which would also give the pairing a
+  cardinality and an endpoint-type check the values key has neither of), or the
+  method is dead surface on the seam and should be said to be.
+- **Nothing validates a `parent_referral` value.** It is provenance `user`,
+  Required Never, kind `link` with `{"target_type_key":"eo_referral"}` — and
+  **nothing in the engine reads a link field's config**, so a clerk may store any
+  string there. B3 does not enforce it (a capability refusing a save would be a
+  rule invented in Go against configuration that permits it); it REPORTS it, as
+  an `anomaly` on the branch, which is why the tree has four of them
+  (`parent_unreadable`, `parent_outside_tree`, `parent_cycle`,
+  `parent_too_deep`). The enforcement seam, when the client wants one, is
+  `ValidateRecordValues` learning the `link` and `multi_link` kinds.
+- **`referral_tree` reserves `referral_tree` and NOTHING in the pilot declares
+  it**, so unlike `decisions_base`'s `related_refs` there is no seed collision to
+  clean up for whichever task enables the capability on Incoming
+  Correspondence. What that task must still do: enable it with
+  `{"branch_type_key":"eo_referral"}`, and leave the letter's `consolidated`
+  field alone — it is the OFFICER's prose ("many inputs, one answer", Required
+  Yes) and the capability refuses it as a target by name, in the same shape as
+  `decisions_base`'s `conflict_verdict` deny list.
+- **`eoApplyValues` panics on a record whose `values` column holds JSON `null`.**
+  `eoDecodeValues` decodes `null` into a NIL map and the merge then writes to it
+  (`eo_record_service.go:~140`). The engine's own create path cannot produce one
+  (an empty `Values` is an empty byte slice, which `eoDecodeValues` special-cases),
+  so this is only reachable through a hand-written row or a future importer —
+  found by a test fixture that marshalled a nil map, not by the capability.
+- **A capability cannot reach `BlockingChildren`.** Task B3's brief asked it to
+  reuse `BlockingChildren` and `WalkAncestors`; neither is usable from a
+  capability as the seam stands. `BlockingChildren` needs a
+  `map[string]EOLinkType`, and `EOCapabilityReader` exposes no link-type lookup
+  (the transition service builds the map from `EORecordTypeRepository.
+  GetLinkTypeByKey`, which a capability has no handle on); `WalkAncestors`
+  follows `ParentRecordID`, which for every referral is the letter, so it has no
+  tree to walk. B3 instead reads the branches' `ClosedAt` — the SAME signal
+  `BlockingChildren` reads — so "outstanding" and "holds the letter open" cannot
+  drift apart without a change to the engine. If a later capability genuinely
+  needs the blocking rule, the seam needs a link-type method, not a repository
+  on the capability.
 
 ---
 
