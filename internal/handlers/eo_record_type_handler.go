@@ -199,9 +199,13 @@ func (h *EORecordTypeHandler) eoTypeHasRecords(c *fiber.Ctx, typeID uuid.UUID) (
 // eoCheckReferencePrefix applies models.ValidateReferencePrefix against every
 // other configured type. Global reference uniqueness rests entirely on
 // prefixes not overlapping, because `reference` is unique per PARTITION only.
-// An abstract type holds no records of its own and so needs no prefix.
+//
+// An abstract type holds no records of its own and so needs no prefix, and a
+// parent-derived one issues every reference inside its parent's. The rule
+// itself exempts both; they are short-circuited here as well so neither pays
+// for the List below.
 func (h *EORecordTypeHandler) eoCheckReferencePrefix(c *fiber.Ctx, t *models.EORecordType) (bool, error) {
-	if t.IsAbstract {
+	if t.IsAbstract || t.ReferenceMode == models.EOReferenceModeParent {
 		return true, nil
 	}
 	all, err := h.types.List(c.UserContext())
@@ -214,7 +218,7 @@ func (h *EORecordTypeHandler) eoCheckReferencePrefix(c *fiber.Ctx, t *models.EOR
 			others = append(others, other)
 		}
 	}
-	if err := models.ValidateReferencePrefix(t.ReferencePrefix, others); err != nil {
+	if err := models.ValidateReferencePrefix(*t, others); err != nil {
 		return false, eoFieldErrors(c, map[string]string{"reference_prefix": err.Error()})
 	}
 	return true, nil

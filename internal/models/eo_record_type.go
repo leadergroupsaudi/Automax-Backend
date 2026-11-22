@@ -185,10 +185,28 @@ func (x *EOLinkType) BeforeCreate(tx *gorm.DB) error {
 // reference is unique only within a partition, so global uniqueness rests
 // entirely on prefixes never overlapping. Types without a prefix are ignored.
 //
+// It takes the whole type, not just the string, because TWO kinds of type own
+// no prefix at all and the rule must not be asked of them:
+//
+//   - an ABSTRACT type holds no records of its own, so it issues no references;
+//   - a PARENT-DERIVED type (ReferenceMode "parent") issues every reference
+//     inside its parent's — EO-SMOKE-2026-001-T1 under EO-SMOKE-2026-001 — so
+//     a truthful prefix for it ALWAYS overlaps its parent's and a blank one
+//     would be rejected outright. Global uniqueness still holds for it without
+//     a prefix of its own: a child reference is its parent's plus a suffix the
+//     parent's own sequence can never produce, and the parent's prefix is
+//     already guarded here. Without this exemption every parent-derived type
+//     has to carry a prefix that is a small lie about the references it issues
+//     — and ValidateTypeEdit makes that lie permanent, because changing a
+//     prefix is a destructive edit once records exist.
+//
 // On an update, the caller MUST exclude the type being edited from existing,
 // otherwise a type that keeps its own prefix is rejected against itself.
-func ValidateReferencePrefix(prefix string, existing []EORecordType) error {
-	p := strings.ToUpper(strings.TrimSpace(prefix))
+func ValidateReferencePrefix(t EORecordType, existing []EORecordType) error {
+	if t.IsAbstract || t.ReferenceMode == EOReferenceModeParent {
+		return nil
+	}
+	p := strings.ToUpper(strings.TrimSpace(t.ReferencePrefix))
 	if p == "" {
 		return fmt.Errorf("reference prefix is required")
 	}
@@ -198,7 +216,7 @@ func ValidateReferencePrefix(prefix string, existing []EORecordType) error {
 			continue
 		}
 		if strings.HasPrefix(p, o) || strings.HasPrefix(o, p) {
-			return fmt.Errorf("reference prefix %q overlaps %q used by record type %q", prefix, e.ReferencePrefix, e.Key)
+			return fmt.Errorf("reference prefix %q overlaps %q used by record type %q", t.ReferencePrefix, e.ReferencePrefix, e.Key)
 		}
 	}
 	return nil

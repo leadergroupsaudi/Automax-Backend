@@ -261,6 +261,15 @@ func (f *eoE2EFixture) eoE2ECloseTransition(t *testing.T, rec *models.EORecord) 
 	return available[0]
 }
 
+// eoE2ECloseInput is what the seeded `close` transition asks for: the comment
+// its mandatory requirement wants, and the one field change it declares.
+func eoE2ECloseInput(reason string) models.EOTransitionInput {
+	return models.EOTransitionInput{
+		Comment: reason,
+		Values:  map[string]any{"change_reason": reason},
+	}
+}
+
 // eoE2EValues decodes a record's jsonb bag.
 func eoE2EValues(t *testing.T, raw []byte) map[string]any {
 	t.Helper()
@@ -338,6 +347,10 @@ func TestEOEngineEndToEnd(t *testing.T) {
 	f := eoE2ENewFixture(t)
 	ctx := context.Background()
 	parentDue := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
+	// Captured BEFORE the first record is created. An own-sequence reference
+	// carries the year the engine read while allocating it, so reading the
+	// year afterwards would disagree with it for one run a year.
+	year := time.Now().Format("2006")
 
 	// ── 1. a parent record, numbered by its own type's pattern ──────────
 	//
@@ -374,9 +387,9 @@ func TestEOEngineEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 1 — create the parent: %v", err)
 	}
-	if want := "-" + time.Now().Format("2006") + "-001"; !strings.HasPrefix(parent.Reference, "EO-SMOKE-") || !strings.HasSuffix(parent.Reference, want) {
-		t.Errorf("step 1 — parent reference %q does not match the type's own pattern %q",
-			parent.Reference, f.parentTyp.ReferencePattern)
+	if want := "EO-SMOKE-" + year + "-001"; parent.Reference != want {
+		t.Errorf("step 1 — parent reference %q does not match the type's own pattern %q (want %q)",
+			parent.Reference, f.parentTyp.ReferencePattern, "EO-SMOKE-"+year+"-001")
 	}
 	if parent.StateID == nil {
 		t.Fatal("step 1 — the parent was created into no state")
@@ -426,17 +439,56 @@ func TestEOEngineEndToEnd(t *testing.T) {
 
 	// ── 3. close the child: history written, closed_at set ───────────────
 	closeChild := f.eoE2ECloseTransition(t, childA)
+
+	// Who may act. An empty AllowedRoles means NO restriction, so this is the
+	// assertion that proves the seed attached the role at all.
 	if _, err := f.transits.Execute(ctx, childA, closeChild.ID, f.outsider,
-		models.EOTransitionInput{Comment: "not my record"}); !errors.Is(err, ErrEOTransitionNotPermitted) {
+		eoE2ECloseInput("not my record")); !errors.Is(err, ErrEOTransitionNotPermitted) {
 		t.Errorf("step 3 — a user without the executive_office role closed the child: %v", err)
 	}
-	closedA, err := f.transits.Execute(ctx, childA, closeChild.ID, f.actor,
+	// The transition's REQUIREMENT: the seeded close carries a mandatory
+	// comment, and the configuration's own wording has to reach the actor.
+	_, err = f.transits.Execute(ctx, childA, closeChild.ID, f.actor,
+		models.EOTransitionInput{Values: map[string]any{"change_reason": "no comment given"}})
+	if err == nil {
+		t.Error("step 3 — the child closed with no comment, though the transition requires one")
+	} else if !strings.Contains(err.Error(), "A closing note is required") {
+		t.Errorf("step 3 — the refusal does not carry the configured message: %v", err)
+	}
+	// The transition's FIELD CHANGE: change_reason is declared and required,
+	// and it is an INHERITED field the concrete type never defines itself.
+	_, err = f.transits.Execute(ctx, childA, closeChild.ID, f.actor,
 		models.EOTransitionInput{Comment: "done"})
+	var missingField *EOValidationError
+	if !errors.As(err, &missingField) {
+		t.Errorf("step 3 — the child closed without the required field change: %v", err)
+	} else if _, ok := missingField.Fields["change_reason"]; !ok {
+		t.Errorf("step 3 — the refusal does not name change_reason: %v", missingField.Fields)
+	}
+	// And only DECLARED keys may be written: a transition is the form its
+	// configuration describes, not a second edit path around the field rules.
+	_, err = f.transits.Execute(ctx, childA, closeChild.ID, f.actor,
+		models.EOTransitionInput{Comment: "done", Values: map[string]any{
+			"change_reason": "work finished",
+			"priority":      "urgent",
+		}})
+	var undeclared *EOValidationError
+	if !errors.As(err, &undeclared) {
+		t.Errorf("step 3 — the transition wrote a field it does not declare: %v", err)
+	} else if _, ok := undeclared.Fields["priority"]; !ok {
+		t.Errorf("step 3 — the refusal does not name the undeclared key: %v", undeclared.Fields)
+	}
+
+	closedA, err := f.transits.Execute(ctx, childA, closeChild.ID, f.actor,
+		eoE2ECloseInput("work finished"))
 	if err != nil {
 		t.Fatalf("step 3 — close the first child: %v", err)
 	}
 	if closedA.ClosedAt == nil {
 		t.Error("step 3 — the child reached a terminal state with no closed_at")
+	}
+	if closedA.ChangeReason != "work finished" {
+		t.Errorf("step 3 — change_reason = %q, want the value the transition's field change carried", closedA.ChangeReason)
 	}
 	var history []models.EORecordHistory
 	if err := f.db.Where("record_id = ?", childA.ID).Order("created_at").Find(&history).Error; err != nil {
@@ -480,8 +532,11 @@ func TestEOEngineEndToEnd(t *testing.T) {
 	}
 
 	closeParent := f.eoE2ECloseTransition(t, parent)
+	// The comment and the field change are supplied, so the ONLY thing left
+	// to refuse this is the open child. Without them it would fail at the
+	// requirement check, two steps earlier, and prove nothing about blocking.
 	_, err = f.transits.Execute(ctx, parent, closeParent.ID, f.actor,
-		models.EOTransitionInput{Comment: "closing early"})
+		eoE2ECloseInput("closing early"))
 	if !errors.Is(err, ErrEOTransitionBlocked) {
 		t.Fatalf("step 4 — closing the parent while %s is open returned %v, want ErrEOTransitionBlocked",
 			childB.Reference, err)
@@ -494,19 +549,60 @@ func TestEOEngineEndToEnd(t *testing.T) {
 	if err != nil || stillOpen == nil {
 		t.Fatalf("step 4 — re-read the parent: %v", err)
 	}
-	if stillOpen.ClosedAt != nil || *stillOpen.StateID != *parent.StateID {
+	if stillOpen.ClosedAt != nil || stillOpen.StateID == nil || *stillOpen.StateID != *parent.StateID {
 		t.Errorf("step 4 — the blocked transition still moved the parent: state %v, closed_at %v",
 			stillOpen.StateID, stillOpen.ClosedAt)
+	}
+
+	// ── 4b. the child sequence is counted PER PARENT, not per pattern ────
+	//
+	// With one parent, a per-parent counter and a global one are
+	// indistinguishable: both produce T1 then T2. A SECOND directive settles
+	// it — its first task must be T1 again, not T3.
+	other, err := f.records.Create(ctx, &models.EORecordCreateRequest{
+		RecordTypeID: f.parentTyp.ID,
+		Values: map[string]any{
+			"subject_ar":     "توجيه آخر",
+			"priority":       "normal",
+			"sensitivity":    "internal",
+			"source":         "direct_instruction",
+			"owning_body_id": f.bodyID.String(),
+		},
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("step 4b — create a second directive: %v", err)
+	}
+	if want := "EO-SMOKE-" + year + "-002"; other.Reference != want {
+		t.Errorf("step 4b — second directive reference = %q, want %q", other.Reference, want)
+	}
+	otherTask, err := f.records.Create(ctx, &models.EORecordCreateRequest{
+		RecordTypeID:      f.childTyp.ID,
+		ParentRecordID:    &other.ID,
+		ParentLinkTypeKey: "eo_smoke_parent",
+		Values: map[string]any{
+			"subject_ar":     "مهمة تابعة لتوجيه آخر",
+			"priority":       "normal",
+			"sensitivity":    "internal",
+			"source":         "direct_instruction",
+			"owning_body_id": f.bodyID.String(),
+		},
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("step 4b — create a task under the second directive: %v", err)
+	}
+	if want := other.Reference + "-T1"; otherTask.Reference != want {
+		t.Errorf("step 4b — the first task of a second directive is %q, want %q: the child sequence is counted per parent, not per pattern",
+			otherTask.Reference, want)
 	}
 
 	// ── 5. close the second child, then the parent ───────────────────────
 	closeChildB := f.eoE2ECloseTransition(t, childB)
 	if _, err := f.transits.Execute(ctx, childB, closeChildB.ID, f.actor,
-		models.EOTransitionInput{Comment: "done"}); err != nil {
+		eoE2ECloseInput("work finished")); err != nil {
 		t.Fatalf("step 5 — close the second child: %v", err)
 	}
 	closedParent, err := f.transits.Execute(ctx, parent, closeParent.ID, f.actor,
-		models.EOTransitionInput{Comment: "every task is closed"})
+		eoE2ECloseInput("every task is closed"))
 	if err != nil {
 		t.Fatalf("step 5 — close the parent once no child is open: %v", err)
 	}

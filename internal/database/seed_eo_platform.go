@@ -39,9 +39,31 @@ const (
 // at, and the per-type permission codes of spec §7.11.
 //
 // House seed shape: unexported, takes the handle, returns nothing, logs what
-// it could not write. It runs on EVERY container boot, so the whole thing is
-// behind ONE marker check — the presence of the base record type — rather
-// than a per-row existence query across 17+ field definitions.
+// it could not write.
+//
+// TWO guards, and they do different jobs:
+//
+//  1. The MARKER — "does eo_base exist?" — is one query outside the
+//     transaction, and it is the fast path on every container boot: a
+//     per-row existence check across 17+ field definitions would be paid on
+//     every restart forever.
+//  2. The TRANSACTION is what makes the marker trustworthy. The marker row
+//     IS the base record type, and it is written first, so without a
+//     transaction a crash or one bad insert partway through would leave a
+//     database whose marker says "seeded" and whose configuration is half
+//     written — and every later boot would return early at the marker and
+//     never repair it. The operator would see a clean startup and a broken
+//     platform. Inside one transaction the marker and the content commit
+//     together or not at all, so a failed seed leaves no marker and the NEXT
+//     boot starts over.
+//
+// Every step therefore returns an error rather than logging and carrying on:
+// a seed that half-succeeds is worse than one that does not run.
+//
+// Two boots racing is handled by the same mechanism and needs no extra
+// locking: eo_record_types.key is uniquely indexed, so the second
+// transaction's insert of eo_base collides and that whole transaction rolls
+// back, leaving the first one's work intact.
 //
 // It must run AFTER the role block of Seed: the smoke workflows attach the
 // executive_office role to their closing transition, and the per-type
@@ -58,23 +80,42 @@ func seedEOPlatform(db *gorm.DB) {
 	}
 	log.Println("Seeding the EO platform base configuration...")
 
-	base := eoSeedBaseType(db)
-	if base == nil {
+	if err := db.Transaction(eoSeedPlatformTx); err != nil {
+		log.Printf("EO platform seed FAILED and was rolled back; nothing was written and the next boot will try again: %v", err)
 		return
 	}
-	policyID := eoSeedEscalationPolicy(db)
-
-	parent := eoSeedSmokeParentType(db, base.ID)
-	child := eoSeedSmokeChildType(db, base.ID)
-	if parent == nil || child == nil {
-		return
-	}
-	eoSeedSmokeLinkType(db, parent.ID, child.ID)
-	eoSeedSmokeWorkflow(db, parent, "eo_smoke_directive_wf", "EO Smoke — Directive", policyID)
-	eoSeedSmokeWorkflow(db, child, "eo_smoke_task_wf", "EO Smoke — Task", policyID)
-	eoSeedTypePermissions(db)
-
 	log.Println("EO platform base configuration seeded")
+}
+
+// eoSeedPlatformTx is the whole seed, on one transaction handle. Every write
+// goes through tx.
+func eoSeedPlatformTx(tx *gorm.DB) error {
+	base, err := eoSeedBaseType(tx)
+	if err != nil {
+		return err
+	}
+	policyID, err := eoSeedEscalationPolicy(tx)
+	if err != nil {
+		return err
+	}
+	parent, err := eoSeedSmokeParentType(tx, base.ID)
+	if err != nil {
+		return err
+	}
+	child, err := eoSeedSmokeChildType(tx, base.ID)
+	if err != nil {
+		return err
+	}
+	if err := eoSeedSmokeLinkType(tx, parent.ID, child.ID); err != nil {
+		return err
+	}
+	if err := eoSeedSmokeWorkflow(tx, parent, "eo_smoke_directive_wf", "EO Smoke — Directive", policyID); err != nil {
+		return err
+	}
+	if err := eoSeedSmokeWorkflow(tx, child, "eo_smoke_task_wf", "EO Smoke — Task", policyID); err != nil {
+		return err
+	}
+	return eoSeedTypePermissions(tx)
 }
 
 // seedEOPlatformWhenEnabled is the gate Seed applies. It is a function rather
@@ -107,7 +148,7 @@ func SeedEOPlatform(db *gorm.DB) { seedEOPlatform(db) }
 // ReferencePrefix is deliberately empty: an abstract type owns no prefix (the
 // designer's eoCheckReferencePrefix skips abstract types for exactly that
 // reason), and a prefix here would overlap every descendant's.
-func eoSeedBaseType(db *gorm.DB) *models.EORecordType {
+func eoSeedBaseType(db *gorm.DB) (*models.EORecordType, error) {
 	base := models.EORecordType{
 		ID:               uuid.New(),
 		Key:              eoBaseTypeKey,
@@ -124,15 +165,14 @@ func eoSeedBaseType(db *gorm.DB) *models.EORecordType {
 		PartitionPending: false,
 	}
 	if err := db.Create(&base).Error; err != nil {
-		log.Printf("EO platform seed: create record type %q: %v", base.Key, err)
-		return nil
+		return nil, fmt.Errorf("create record type %q: %w", base.Key, err)
 	}
 	for _, f := range eoBaseFieldDefs(base.ID) {
 		if err := db.Create(&f).Error; err != nil {
-			log.Printf("EO platform seed: create field %q on %q: %v", f.Key, base.Key, err)
+			return nil, fmt.Errorf("create field %q on %q: %w", f.Key, base.Key, err)
 		}
 	}
-	return &base
+	return &base, nil
 }
 
 // eoBaseFieldDefs is the field matrix's "All types (inherited)" table: the
@@ -257,7 +297,7 @@ func eoBaseFieldDefs(typeID uuid.UUID) []models.EOFieldDef {
 
 // eoSeedSmokeParentType is the root of the smoke hierarchy: its own sequence,
 // restarting each year, and one derived roll-up over its children.
-func eoSeedSmokeParentType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
+func eoSeedSmokeParentType(db *gorm.DB, baseID uuid.UUID) (*models.EORecordType, error) {
 	t := models.EORecordType{
 		ID:               uuid.New(),
 		Key:              eoSmokeParentTypeKey,
@@ -274,8 +314,7 @@ func eoSeedSmokeParentType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
 		PartitionPending: true,
 	}
 	if err := db.Create(&t).Error; err != nil {
-		log.Printf("EO platform seed: create record type %q: %v", t.Key, err)
-		return nil
+		return nil, fmt.Errorf("create record type %q: %w", t.Key, err)
 	}
 	// The one derived field: a roll-up over the children of the smoke child
 	// type. `child` dependencies always publish children_<type>_count, so the
@@ -298,23 +337,23 @@ func eoSeedSmokeParentType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
 		HelpTextAr:   "عدد المهام المرتبطة بهذا التوجيه.",
 	}
 	if err := db.Create(&rollup).Error; err != nil {
-		log.Printf("EO platform seed: create field %q on %q: %v", rollup.Key, t.Key, err)
+		return nil, fmt.Errorf("create field %q on %q: %w", rollup.Key, t.Key, err)
 	}
-	return &t
+	return &t, nil
 }
 
 // eoSeedSmokeChildType is numbered INSIDE its parent's reference: the pattern's
 // last segment is a suffix letter and a sequence counted per parent, so the
 // first task of EO-SMOKE-2026-001 is EO-SMOKE-2026-001-T1.
 //
-// ReferencePrefix is "EOT-SMOKE" and not "EO-SMOKE". A parent-derived type
-// issues every reference inside its parent's prefix and owns no prefix of its
-// own, but models.ValidateReferencePrefix rejects a blank prefix AND one that
-// overlaps another type's, and models.ValidateTypeEdit calls a later change to
-// the prefix destructive once records exist. A blank prefix here would make
-// this type uneditable through the designer forever, so it carries a distinct,
-// non-overlapping placeholder instead. See the report for the alternative.
-func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
+// ReferencePrefix is EMPTY, and that is the honest configuration: this type
+// owns no prefix, because every reference it issues is inside its parent's.
+// models.ValidateReferencePrefix exempts ReferenceMode "parent" types for
+// exactly that reason, so the designer accepts it; before that exemption
+// existed this type had to carry a placeholder prefix that was a small lie
+// about the references it issues, made permanent by ValidateTypeEdit's rule
+// that a prefix change is destructive once records exist.
+func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) (*models.EORecordType, error) {
 	t := models.EORecordType{
 		ID:               uuid.New(),
 		Key:              eoSmokeChildTypeKey,
@@ -323,7 +362,7 @@ func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
 		Icon:             "check-square",
 		ParentTypeID:     &baseID,
 		IsAbstract:       false,
-		ReferencePrefix:  "EOT-SMOKE",
+		ReferencePrefix:  "",
 		ReferenceMode:    models.EOReferenceModeParent,
 		ReferencePattern: "EO-SMOKE-YYYY-NNN-T#",
 		Capabilities:     datatypes.JSON(`[]`),
@@ -331,10 +370,9 @@ func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
 		PartitionPending: true,
 	}
 	if err := db.Create(&t).Error; err != nil {
-		log.Printf("EO platform seed: create record type %q: %v", t.Key, err)
-		return nil
+		return nil, fmt.Errorf("create record type %q: %w", t.Key, err)
 	}
-	return &t
+	return &t, nil
 }
 
 // eoSeedSmokeLinkType carries the three rules of spec §7.6 that a parent/child
@@ -343,7 +381,7 @@ func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) *models.EORecordType {
 //
 // Direction: the save pipeline writes the link FROM the child TO the parent,
 // so the child's type is the source and the parent's the target.
-func eoSeedSmokeLinkType(db *gorm.DB, parentTypeID, childTypeID uuid.UUID) {
+func eoSeedSmokeLinkType(db *gorm.DB, parentTypeID, childTypeID uuid.UUID) error {
 	lt := models.EOLinkType{
 		ID:                       uuid.New(),
 		Key:                      eoSmokeLinkTypeKey,
@@ -358,8 +396,9 @@ func eoSeedSmokeLinkType(db *gorm.DB, parentTypeID, childTypeID uuid.UUID) {
 		CascadeSensitivity:       true,
 	}
 	if err := db.Create(&lt).Error; err != nil {
-		log.Printf("EO platform seed: create link type %q: %v", lt.Key, err)
+		return fmt.Errorf("create link type %q: %w", lt.Key, err)
 	}
+	return nil
 }
 
 // ── the smoke workflows ─────────────────────────────────────────────────────
@@ -372,7 +411,7 @@ func eoSeedSmokeLinkType(db *gorm.DB, parentTypeID, childTypeID uuid.UUID) {
 //
 // The closing transition is restricted to the executive_office role, which is
 // why this seed has to run after the role block of Seed.
-func eoSeedSmokeWorkflow(db *gorm.DB, t *models.EORecordType, code, name string, policyID *uuid.UUID) {
+func eoSeedSmokeWorkflow(db *gorm.DB, t *models.EORecordType, code, name string, policyID *uuid.UUID) error {
 	wf := models.Workflow{
 		ID:           uuid.New(),
 		Name:         name,
@@ -385,8 +424,7 @@ func eoSeedSmokeWorkflow(db *gorm.DB, t *models.EORecordType, code, name string,
 		IsDefault:    false,
 	}
 	if err := db.Create(&wf).Error; err != nil {
-		log.Printf("EO platform seed: create workflow %q: %v", code, err)
-		return
+		return fmt.Errorf("create workflow %q: %w", code, err)
 	}
 
 	open := models.WorkflowState{
@@ -406,46 +444,79 @@ func eoSeedSmokeWorkflow(db *gorm.DB, t *models.EORecordType, code, name string,
 		StateType: "terminal", Color: "#64748b", SortOrder: 2,
 		PositionX: 400, PositionY: 200, IsActive: true,
 	}
-	for _, s := range []models.WorkflowState{open, closed} {
-		if err := db.Create(&s).Error; err != nil {
-			log.Printf("EO platform seed: create state %q of workflow %q: %v", s.Code, code, err)
-			return
+	for _, st := range []models.WorkflowState{open, closed} {
+		if err := db.Create(&st).Error; err != nil {
+			return fmt.Errorf("create state %q of workflow %q: %w", st.Code, code, err)
 		}
 	}
 
+	// The role that may close. A MISSING role is a reason to stop, not a
+	// reason to widen access: services.eoTransitionService.checkActor treats
+	// an EMPTY AllowedRoles as "no restriction", so creating the transition
+	// without the role would hand every authenticated user the power to close
+	// a record in a statutory register — and, because the marker would commit
+	// with it, that state would be permanent. Aborting instead rolls the whole
+	// seed back, and the next boot (after the role block has run) retries.
+	var eoRole models.Role
+	if err := db.Where("code = ?", "executive_office").First(&eoRole).Error; err != nil {
+		return fmt.Errorf("role executive_office is required by transition \"close\" of workflow %q and was not found; the EO seed must run after the role block of Seed: %w", code, err)
+	}
 	transition := models.WorkflowTransition{
 		ID: uuid.New(), WorkflowID: wf.ID,
 		Name: "Close", NameAr: "إغلاق", Code: "close",
 		Description: "Close the record. An open child record blocks it.",
 		FromStateID: open.ID, ToStateID: closed.ID,
 		IsActive: true, SortOrder: 1,
-	}
-	var eoRole models.Role
-	if err := db.Where("code = ?", "executive_office").First(&eoRole).Error; err == nil {
-		transition.AllowedRoles = []models.Role{eoRole}
-	} else {
-		log.Printf("EO platform seed: role executive_office not found, transition %q of workflow %q is left open to every role: %v",
-			transition.Code, code, err)
+		AllowedRoles: []models.Role{eoRole},
 	}
 	if err := db.Create(&transition).Error; err != nil {
-		log.Printf("EO platform seed: create transition %q of workflow %q: %v", transition.Code, code, err)
-		return
+		return fmt.Errorf("create transition %q of workflow %q: %w", transition.Code, code, err)
+	}
+
+	// One REQUIREMENT and one FIELD CHANGE, so the closing transition
+	// exercises both halves of the executor that configuration drives:
+	// services.eoCheckRequirements (a mandatory comment) and
+	// applyFieldChanges (a declared key the actor may write, and only that
+	// key). Without them the transition is a bare state move and those two
+	// paths never run on any seeded configuration.
+	mandatory := true
+	requirement := models.TransitionRequirement{
+		ID: uuid.New(), TransitionID: transition.ID,
+		RequirementType: "comment",
+		IsMandatory:     &mandatory,
+		ErrorMessage:    "A closing note is required before this record can be closed.",
+	}
+	if err := db.Create(&requirement).Error; err != nil {
+		return fmt.Errorf("create the comment requirement of transition %q of workflow %q: %w", transition.Code, code, err)
+	}
+	// change_reason is an INHERITED field (the field matrix's "Change
+	// reason"), so declaring it here also proves a transition can drive a
+	// field the concrete type never defines itself.
+	fieldChange := models.TransitionFieldChange{
+		ID: uuid.New(), TransitionID: transition.ID,
+		FieldName: "change_reason", Label: "Reason for closing", LabelAr: "سبب الإغلاق",
+		IsRequired: true, SortOrder: 1,
+	}
+	if err := db.Create(&fieldChange).Error; err != nil {
+		return fmt.Errorf("create the field change of transition %q of workflow %q: %w", transition.Code, code, err)
 	}
 
 	// The type's own WorkflowID is kept in step with the binding, so the
 	// designer shows the same workflow the engine resolves.
 	if err := db.Model(&models.EORecordType{}).Where("id = ?", t.ID).Update("workflow_id", wf.ID).Error; err != nil {
-		log.Printf("EO platform seed: bind workflow %q to record type %q: %v", code, t.Key, err)
+		return fmt.Errorf("bind workflow %q to record type %q: %w", code, t.Key, err)
 	}
+	return nil
 }
 
 func eoSeedInt(v int) *int { return &v }
 
 // eoSeedEscalationPolicy writes the one-step policy the smoke states' SLA
 // points at, so the SLA clock the WithSLA constructors start has something to
-// schedule. A nil return means no policy, and the states are then seeded
-// without one: a missing policy must not fail the seed.
-func eoSeedEscalationPolicy(db *gorm.DB) *uuid.UUID {
+// schedule. A failure here aborts the whole seed: a state whose SLA points at
+// nothing starts no clock, and a register that silently stopped escalating is
+// the kind of half-configuration the transaction exists to prevent.
+func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 	policy := models.EscalationPolicy{
 		ID:          uuid.New(),
 		Name:        eoSmokePolicyName,
@@ -453,8 +524,7 @@ func eoSeedEscalationPolicy(db *gorm.DB) *uuid.UUID {
 		IsActive:    true,
 	}
 	if err := db.Create(&policy).Error; err != nil {
-		log.Printf("EO platform seed: create escalation policy %q: %v", policy.Name, err)
-		return nil
+		return nil, fmt.Errorf("create escalation policy %q: %w", policy.Name, err)
 	}
 	step := models.EscalationPolicyStep{
 		ID:         uuid.New(),
@@ -464,10 +534,9 @@ func eoSeedEscalationPolicy(db *gorm.DB) *uuid.UUID {
 		Channel:    "both",
 	}
 	if err := db.Create(&step).Error; err != nil {
-		log.Printf("EO platform seed: create escalation step of %q: %v", policy.Name, err)
-		return nil
+		return nil, fmt.Errorf("create escalation step of %q: %w", policy.Name, err)
 	}
-	return &policy.ID
+	return &policy.ID, nil
 }
 
 // ── the per-type permission codes (spec §7.11) ──────────────────────────────
@@ -486,11 +555,10 @@ func eoSeedEscalationPolicy(db *gorm.DB) *uuid.UUID {
 // ordering: that block runs while the roles are being created, and these codes
 // do not exist until the types they name have been seeded, which must happen
 // after the roles exist.
-func eoSeedTypePermissions(db *gorm.DB) {
+func eoSeedTypePermissions(db *gorm.DB) error {
 	var concrete []models.EORecordType
 	if err := db.Where("is_abstract = ?", false).Order("key").Find(&concrete).Error; err != nil {
-		log.Printf("EO platform seed: list concrete record types: %v", err)
-		return
+		return fmt.Errorf("list concrete record types: %w", err)
 	}
 
 	actions := []struct{ action, verb, verbAr string }{
@@ -501,47 +569,53 @@ func eoSeedTypePermissions(db *gorm.DB) {
 	var codes []string
 	for _, t := range concrete {
 		for _, a := range actions {
+			// Permission.Name is uniquely indexed, so it is built from the
+			// type KEY — which eo_record_types.key already makes unique —
+			// and not from the display Name, which two types may share. The
+			// display name goes in the description, where a collision is
+			// harmless. The existence check keys on Code, which is derived
+			// from the same key, so the two agree.
 			perm := models.Permission{
 				ID:            uuid.New(),
-				Name:          fmt.Sprintf("EO %s %s", a.verb, t.Name),
+				Name:          fmt.Sprintf("EO %s %s", a.verb, t.Key),
 				Code:          fmt.Sprintf("eo:%s:%s", t.Key, a.action),
 				Module:        "eo",
 				Action:        fmt.Sprintf("%s:%s", t.Key, a.action),
 				ActionAr:      a.verbAr,
-				Description:   fmt.Sprintf("%s executive-office records of type %s", a.verb, t.Name),
+				Description:   fmt.Sprintf("%s executive-office records of type %s (%s)", a.verb, t.Name, t.Key),
 				DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s", a.verbAr, t.NameAr),
 			}
 			var existing int64
 			if err := db.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
-				log.Printf("EO platform seed: check permission %q: %v", perm.Code, err)
-				continue
+				return fmt.Errorf("check permission %q: %w", perm.Code, err)
 			}
 			if existing == 0 {
 				if err := db.Create(&perm).Error; err != nil {
-					log.Printf("EO platform seed: create permission %q: %v", perm.Code, err)
-					continue
+					return fmt.Errorf("create permission %q: %w", perm.Code, err)
 				}
 			}
 			codes = append(codes, perm.Code)
 		}
 	}
 	if len(codes) == 0 {
-		return
+		return nil
 	}
 
 	var perms []models.Permission
 	if err := db.Where("code IN ?", codes).Find(&perms).Error; err != nil {
-		log.Printf("EO platform seed: read back the per-type permissions: %v", err)
-		return
+		return fmt.Errorf("read back the per-type permissions: %w", err)
 	}
+	// A missing role aborts for the same reason the transition's does: a
+	// permission code nobody holds is a type nobody can use, and the marker
+	// would commit alongside it.
 	for _, roleCode := range []string{"admin", "executive_office"} {
 		var role models.Role
 		if err := db.Where("code = ?", roleCode).First(&role).Error; err != nil {
-			log.Printf("EO platform seed: role %q not found, per-type permissions not granted to it: %v", roleCode, err)
-			continue
+			return fmt.Errorf("role %q is required to hold the per-type permission codes and was not found; the EO seed must run after the role block of Seed: %w", roleCode, err)
 		}
 		if err := db.Model(&role).Association("Permissions").Append(perms); err != nil {
-			log.Printf("EO platform seed: grant per-type permissions to role %q: %v", roleCode, err)
+			return fmt.Errorf("grant per-type permissions to role %q: %w", roleCode, err)
 		}
 	}
+	return nil
 }

@@ -92,6 +92,8 @@ func eoSeedTables() []any {
 		&models.Workflow{},
 		&models.WorkflowState{},
 		&models.WorkflowTransition{},
+		&models.TransitionRequirement{},
+		&models.TransitionFieldChange{},
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
@@ -238,6 +240,110 @@ func TestSeedEOPlatformRunsOnlyWhenEnabled(t *testing.T) {
 			t.Error("EO_PLATFORM is on but no record type was seeded")
 		}
 	})
+}
+
+// TestSeedEOPlatformIsAtomic is the guard on the marker. The marker row IS the
+// base record type and it is written first, so a seed that failed partway
+// through without a transaction would leave a database that says "seeded" and
+// is not — and every later boot would return early at the marker and never
+// repair it.
+//
+// The failure is a REAL one, not an injected seam: the escalation policy's
+// name is uniquely indexed, so a row already sitting under that name makes the
+// policy insert fail at a step that comes after the base type has been
+// written. Nothing is mocked and no test-only hook exists in the seed.
+func TestSeedEOPlatformIsAtomic(t *testing.T) {
+	db := eoSeedTestDB(t)
+	eoSeedRoles(t, db)
+
+	blocker := models.EscalationPolicy{Name: eoSmokePolicyName, IsActive: true}
+	if err := db.Create(&blocker).Error; err != nil {
+		t.Fatalf("create the colliding escalation policy: %v", err)
+	}
+
+	seedEOPlatform(db)
+
+	// The marker must be absent, or the next boot will skip the repair.
+	var marker int64
+	if err := db.Model(&models.EORecordType{}).Where("key = ?", eoBaseTypeKey).Count(&marker).Error; err != nil {
+		t.Fatalf("count the marker: %v", err)
+	}
+	if marker != 0 {
+		t.Error("the seed failed partway through but left its marker behind; every later boot will skip the repair")
+	}
+	for _, c := range []struct {
+		label string
+		model any
+	}{
+		{"record types", &models.EORecordType{}},
+		{"field definitions", &models.EOFieldDef{}},
+		{"link types", &models.EOLinkType{}},
+		{"workflows", &models.Workflow{}},
+		{"permissions", &models.Permission{}},
+	} {
+		if got := eoCountRows(t, db, c.model); got != 0 {
+			t.Errorf("a failed seed left %d %s behind, want none", got, c.label)
+		}
+	}
+
+	// Clear the obstruction: the next run must complete the configuration,
+	// which is the repair the marker would otherwise have prevented.
+	if err := db.Unscoped().Delete(&blocker).Error; err != nil {
+		t.Fatalf("remove the colliding escalation policy: %v", err)
+	}
+	seedEOPlatform(db)
+
+	if got := eoCountRows(t, db, &models.EOFieldDef{}); got != 18 {
+		t.Errorf("after the repairing run there are %d field definitions, want 18 (17 inherited plus the smoke roll-up)", got)
+	}
+	var concrete int64
+	if err := db.Model(&models.EORecordType{}).Where("is_abstract = ?", false).Count(&concrete).Error; err != nil {
+		t.Fatalf("count concrete types: %v", err)
+	}
+	if concrete != 2 {
+		t.Errorf("after the repairing run there are %d concrete record types, want 2", concrete)
+	}
+}
+
+// TestSeedEOPlatformRefusesToSeedAnOpenClosingTransition: an empty
+// AllowedRoles means "no restriction" to the transition guard, so a closing
+// transition seeded without its role would be runnable by every authenticated
+// user on a statutory register. The seed must stop instead of widening access,
+// and must leave no marker, so a later boot retries once the role exists.
+func TestSeedEOPlatformRefusesToSeedAnOpenClosingTransition(t *testing.T) {
+	db := eoSeedTestDB(t)
+	// Deliberately NOT eoSeedRoles: executive_office does not exist.
+
+	seedEOPlatform(db)
+
+	var marker int64
+	if err := db.Model(&models.EORecordType{}).Where("key = ?", eoBaseTypeKey).Count(&marker).Error; err != nil {
+		t.Fatalf("count the marker: %v", err)
+	}
+	if marker != 0 {
+		t.Error("the seed ran without the executive_office role and marked itself done")
+	}
+	if got := eoCountRows(t, db, &models.WorkflowTransition{}); got != 0 {
+		t.Fatalf("%d transitions were seeded without the role that restricts them", got)
+	}
+
+	// With the role present, the same seed completes and the transition is
+	// restricted.
+	eoSeedRoles(t, db)
+	seedEOPlatform(db)
+
+	var transitions []models.WorkflowTransition
+	if err := db.Preload("AllowedRoles").Where("code = ?", "close").Find(&transitions).Error; err != nil {
+		t.Fatalf("read the closing transitions: %v", err)
+	}
+	if len(transitions) != 2 {
+		t.Fatalf("got %d closing transitions, want one per concrete type", len(transitions))
+	}
+	for _, tr := range transitions {
+		if len(tr.AllowedRoles) != 1 || tr.AllowedRoles[0].Code != "executive_office" {
+			t.Errorf("transition %s has AllowedRoles %v; an empty list means NO restriction", tr.ID, tr.AllowedRoles)
+		}
+	}
 }
 
 // TestSeedEOPlatformSeedsPerTypePermissionCodes is spec §7.11's per-type

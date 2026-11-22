@@ -8,32 +8,32 @@ import (
 
 func TestValidateReferencePrefixRejectsDuplicate(t *testing.T) {
 	existing := []EORecordType{{Key: "directive", ReferencePrefix: "EO-DIR"}}
-	if err := ValidateReferencePrefix("EO-DIR", existing); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "EO-DIR"}, existing); err == nil {
 		t.Error("duplicate prefix accepted; reference uniqueness is per-partition only")
 	}
-	if err := ValidateReferencePrefix("eo-dir", existing); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "eo-dir"}, existing); err == nil {
 		t.Error("case-variant duplicate accepted")
 	}
-	if err := ValidateReferencePrefix("EO-COM", existing); err != nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "EO-COM"}, existing); err != nil {
 		t.Errorf("unique prefix rejected: %v", err)
 	}
 }
 
 func TestValidateReferencePrefixRejectsPrefixOfAnother(t *testing.T) {
 	existing := []EORecordType{{Key: "directive", ReferencePrefix: "EO-DIR"}}
-	if err := ValidateReferencePrefix("EO", existing); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "EO"}, existing); err == nil {
 		t.Error("prefix that is a prefix of an existing one accepted")
 	}
-	if err := ValidateReferencePrefix("EO-DIR-X", existing); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "EO-DIR-X"}, existing); err == nil {
 		t.Error("prefix that extends an existing one accepted")
 	}
-	if err := ValidateReferencePrefix("eo", existing); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "eo"}, existing); err == nil {
 		t.Error("lowercase prefix-of-another accepted")
 	}
 }
 
 func TestValidateReferencePrefixRejectsEmpty(t *testing.T) {
-	if err := ValidateReferencePrefix("  ", nil); err == nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "  "}, nil); err == nil {
 		t.Error("blank prefix accepted")
 	}
 }
@@ -42,8 +42,46 @@ func TestValidateReferencePrefixIgnoresTypesWithoutPrefix(t *testing.T) {
 	// Abstract bases carry no prefix; an empty existing prefix must not
 	// count as a prefix of everything.
 	existing := []EORecordType{{Key: "base", IsAbstract: true}}
-	if err := ValidateReferencePrefix("EO-DIR", existing); err != nil {
+	if err := ValidateReferencePrefix(EORecordType{ReferencePrefix: "EO-DIR"}, existing); err != nil {
 		t.Errorf("rejected against a type with no prefix: %v", err)
+	}
+}
+
+// A parent-derived type issues every reference inside its parent's, so it owns
+// no prefix of its own: a truthful prefix always overlaps its parent's and a
+// blank one would be rejected. Both must pass.
+func TestValidateReferencePrefixExemptsParentDerivedTypes(t *testing.T) {
+	existing := []EORecordType{{Key: "directive", ReferencePrefix: "EO-DIR"}}
+	derived := EORecordType{
+		Key:              "assignment",
+		ReferenceMode:    EOReferenceModeParent,
+		ReferencePattern: "EO-DIR-YYYY-NNN-A#",
+	}
+	if err := ValidateReferencePrefix(derived, existing); err != nil {
+		t.Errorf("a parent-derived type with no prefix was rejected: %v", err)
+	}
+	// Even the prefix it genuinely renders under — which overlaps its
+	// parent's by construction — must not be refused.
+	derived.ReferencePrefix = "EO-DIR"
+	if err := ValidateReferencePrefix(derived, existing); err != nil {
+		t.Errorf("a parent-derived type was rejected against its own parent's prefix: %v", err)
+	}
+	// The exemption is for parent-derived types ONLY: an own-sequence type is
+	// still held to the rule.
+	own := EORecordType{Key: "assignment", ReferenceMode: EOReferenceModeOwn, ReferencePrefix: "EO-DIR"}
+	if err := ValidateReferencePrefix(own, existing); err == nil {
+		t.Error("an own-sequence type was let through with an overlapping prefix")
+	}
+}
+
+// An abstract type holds no records and issues no references, so it needs no
+// prefix either. The rule carries that exemption so the only copy of it is not
+// the handler's early return.
+func TestValidateReferencePrefixExemptsAbstractTypes(t *testing.T) {
+	existing := []EORecordType{{Key: "directive", ReferencePrefix: "EO-DIR"}}
+	base := EORecordType{Key: "eo_base", IsAbstract: true}
+	if err := ValidateReferencePrefix(base, existing); err != nil {
+		t.Errorf("an abstract type with no prefix was rejected: %v", err)
 	}
 }
 
