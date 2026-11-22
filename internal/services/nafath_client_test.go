@@ -50,7 +50,7 @@ func newTestNafathClient(t *testing.T, g *fakeGateway, mode string) NafathClient
 	t.Cleanup(srv.Close)
 	c, err := NewNafathClient(config.NafathConfig{
 		Mode: mode, BaseURL: srv.URL, Service: "svc", Key: "secret-key", AppID: "13", CheckAppID: "17",
-		TimeoutSeconds: 5, RotateSeconds: 10, LoginTimeoutSeconds: 180,
+		TimeoutSeconds: 5, PollSeconds: 2,
 	}, "development")
 	if err != nil {
 		t.Fatal(err)
@@ -173,8 +173,8 @@ func TestNafathCheckRequest(t *testing.T) {
 
 	g.status[nafathCheckPath] = http.StatusBadRequest
 	g.body[nafathCheckPath] = `{"errorMessage":null,"detailedCodeID":1013,"businessErrorMessage":"Request not found."}`
-	if _, err := c.CheckRequest(context.Background(), "tok", "1111111111", req); !errors.Is(err, ErrNafathUnknownRequest) {
-		t.Errorf("unknown transID: want ErrNafathUnknownRequest, got %v", err)
+	if _, err := c.CheckRequest(context.Background(), "tok", "1111111111", req); !errors.Is(err, ErrNafathRefused) {
+		t.Errorf("unknown transID: want ErrNafathRefused, got %v", err)
 	}
 }
 
@@ -186,7 +186,7 @@ func TestNafathRealModeRefusesSimulator(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c, err := NewNafathClient(config.NafathConfig{
 		Mode: "real", BaseURL: srv.URL, Service: "svc", Key: "k", AppID: "13", CheckAppID: "13",
-		TimeoutSeconds: 5, RotateSeconds: 10, LoginTimeoutSeconds: 180, InsecureSkipVerify: true,
+		TimeoutSeconds: 5, PollSeconds: 2, InsecureSkipVerify: true,
 	}, "development")
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestNafathRealModeRefusesSimulator(t *testing.T) {
 
 func TestNewNafathClientValidation(t *testing.T) {
 	base := config.NafathConfig{Mode: "real", BaseURL: "https://gw.example", Service: "s", Key: "k", AppID: "13", CheckAppID: "17",
-		TimeoutSeconds: 15, RotateSeconds: 10, LoginTimeoutSeconds: 180}
+		TimeoutSeconds: 15, PollSeconds: 2}
 	cases := map[string]func(*config.NafathConfig, *string){
 		"mock in production": func(c *config.NafathConfig, env *string) {
 			c.Mode, c.BaseURL, *env = "mock", "http://localhost:8098", "production"
