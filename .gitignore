@@ -56,3 +56,5 @@ automax-backend.postman_collection.json
 CLAUDE.md
 
 automax3-firebase-adminsdk-*.json
+# Superpowers SDD scratch workspace
+.superpowers/
