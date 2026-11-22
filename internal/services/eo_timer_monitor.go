@@ -171,7 +171,15 @@ func (m *eoTimerMonitor) fire(ctx context.Context, tm models.EOTimer) error {
 		}
 		return nil
 	default:
-		// Left claimed: re-delivered after the lease expires.
+		// Stays claimed and is re-delivered after the lease, until it has used
+		// its attempts, when the repository marks it failed.
+		failed, rerr := m.repo.RecordFailure(ctx, tm.ID, err.Error())
+		if rerr != nil && !errors.Is(rerr, repository.ErrEOTimerNotClaimed) {
+			err = errors.Join(err, rerr)
+		}
+		if failed {
+			log.Printf("[EOTimerMonitor] timer %s (%s) gave up after %d attempts: %v", tm.ID, tm.CapabilityKey, tm.Attempts, err)
+		}
 		return fmt.Errorf("timer %s (%s) failed: %w", tm.ID, tm.CapabilityKey, err)
 	}
 }

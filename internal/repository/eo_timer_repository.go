@@ -18,6 +18,11 @@ import (
 // handler must tolerate being run twice for the same timer.
 const EOTimerClaimLease = 10 * time.Minute
 
+// EOTimerMaxAttempts bounds delivery. Each claim counts as an attempt; a timer
+// that has been claimed this many times without firing is marked failed instead
+// of being retried again.
+const EOTimerMaxAttempts = 5
+
 // ErrEOTimerNotClaimed is returned by MarkFired when the timer is not in the
 // claimed state: it was cancelled while its handler ran, or it does not exist.
 var ErrEOTimerNotClaimed = errors.New("eo timer is not claimed")
@@ -35,6 +40,11 @@ type EOTimerRepository interface {
 	ClaimDue(ctx context.Context, now time.Time, limit int) ([]models.EOTimer, error)
 	// MarkFired records that a claimed timer's handler succeeded.
 	MarkFired(ctx context.Context, id uuid.UUID) error
+	// RecordFailure notes that a claimed timer's handler failed. It stores the
+	// message and, once the timer has used EOTimerMaxAttempts attempts, marks
+	// it failed (terminal); otherwise it stays claimed and is re-delivered
+	// after the lease. It returns whether the timer is now failed.
+	RecordFailure(ctx context.Context, id uuid.UUID, msg string) (failed bool, err error)
 	// CancelForRecord cancels every timer of the record that has not fired.
 	CancelForRecord(ctx context.Context, recordID uuid.UUID) error
 }
@@ -64,23 +74,32 @@ func (r *eoTimerRepository) Schedule(ctx context.Context, t *models.EOTimer) err
 
 // eoClaimDueSQL claims in one statement: the CTE picks and row-locks the
 // candidates with FOR UPDATE SKIP LOCKED, and the UPDATE flips them to claimed
-// in the same statement, so there is no window between "chosen" and "claimed"
-// for a second worker to slip through.
+// (counting the attempt) in the same statement, so there is no window between
+// "chosen" and "claimed" for a second worker to slip through.
 //
 // The CTE is MATERIALIZED on purpose. Written as `WHERE id IN (SELECT ... LIMIT
 // n FOR UPDATE SKIP LOCKED)` the planner may run the subquery as a nested loop,
 // re-evaluating the LIMIT per outer row and claiming more than n timers (the
 // limit test caught exactly this). Materialising evaluates it once.
+//
+// Abandoned claims (older than the lease) are only reclaimed while attempts <
+// max. The `dead` CTE gives up on the rest, which covers a timer that kills its
+// worker before RecordFailure can run.
 const eoClaimDueSQL = `
-WITH due AS MATERIALIZED (
+WITH dead AS (
+	UPDATE eo_timers SET status = 'failed',
+		last_error = CASE WHEN last_error = '' THEN 'abandoned: worker did not finish' ELSE last_error END
+	WHERE status = 'claimed' AND claimed_at <= @stale AND attempts >= @max
+),
+due AS MATERIALIZED (
 	SELECT id FROM eo_timers
 	WHERE fire_at <= @now
-	  AND (status = 'pending' OR (status = 'claimed' AND claimed_at <= @stale))
+	  AND (status = 'pending' OR (status = 'claimed' AND claimed_at <= @stale AND attempts < @max))
 	ORDER BY fire_at, id
 	LIMIT @limit
 	FOR UPDATE SKIP LOCKED
 )
-UPDATE eo_timers t SET status = 'claimed', claimed_at = @now
+UPDATE eo_timers t SET status = 'claimed', claimed_at = @now, attempts = t.attempts + 1
 FROM due
 WHERE t.id = due.id
 RETURNING t.*`
@@ -94,6 +113,7 @@ func (r *eoTimerRepository) ClaimDue(ctx context.Context, now time.Time, limit i
 		"now":   now,
 		"stale": now.Add(-EOTimerClaimLease),
 		"limit": limit,
+		"max":   EOTimerMaxAttempts,
 	}).Scan(&out).Error
 	if err != nil {
 		return nil, fmt.Errorf("claim due timers: %w", err)
@@ -111,6 +131,22 @@ func (r *eoTimerRepository) MarkFired(ctx context.Context, id uuid.UUID) error {
 		return ErrEOTimerNotClaimed
 	}
 	return nil
+}
+
+func (r *eoTimerRepository) RecordFailure(ctx context.Context, id uuid.UUID, msg string) (bool, error) {
+	var status string
+	res := r.db.WithContext(ctx).Raw(
+		`UPDATE eo_timers SET last_error = ?,
+			status = CASE WHEN attempts >= ? THEN 'failed' ELSE status END
+		 WHERE id = ? AND status = 'claimed'
+		 RETURNING status`, msg, EOTimerMaxAttempts, id).Scan(&status)
+	if res.Error != nil {
+		return false, fmt.Errorf("record timer failure: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return false, ErrEOTimerNotClaimed
+	}
+	return status == models.EOTimerFailed, nil
 }
 
 func (r *eoTimerRepository) CancelForRecord(ctx context.Context, recordID uuid.UUID) error {

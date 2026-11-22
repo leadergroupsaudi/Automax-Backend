@@ -229,9 +229,11 @@ func MigrateEOPlatform(db *gorm.DB) error {
 		payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
 		status         VARCHAR(20) NOT NULL DEFAULT 'pending',
 		claimed_at     TIMESTAMP WITH TIME ZONE,
+		attempts       INTEGER NOT NULL DEFAULT 0,
+		last_error     TEXT NOT NULL DEFAULT '',
 		created_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 		CONSTRAINT pk_eo_timers PRIMARY KEY (id),
-		CONSTRAINT chk_eo_timers_status CHECK (status IN ('pending', 'claimed', 'fired', 'cancelled'))
+		CONSTRAINT chk_eo_timers_status CHECK (status IN ('pending', 'claimed', 'fired', 'cancelled', 'failed'))
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_eo_timers_due ON eo_timers (fire_at) WHERE status IN ('pending', 'claimed');
@@ -348,6 +350,8 @@ var (
 		{"payload", "jsonb", 0, false},
 		{"status", "character varying", 20, false},
 		{"claimed_at", "timestamp with time zone", 0, true},
+		{"attempts", "integer", 0, false},
+		{"last_error", "text", 0, false},
 		{"created_at", "timestamp with time zone", 0, false},
 	}
 )

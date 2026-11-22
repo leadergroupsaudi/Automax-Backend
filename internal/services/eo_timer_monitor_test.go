@@ -25,6 +25,8 @@ type eoFakeTimerRepo struct {
 	claimErr  error
 	fireErr   error
 	batches   []int
+	failures  map[uuid.UUID]string
+	failedNow bool
 }
 
 func (f *eoFakeTimerRepo) Schedule(context.Context, *models.EOTimer) error { return nil }
@@ -54,6 +56,16 @@ func (f *eoFakeTimerRepo) MarkFired(_ context.Context, id uuid.UUID) error {
 	}
 	f.fired = append(f.fired, id)
 	return nil
+}
+
+func (f *eoFakeTimerRepo) RecordFailure(_ context.Context, id uuid.UUID, msg string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures == nil {
+		f.failures = map[uuid.UUID]string{}
+	}
+	f.failures[id] = msg
+	return f.failedNow, nil
 }
 
 func (f *eoFakeTimerRepo) CancelForRecord(_ context.Context, id uuid.UUID) error {
@@ -156,6 +168,12 @@ func TestTimerMonitorRunOnce(t *testing.T) {
 			}
 			if len(repo.fired) != tc.wantFired || len(repo.cancelled) != tc.wantCancelled {
 				t.Errorf("fired %d cancelled %d, want %d / %d", len(repo.fired), len(repo.cancelled), tc.wantFired, tc.wantCancelled)
+			}
+			if _, recorded := repo.failures[bad]; recorded != (tc.wantErr) {
+				t.Errorf("failure recorded = %v, want %v", recorded, tc.wantErr)
+			}
+			if tc.wantErr && repo.failures[bad] != "boom" {
+				t.Errorf("recorded message %q, want the handler error", repo.failures[bad])
 			}
 			for _, id := range repo.fired {
 				if id == bad && tc.wantFired < 3 {

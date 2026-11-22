@@ -15,6 +15,10 @@ const (
 	EOTimerClaimed   = "claimed"
 	EOTimerFired     = "fired"
 	EOTimerCancelled = "cancelled"
+	// EOTimerFailed is terminal: the handler failed EOTimerMaxAttempts times
+	// (or the worker died that often mid-timer) and the timer was given up on.
+	// It never fired; last_error says why.
+	EOTimerFailed = "failed"
 )
 
 // EOTimer is a durable, record-scoped timer: an SLA clock, a reminder, a
@@ -32,6 +36,8 @@ type EOTimer struct {
 	Payload       datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'::jsonb" json:"payload"`
 	Status        string         `gorm:"size:20;not null;default:'pending'" json:"status"`
 	ClaimedAt     *time.Time     `json:"claimed_at"`
+	Attempts      int            `gorm:"not null;default:0" json:"attempts"`
+	LastError     string         `gorm:"type:text;not null;default:''" json:"last_error"`
 	CreatedAt     time.Time      `json:"created_at"`
 }
 

@@ -354,3 +354,104 @@ func TestMigrateEOPlatformDetectsEOTimersDrift(t *testing.T) {
 		t.Fatalf("drifted eo_timers not detected, err = %v", err)
 	}
 }
+
+// eoTimerRetry plays the monitor against the real repository: claim, then fail
+// or fire. Each round advances the clock past the lease so the timer is due
+// for re-delivery.
+func eoTimerRound(t *testing.T, repo EOTimerRepository, clock *time.Time) []models.EOTimer {
+	t.Helper()
+	*clock = clock.Add(EOTimerClaimLease + time.Minute)
+	got, err := repo.ClaimDue(context.Background(), *clock, 10)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	return got
+}
+
+func TestTimerGivesUpAfterMaxAttempts(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	clock := time.Now()
+	tm := eoNewTimer(clock.Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 1; attempt <= EOTimerMaxAttempts; attempt++ {
+		got := eoTimerRound(t, repo, &clock)
+		if len(got) != 1 || got[0].Attempts != attempt {
+			t.Fatalf("attempt %d: got %d timers (attempts %v)", attempt, len(got), got)
+		}
+		failed, err := repo.RecordFailure(ctx, tm.ID, "handler exploded")
+		if err != nil {
+			t.Fatalf("RecordFailure: %v", err)
+		}
+		if want := attempt == EOTimerMaxAttempts; failed != want {
+			t.Fatalf("attempt %d: failed = %v, want %v", attempt, failed, want)
+		}
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFailed {
+		t.Fatalf("status = %q, want failed", s)
+	}
+	var msg string
+	db.Raw(`SELECT last_error FROM eo_timers WHERE id = ?`, tm.ID).Scan(&msg)
+	if msg != "handler exploded" {
+		t.Errorf("last_error = %q", msg)
+	}
+	if got := eoTimerRound(t, repo, &clock); len(got) != 0 {
+		t.Errorf("a failed timer was claimed again")
+	}
+}
+
+func TestTimerSucceedingOnALaterAttemptIsNotFailed(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	clock := time.Now()
+	tm := eoNewTimer(clock.Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt < EOTimerMaxAttempts; attempt++ {
+		if got := eoTimerRound(t, repo, &clock); len(got) != 1 {
+			t.Fatalf("attempt %d: not redelivered", attempt)
+		}
+		if failed, err := repo.RecordFailure(ctx, tm.ID, "transient"); err != nil || failed {
+			t.Fatalf("attempt %d: failed=%v err=%v", attempt, failed, err)
+		}
+	}
+	if got := eoTimerRound(t, repo, &clock); len(got) != 1 {
+		t.Fatal("last attempt not redelivered")
+	}
+	if err := repo.MarkFired(ctx, tm.ID); err != nil {
+		t.Fatalf("MarkFired: %v", err)
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFired {
+		t.Errorf("status = %q, want fired", s)
+	}
+}
+
+// A timer that kills its worker never reaches RecordFailure; ClaimDue must give
+// up on it rather than leave it claimed forever.
+func TestClaimDueFailsTimersThatExhaustedAttemptsWithoutReporting(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	clock := time.Now()
+	tm := eoNewTimer(clock.Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < EOTimerMaxAttempts; i++ {
+		if got := eoTimerRound(t, repo, &clock); len(got) != 1 { // claimed, worker "crashes"
+			t.Fatalf("round %d: got %d", i, len(got))
+		}
+	}
+	if got := eoTimerRound(t, repo, &clock); len(got) != 0 {
+		t.Fatal("exhausted timer reclaimed")
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFailed {
+		t.Errorf("status = %q, want failed", s)
+	}
+}
