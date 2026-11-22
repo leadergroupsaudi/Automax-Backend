@@ -14,11 +14,23 @@ database that has been through an intermediate commit of this branch.
 
 1. **`migrations.MigrateEOPlatform`'s error is now returned, not logged.**
    `internal/database/postgres.go` used to write `Warning: EO platform
-   migration failed: …` and carry on. The migration is built to fail closed —
-   its `relkind` guard, `assertPartitionKey` and `assertColumns` all return
-   errors precisely so that production and the migration file cannot drift
-   unnoticed — so a warning defeated the entire mechanism. The server now
-   refuses to start if any of them fires.
+   migration failed: …` and carry on. The migration is built to fail closed, so
+   a warning defeated the entire mechanism. The server now refuses to start if
+   **any** of its guards fires, and there are three kinds:
+
+   - the `relkind` guard — `eo_records` exists but is not a partitioned table;
+   - `assertPartitionKey` — it is partitioned, but not by `record_type_id`;
+   - `assertColumns` — a table's live columns do not match what the migration
+     declares. **This one runs on six tables**: `eo_records`,
+     `eo_record_links`, `eo_record_history`, `eo_reference_sequences`,
+     `eo_timers` and `eo_escalation_events`.
+
+   Every `CREATE TABLE` in that file is `IF NOT EXISTS`, so on a database that
+   already has a table, editing a column list up there changes nothing —
+   `assertColumns` is the only thing that notices. That is exactly the shape of
+   an upgrade from an intermediate commit of this branch: a column changed
+   mid-branch, the table is already present, the create is a no-op, and the
+   assertion fires at boot.
 
 2. **`eo_record_links` now carries `uq_eo_record_links_pair_type`**, a unique
    index on `(from_record_id, to_record_id, link_type_key)`. The duplicate
@@ -29,38 +41,94 @@ database that has been through an intermediate commit of this branch.
 
 ## The check
 
-Run these against the target database **before** deploying. All four are
-read-only.
+Five things to establish. All are read-only; none writes or locks anything.
+**Run all five**: each covers a different guard, and a clean result from one
+says nothing about the others.
+
+### 1 — the six tables' columns
+
+This is the guard a hand-written query cannot cover honestly, because the
+expected column list lives in Go. So the query is **generated from the very
+slices `assertColumns` compares against**, by `migrations.EOPreflightSQL`.
+There is no second copy of the list to drift, which is the failure this whole
+mechanism exists to prevent.
+
+```sh
+# Run it directly. Exit 0 = clear, 1 = the deployment would fail, 2 = could not connect.
+go run ./cmd/eo-preflight -dsn "postgres://user:pass@host:5432/dbname?sslmode=disable"
+
+# Or print the SQL and run it however you like — it takes no parameters.
+go run ./cmd/eo-preflight | psql "$DSN"
+```
+
+**Zero rows / `OK` means no column assertion will fail at boot.** Any row names
+the table, the column, what the database has and what this build expects, in
+the same wording the startup error would use:
+
+```
+eo_timers.capability_key is character varying(40) NOT NULL; expected character varying(100) NOT NULL
+eo_escalation_events.stray_column exists in the database but is not declared in this migration
+```
+
+A table that does not exist yet is deliberately not reported: the migration
+creates it, so a fresh database is silent rather than a wall of noise.
+
+If the Go toolchain is not available on the target host, run
+`go run ./cmd/eo-preflight` anywhere with the source and paste the printed SQL
+into a psql session on the target. The SQL is self-contained and schema-
+relative (`current_schema()`).
+
+Each row is resolved by writing an `ALTER TABLE` migration, **or** by
+correcting the expected column list in
+`internal/database/migrations/eo_platform.go` — whichever of the two is
+actually the mistake. Do not simply edit the expected list to match a drifted
+production table without first establishing why they differ; that list is the
+checksum, and editing it to agree with whatever is there defeats it.
+
+### 2 — partitioning
 
 ```sql
--- 1. eo_records must be a PARTITIONED table ('p'), not a plain one ('r').
---    'r' means AutoMigrate created it: it has no composite primary key and no
---    per-partition UNIQUE (record_type_id, reference), so reference
---    uniqueness has not been enforced. Nothing is empty here: the table has to
---    be migrated by hand before this build can start.
+-- eo_records must be a PARTITIONED table ('p'), not a plain one ('r').
 SELECT relkind FROM pg_class WHERE oid = to_regclass('eo_records');
 
--- 2. ... and partitioned exactly this way.
+-- ... and partitioned exactly this way.
 SELECT pg_get_partkeydef(to_regclass('eo_records'));   -- expect: LIST (record_type_id)
+```
 
--- 3. Duplicate links, which block the new unique index. Expect zero rows.
+If `to_regclass` is NULL, `eo_records` does not exist: this is a fresh database
+and the migration creates it correctly. Nothing to do.
+
+**If `relkind` is `'r'`** the table is a plain, unpartitioned one. It has no
+composite primary key and no per-partition
+`UNIQUE (record_type_id, reference)`, so reference uniqueness has never been
+enforced on it. There is no in-place upgrade — `PARTITION BY` can only be given
+at creation — so fixing it is a hand migration: create the partitioned table
+under a new name with the shape in `eo_platform.go`, create its `DEFAULT`
+partition, resolve any duplicate `(record_type_id, reference)` pairs (the new
+constraint will reject them), `INSERT INTO … SELECT` the rows, drop
+`eo_record_links`' and `eo_record_history`'s foreign keys, swap the names, and
+recreate the foreign keys. That is a maintenance window, not a deploy step.
+
+**This should not happen on this branch.** The only thing that creates a plain
+`eo_records` is AutoMigrate, and `models.EORecord` has never been in the
+AutoMigrate list in `internal/database/postgres.go` — its doc comment says so,
+the model's own comment says so, and
+`repository.TestMigrateEOPlatformRejectsANonPartitionedTable` covers the guard.
+Treat an `'r'` here as evidence that something outside this branch created the
+table, and find out what, before migrating it.
+
+### 3 — duplicate links
+
+```sql
+-- Blocks the new unique index. Expect zero rows.
 SELECT from_record_id, to_record_id, link_type_key, count(*)
 FROM eo_record_links
 GROUP BY 1, 2, 3
 HAVING count(*) > 1;
-
--- 4. Is the EO seed marker present? The marker IS the base record type, and
---    the whole seed is one transaction, so this answers "is the platform
---    configured" exactly.
-SELECT count(*) FROM eo_record_types WHERE key = 'eo_base';
 ```
 
-If `eo_records` does not exist at all (`to_regclass` is NULL), this is a fresh
-database and there is nothing to check: the migration creates everything.
-
-### If (3) returns rows
-
-Delete the surplus rows, keeping the oldest of each group, then redeploy:
+If it returns rows, delete the surplus, keeping the oldest of each group, then
+redeploy:
 
 ```sql
 DELETE FROM eo_record_links a
@@ -71,13 +139,36 @@ WHERE a.from_record_id = b.from_record_id
   AND (a.created_at, a.id) > (b.created_at, b.id);
 ```
 
-### If (4) returns 0 on a database that has served EO traffic
+### 4 — the escalation-event unique index
 
-The seed rolled back at some point and the platform is **absent**, not
-partially present — the seed is one transaction, so there is no half-written
-state to repair. Check the startup log for the three lines beginning
-`EO platform seed FAILED` / `EO CONFIGURATION WAS NOT APPLIED`; the first names
-the underlying error.
+```sql
+-- uq_eo_escalation_events_step blocks on existing duplicates the same way.
+-- Expect zero rows.
+SELECT record_id, state_id, policy_id, step_index, breached_at, count(*)
+FROM eo_escalation_events
+GROUP BY 1, 2, 3, 4, 5
+HAVING count(*) > 1;
+```
+
+Only relevant on a database where the table predates that index. De-duplicate
+the same way as (3) if it returns anything.
+
+### 5 — is the platform seeded?
+
+```sql
+-- The marker IS the base record type, and the whole seed is one transaction,
+-- so this answers "is the platform configured" exactly.
+SELECT count(*) FROM eo_record_types WHERE key = 'eo_base';
+```
+
+This one does not block the boot; it tells you whether the EO configuration is
+present at all.
+
+**If it returns 0 on a database that has served EO traffic**, the seed rolled
+back at some point and the platform is **absent**, not partially present — the
+seed is one transaction, so there is no half-written state to repair. Check the
+startup log for the three lines beginning `EO platform seed FAILED` /
+`EO CONFIGURATION WAS NOT APPLIED`; the first names the underlying error.
 
 The cause is almost always a **leftover row from an intermediate commit of this
 branch** colliding with one the seed is trying to write. The seed's marker row
@@ -115,13 +206,15 @@ startup (`cmd/server/main.go`, `eoWarnSwitchDisagreement`). A licence without
 without the licence seeds configuration nobody can reach.
 
 `EO_TIMER_INTERVAL_SECONDS` (default 30) is read by `config.Load` alongside
-them and sets the timer worker's poll interval.
+them and sets the timer worker's poll interval. A value that is not a number,
+and one that is zero or negative, both fall back to 30 — and both are named in
+a startup warning, so a typo is not silent.
 
 ## Per-type partitions
 
 Plan 1 creates `eo_records` and its `DEFAULT` partition only. **No per-type
 partition is ever created**, and every record of every type lives in
-`eo_records_default`. This is fully functional — see spec §7.7 for why
-promoting a type to its own partition after it has records is a one-way door
-that needs a data move under lock, and why Plan 2 must create each type's
-partition before that type's first record.
+`eo_records_default`. This is fully functional. See spec §7.7 for why promoting
+a type to a partition of its own is a one-way door, and why it is a maintenance
+operation on a populated register even for a type that holds no records of its
+own.

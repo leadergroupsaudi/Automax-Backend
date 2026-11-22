@@ -153,18 +153,29 @@ type EORecordType struct {
 	// its records live in eo_records_default (spec §7.7). In Plan 1 NOTHING
 	// EVER CLEARS IT: no per-type partition is created, by the designer or by
 	// any command, so every record of every type is in the default partition
-	// and the platform is fully functional there.
+	// and the platform is fully functional there. It is a LABEL — the designer
+	// displays it — and nothing in the engine reads it.
+	//
+	// It is written true on every type the designer creates, and the column
+	// defaults to true. The seed writes it FALSE for the abstract base type
+	// eo_base, which holds no records and will never want a partition
+	// (seed_eo_platform.go). So "always true" would be wrong as a claim about
+	// the data, even though nothing ever flips a true to a false.
 	//
 	// Promotion is a ONE-WAY DOOR and it closes at the type's first record.
 	// Creating a partition of a table that already has a DEFAULT partition
-	// makes Postgres scan that default and fail if any row would belong to the
-	// new partition — so promoting an EMPTY type is a plain CREATE TABLE …
-	// PARTITION OF, while promoting a POPULATED one needs a data move under an
-	// ACCESS EXCLUSIVE lock (create detached, copy, delete, attach): a
-	// maintenance window on the register, not a release step. Plan 2 must
-	// therefore create each type's partition BEFORE that type's first record,
-	// at type creation rather than at the next release. Nothing here enforces
-	// that ordering. Recorded in spec §7.7 during the Plan 1 fix wave.
+	// makes Postgres take an ACCESS EXCLUSIVE lock on that default and
+	// FULL-SCAN it to prove no existing row would belong to the new partition.
+	// That scan happens whether or not the type being promoted has records, and
+	// here the default holds every record of every type — so promoting an EMPTY
+	// type is the cheap case only RELATIVE to the other: a plain CREATE TABLE …
+	// PARTITION OF, still scanning the whole register under lock. Promoting a
+	// POPULATED one adds a data move on top (create detached, copy, delete,
+	// attach), with the lock held across it. Neither is free on a populated
+	// register. Plan 2 must therefore create each type's partition BEFORE that
+	// type's first record, at type creation rather than at the next release.
+	// Nothing here enforces that ordering. Recorded in spec §7.7 during the
+	// Plan 1 fix wave.
 	PartitionPending bool           `gorm:"default:true" json:"partition_pending"`
 	CreatedAt        time.Time      `json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`

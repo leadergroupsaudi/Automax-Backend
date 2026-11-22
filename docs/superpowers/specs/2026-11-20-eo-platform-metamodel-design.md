@@ -273,20 +273,34 @@ transaction, which does not fit the house migration style
 record.** (Added 2026-11-22, during the Plan 1 fix wave.) Plan 1 creates
 `eo_records` and its `DEFAULT` partition and nothing else: no per-type
 partition is ever created, by the designer or by a command, and every record of
-every type lands in `eo_records_default`. `EORecordType.PartitionPending` is
-set to true on creation and nothing ever clears it.
+every type lands in `eo_records_default`. `EORecordType.PartitionPending`
+defaults to true, the designer sets it true on every type it creates, and
+nothing ever clears it. (The one exception is the seeded base type `eo_base`,
+which the seed writes with `partition_pending = false` because an abstract type
+holds no records and will never be partitioned — see
+`seed_eo_platform.go`. It is a label, not a mechanism; nothing reads it.)
 
 The tooling promised above is still the right shape, but it has a constraint
 that was not stated when it was promised. When Postgres creates a new partition
-of a table that already has a DEFAULT partition, it SCANS the default partition
-and errors if any row in it would belong to the new one. So:
+of a table that already has a DEFAULT partition, it takes an
+`ACCESS EXCLUSIVE` lock on that default and **full-scans it** to prove no
+existing row would belong to the new partition. The scan happens whether or not
+the type being promoted has records of its own, and in Plan 1 the default
+partition holds *every record of every type*. So:
 
-- promoting a type that has **no** records is free — a plain
-  `CREATE TABLE … PARTITION OF eo_records FOR VALUES IN (…)`;
-- promoting a type that **already has records in the default partition** needs a
-  data move under an `ACCESS EXCLUSIVE` lock: create the partition detached,
-  copy the rows, delete them from the default, attach. That is a maintenance
-  window on the register, not a release step.
+- promoting a type that has **no** records is the cheap case, a plain
+  `CREATE TABLE … PARTITION OF eo_records FOR VALUES IN (…)` — but "cheap"
+  only relative to the other one. It still scans the whole register under an
+  exclusive lock, so on a populated deployment it is a maintenance operation
+  too, not a free release step. On an empty or small register it is instant;
+  the cost grows with the register, not with the type;
+- promoting a type that **already has records in the default partition** needs
+  a data move on top: create the partition detached, copy the rows, delete
+  them from the default, attach. Longer, and the lock is held across the move.
+
+The difference between the two is scan-and-attach versus copy-and-delete. The
+door is one-way in the sense that the second case cannot be downgraded to the
+first once records exist; it was never the case that either was free.
 
 Plan 2 must therefore create each type's partition **before that type's first
 record is written** — at type creation, not at the next release — or accept the
