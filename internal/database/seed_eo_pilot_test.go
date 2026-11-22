@@ -3433,6 +3433,14 @@ func TestEoLinkTypeRowRefusesAnIncoherentSpec(t *testing.T) {
 		}), "one or the other"},
 		{"an offset nothing reads", with(func(s *eoLinkTypeSpec) { s.deadlineOffsetDays = 2 }), "offset"},
 		{"a derivation with no offset", with(func(s *eoLinkTypeSpec) { s.deriveDeadline = true }), "offset"},
+		// The shape the derive/offset equality lets through, and it INVERTS
+		// the rule instead of breaking it: DeriveDeadlineFromParent subtracts
+		// the offset, so a negative one makes the child due LATER than the
+		// parent it was counted back from.
+		{"a derivation that moves the deadline later", with(func(s *eoLinkTypeSpec) {
+			s.deriveDeadline = true
+			s.deadlineOffsetDays = -3
+		}), "counted back"},
 		{"an empty key", with(func(s *eoLinkTypeSpec) { s.key = "" }), "key"},
 		{"no label", with(func(s *eoLinkTypeSpec) { s.label = "" }), "label"},
 	}
@@ -3522,5 +3530,90 @@ func TestEoLinkLabelsAwaitArabicSignOff(t *testing.T) {
 		if lt.LabelAr != lt.Label {
 			t.Errorf("link type %q carries Arabic (%q) the client has not signed off; the English stands in until it does", spec.key, lt.LabelAr)
 		}
+	}
+}
+
+// THE TEST THAT FORCES TASK A5'S HAND.
+//
+// A link type that names a blocked transition is only a rule while some
+// workflow HAS a transition under that code: services.checkBlockingChildren
+// compares BlocksParentTransitionKey with transition.Code by string equality,
+// so a transition seeded under any other code leaves the rule matching nothing
+// — an objection raised, recorded, and silently ignored by the step it exists
+// to hold up. Nothing in the engine reports that, because an unmatched key is
+// not an error, just a comparison that never comes out true. Four documents
+// telling A5 to use the constant are four documents A5 need not open; this is
+// the one that fails.
+//
+// IT IS VACUOUS TODAY, DELIBERATELY: the pilot seed binds no workflow to any
+// of its types (Task A5 seeds the workflows), so the inner loop runs zero
+// times and A4 does not ship a red test for work it does not own.
+//
+// IT BECOMES BINDING THE MOMENT A5 BINDS A WORKFLOW to the Draft Decision
+// Study, and it cannot lapse back: A5's own acceptance requires a workflow on
+// every pilot type. The guard below is what stops it going vacuous for the
+// OTHER reason — a link type set that no longer names a transition at all.
+//
+// Mutation (once A5 has run): seed the raise step under any code other than
+// eoDraftRaiseToHETransitionCode. Today: delete blocksTransitionCode from
+// eoObjectionLinkKey's spec, and the guard fires.
+func TestEoBlockedTransitionNamesATransitionItsWorkflowHas(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	named := 0
+	bound := 0
+	for key, lt := range eoSeededLinkTypes(t, db) {
+		if lt.BlocksParentTransitionKey == "" {
+			continue
+		}
+		named++
+		for _, raw := range eoLinkTypeIDs(t, "target_type_ids", lt.TargetTypeIDs) {
+			if raw == eoAnyTargetType {
+				// A polymorphic target names every type, so there is no one
+				// workflow to check. No pilot link type is in this position;
+				// if one ever is, the rule needs a different guard.
+				continue
+			}
+			parentTypeID, err := uuid.Parse(raw)
+			if err != nil {
+				t.Fatalf("link type %q has the unparseable target %q", key, raw)
+			}
+			// The binding services.ResolveWorkflowForType reads, and only it:
+			// workflows.record_type_id. The record type's own workflow_id is
+			// the designer's copy of the same fact.
+			var workflows []models.Workflow
+			if err := db.Where("record_type_id = ? AND is_active = ?", parentTypeID, true).Find(&workflows).Error; err != nil {
+				t.Fatalf("read the workflows bound to %s: %v", parentTypeID, err)
+			}
+			for _, wf := range workflows {
+				bound++
+				var codes []string
+				if err := db.Model(&models.WorkflowTransition{}).
+					Where("workflow_id = ? AND is_active = ?", wf.ID, true).
+					Pluck("code", &codes).Error; err != nil {
+					t.Fatalf("read the transitions of workflow %q: %v", wf.Code, err)
+				}
+				found := false
+				for _, c := range codes {
+					if c == lt.BlocksParentTransitionKey {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("link type %q blocks the transition %q, and the workflow %q bound to its parent type %s has no active transition with that code (it has %v): the rule matches nothing, an objection is raised and silently ignored, and the engine reports neither",
+						key, lt.BlocksParentTransitionKey, wf.Code, parentTypeID, codes)
+				}
+			}
+		}
+	}
+	// The guard against the other kind of vacuity: a link type set that names
+	// no transition at all would make the loop above prove nothing.
+	if named == 0 {
+		t.Fatalf("no seeded link type names a blocked transition; eo_objection_parent is supposed to, and without it this test checks nothing")
+	}
+	if bound == 0 {
+		t.Logf("vacuous as expected: %d link type(s) name a blocked transition and no workflow is bound to any of their parent types yet. Task A5 binds them, and this test becomes binding then.", named)
 	}
 }

@@ -2276,7 +2276,7 @@ var eoPilotLinkTypes = []eoLinkTypeSpec{
 
 	// ── EO-COM ───────────────────────────────────────────────────────────
 	{
-		key: eoReferralLinkKey, label: "Parent letter or referral",
+		key: eoReferralLinkKey, label: "Parent letter",
 		childTypeKey: eoReferralTypeKey,
 		// THE LETTER, AND ONLY THE LETTER — including for a SUB-REFERRAL.
 		//
@@ -2407,6 +2407,18 @@ func eoLinkTypeRow(spec eoLinkTypeSpec, ids map[string]uuid.UUID) (models.EOLink
 	if spec.deriveDeadline != (spec.deadlineOffsetDays != 0) {
 		return lt, fmt.Errorf("link type %q: derive_deadline_from_parent is %v with an offset of %d days; a derivation with no offset copies the parent's own deadline onto the child and an offset without the flag is a number services.DeriveDeadlineFromParent never reads",
 			spec.key, spec.deriveDeadline, spec.deadlineOffsetDays)
+	}
+	// A NEGATIVE offset is the one shape the equality above lets through, and
+	// it inverts the rule rather than breaking it: DeriveDeadlineFromParent
+	// computes parent.DueDate.AddDate(0, 0, -offset), so -3 moves the CHILD'S
+	// deadline three days LATER than its parent's. A child due after the
+	// deadline it was counted back from is not a derived deadline at all — the
+	// SLA clock arms on it, the parent goes overdue first, and the
+	// configuration reads as if the child were being given time. The matrix
+	// says "counted back", so the guard is "counted back by at least a day".
+	if spec.deriveDeadline && spec.deadlineOffsetDays <= 0 {
+		return lt, fmt.Errorf("link type %q derives a deadline with an offset of %d days; services.DeriveDeadlineFromParent subtracts it, so a non-positive offset makes the child due no earlier than its parent — the opposite of a deadline counted back",
+			spec.key, spec.deadlineOffsetDays)
 	}
 
 	source, err := json.Marshal([]string{childID.String()})

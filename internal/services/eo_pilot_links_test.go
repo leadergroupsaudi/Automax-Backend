@@ -399,6 +399,14 @@ func TestEoPilotTaskLinkAcceptsAnyTarget(t *testing.T) {
 		if err == nil {
 			t.Fatalf("a referral was allowed to use the task's link type")
 		}
+		// The MESSAGE, not merely a failure: a create has many ways to fail
+		// (a missing required field, a pattern that will not render), and any
+		// of them would satisfy `err != nil` while proving nothing about the
+		// source list. ValidateLink's own wording is what says the SOURCE was
+		// what refused it.
+		if !strings.Contains(err.Error(), "does not allow a source record of type") {
+			t.Errorf("refused, but not by the link type's source list: %v", err)
+		}
 	})
 }
 
@@ -564,6 +572,42 @@ func TestEoPilotOpenReferralBlocksTheLetterClosing(t *testing.T) {
 	}
 	if _, err := f.transits.Execute(ctx, fresh, f.closeID[eoPilotIncomingTypeKey], f.actor, models.EOTransitionInput{Comment: "closing"}); err != nil {
 		t.Fatalf("closing the letter once its referral is closed: %v", err)
+	}
+}
+
+// The closure rule through the whole pipeline a SECOND time, for the
+// polymorphic link type — because the mechanism differs by target type: the
+// Referral's letter is permitted by an id in the list, a Task's parent by the
+// "any" sentinel, which is a different branch of services.eoTypeAllowed. A
+// task holding a DIRECTIVE open is also the matrix's own example of
+// "partial closure is not closure" (spec §7.6, EO-DIR).
+//
+// Mutation: set `blocksClosure: false` on eoTaskLinkKey in
+// database.eoPilotLinkTypes.
+func TestEoPilotOpenTaskBlocksTheDirectiveClosing(t *testing.T) {
+	f := eoPilotNewFixture(t)
+	ctx := context.Background()
+
+	directive := f.eoPilotCreate(t, eoPilotDirectiveTypeKey, nil, "", nil)
+	task := f.eoPilotCreate(t, eoPilotTaskTypeKey, directive, eoPilotTaskLinkKey, nil)
+
+	_, err := f.transits.Execute(ctx, directive, f.closeID[eoPilotDirectiveTypeKey], f.actor, models.EOTransitionInput{Comment: "closing"})
+	if !errors.Is(err, ErrEOTransitionBlocked) {
+		t.Fatalf("closing a directive with an open task returned %v, want ErrEOTransitionBlocked", err)
+	}
+	if !strings.Contains(err.Error(), task.Reference) {
+		t.Errorf("the refusal does not name the task holding it open (%s): %v", task.Reference, err)
+	}
+
+	if _, err := f.transits.Execute(ctx, task, f.closeID[eoPilotTaskTypeKey], f.actor, models.EOTransitionInput{Comment: "done"}); err != nil {
+		t.Fatalf("close the task: %v", err)
+	}
+	fresh, err := f.repo.GetByID(ctx, directive.ID, directive.RecordTypeID)
+	if err != nil || fresh == nil {
+		t.Fatalf("re-read the directive: %v", err)
+	}
+	if _, err := f.transits.Execute(ctx, fresh, f.closeID[eoPilotDirectiveTypeKey], f.actor, models.EOTransitionInput{Comment: "closing"}); err != nil {
+		t.Fatalf("closing the directive once its task is closed: %v", err)
 	}
 }
 

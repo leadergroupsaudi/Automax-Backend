@@ -258,6 +258,30 @@ stands in both labels (`eoUntranslatedLinkLabel`) and
 `TestEoLinkLabelsAwaitArabicSignOff` keeps invented Arabic out, but the
 obligation is visible only in this document until the column exists.
 
+**For Task A5, from Task A4: TWO CLIENT-STATED RULES ARE IMPLEMENTED BY NOBODY
+UNTIL A5 WRITES A TRANSITION ACTION.** The matrix says a **Decision Record**
+"Closes the parent, then joins the base that checks the next draft"
+(matrix:165) and an **Outgoing Reply** "Closes the parent" (matrix:311). **No
+field of `models.EOLinkType` closes anything**, and nothing in the save or
+transition pipeline closes one record because another was created — so
+`eo_decision_record_parent` and `eo_outgoing_reply_parent` are deliberately
+seeded with NO rule at all (Task A4; `eoLinkRuleDecisions` carries the full
+reasoning, and seeding `blocks_parent_closure` on either would have been the
+exact inversion of the client's sentence — a decision record holding its study
+open for ever). The mechanism that can express it is a **transition action**
+(spec §7.8) on the parent's workflow, fired by the child's creation, and that
+is **A5's**. Until it exists, both types ship with configuration that looks
+complete and a governance rule that runs nowhere.
+
+**In the same paragraph, because it has the same shape:** Outgoing Reply's
+"One per letter, however many rounds of direction it took" (matrix:311) is
+**not** expressible as link-type cardinality. `services.ValidateLink` counts
+cardinality PER SOURCE RECORD, so the seeded `one` means "a reply carries one
+parent link", not "a letter carries one reply" — nothing in the link-type model
+bounds a parent's children. Holding the client to one reply per letter is a
+workflow matter too. The same reading applies to Execution Plan's "One per
+directive", which A3 answered through the per-parent sequence scope.
+
 **For Task A5, from Task A4: the Objection's blocked transition is a shared
 constant.** `database.eoDraftRaiseToHETransitionCode` (`"raise_to_he"`) is what
 `eo_objection_parent.blocks_parent_transition_key` names, and
@@ -269,7 +293,12 @@ hold up — no error anywhere, because an unmatched transition key is simply a
 comparison that never comes out true. `services.TestEoPilotOpenObjectionBlocks
 TheRaiseToHEAndNotTheClosure` proves the branch refuses, using a workflow of
 its own; it is the first time `blocks_parent_transition_key` has run on seeded
-configuration.
+configuration. **And it is enforced rather than merely documented:**
+`database.TestEoBlockedTransitionNamesATransitionItsWorkflowHas` resolves the
+parent types of every link type that names a transition and, **for any workflow
+bound to one of them**, requires an active transition under that code. It
+passes vacuously today (the pilot binds no workflow) and becomes binding the
+moment A5 binds one — failing with both strings named.
 
 **The matrix has five "one per parent" child types whose reference patterns
 cannot be rendered, and the fix is engine work, not five edits (owner: engine,
