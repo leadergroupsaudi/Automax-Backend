@@ -425,6 +425,16 @@ func (h *EORecordTypeHandler) CreateField(c *fiber.Ctx) error {
 	if fieldErrs := eoValidateFieldShape(c, def); len(fieldErrs) > 0 {
 		return eoFieldErrors(c, fieldErrs)
 	}
+	// The collision check is against this type's OWN fields only, and that is
+	// deliberate: a key an ANCESTOR declares is not a collision, it is an
+	// override. services.ResolveEffectiveFields (eo_fields.go:20-30) states
+	// the rule — "if a type redefines an ancestor's field key, the type's
+	// definition replaces the ancestor's at the ancestor's position; the key
+	// appears once" — and overriding is how a child narrows an inherited
+	// field (optional to required, a relabel). Rejecting inherited keys here
+	// would make that documented feature unreachable from the designer. What
+	// is refused is two definitions of the same key on the SAME type, which
+	// the unique index idx_eo_field_defs_type_key also forbids.
 	for _, existing := range before {
 		if existing.Key == def.Key {
 			return eoFieldErrors(c, map[string]string{"key": i18n.T(c.UserContext(), "eo_field_key_exists")})

@@ -206,12 +206,49 @@ func ValidateReferencePrefix(prefix string, existing []EORecordType) error {
 
 // ValidateTypeEdit applies the guard rails of spec §7.14. Additive changes are
 // always allowed. While records exist, removing a field, changing its kind,
-// making an existing field required, or changing the reference prefix is
-// rejected. It never deletes anything: a removed field's data stays in the
-// values jsonb so a mistaken removal is recoverable. Fields are matched by Key.
+// making an existing field required, changing the reference prefix or pattern,
+// re-keying the type, repointing its workflow or its parent, or turning it
+// abstract is rejected. It never deletes anything: a removed field's data
+// stays in the values jsonb so a mistaken removal is recoverable. Fields are
+// matched by Key.
+//
+// Every rule here is conditional on hasRecords. None of them is "never": a
+// type nobody has used yet is still being designed and may be changed freely.
 func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef, hasRecords bool) error {
 	if !hasRecords {
 		return nil
+	}
+	// A record's state_id names a state of the type's CURRENT workflow.
+	// Repointing the workflow leaves every existing record in a state its
+	// workflow does not contain: no transition runs from it, AvailableTransitions
+	// returns nothing, and no API path can put the record back — in a register
+	// that is a statutory audit trail. This is the worst of the five.
+	if !eoSameUUID(before.WorkflowID, after.WorkflowID) {
+		return fmt.Errorf("changing workflow from %s to %s is destructive: every existing record's state_id names a state of the old workflow, and no transition runs from a state the new workflow does not contain",
+			eoUUIDText(before.WorkflowID), eoUUIDText(after.WorkflowID))
+	}
+	// Inherited fields are resolved at read time from the ancestor chain
+	// (spec §7.2), so re-parenting changes which definitions a record's
+	// stored values have. Values under a key the new chain does not define
+	// stop being validated, displayed or derivable — they are still in the
+	// jsonb, but nothing knows what they are.
+	if !eoSameUUID(before.ParentTypeID, after.ParentTypeID) {
+		return fmt.Errorf("changing parent type from %s to %s is destructive: effective fields are resolved from the ancestor chain at read time, so stored values can lose the definitions that give them meaning",
+			eoUUIDText(before.ParentTypeID), eoUUIDText(after.ParentTypeID))
+	}
+	// The key identifies the type to configuration that names it by key —
+	// the reference prefix it owns, formulas that address a child type by key
+	// (eoRecordDeps.Children, .Ancestor), and seeded capability config.
+	if before.Key != after.Key {
+		return fmt.Errorf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns and to every formula that names it",
+			before.Key, after.Key)
+	}
+	// An abstract type holds no records of its own: the save pipeline refuses
+	// to create one. Flipping the flag on a type that already has records
+	// declares that those records cannot exist.
+	if !before.IsAbstract && after.IsAbstract {
+		return fmt.Errorf("making record type %q abstract is destructive: an abstract type holds no records of its own, and this one already has some",
+			before.Key)
 	}
 	if before.ReferencePrefix != after.ReferencePrefix {
 		return fmt.Errorf("changing reference prefix %q to %q is destructive: existing references were issued under the old prefix",
@@ -244,3 +281,21 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 }
 
 func isNeverRequired(mode string) bool { return mode == "" || mode == EORequiredNever }
+
+// eoSameUUID compares two optional ids, treating nil as its own value: nil to
+// set and set to nil are both changes, and a == b on the pointers would
+// compare addresses.
+func eoSameUUID(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// eoUUIDText renders an optional id for an error message.
+func eoUUIDText(id *uuid.UUID) string {
+	if id == nil {
+		return "none"
+	}
+	return id.String()
+}

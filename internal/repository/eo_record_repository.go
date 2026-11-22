@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
@@ -329,6 +331,15 @@ func (r *eoRecordRepository) List(ctx context.Context, filter *models.EORecordFi
 	return out, total, nil
 }
 
+// ErrEOUnsupportedSort marks a sort key or direction the allow-list does not
+// contain. It is a SENTINEL because it is the one List failure that is the
+// caller's mistake rather than the server's: it is raised before any query
+// runs, and the HTTP layer answers 400 for it instead of logging an internal
+// error for somebody's typo. Matching on the message text would be the only
+// alternative, and the allow-list itself must not be duplicated outside this
+// file — a second copy is a second thing to keep in step with eoSortColumns.
+var ErrEOUnsupportedSort = errors.New("unsupported sort")
+
 // eoOrderClause builds ORDER BY from the allow-list. eo_records.id breaks ties
 // so pages never repeat or skip a row.
 func eoOrderClause(filter *models.EORecordFilter) (string, error) {
@@ -338,7 +349,7 @@ func eoOrderClause(filter *models.EORecordFilter) (string, error) {
 	}
 	col, ok := eoSortColumns[key]
 	if !ok {
-		return "", fmt.Errorf("list eo records: unsupported sort_by %q", filter.SortBy)
+		return "", fmt.Errorf("list eo records: %w sort_by %q", ErrEOUnsupportedSort, filter.SortBy)
 	}
 	dir := "DESC"
 	switch strings.ToLower(filter.SortDir) {
@@ -346,9 +357,21 @@ func eoOrderClause(filter *models.EORecordFilter) (string, error) {
 	case "asc":
 		dir = "ASC"
 	default:
-		return "", fmt.Errorf("list eo records: unsupported sort_dir %q", filter.SortDir)
+		return "", fmt.Errorf("list eo records: %w sort_dir %q", ErrEOUnsupportedSort, filter.SortDir)
 	}
 	return col + " " + dir + ", eo_records.id ASC", nil
+}
+
+// EOSortKeys is the allow-listed sort_by values, for an API that wants to tell
+// a caller what it may ask for. It is derived from eoSortColumns, never
+// written out a second time.
+func EOSortKeys() []string {
+	out := make([]string, 0, len(eoSortColumns))
+	for k := range eoSortColumns {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // applyEORecordFilters is the one place a register's WHERE clause is built, so

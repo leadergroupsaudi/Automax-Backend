@@ -164,3 +164,129 @@ func TestValidateTypeEditTreatsPrefixChangeAsDestructive(t *testing.T) {
 		t.Errorf("prefix change rejected with no records: %v", err)
 	}
 }
+
+// TestValidateTypeEditTreatsIdentityAndStructureChangesAsDestructive covers
+// the four attributes nothing guarded until an update ROUTE existed: before
+// task 19 there was no way to change any of them, so the hole was unreachable.
+//
+// Each case names the mutation that re-opens it: deleting the matching guard
+// from ValidateTypeEdit fails exactly the subtest named here.
+func TestValidateTypeEditTreatsIdentityAndStructureChangesAsDestructive(t *testing.T) {
+	oldWorkflow, newWorkflow := uuid.New(), uuid.New()
+	oldParent, newParent := uuid.New(), uuid.New()
+
+	cases := []struct {
+		name string
+		// mutate turns the before-state into the proposed after-state.
+		mutate func(before *EORecordType, after *EORecordType)
+	}{
+		{
+			// Guard: the WorkflowID branch. Removing it orphans every
+			// existing record's state_id.
+			name: "repointing the workflow",
+			mutate: func(before, after *EORecordType) {
+				before.WorkflowID = &oldWorkflow
+				after.WorkflowID = &newWorkflow
+			},
+		},
+		{
+			name: "giving a type a workflow it did not have",
+			mutate: func(before, after *EORecordType) {
+				before.WorkflowID = nil
+				after.WorkflowID = &newWorkflow
+			},
+		},
+		{
+			name: "taking a type's workflow away",
+			mutate: func(before, after *EORecordType) {
+				before.WorkflowID = &oldWorkflow
+				after.WorkflowID = nil
+			},
+		},
+		{
+			// Guard: the ParentTypeID branch. Removing it lets stored values
+			// lose the inherited definitions that give them meaning.
+			name: "re-parenting the type",
+			mutate: func(before, after *EORecordType) {
+				before.ParentTypeID = &oldParent
+				after.ParentTypeID = &newParent
+			},
+		},
+		{
+			name: "detaching the type from its parent",
+			mutate: func(before, after *EORecordType) {
+				before.ParentTypeID = &oldParent
+				after.ParentTypeID = nil
+			},
+		},
+		{
+			// Guard: the Key branch.
+			name:   "re-keying the type",
+			mutate: func(before, after *EORecordType) { after.Key = "directive_v2" },
+		},
+		{
+			// Guard: the IsAbstract branch.
+			name: "making a populated type abstract",
+			mutate: func(before, after *EORecordType) {
+				before.IsAbstract = false
+				after.IsAbstract = true
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before, fb := eoBase()
+			after := before
+			tc.mutate(&before, &after)
+
+			if err := ValidateTypeEdit(before, after, fb, fb, true); err == nil {
+				t.Errorf("change allowed while records exist, want it refused")
+			}
+			// The rule is "not once records exist", not "never": a type
+			// nobody has used yet is still being designed.
+			if err := ValidateTypeEdit(before, after, fb, fb, false); err != nil {
+				t.Errorf("change rejected with no records: %v", err)
+			}
+		})
+	}
+}
+
+// The inverse of the IsAbstract rule: an abstract type that becomes concrete
+// is not destructive, and nothing else here is tripped by a no-op.
+func TestValidateTypeEditAllowsHarmlessIdentityEdits(t *testing.T) {
+	workflow := uuid.New()
+	parent := uuid.New()
+
+	cases := []struct {
+		name   string
+		mutate func(before *EORecordType, after *EORecordType)
+	}{
+		{"making an abstract type concrete", func(before, after *EORecordType) {
+			before.IsAbstract = true
+			after.IsAbstract = false
+		}},
+		{"renaming without re-keying", func(before, after *EORecordType) {
+			after.Name = "Directive (revised)"
+			after.NameAr = "توجيه"
+		}},
+		{"keeping the same workflow and parent", func(before, after *EORecordType) {
+			before.WorkflowID, after.WorkflowID = &workflow, &workflow
+			before.ParentTypeID, after.ParentTypeID = &parent, &parent
+		}},
+		{"deactivating the type", func(before, after *EORecordType) {
+			before.IsActive = true
+			after.IsActive = false
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before, fb := eoBase()
+			after := before
+			tc.mutate(&before, &after)
+			if err := ValidateTypeEdit(before, after, fb, fb, true); err != nil {
+				t.Errorf("harmless edit rejected: %v", err)
+			}
+		})
+	}
+}

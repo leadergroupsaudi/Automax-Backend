@@ -1183,6 +1183,7 @@ var messages = map[string][2]string{
 
 	// Executive Office (EO) platform
 	"eo_actor_required":             {"Authentication is required", "المصادقة مطلوبة"},
+	"eo_sort_by_unsupported":        {"Unknown sort field; choose one of: %s", "حقل ترتيب غير معروف؛ اختر أحدها: %s"},
 	"eo_record_created":             {"Record created", "تم إنشاء السجل"},
 	"eo_record_updated":             {"Record updated", "تم تحديث السجل"},
 	"eo_record_retrieved":           {"Record retrieved", "تم استرجاع السجل"},

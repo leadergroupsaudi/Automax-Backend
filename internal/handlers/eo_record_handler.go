@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
@@ -213,7 +214,18 @@ func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.
 	if err != nil {
 		return nil, false, utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
-	if rec == nil || !h.eoVisible(c, rec, user) {
+	if rec == nil {
+		return nil, false, utils.ErrorResponse(c, fiber.StatusNotFound, i18n.T(c.UserContext(), "eo_record_not_found"))
+	}
+	visible, err := h.eoVisible(c, rec, user)
+	if err != nil {
+		// A failed visibility probe is an OUTAGE, not an answer. Reporting it
+		// as 404 would be safe in direction and badly wrong in meaning: it
+		// tells an operator a record was deleted, logs nothing, and makes a
+		// database incident look like a data incident.
+		return nil, false, utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	if !visible {
 		return nil, false, utils.ErrorResponse(c, fiber.StatusNotFound, i18n.T(c.UserContext(), "eo_record_not_found"))
 	}
 	return rec, true, nil
@@ -223,7 +235,11 @@ func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.
 // The visibility rule lives in the repository's WHERE clause and exists in one
 // place (applyEORecordVisibility); re-implementing it here against the values
 // bag would be a second copy that drifts.
-func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *models.User) bool {
+//
+// It returns the repository's error rather than folding it into false: "the
+// caller may not see this" and "the database did not answer" are different
+// facts and must not share a status code.
+func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *models.User) (bool, error) {
 	filter := &models.EORecordFilter{
 		RecordID:     &rec.ID,
 		RecordTypeID: []string{rec.RecordTypeID.String()},
@@ -231,13 +247,13 @@ func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *mo
 	}
 	eoScopeFilter(filter, user)
 	if filter.IsAdmin {
-		return true
+		return true, nil
 	}
 	rows, _, err := h.records.List(c.UserContext(), filter)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return len(rows) > 0
+	return len(rows) > 0, nil
 }
 
 // ── handlers ────────────────────────────────────────────────────────────────
@@ -300,9 +316,17 @@ func (h *EORecordHandler) list(c *fiber.Ctx, filter *models.EORecordFilter, user
 
 	rows, total, err := h.records.List(c.UserContext(), filter)
 	if err != nil {
-		// An unknown sort_by is the caller's mistake, not the server's. The
-		// repository reports it as a plain error, so it is matched on the one
-		// thing that distinguishes it: it is raised before any query runs.
+		// An unknown sort_by or sort_dir is the caller's mistake, not the
+		// server's: the repository raises it from its allow-list before any
+		// query runs. It is matched on the sentinel, because duplicating
+		// eoSortColumns here would be a second copy to keep in step. Without
+		// this branch, ?sort_by=bogus answers 500 and writes an "internal
+		// error" line to the log for somebody's typo.
+		if errors.Is(err, repository.ErrEOUnsupportedSort) {
+			return eoFieldErrors(c, map[string]string{
+				"sort_by": i18n.Tf(c.UserContext(), "eo_sort_by_unsupported", strings.Join(repository.EOSortKeys(), ", ")),
+			})
+		}
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 	if rows == nil {
