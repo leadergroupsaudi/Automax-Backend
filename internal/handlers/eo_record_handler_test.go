@@ -561,13 +561,17 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		// a disabled deployment — the default — under an id that resolves to
 		// nothing, and hide it from the backfill that selects records whose
 		// documenta_folder_id is empty.
-		"services.EOWithDocumentaFolders(\n\t\t\tstorage.NewHTTPDocumentaClient(cfg.EODocumenta, nil), cfg.EODocumenta.WorkspaceName)",
+		// (the call itself is pinned whitespace-insensitively below, so a
+		// reformat of this statement does not fail the test)
 		"var eoFolderOption services.EORecordOption",
-		"escalationPolicyRepo,\n\t\teoFolderOption)",
-		// The boot guard. A folder failure does not block a record, so without
-		// this a deployment with a broken EO_DOCUMENTA_BASE_URL would file
-		// nothing and say so only in the history of each record.
+		// The boot guard, BOTH HALVES. Pinning only the check lets the
+		// log.Fatalf be downgraded to a log.Printf with the suite still
+		// green, and the deployment would then boot with a dead Documenta
+		// URL — exactly what the guard exists to prevent. A folder failure
+		// does not block a record, so nothing else would say so except the
+		// history of every record.
 		"services.EOCheckDocumentaBaseURL(cfg.EODocumenta.BaseURL)",
+		`log.Fatalf("EO_DOCUMENTA_ENABLED=true but %v`,
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
 		"services.NewEOTransitionServiceWithSLA(",
@@ -606,6 +610,62 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		if strings.Contains(src, banned) {
 			t.Errorf("cmd/server/main.go contains %q: that constructor passes a nil policy repository, so SLA clocks never start", banned)
 		}
+	}
+
+	// Whitespace-insensitive pins, for statements that gofmt wraps. Matching
+	// the wrapped form pins the INDENTATION as much as the code: a correct
+	// one-line rewrite would fail, and the thing actually under test — which
+	// call is made with which argument — would be no better guarded. ALL
+	// whitespace is removed rather than collapsed to single spaces, because
+	// collapsing still encodes where the line breaks fall.
+	flat := strings.Join(strings.Fields(src), "")
+	for _, want := range []string{
+		// Task C2: the record service is given its folders, and they are
+		// built from the EO block's own HTTP client. The workspace name is
+		// part of the pin because the client constructor ignores
+		// cfg.WorkspaceName — the per-call argument is the only way
+		// EO_DOCUMENTA_WORKSPACE_NAME reaches Documenta.
+		"services.EOWithDocumentaFolders(storage.NewHTTPDocumentaClient(cfg.EODocumenta,nil),cfg.EODocumenta.WorkspaceName)",
+		"escalationPolicyRepo,eoFolderOption)",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("cmd/server/main.go does not contain %q (whitespace-insensitive): the EO engine is constructed but unreachable", want)
+		}
+	}
+
+	// The stub must not reach the EO record path. StubDocumentaClient invents
+	// "stub-folder-<uuid>", and persisting that would file every record of a
+	// DISABLED deployment — the default, and what the pilot runs — under an
+	// id that resolves to nothing, and hide it from the backfill that selects
+	// records whose documenta_folder_id is empty.
+	//
+	// Counting is what pins it. The positive pin above fixes what the ONE
+	// call is built from, but adding a SECOND call in the else branch —
+	// which is precisely the defect this replaced — satisfies every pin here
+	// and reinstates it. The stub is still legitimately used elsewhere in
+	// main.go (Goals, KPI), so the ban has to be on this call, not on the
+	// stub's name.
+	if n := strings.Count(src, "services.EOWithDocumentaFolders("); n != 1 {
+		t.Errorf("cmd/server/main.go calls services.EOWithDocumentaFolders %d times, want exactly 1: a second call outside the cfg.EODocumenta.Enabled branch would file every record of a disabled deployment under a fabricated stub id", n)
+	}
+	// And the disabled branch does nothing but log. The WHOLE branch is
+	// extracted — from `} else {` to its closing brace — not just the part
+	// after its log line, or an assignment placed above that line would slip
+	// through.
+	_, afterDecl, found := strings.Cut(src, "var eoFolderOption services.EORecordOption")
+	if !found {
+		t.Fatalf("cmd/server/main.go no longer declares eoFolderOption: the EO folder option must be nil unless EO Documenta is enabled")
+	}
+	_, elseBranch, found := strings.Cut(afterDecl, "\n\t} else {\n")
+	if !found {
+		t.Fatalf("cmd/server/main.go has no EO-Documenta-disabled branch")
+	}
+	elseBranch, _, found = strings.Cut(elseBranch, "\n\t}")
+	if !found {
+		t.Fatalf("cmd/server/main.go's EO-Documenta-disabled branch does not close")
+	}
+	if strings.Contains(elseBranch, "eoFolderOption") || strings.Contains(elseBranch, "DocumentaClient") {
+		t.Errorf("the EO-Documenta-disabled branch touches the folder option or a client:\n%s\nit must leave eoFolderOption nil, so records are created with an empty documenta_folder_id rather than a fabricated stub id", elseBranch)
 	}
 }
 

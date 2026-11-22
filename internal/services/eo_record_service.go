@@ -450,47 +450,115 @@ func (f *eoDocumentaFolders) createFor(ctx context.Context, t *models.EORecordTy
 	return folderID, nil
 }
 
+// eoAnchorWaitRetries bounds how many times a caller will re-attempt after
+// INHERITING a leader's cancellation. Sharing one resolution means sharing its
+// error, and a leader whose own HTTP request was cancelled fails with a
+// context error that has nothing to do with the waiter: without this, a
+// perfectly healthy create would be filed folderless and its history row would
+// blame a cancellation that happened to ANOTHER request. A false reason on the
+// record is the failure this whole design exists to avoid, so the waiter tries
+// again — as leader, if nobody else has claimed it — rather than adopt it.
+//
+// Bounded rather than unbounded: each retry needs a fresh leader to appear and
+// be cancelled, so it terminates on its own, but a bound makes that a fact
+// about the code rather than about the traffic.
+const eoAnchorWaitRetries = 2
+
 // anchorFor returns the folder every record of this type is filed under,
 // creating it only when the workspace root has been listed successfully and
 // shown not to contain it.
 func (f *eoDocumentaFolders) anchorFor(ctx context.Context, t *models.EORecordType) (string, error) {
+	for attempt := 0; ; attempt++ {
+		id, err, inherited := f.anchorAttempt(ctx, t)
+		if err == nil || !inherited || attempt >= eoAnchorWaitRetries {
+			return id, err
+		}
+		// No `ctx.Err() != nil` guard here, deliberately. It would be the
+		// second test of the same thing — anchorAttempt's select already
+		// returns on this caller's own cancellation — and a retry on a dead
+		// context costs nothing anyway: the Documenta call fails immediately
+		// with THIS caller's error, which is the honest one to report.
+		log.Printf("[EO] anchor folder of %q: inherited another request's cancellation (%v), retrying", t.Key, err)
+	}
+}
+
+// anchorAttempt is one pass at the anchor. Its third result is true when the
+// error is not this caller's to own: it came from a leader whose own context
+// was cancelled, so retrying is sound.
+func (f *eoDocumentaFolders) anchorAttempt(ctx context.Context, t *models.EORecordType) (string, error, bool) {
 	f.mu.Lock()
 	if cached, ok := f.anchors[t.ID]; ok {
 		f.mu.Unlock()
-		return cached, nil
+		return cached, nil, false
 	}
 	if inflight, ok := f.resolving[t.ID]; ok {
 		// Someone else is already resolving this type. Wait for their answer
 		// instead of starting a second listing that would create a second
-		// anchor. The context is honoured so a cancelled request does not
-		// wait out another request's remote timeout.
+		// anchor. This caller's own context is honoured too, so a cancelled
+		// request does not wait out another request's remote timeout.
 		f.mu.Unlock()
 		select {
 		case <-inflight.done:
-			return inflight.id, inflight.err
+			if inflight.err != nil &&
+				(errors.Is(inflight.err, context.Canceled) || errors.Is(inflight.err, context.DeadlineExceeded)) {
+				return "", inflight.err, true
+			}
+			return inflight.id, inflight.err, false
 		case <-ctx.Done():
-			return "", fmt.Errorf("wait for the anchor folder of %q: %w", t.Key, ctx.Err())
+			return "", fmt.Errorf("wait for the anchor folder of %q: %w", t.Key, ctx.Err()), false
 		}
 	}
 	inflight := &eoAnchorResolve{done: make(chan struct{})}
 	f.resolving[t.ID] = inflight
 	f.mu.Unlock()
 
-	id, err := f.resolveAnchor(ctx, t)
+	id, err := f.leadResolve(ctx, t, inflight)
+	return id, err, false
+}
 
-	f.mu.Lock()
-	delete(f.resolving, t.ID)
-	if err == nil {
-		// Memoised only on success: a failed resolution must not be cached,
-		// or one outage would leave the type anchorless for the process's
-		// lifetime.
-		f.anchors[t.ID] = id
-	}
-	f.mu.Unlock()
+// leadResolve runs the resolution for the caller that claimed it and publishes
+// the outcome to whoever is waiting.
+//
+// The cleanup is DEFERRED, not straight-line. A panic in the Documenta client
+// would otherwise unwind past the delete and the close — and since the HTTP
+// layer recovers panics, the process would carry on holding a permanent
+// in-flight entry whose done channel never closes, so every later create of
+// this type would block until its own context expired. One request's panic
+// would become that record type's outage.
+func (f *eoDocumentaFolders) leadResolve(ctx context.Context, t *models.EORecordType, inflight *eoAnchorResolve) (id string, err error) {
+	defer func() {
+		f.mu.Lock()
+		delete(f.resolving, t.ID)
+		// Keyed on the ID, not on err, and that is the whole condition.
+		//
+		// resolveAnchor returns no partial results — every failure path of it
+		// gives ("", err) — so a non-empty id IS a success, and `err == nil`
+		// beside this could not change the outcome. IF THAT EVER CHANGES, this
+		// line is what has to change with it: memoising an id that came back
+		// alongside an error would file every record of the type under it for
+		// the life of the process.
+		//
+		// The id is also the half that matters while unwinding from a panic,
+		// when BOTH named results are still zero: `err == nil` alone would
+		// memoise "" as this type's anchor.
+		if id != "" {
+			// Memoised only on success: a failed resolution must not be
+			// cached, or one outage would leave the type anchorless for the
+			// process's lifetime.
+			f.anchors[t.ID] = id
+		}
+		f.mu.Unlock()
 
-	inflight.id, inflight.err = id, err
-	close(inflight.done)
-	return id, err
+		if err == nil && id == "" {
+			// Only reachable while unwinding. Waiters must not be handed an
+			// empty id with no error, or they would treat "" as the anchor
+			// and create their folders at the workspace root.
+			err = fmt.Errorf("resolve the anchor folder of %q: the resolving request did not finish", t.Key)
+		}
+		inflight.id, inflight.err = id, err
+		close(inflight.done)
+	}()
+	return f.resolveAnchor(ctx, t)
 }
 
 // resolveAnchor is the remote half of anchorFor, run by exactly one caller per

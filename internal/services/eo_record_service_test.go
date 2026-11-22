@@ -1342,12 +1342,27 @@ func TestCreateGivesTheRecordADocumentaFolder(t *testing.T) {
 				},
 			},
 			{
-				// main.go always passes a client, but a nil one must not turn
-				// every create into a nil-pointer panic.
+				// A caller that has a client variable but no client. Not what
+				// main.go does — see the next case — but it must not turn
+				// every create into a nil-pointer panic either.
 				name: "the option is passed a nil client",
 				svc: func(f *eoSvcFixture) EORecordService {
 					return NewEORecordService(f.records, f.types, f.sequences, f.workflows,
 						EOWithDocumentaFolders(nil, "eo-workspace"))
+				},
+			},
+			{
+				// THIS is what main.go does when EO_DOCUMENTA_ENABLED=false,
+				// which is the default and what the pilot runs: it declares
+				// eoFolderOption, never assigns it, and passes it in. A nil
+				// func value is not a nil variadic slice — the constructor's
+				// `if opt != nil` is the only thing between this and a nil
+				// func call that panics the server at boot. That guard was
+				// dead code until main.go started relying on it.
+				name: "a nil option, exactly as main.go passes when EO Documenta is disabled",
+				svc: func(f *eoSvcFixture) EORecordService {
+					var opt EORecordOption
+					return NewEORecordService(f.records, f.types, f.sequences, f.workflows, opt)
 				},
 			},
 		} {
@@ -1914,15 +1929,217 @@ func TestEOACancelledCallerDoesNotWaitOutAnothersResolution(t *testing.T) {
 	}()
 	<-entered
 
+	// The waiter runs on its own goroutine with a deadline on the RESULT, not
+	// on anchorFor's context. Called inline it would block the test goroutine,
+	// and a regression that removed the ctx arm would be caught only by the
+	// package's 10-minute go-test timeout — a real catch, but an illegible
+	// one that says nothing about which assertion failed.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := svc.folders.anchorFor(ctx, recordType); !errors.Is(err, context.Canceled) {
-		t.Errorf("anchorFor on a cancelled context = %v, want it to carry context.Canceled", err)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := svc.folders.anchorFor(ctx, recordType)
+		waited <- err
+	}()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("anchorFor on a cancelled context = %v, want it to carry context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("anchorFor did not return on a cancelled context: it is waiting out another request's resolution")
 	}
 	// The cancelled caller must not have started a listing of its own.
 	close(release)
 	<-done
 	if len(client.lists) != 1 {
 		t.Errorf("ListFiles calls = %d, want 1: a cancelled waiter starts nothing", len(client.lists))
+	}
+}
+
+// eoAnchorFolders builds a record service by the REAL constructor and returns
+// its folder collaborator, so a test of the collaborator cannot drift from how
+// production initialises it.
+func eoAnchorFolders(t *testing.T, client storage.DocumentaClient) *eoDocumentaFolders {
+	t.Helper()
+	svc, ok := NewEORecordService(
+		eoNewSvcRecordRepo(), &eoSvcTypeRepo{}, &eoSvcSequenceRepo{}, &eoWorkflowFakeRepo{},
+		EOWithDocumentaFolders(client, "eo-workspace"),
+	).(*eoRecordService)
+	if !ok || svc.folders == nil {
+		t.Fatalf("the option wired no folders")
+	}
+	return svc.folders
+}
+
+// TestEOAPanicWhileResolvingDoesNotWedgeTheType covers the deferred cleanup.
+// The HTTP layer recovers panics, so a panic in the Documenta client does not
+// stop the process — it would simply leave an in-flight entry behind whose
+// done channel never closes, and every later create of that record type would
+// then block until its own context expired. One request's panic would become
+// that record type's outage.
+func TestEOAPanicWhileResolvingDoesNotWedgeTheType(t *testing.T) {
+	client := &eoFakeDocumenta{}
+	panicOnce := true
+	client.onList = func() {
+		if panicOnce {
+			panicOnce = false
+			panic("documenta client blew up")
+		}
+	}
+	folders := eoAnchorFolders(t, client)
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	// The leader panics, and is recovered the way fiber's middleware recovers
+	// it: the process carries on.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("the fake did not panic")
+			}
+		}()
+		folders.anchorFor(context.Background(), recordType)
+	}()
+
+	// A later create of the same type must resolve normally rather than block.
+	done := make(chan error, 1)
+	go func() {
+		_, err := folders.anchorFor(context.Background(), recordType)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("anchorFor after a panic: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("anchorFor blocked after a panic: the in-flight entry was never cleaned up, so this record type is wedged for the life of the process")
+	}
+	if len(client.creates) != 1 {
+		t.Errorf("CreateFolder calls = %+v, want 1", client.creates)
+	}
+}
+
+// TestEOAPanicDoesNotPublishAnEmptyAnchor is the other half of the deferred
+// cleanup: while unwinding, the named results are still zero, so a cleanup
+// that keyed on `err == nil` alone would memoise "" as the type's anchor and
+// hand waiters an empty id with no error — and every record of the type would
+// be filed at the workspace root instead of under its folder.
+func TestEOAPanicDoesNotPublishAnEmptyAnchor(t *testing.T) {
+	client := &eoFakeDocumenta{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	first := true
+	client.onList = func() {
+		if first {
+			first = false
+			once.Do(func() { close(entered) })
+			<-release
+			panic("documenta client blew up")
+		}
+	}
+	folders := eoAnchorFolders(t, client)
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	go func() {
+		defer func() { _ = recover() }()
+		folders.anchorFor(context.Background(), recordType)
+	}()
+	<-entered
+
+	// This caller is parked on the leader's resolution when the leader panics.
+	waited := make(chan struct {
+		id  string
+		err error
+	}, 1)
+	go func() {
+		id, err := folders.anchorFor(context.Background(), recordType)
+		waited <- struct {
+			id  string
+			err error
+		}{id, err}
+	}()
+	// Give the waiter time to reach the wait, then let the leader panic.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case got := <-waited:
+		// The waiter may inherit the failure or retry and succeed; what it
+		// must never do is come back with an empty id and no error.
+		if got.err == nil && got.id == "" {
+			t.Errorf("a waiter got an empty anchor id with no error; it would file its record at the workspace root")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("the waiter never woke: the panicking leader never closed its done channel")
+	}
+	if id, ok := folders.anchors[recordType.ID]; ok && id == "" {
+		t.Errorf("the panicking resolution memoised %q as this type's anchor", id)
+	}
+}
+
+// TestEOAWaiterDoesNotInheritTheLeadersCancellation covers the retry. Sharing
+// one resolution means sharing its error, and a leader whose own HTTP request
+// was cancelled fails with a context error that has nothing to do with the
+// waiter. Without the retry a perfectly healthy create would be filed
+// folderless and its history row would blame a cancellation that happened to
+// ANOTHER request — a false reason on the record, which is the failure this
+// whole design exists to avoid.
+func TestEOAWaiterDoesNotInheritTheLeadersCancellation(t *testing.T) {
+	client := &eoFakeDocumenta{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	first := true
+	client.onList = func() {
+		if first {
+			first = false
+			once.Do(func() { close(entered) })
+			<-release
+		}
+	}
+	// The leader's listing fails the way a cancelled request's would.
+	client.listErr = context.Canceled
+	folders := eoAnchorFolders(t, client)
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	go func() { folders.anchorFor(leaderCtx, recordType) }()
+	<-entered
+
+	// A healthy second caller parks on the leader's resolution.
+	waited := make(chan struct {
+		id  string
+		err error
+	}, 1)
+	go func() {
+		id, err := folders.anchorFor(context.Background(), recordType)
+		waited <- struct {
+			id  string
+			err error
+		}{id, err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	// The leader's request goes away; its listing comes back cancelled.
+	cancelLeader()
+	client.mu.Lock()
+	client.listErr = nil // Documenta itself was never unwell
+	client.mu.Unlock()
+	close(release)
+
+	select {
+	case got := <-waited:
+		if got.err != nil {
+			t.Fatalf("the healthy waiter failed with %v, want it to retry rather than adopt the leader's cancellation", got.err)
+		}
+		if got.id == "" {
+			t.Errorf("the waiter got no anchor")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the waiter never returned")
+	}
+	if len(client.lists) != 2 {
+		t.Errorf("ListFiles calls = %d, want 2: the leader's cancelled one, then the waiter's own", len(client.lists))
 	}
 }
