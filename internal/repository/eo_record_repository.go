@@ -37,6 +37,18 @@ type EORecordRepository interface {
 	// the type cannot be supplied. Use GetByID wherever the type is known.
 	GetAnyByID(ctx context.Context, id uuid.UUID) (*models.EORecord, error)
 	GetByReference(ctx context.Context, reference string) (*models.EORecord, error)
+	// LockForUpdate re-reads a record inside the CALLER'S TRANSACTION and
+	// holds a row lock on it (SELECT … FOR UPDATE) until that transaction
+	// ends. It is only meaningful on a repository bound by Transaction.
+	//
+	// A transaction alone does not serialise two transitions: under
+	// Postgres' default READ COMMITTED both would read the same state, both
+	// would pass their from-state check, and both would commit with the
+	// second write winning silently. That is worse than a lost update here,
+	// because the transition engine dispatches its actions after the commit,
+	// so a doubly-executed transition spawns two child records from one
+	// logical action in a register whose references are an audit trail.
+	LockForUpdate(ctx context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error)
 	Update(ctx context.Context, rec *models.EORecord) error
 	// UpdateValues merges keys into the values jsonb; keys it does not
 	// mention keep their stored value.
@@ -97,6 +109,21 @@ func (r *eoRecordRepository) GetAnyByID(ctx context.Context, id uuid.UUID) (*mod
 
 func (r *eoRecordRepository) GetByReference(ctx context.Context, reference string) (*models.EORecord, error) {
 	return eoFirstRecord(r.db.WithContext(ctx).Where("eo_records.reference = ?", reference))
+}
+
+// LockForUpdate takes the row lock. lock_timeout is SET LOCAL, so it lasts
+// for the caller's transaction only and a contended row fails fast instead of
+// pinning a request handler indefinitely — the same shape as the incident
+// path's lock (incident_repository.go:2167), with the composite key
+// (id, record_type_id) this table requires. A missing record is (nil, nil),
+// as it is for every other getter here.
+func (r *eoRecordRepository) LockForUpdate(ctx context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
+	if err := r.db.WithContext(ctx).Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
+		return nil, fmt.Errorf("lock eo record %s: set lock timeout: %w", id, err)
+	}
+	return eoFirstRecord(r.db.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("eo_records.id = ? AND eo_records.record_type_id = ?", id, recordTypeID))
 }
 
 // eoFirstRecord reads at most one record. It uses Find rather than First

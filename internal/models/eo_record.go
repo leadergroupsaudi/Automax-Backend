@@ -121,7 +121,12 @@ type EORecordUpdateRequest struct {
 // modal is a form the configuration describes, not a second edit path around
 // the field rules.
 type EOTransitionInput struct {
-	Comment     string         `json:"comment"`
+	Comment string `json:"comment"`
+	// Attachments satisfies an "attachment" transition requirement and is NOT
+	// stored: spec §7.12 puts file handling in Documenta and the attachments
+	// field lives in the values bag, so persistence belongs with that
+	// integration. Until it lands, these ids are checked for presence and
+	// dropped.
 	Attachments []uuid.UUID    `json:"attachments"`
 	Values      map[string]any `json:"values"`
 }

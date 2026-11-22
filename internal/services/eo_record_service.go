@@ -714,7 +714,14 @@ func (s *eoRecordService) applyLinkRules(ctx context.Context, rec, parent *model
 // RecomputeDerived returns what it could compute and reports the rest, which
 // is logged.
 func (s *eoRecordService) applyDerived(ctx context.Context, fields []models.EOFieldDef, rec *models.EORecord) {
-	derived, err := RecomputeDerived(ctx, fields, rec, s.deps)
+	eoApplyDerived(ctx, fields, rec, s.deps)
+}
+
+// eoApplyDerived is the shared recompute the save pipeline and the transition
+// executor both run (spec §7.5: recompute whenever a declared dependency
+// changes, and a transition's field change is exactly such a change).
+func eoApplyDerived(ctx context.Context, fields []models.EOFieldDef, rec *models.EORecord, deps DependencyLoader) {
+	derived, err := RecomputeDerived(ctx, fields, rec, deps)
 	if pending, broken := eoClassifyDeriveError(err); len(pending) > 0 || len(broken) > 0 {
 		if len(pending) > 0 {
 			log.Printf("eo: record %s: derived field(s) waiting on data: %v", rec.ID, errors.Join(pending...))

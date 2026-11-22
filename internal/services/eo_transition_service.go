@@ -129,6 +129,7 @@ type eoTransitionService struct {
 	types     repository.EORecordTypeRepository
 	workflows repository.WorkflowRepository
 	eval      FormulaEvaluator
+	deps      DependencyLoader
 	actions   EOTransitionActionDispatcher
 }
 
@@ -145,6 +146,7 @@ func NewEOTransitionService(
 		types:     types,
 		workflows: workflows,
 		eval:      eoformula.New(0),
+		deps:      &eoRecordDeps{records: records, types: types},
 		actions:   actions,
 	}
 }
@@ -237,7 +239,11 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 
 	var updated *models.EORecord
 	err = s.records.Transaction(ctx, func(r repository.EORecordRepository) error {
-		fresh, err := r.GetByID(ctx, rec.ID, rec.RecordTypeID)
+		// The row lock is the FIRST statement in the transaction: a
+		// transaction alone does not serialise two transitions under READ
+		// COMMITTED, and a doubly-executed transition would dispatch its
+		// post-commit actions twice.
+		fresh, err := r.LockForUpdate(ctx, rec.ID, rec.RecordTypeID)
 		if err != nil {
 			return err
 		}
@@ -277,6 +283,13 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 		before := eoFlattenStored(fresh)
+
+		// Assignment resolution comes before the field changes, so an
+		// assigned_user_id the transition DECLARES as a field change beats
+		// the static assignment it carries — the order the incident path
+		// uses, and the one that makes the actor's own choice win.
+		eoApplyTransitionAssignment(fresh, transition)
+
 		if err := s.applyFieldChanges(ctx, r, fields, fresh, transition, input); err != nil {
 			return err
 		}
@@ -291,7 +304,15 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			fresh.ClosedAt = nil
 		}
 
-		// 7. the record and its journal entry are one write.
+		// 7. the derived fields, over the values and the state written
+		// above. A transition field change is a declared dependency
+		// changing (spec §7.5), so a roll-up must not go stale at the exact
+		// moment the record moves. It runs AFTER the state and closed_at are
+		// set, so a formula reading them sees the new ones, and BEFORE the
+		// write, so the row the database receives is already current.
+		eoApplyDerived(ctx, fields, fresh, s.deps)
+
+		// 8. the record and its journal entry are one write.
 		if err := r.Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -452,6 +473,33 @@ func eoFieldNamesUser(v any, id uuid.UUID) bool {
 	return false
 }
 
+// ── assignment ──────────────────────────────────────────────────────────────
+
+// eoApplyTransitionAssignment resolves the assignment the transition carries
+// (spec §7.8 lists assignment resolution as part of this path). Only the
+// STATIC half is EO's: AssignUserID names the user and AssignDepartmentID the
+// owning body.
+//
+// AutoDetectDepartment and AutoMatchUser are deliberately not implemented:
+// they match on an incident's classification and location, which EO records
+// do not have. ManualSelectUser needs no code either — a transition that lets
+// the actor choose declares assigned_user_id as a field change, so the choice
+// goes through the field rules like any other value, and because field
+// changes are applied after this, it wins.
+//
+// A transition carrying no assignment leaves the record's own alone; it is
+// not a way to clear an assignee.
+func eoApplyTransitionAssignment(rec *models.EORecord, transition *models.WorkflowTransition) {
+	if transition.AssignUserID != nil {
+		id := *transition.AssignUserID
+		rec.AssignedUserID = &id
+	}
+	if transition.AssignDepartmentID != nil {
+		id := *transition.AssignDepartmentID
+		rec.OwningBodyID = &id
+	}
+}
+
 // ── requirements ────────────────────────────────────────────────────────────
 
 // eoCheckRequirements enforces the transition's requirements.
@@ -479,6 +527,13 @@ func eoCheckRequirements(transition *models.WorkflowTransition, input models.EOT
 				return eoRequirementError(req, "a comment is required for this transition")
 			}
 		case "attachment":
+			// NOTE: attachments are checked for PRESENCE and then dropped.
+			// Nothing here stores them and no eo_record_attachments table
+			// exists: spec §7.12 puts all file handling in Documenta, and
+			// the attachments field itself lives in the values bag, so
+			// persisting them belongs with the Documenta integration (a
+			// later plan). Until then input.Attachments satisfies a
+			// requirement and goes no further — it is not an upload path.
 			if len(input.Attachments) == 0 {
 				return eoRequirementError(req, "an attachment is required for this transition")
 			}

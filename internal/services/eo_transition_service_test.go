@@ -31,9 +31,23 @@ type eoTxRecordRepo struct {
 	updated   []models.EORecord
 	history   []models.EORecordHistory
 	committed bool
+	// calls records the repository methods the executor used, in order, so a
+	// test can pin that the row lock is taken before anything is read.
+	calls []string
+}
+
+func (f *eoTxRecordRepo) LockForUpdate(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
+	f.calls = append(f.calls, "LockForUpdate")
+	rec, ok := f.stored[id]
+	if !ok || rec.RecordTypeID != recordTypeID {
+		return nil, nil
+	}
+	cp := *rec
+	return &cp, nil
 }
 
 func (f *eoTxRecordRepo) GetByID(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
+	f.calls = append(f.calls, "GetByID")
 	rec, ok := f.stored[id]
 	if !ok || rec.RecordTypeID != recordTypeID {
 		return nil, nil
@@ -52,6 +66,7 @@ func (f *eoTxRecordRepo) GetAnyByID(_ context.Context, id uuid.UUID) (*models.EO
 }
 
 func (f *eoTxRecordRepo) Children(_ context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error) {
+	f.calls = append(f.calls, "Children")
 	var out []models.EORecord
 	for _, c := range f.children[parentID] {
 		if recordTypeID == nil || c.RecordTypeID == *recordTypeID {
@@ -70,6 +85,7 @@ func (f *eoTxRecordRepo) EnteredStateIDs(_ context.Context, _, _ uuid.UUID) (map
 }
 
 func (f *eoTxRecordRepo) Update(_ context.Context, rec *models.EORecord) error {
+	f.calls = append(f.calls, "Update")
 	f.updated = append(f.updated, *rec)
 	cp := *rec
 	f.stored[rec.ID] = &cp
@@ -1005,6 +1021,148 @@ func TestExecuteDispatchesActionsAfterCommit(t *testing.T) {
 			t.Errorf("action dispatches = %d, want 0 after a refusal", f.actions.calls)
 		}
 	})
+}
+
+// ── concurrency ─────────────────────────────────────────────────────────────
+
+func TestExecuteLocksTheRecordBeforeReadingIt(t *testing.T) {
+	// A transaction alone does not serialise two transitions: under READ
+	// COMMITTED both would read the same state, both would pass their
+	// from-state check and both would commit. The lock has to be the first
+	// statement in the transaction, before any check reads anything.
+	f := eoNewTxFixture(t)
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatalf("raise: %v", err)
+	}
+	if len(f.records.calls) == 0 || f.records.calls[0] != "LockForUpdate" {
+		t.Fatalf("repository calls = %v, want LockForUpdate first", f.records.calls)
+	}
+	for _, c := range f.records.calls {
+		if c == "GetByID" {
+			t.Errorf("the executor read the record with an unlocked GetByID: %v", f.records.calls)
+		}
+	}
+	if n := strings.Count(strings.Join(f.records.calls, " "), "LockForUpdate"); n != 1 {
+		t.Errorf("LockForUpdate calls = %d, want 1", n)
+	}
+}
+
+func TestExecuteFailsWhenTheRecordIsGone(t *testing.T) {
+	f := eoNewTxFixture(t)
+	delete(f.records.stored, f.rec.ID)
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); !errors.Is(err, ErrEORecordNotFound) {
+		t.Fatalf("err = %v, want ErrEORecordNotFound", err)
+	}
+}
+
+// ── assignment resolution (spec §7.8) ───────────────────────────────────────
+
+func TestExecuteAppliesTransitionAssignment(t *testing.T) {
+	assignee := uuid.New()
+	body := uuid.New()
+
+	t.Run("the transition's user and body are written", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		raise := f.transition("raise")
+		raise.AssignUserID = &assignee
+		raise.AssignDepartmentID = &body
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err != nil {
+			t.Fatalf("raise: %v", err)
+		}
+		if rec.AssignedUserID == nil || *rec.AssignedUserID != assignee {
+			t.Errorf("assigned_user_id = %v, want %s", rec.AssignedUserID, assignee)
+		}
+		if rec.OwningBodyID == nil || *rec.OwningBodyID != body {
+			t.Errorf("owning_body_id = %v, want %s", rec.OwningBodyID, body)
+		}
+		if len(f.records.updated) != 1 || f.records.updated[0].AssignedUserID == nil ||
+			*f.records.updated[0].AssignedUserID != assignee {
+			t.Error("the assignment was not persisted")
+		}
+		// The move of an assignee is a change to the record, so it belongs in
+		// the journal beside the state change.
+		if len(f.records.history) != 1 {
+			t.Fatalf("history rows = %d, want 1", len(f.records.history))
+		}
+		if _, ok := eoTxValues(t, f.records.history[0].NewValues)["assigned_user_id"]; !ok {
+			t.Errorf("new_values = %v, want the assignment journalled", eoTxValues(t, f.records.history[0].NewValues))
+		}
+	})
+
+	t.Run("a transition carrying no assignment leaves the assignee alone", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		f.rec.AssignedUserID = &assignee
+		f.records.stored[f.rec.ID] = f.rec
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err != nil {
+			t.Fatalf("raise: %v", err)
+		}
+		if rec.AssignedUserID == nil || *rec.AssignedUserID != assignee {
+			t.Errorf("assigned_user_id = %v, want the existing assignee %s kept", rec.AssignedUserID, assignee)
+		}
+	})
+
+	t.Run("a declared field change overrides the static assignment", func(t *testing.T) {
+		// The incident path applies the transition's assignment first and the
+		// actor's field changes after, so the actor's choice wins. This is
+		// also how manual selection is expressed in EO: declare
+		// assigned_user_id as a field change and the choice goes through the
+		// field rules like any other value.
+		f := eoNewTxFixture(t)
+		chosen := uuid.New()
+		raise := f.transition("raise")
+		raise.AssignUserID = &assignee
+		raise.FieldChanges = []models.TransitionFieldChange{{FieldName: "assigned_user_id"}}
+		f.types.defs = append(f.types.defs,
+			eoTxField("assigned_user_id", models.EOKindUser, models.EORequiredNever, f.recordType.ID))
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{
+			Values: map[string]any{"assigned_user_id": chosen.String()},
+		})
+		if err != nil {
+			t.Fatalf("raise: %v", err)
+		}
+		if rec.AssignedUserID == nil || *rec.AssignedUserID != chosen {
+			t.Errorf("assigned_user_id = %v, want the actor's choice %s", rec.AssignedUserID, chosen)
+		}
+	})
+}
+
+// ── derived fields (spec §7.5) ──────────────────────────────────────────────
+
+func TestExecuteRecomputesDerivedFields(t *testing.T) {
+	// A transition field change is a declared dependency changing, so the
+	// derived field must be recomputed before the row is written: otherwise a
+	// roll-up goes stale at the exact moment the record moves.
+	f := eoNewTxFixture(t)
+	f.rec.StateID = &f.draft.ID
+	f.records.stored[f.rec.ID] = f.rec
+
+	weeks := eoTxField("weeks", models.EOKindNumber, models.EORequiredNever, f.recordType.ID)
+	total := eoDerivedField("total_days", "weeks * 7", eoOwn("weeks"))
+	total.ID, total.RecordTypeID, total.Kind = uuid.New(), f.recordType.ID, models.EOKindNumber
+	f.types.defs = append(f.types.defs, weeks, total)
+	f.transition("submit").FieldChanges = append(f.transition("submit").FieldChanges,
+		models.TransitionFieldChange{FieldName: "weeks"})
+
+	rec, err := f.run("submit", f.actor, models.EOTransitionInput{Values: map[string]any{"weeks": 3}})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got := eoTxValues(t, rec.Values)["total_days"]; got != 21.0 {
+		t.Errorf("total_days = %v, want 21 recomputed from the value the transition wrote", got)
+	}
+	// What the database received is what matters: recomputing after the write
+	// would leave the stored row stale until the next edit.
+	if len(f.records.updated) != 1 {
+		t.Fatalf("records updated = %d, want 1", len(f.records.updated))
+	}
+	if got := eoTxValues(t, f.records.updated[0].Values)["total_days"]; got != 21.0 {
+		t.Errorf("persisted total_days = %v, want 21 — derived fields run before the write", got)
+	}
 }
 
 // ── terminal states ─────────────────────────────────────────────────────────
