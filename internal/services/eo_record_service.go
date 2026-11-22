@@ -148,6 +148,84 @@ func eoApplyValues(rec *models.EORecord, values map[string]any) map[string]strin
 	return errs
 }
 
+// eoUnknownFieldErrors rejects submitted keys that no effective field defines.
+//
+// Only the request path calls it. Values the engine writes itself — derived
+// fields, and later the capabilities — always have a definition or belong to
+// the engine's own columns, and they are written server-side, so nothing is
+// gained by letting a client post a key no configuration knows. What it
+// prevents is a client pre-seeding a key a capability will later read as its
+// own (an approval stamp, a quorum flag) before any definition exists to
+// guard it, and unbounded growth of the GIN-indexed bag (spec §7.7: values
+// holds the variable tail of a record, not its bulk).
+func eoUnknownFieldErrors(fields []models.EOFieldDef, values map[string]any) map[string]string {
+	known := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		known[f.Key] = true
+	}
+	errs := map[string]string{}
+	for k := range values {
+		if !known[k] {
+			errs[k] = "is not a field of this record type"
+		}
+	}
+	return errs
+}
+
+// eoMergeFieldErrors folds src into dst without overwriting a message already
+// there, so the first explanation of a key wins.
+func eoMergeFieldErrors(dst, src map[string]string) map[string]string {
+	for k, v := range src {
+		if _, ok := dst[k]; !ok {
+			dst[k] = v
+		}
+	}
+	return dst
+}
+
+// eoDiffValues returns the before and after of every key whose value changed,
+// compared by JSON encoding so a submitted int and a stored float64 are equal.
+func eoDiffValues(before, after map[string]any) (old, updated map[string]any) {
+	old, updated = map[string]any{}, map[string]any{}
+	for k, v := range after {
+		if !eoValuesEqual(before[k], v) {
+			old[k], updated[k] = before[k], v
+		}
+	}
+	for k, v := range before {
+		if _, ok := after[k]; !ok {
+			old[k], updated[k] = v, nil
+		}
+	}
+	return old, updated
+}
+
+// eoClassifyDeriveError splits what RecomputeDerived reports into fields that
+// could not be computed because the data is not there yet (an unresolved
+// reference — a roll-up over children a new record does not have) and fields
+// whose configuration is broken (a cycle, an unknown recompute_on scope, a
+// loader failure, a type error in the formula). Only the second kind is
+// actionable, and logging them alike makes a misconfigured formula
+// indistinguishable from a correct one.
+func eoClassifyDeriveError(err error) (pending, broken []error) {
+	if err == nil {
+		return nil, nil
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		for _, e := range joined.Unwrap() {
+			p, b := eoClassifyDeriveError(e)
+			pending = append(pending, p...)
+			broken = append(broken, b...)
+		}
+		return pending, broken
+	}
+	if errors.Is(err, eoformula.ErrUnresolvedReference) {
+		return []error{err}, nil
+	}
+	return nil, []error{err}
+}
+
 // eoDecodeValues decodes the jsonb bag without coercing anything. It is
 // deliberately not eoValuesOf (eo_derive.go), which turns date-shaped strings
 // into time.Time for the formula env: a coerced value would no longer compare
@@ -343,6 +421,16 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		if parent == nil {
 			return nil, fmt.Errorf("create eo record: parent %s: %w", *req.ParentRecordID, ErrEORecordNotFound)
 		}
+		// Checked here, before anything is written or a sequence number
+		// burned: parent_record_id alone buys the whole hierarchy — the
+		// record counts as a child for Children, BlockingChildren and
+		// ancestor derivation — while the rules that come with being a child
+		// live on the link type. Without this, omitting one JSON field lets a
+		// client set its own deadline (which the SLA sweep and escalation run
+		// on) and its own sensitivity label.
+		if strings.TrimSpace(req.ParentLinkTypeKey) == "" {
+			return nil, fmt.Errorf("create eo record: parent %s was given with no link type: the link type carries the rules that apply to a child (derived deadline, sensitivity cascade), so it cannot be omitted", parent.ID)
+		}
 	}
 
 	// The initial state is resolved before validation because it is the state
@@ -368,6 +456,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
+	fieldErrs = eoMergeFieldErrors(fieldErrs, eoUnknownFieldErrors(fields, req.Values))
 	if err := eoValidationError(fieldErrs); err != nil {
 		return nil, err
 	}
@@ -455,10 +544,15 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
 
-	fieldErrs, err := ValidateRecordValues(fields, eoFlattenStored(rec), req.Values, rec.StateID, entered, s.eval)
+	// The before-snapshot of the journal, taken while rec still holds what
+	// the database holds.
+	before := eoFlattenStored(rec)
+
+	fieldErrs, err := ValidateRecordValues(fields, before, req.Values, rec.StateID, entered, s.eval)
 	if err != nil {
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
+	fieldErrs = eoMergeFieldErrors(fieldErrs, eoUnknownFieldErrors(fields, req.Values))
 	if err := eoValidationError(fieldErrs); err != nil {
 		return nil, err
 	}
@@ -468,7 +562,36 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 
 	s.applyDerived(ctx, fields, rec)
 
-	if err := s.records.Update(ctx, rec); err != nil {
+	// A field edit is not a transition, so the history row carries no
+	// transition and no state change — but it is still a change to a record
+	// whose path has to be traceable, and change_reason is captured for
+	// exactly this. The record and its journal entry are one write.
+	oldValues, newValues := eoDiffValues(before, eoFlattenStored(rec))
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository) error {
+		if err := r.Update(ctx, rec); err != nil {
+			return err
+		}
+		if len(newValues) == 0 {
+			return nil
+		}
+		oldJSON, err := json.Marshal(oldValues)
+		if err != nil {
+			return fmt.Errorf("encode old values: %w", err)
+		}
+		newJSON, err := json.Marshal(newValues)
+		if err != nil {
+			return fmt.Errorf("encode new values: %w", err)
+		}
+		return r.CreateHistory(ctx, &models.EORecordHistory{
+			RecordID:      rec.ID,
+			RecordTypeID:  rec.RecordTypeID,
+			PerformedByID: &actor.ID,
+			Comment:       rec.ChangeReason,
+			OldValues:     oldJSON,
+			NewValues:     newJSON,
+		})
+	})
+	if err != nil {
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
 	return rec, nil
@@ -524,8 +647,11 @@ func (s *eoRecordService) allocateReference(ctx context.Context, rec *models.EOR
 // cascade. It returns the link row to write, or nil when the hierarchy is
 // recorded by parent_record_id alone.
 func (s *eoRecordService) applyLinkRules(ctx context.Context, rec, parent *models.EORecord, linkTypeKey string, actor *models.User) (*models.EORecordLink, error) {
-	if parent == nil || strings.TrimSpace(linkTypeKey) == "" {
+	if parent == nil {
 		return nil, nil
+	}
+	if strings.TrimSpace(linkTypeKey) == "" {
+		return nil, fmt.Errorf("parent %s was given with no link type", parent.ID)
 	}
 	lt, err := s.types.GetLinkTypeByKey(ctx, linkTypeKey)
 	if err != nil {
@@ -582,8 +708,13 @@ func (s *eoRecordService) applyLinkRules(ctx context.Context, rec, parent *model
 // is logged.
 func (s *eoRecordService) applyDerived(ctx context.Context, fields []models.EOFieldDef, rec *models.EORecord) {
 	derived, err := RecomputeDerived(ctx, fields, rec, s.deps)
-	if err != nil {
-		log.Printf("eo: record %s derived fields: %v", rec.ID, err)
+	if pending, broken := eoClassifyDeriveError(err); len(pending) > 0 || len(broken) > 0 {
+		if len(pending) > 0 {
+			log.Printf("eo: record %s: derived field(s) waiting on data: %v", rec.ID, errors.Join(pending...))
+		}
+		if len(broken) > 0 {
+			log.Printf("eo: record %s: derived field configuration is broken: %v", rec.ID, errors.Join(broken...))
+		}
 	}
 	if len(derived) == 0 {
 		return

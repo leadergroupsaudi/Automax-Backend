@@ -137,6 +137,22 @@ func TestValidateTypeEditBlocksDestructiveChangesWhenRecordsExist(t *testing.T) 
 	}
 }
 
+func TestValidateTypeEditTreatsReferencePatternChangeAsDestructive(t *testing.T) {
+	before, fb := eoBase()
+	before.ReferencePattern = "EO-DX-YYYY-NNN"
+	after := before
+	after.ReferencePattern = "EO-DX-YYYY-NNNN"
+	// The sequence scope is keyed on the pattern, so a live type that changes
+	// it starts counting at 1 again under a new scope and re-issues
+	// references that are already in use.
+	if err := ValidateTypeEdit(before, after, fb, fb, true); err == nil {
+		t.Error("reference pattern change allowed with records")
+	}
+	if err := ValidateTypeEdit(before, after, fb, fb, false); err != nil {
+		t.Errorf("reference pattern change rejected with no records: %v", err)
+	}
+}
+
 func TestValidateTypeEditTreatsPrefixChangeAsDestructive(t *testing.T) {
 	before, fb := eoBase()
 	after := before

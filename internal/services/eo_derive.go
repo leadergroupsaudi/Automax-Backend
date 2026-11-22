@@ -251,23 +251,66 @@ func eoSortDerived(keys []string, parsed map[string][]eoDependency, derived map[
 	return sorted, cyclic
 }
 
-// eoValuesOf decodes rec.Values, dropping nulls and coercing date strings.
+// eoValuesOf is a record's values as a formula environment, keyed by field
+// key and spanning BOTH the real eo_records columns and the values jsonb.
+//
+// It reads the flattened view rather than rec.Values alone because the 17
+// inherited fields are columns: spec §7.5's Referral deadline is "counted
+// back from the parent letter's external deadline", which reads an ancestor's
+// due_date — a column. A jsonb-only environment resolves no such formula and,
+// because an unresolved reference is reported rather than raised, the field
+// would simply never be computed.
+//
+// Empty values are omitted rather than set to nil, so a formula over missing
+// data yields eoformula.ErrUnresolvedReference. Date-shaped strings become
+// time.Time; identifiers become their string form, which is comparable in a
+// formula where a [16]byte array is not.
 func eoValuesOf(rec *models.EORecord) map[string]any {
 	out := map[string]any{}
-	if len(rec.Values) == 0 {
-		return out
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(rec.Values, &raw); err != nil {
-		return out
-	}
-	for k, v := range raw {
-		if v == nil {
-			continue
+	for k, v := range eoFlattenStored(rec) {
+		if env := eoEnvValue(v); env != nil {
+			out[k] = env
 		}
-		out[k] = eoCoerce(v)
 	}
 	return out
+}
+
+func eoEnvValue(v any) any {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return nil
+		}
+		return eoCoerce(x)
+	case time.Time:
+		if x.IsZero() {
+			return nil
+		}
+		return x
+	case *time.Time:
+		if x == nil {
+			return nil
+		}
+		return *x
+	case uuid.UUID:
+		if x == uuid.Nil {
+			return nil
+		}
+		return x.String()
+	case *uuid.UUID:
+		if x == nil {
+			return nil
+		}
+		return x.String()
+	case []any:
+		if len(x) == 0 {
+			return nil
+		}
+		return x
+	}
+	return v
 }
 
 // eoOwnEnv is the record's own values minus derived fields, whose stored

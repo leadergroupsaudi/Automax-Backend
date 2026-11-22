@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
+	"github.com/automax/backend/internal/services/eoformula"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
@@ -204,6 +206,7 @@ func eoNewSvcFixture(t *testing.T, defs ...models.EOFieldDef) *eoSvcFixture {
 	wf.States = []models.WorkflowState{f.initial, {ID: uuid.New(), Code: "closed", StateType: "terminal"}}
 	f.workflows = &eoWorkflowFakeRepo{workflows: []models.Workflow{wf}}
 
+	defs = append(eoSvcInheritedFields(), defs...)
 	for i := range defs {
 		if defs[i].RecordTypeID == uuid.Nil {
 			defs[i].RecordTypeID = f.recordType.ID
@@ -212,6 +215,19 @@ func eoNewSvcFixture(t *testing.T, defs ...models.EOFieldDef) *eoSvcFixture {
 	f.types.defs = defs
 	f.svc = NewEORecordService(f.records, f.types, f.sequences, f.workflows)
 	return f
+}
+
+// eoSvcInheritedFields stands in for the inherited, column-backed definitions
+// the base type carries (Task 20 seeds the full 17). Every key a request may
+// submit needs one: a key no effective field defines is rejected.
+func eoSvcInheritedFields() []models.EOFieldDef {
+	out := []models.EOFieldDef{eoSvcField("subject_ar", models.EORequiredAlways)}
+	for _, key := range []string{"subject_en", "priority", "sensitivity", "source", "change_reason"} {
+		out = append(out, eoSvcField(key, models.EORequiredNever))
+	}
+	due := eoSvcField("due_date", models.EORequiredNever)
+	due.Kind = models.EOKindDate
+	return append(out, due)
 }
 
 // eoSvcField is a plain user-entered field definition.
@@ -246,7 +262,7 @@ func eoSvcFieldErrors(t *testing.T, err error) map[string]string {
 // ── create ──────────────────────────────────────────────────────────────────
 
 func TestCreateAssignsReferenceAndInitialState(t *testing.T) {
-	f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+	f := eoNewSvcFixture(t)
 	year := time.Now().Year()
 
 	rec, err := f.svc.Create(context.Background(), &models.EORecordCreateRequest{
@@ -310,7 +326,6 @@ func TestCreateAssignsReferenceAndInitialState(t *testing.T) {
 
 func TestCreateRejectsMissingRequiredField(t *testing.T) {
 	f := eoNewSvcFixture(t,
-		eoSvcField("subject_ar", models.EORequiredAlways),
 		eoSvcField("justification", models.EORequiredAlways),
 		eoSvcField("note", models.EORequiredNever),
 	)
@@ -340,7 +355,6 @@ func TestCreateRejectsMissingRequiredField(t *testing.T) {
 
 func TestCreateRunsDerivedFieldsBeforePersisting(t *testing.T) {
 	f := eoNewSvcFixture(t,
-		eoSvcField("subject_ar", models.EORequiredAlways),
 		models.EOFieldDef{
 			ID: uuid.New(), Key: "weeks", Label: "Weeks", Kind: models.EOKindNumber,
 			Provenance: models.EOProvenanceUser,
@@ -370,7 +384,6 @@ func TestCreateRunsDerivedFieldsBeforePersisting(t *testing.T) {
 
 func TestCreateWritesADerivedFieldIntoItsColumn(t *testing.T) {
 	f := eoNewSvcFixture(t,
-		eoSvcField("subject_ar", models.EORequiredAlways),
 		models.EOFieldDef{
 			ID: uuid.New(), Key: "visit_date", Label: "Visit date", Kind: models.EOKindDate,
 			Provenance: models.EOProvenanceUser,
@@ -415,7 +428,7 @@ func eoSvcParent(t *testing.T, f *eoSvcFixture, lt *models.EOLinkType, due *time
 }
 
 func TestCreateAppliesParentDerivedDeadline(t *testing.T) {
-	f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+	f := eoNewSvcFixture(t)
 	parentDue := time.Now().Add(30 * 24 * time.Hour).UTC()
 	submitted := time.Now().Add(90 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	lt := &models.EOLinkType{
@@ -455,7 +468,7 @@ func TestCreateAppliesParentDerivedDeadline(t *testing.T) {
 }
 
 func TestCreateKeepsADerivedDeadlineThatIsAlreadyPast(t *testing.T) {
-	f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+	f := eoNewSvcFixture(t)
 	parentDue := time.Now().Add(3 * 24 * time.Hour).UTC()
 	lt := &models.EOLinkType{
 		ID: uuid.New(), Key: "covers_item", Label: "Covers",
@@ -496,7 +509,7 @@ func TestCreateCascadesSensitivityFromParent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+			f := eoNewSvcFixture(t)
 			lt := &models.EOLinkType{
 				ID: uuid.New(), Key: "covers_item", Label: "Covers",
 				CascadeSensitivity: tc.cascade,
@@ -520,7 +533,7 @@ func TestCreateCascadesSensitivityFromParent(t *testing.T) {
 }
 
 func TestCreateNumbersAChildFromItsParentsReference(t *testing.T) {
-	f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+	f := eoNewSvcFixture(t)
 	f.recordType.ReferenceMode = models.EOReferenceModeParent
 	f.recordType.ReferencePattern = "EO-PRG-YYYY-NNN-A#"
 	lt := &models.EOLinkType{ID: uuid.New(), Key: "covers_item", Label: "Covers"}
@@ -546,6 +559,68 @@ func TestCreateNumbersAChildFromItsParentsReference(t *testing.T) {
 	}
 	if len(f.sequences.scopes) != 1 || f.sequences.scopes[0] != wantScope {
 		t.Errorf("sequence scopes = %v, want [%s]", f.sequences.scopes, wantScope)
+	}
+}
+
+func TestCreateRequiresALinkTypeForAParent(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	parentDue := time.Now().Add(30 * 24 * time.Hour).UTC()
+	lt := &models.EOLinkType{
+		ID: uuid.New(), Key: "covers_item", Label: "Covers",
+		DeriveDeadlineFromParent: true, DeadlineOffsetDays: 7, CascadeSensitivity: true,
+	}
+	parent := eoSvcParent(t, f, lt, &parentDue, "confidential")
+	submitted := time.Now().Add(90 * 24 * time.Hour).UTC().Format(time.RFC3339)
+
+	// Omitting the link type would otherwise buy the full parent hierarchy —
+	// the record counts as a child for Children, BlockingChildren and
+	// ancestor derivation — with none of the link rules: the client would set
+	// its own deadline and its own sensitivity label.
+	_, err := f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+		RecordTypeID:   f.recordType.ID,
+		ParentRecordID: &parent.ID,
+		Values:         map[string]any{"subject_ar": "بند", "due_date": submitted, "sensitivity": "normal"},
+	}, f.actor)
+	if err == nil {
+		t.Fatalf("create under a parent with no link type succeeded, want it rejected")
+	}
+	if len(f.records.created) != 0 || len(f.sequences.scopes) != 0 {
+		t.Errorf("records = %d, sequences = %v, want nothing written and no number burned",
+			len(f.records.created), f.sequences.scopes)
+	}
+}
+
+func TestCreateRejectsValuesNoFieldDefines(t *testing.T) {
+	f := eoNewSvcFixture(t, eoSvcField("note", models.EORequiredNever))
+
+	// A client must not be able to pre-seed a key a capability will later
+	// read as its own (an approval stamp, a quorum flag) before any
+	// definition exists to guard it, nor to grow the GIN-indexed bag at will.
+	_, err := f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+		RecordTypeID: f.recordType.ID,
+		Values:       map[string]any{"subject_ar": "توجيه", "note": "fine", "approval_stamp": "forged"},
+	}, f.actor)
+	if err == nil {
+		t.Fatalf("create with an undefined key succeeded, want it rejected")
+	}
+	fields := eoSvcFieldErrors(t, err)
+	if _, ok := fields["approval_stamp"]; !ok {
+		t.Errorf("error fields = %v, want approval_stamp", fields)
+	}
+	if _, ok := fields["note"]; ok {
+		t.Errorf("error fields = %v, want nothing for the defined key", fields)
+	}
+	if len(f.records.created) != 0 {
+		t.Errorf("records created = %d, want 0", len(f.records.created))
+	}
+
+	// The same key is rejected on the update path.
+	rec := eoSvcExisting(f, nil)
+	if _, err := f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
+		RecordTypeID: rec.RecordTypeID,
+		Values:       map[string]any{"approval_stamp": "forged"},
+	}, f.actor); err == nil {
+		t.Errorf("update with an undefined key succeeded, want it rejected")
 	}
 }
 
@@ -603,7 +678,6 @@ func eoSvcExisting(f *eoSvcFixture, apply func(*models.EORecord)) *models.EOReco
 func TestUpdateValidatesAgainstColumnsAndJSONBTogether(t *testing.T) {
 	t.Run("a stored column satisfies a required field a partial edit does not mention", func(t *testing.T) {
 		f := eoNewSvcFixture(t,
-			eoSvcField("subject_ar", models.EORequiredAlways),
 			eoSvcField("note", models.EORequiredNever),
 			eoSvcField("remark", models.EORequiredNever),
 		)
@@ -630,7 +704,6 @@ func TestUpdateValidatesAgainstColumnsAndJSONBTogether(t *testing.T) {
 
 	t.Run("an empty stored column still fails the required check", func(t *testing.T) {
 		f := eoNewSvcFixture(t,
-			eoSvcField("subject_ar", models.EORequiredAlways),
 			eoSvcField("remark", models.EORequiredNever),
 		)
 		rec := eoSvcExisting(f, func(r *models.EORecord) { r.SubjectAr = "" })
@@ -651,7 +724,7 @@ func TestUpdateValidatesAgainstColumnsAndJSONBTogether(t *testing.T) {
 	})
 
 	t.Run("a column value is written to its column, not into the values bag", func(t *testing.T) {
-		f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+		f := eoNewSvcFixture(t)
 		rec := eoSvcExisting(f, nil)
 		due := time.Now().Add(48 * time.Hour).UTC().Truncate(time.Second)
 
@@ -677,7 +750,7 @@ func TestUpdateValidatesAgainstColumnsAndJSONBTogether(t *testing.T) {
 	})
 
 	t.Run("an unparseable column value is a field error, not a panic", func(t *testing.T) {
-		f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways))
+		f := eoNewSvcFixture(t)
 		rec := eoSvcExisting(f, nil)
 
 		_, err := f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
@@ -700,7 +773,7 @@ func TestUpdateLocksAFieldTheRecordHasEverEntered(t *testing.T) {
 		d.IsLockedAfterStateID = &lockAfter
 		return d
 	}
-	f := eoNewSvcFixture(t, eoSvcField("subject_ar", models.EORequiredAlways), newField(locked))
+	f := eoNewSvcFixture(t, newField(locked))
 	// The record is NOT in the locking state now — it returned to an earlier
 	// one — but its history says it has been there. Asking rec.StateID would
 	// answer no and let the edit through.
@@ -732,7 +805,7 @@ func TestUpdateLocksAFieldTheRecordHasEverEntered(t *testing.T) {
 
 func TestUpdateRecomputesDerivedAcrossChildrenAndAncestors(t *testing.T) {
 	f := eoNewSvcFixture(t,
-		eoSvcField("subject_ar", models.EORequiredAlways),
+		eoSvcField("note", models.EORequiredNever),
 		eoDerivedField("total_weeks", "children_eo_stage_sum_weeks", []map[string]any{
 			{"scope": "child", "type": "eo_stage", "field": "weeks", "aggregates": []string{"sum"}},
 		}),
@@ -772,6 +845,134 @@ func TestUpdateRecomputesDerivedAcrossChildrenAndAncestors(t *testing.T) {
 	if values["programme_subject"] != "national programme" {
 		t.Errorf("programme_subject = %v, want the nearest ancestor of type eo_programme", values["programme_subject"])
 	}
+}
+
+func TestUpdateDerivesFromInheritedColumns(t *testing.T) {
+	f := eoNewSvcFixture(t,
+		eoSvcField("note", models.EORequiredNever),
+		eoDerivedField("reminder_date", "due_date - days(1)", eoOwn("due_date")),
+		eoDerivedField("letter_deadline", "ancestor_eo_programme_due_date - days(3)", []map[string]any{
+			{"scope": "ancestor", "type": "eo_programme", "field": "due_date"},
+		}),
+	)
+	programmeType := f.types.add(&models.EORecordType{Key: "eo_programme", Name: "Programme", IsActive: true})
+	programmeDue := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	programme := &models.EORecord{
+		ID: uuid.New(), RecordTypeID: programmeType.ID, Reference: "EO-PRG-2026-007",
+		DueDate: &programmeDue,
+	}
+	f.records.stored[programme.ID] = programme
+
+	ownDue := time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC)
+	rec := eoSvcExisting(f, func(r *models.EORecord) {
+		r.ParentRecordID = &programme.ID
+		r.DueDate = &ownDue
+	})
+
+	got, err := f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
+		RecordTypeID: rec.RecordTypeID,
+		Values:       map[string]any{"note": "touched"},
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	values := eoSvcValues(t, got.Values)
+	// due_date is a column, not a values key. A formula that cannot see the
+	// columns resolves neither of these and the save succeeds with both
+	// fields simply never computed.
+	if values["reminder_date"] != "2026-04-09T00:00:00Z" {
+		t.Errorf("reminder_date = %v, want 2026-04-09T00:00:00Z derived from the record's own due_date column", values["reminder_date"])
+	}
+	// Spec §7.5: a Referral deadline is counted back from the parent letter's
+	// external deadline — an ancestor's due_date, also a column.
+	if values["letter_deadline"] != "2026-05-17T00:00:00Z" {
+		t.Errorf("letter_deadline = %v, want 2026-05-17T00:00:00Z derived from the ancestor's due_date column", values["letter_deadline"])
+	}
+}
+
+func TestEOClassifyDeriveErrorSeparatesMissingDataFromBrokenConfiguration(t *testing.T) {
+	pendingErr := fmt.Errorf("derived field %q: %w", "total_weeks", eoformula.ErrUnresolvedReference)
+	cycleErr := fmt.Errorf("derived field %q: %w", "a", ErrEODeriveCycle)
+	configErr := errors.New(`derived field "b": unknown recompute_on scope "cousin"`)
+
+	cases := []struct {
+		name        string
+		err         error
+		wantPending int
+		wantBroken  int
+	}{
+		{"nothing at all", nil, 0, 0},
+		{"a roll-up with no data yet", pendingErr, 1, 0},
+		{"a cycle is a configuration fault", cycleErr, 0, 1},
+		{"an unknown scope is a configuration fault", configErr, 0, 1},
+		{"a mixture is split", errors.Join(pendingErr, cycleErr, configErr), 1, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pending, broken := eoClassifyDeriveError(tc.err)
+			if len(pending) != tc.wantPending || len(broken) != tc.wantBroken {
+				t.Errorf("pending = %v, broken = %v, want %d pending and %d broken",
+					pending, broken, tc.wantPending, tc.wantBroken)
+			}
+		})
+	}
+}
+
+func TestUpdateJournalsTheFieldChange(t *testing.T) {
+	f := eoNewSvcFixture(t, eoSvcField("note", models.EORequiredNever))
+	rec := eoSvcExisting(f, nil)
+
+	if _, err := f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
+		RecordTypeID: rec.RecordTypeID,
+		Values: map[string]any{
+			"note":          "edited",
+			"priority":      "low",
+			"change_reason": "the owning body asked for it",
+		},
+	}, f.actor); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if len(f.records.history) != 1 {
+		t.Fatalf("history rows = %d, want 1: a field edit is not a transition, but it is still a change to a government record", len(f.records.history))
+	}
+	h := f.records.history[0]
+	if h.RecordID != rec.ID || h.RecordTypeID != rec.RecordTypeID {
+		t.Errorf("history row points at %s/%s, want %s/%s", h.RecordID, h.RecordTypeID, rec.ID, rec.RecordTypeID)
+	}
+	if h.TransitionID != nil || h.ToStateID != nil || h.FromStateID != nil {
+		t.Errorf("history row = transition %v, %v -> %v, want all nil: no transition took place", h.TransitionID, h.FromStateID, h.ToStateID)
+	}
+	if h.PerformedByID == nil || *h.PerformedByID != f.actor.ID {
+		t.Errorf("performed_by = %v, want the actor %s", h.PerformedByID, f.actor.ID)
+	}
+	if h.Comment != "the owning body asked for it" {
+		t.Errorf("comment = %q, want the submitted change_reason", h.Comment)
+	}
+	before, after := eoSvcValues(t, h.OldValues), eoSvcValues(t, h.NewValues)
+	if before["note"] != "original" || after["note"] != "edited" {
+		t.Errorf("note journalled %v -> %v, want original -> edited", before["note"], after["note"])
+	}
+	if before["priority"] != "high" || after["priority"] != "low" {
+		t.Errorf("priority journalled %v -> %v, want high -> low", before["priority"], after["priority"])
+	}
+	if _, ok := after["subject_ar"]; ok {
+		t.Errorf("new values = %v, want only the keys that changed", after)
+	}
+
+	t.Run("an edit that changes nothing is not journalled", func(t *testing.T) {
+		f := eoNewSvcFixture(t, eoSvcField("note", models.EORequiredNever))
+		rec := eoSvcExisting(f, nil)
+		if _, err := f.svc.Update(context.Background(), rec.ID, &models.EORecordUpdateRequest{
+			RecordTypeID: rec.RecordTypeID,
+			Values:       map[string]any{"note": "original"},
+		}, f.actor); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if len(f.records.history) != 0 {
+			t.Errorf("history rows = %d, want 0 for an edit that changed nothing", len(f.records.history))
+		}
+	})
 }
 
 func TestUpdateRejectsAnUnknownRecord(t *testing.T) {

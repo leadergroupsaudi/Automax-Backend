@@ -217,6 +217,13 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 		return fmt.Errorf("changing reference prefix %q to %q is destructive: existing references were issued under the old prefix",
 			before.ReferencePrefix, after.ReferencePrefix)
 	}
+	// The sequence scope is keyed on the pattern (services.EOSequenceScope),
+	// so changing it restarts the counter at 1 under a new scope and re-issues
+	// references that are already in use.
+	if before.ReferencePattern != after.ReferencePattern {
+		return fmt.Errorf("changing reference pattern %q to %q is destructive: the sequence counter is keyed on the pattern, so a new one restarts at 1 and re-issues references already in use",
+			before.ReferencePattern, after.ReferencePattern)
+	}
 	next := make(map[string]EOFieldDef, len(fieldsAfter))
 	for _, f := range fieldsAfter {
 		next[f.Key] = f
