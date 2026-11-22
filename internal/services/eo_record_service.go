@@ -501,9 +501,10 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 	// create pipeline validates and derives BEFORE it opens one, exactly as
 	// it resolves the capability list and the effective fields before it. The
 	// timer arming at the end of the transaction gets a transaction-bound
-	// reader of its own.
-	capRead := eoNewCapabilityReader(s.records, s.types)
-	capErrs, err := eoCapabilitiesValidate(ctx, capRead, caps, rec)
+	// reader of its own. The name says which is which: preTxCapRead is still
+	// in scope inside the closure below, and using it there is the deadlock.
+	preTxCapRead := eoNewCapabilityReader(s.records, s.types)
+	capErrs, err := eoCapabilitiesValidate(ctx, preTxCapRead, caps, rec)
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
@@ -530,7 +531,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 
 	// 5. derived fields, over the values written above.
 	s.applyDerived(ctx, fields, rec)
-	if err := eoCapabilitiesDerive(ctx, capRead, caps, rec); err != nil {
+	if err := eoCapabilitiesDerive(ctx, preTxCapRead, caps, rec); err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
 	}
 

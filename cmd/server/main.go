@@ -39,16 +39,26 @@ func main() {
 
 	log.Printf("GOAL_MANAGEMENT enabled: %v", cfg.GoalManagement.Enabled)
 	validation.InitValidatorRegistry()
-	// Explicit, not an init(): see services/eo_capability.go. It stays BEFORE
-	// database.Connect and that ordering is load-bearing — with no *gorm.DB
-	// and no repository in scope here, a capability cannot be constructed
-	// holding a POOLED one. Three of a capability's four record hooks run
-	// inside a transaction that holds a FOR UPDATE row lock, and a pooled
-	// read taken there waits for a free connection forever on a capped pool.
-	// Capabilities read through the services.EOCapabilityReader the engine
-	// hands each hook, bound per call to the handles that are safe where the
-	// hook runs. services.TestRegistrationOrderAllowsARepositoryBackedCapability
-	// fails if these two lines are swapped.
+	// Explicit, not an init(): see services/eo_capability.go.
+	//
+	// This is where EVERY capability is registered, and it runs BEFORE
+	// database.Connect on purpose. The call SEALS the registry on the way
+	// out, so a later services.RegisterCapability — most plausibly in the EO
+	// wiring block far below, where eoRecordRepo and eoTypeRepo are in scope
+	// and a repository-backed capability is one constructor argument away —
+	// panics the boot instead of quietly succeeding. Being out of scope here
+	// is the convention; the seal is what enforces it.
+	//
+	// What it enforces: a capability must not hold a POOLED repository. Three
+	// of its four record hooks run inside a transaction that holds a FOR
+	// UPDATE row lock, and a pooled read taken there waits for a free
+	// connection forever on a capped pool — no timeout, no error, a hung
+	// request. Capabilities read other records through the
+	// services.EOCapabilityReader the engine hands each hook, bound per call
+	// to the handles that are safe where the hook runs.
+	//
+	// services.TestCapabilityRegistrationRunsBeforeTheDatabaseExists fails if
+	// this line is moved after the connect.
 	services.RegisterEOCapabilities()
 	db, err := database.Connect(&cfg.Database)
 	if err != nil {
@@ -472,6 +482,11 @@ func main() {
 	// reads this file as text and fails if they come back.
 	// services.RegisterEOCapabilities() is called once at startup, at the top
 	// of main: it panics on a duplicate key, so it must not be called twice.
+	// It also SEALS the capability registry, so services.RegisterCapability
+	// must not be called here either — a capability built with one of the
+	// repositories below is the pooled-read deadlock, and the seal turns that
+	// mistake into a panic at boot. A capability reads other records through
+	// the services.EOCapabilityReader the engine hands each hook.
 	eoEscalationEventRepo := repository.NewEOEscalationEventRepository(db)
 	eoTimerRepo := repository.NewEOTimerRepository(db)
 	eoRecordRepo := repository.NewEORecordRepository(db)

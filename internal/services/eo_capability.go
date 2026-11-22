@@ -70,6 +70,8 @@ type EOEnabledCapability struct {
 type eoCapabilityRegistry struct {
 	mu   sync.RWMutex
 	caps map[string]Capability
+	// sealed is set when RegisterEOCapabilities returns. See seal.
+	sealed bool
 }
 
 func newEOCapabilityRegistry() *eoCapabilityRegistry {
@@ -82,10 +84,32 @@ func (r *eoCapabilityRegistry) register(c Capability) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.sealed {
+		panic(fmt.Sprintf("eo: RegisterCapability: %q arrives after RegisterEOCapabilities sealed the registry. "+
+			"Every capability is registered there, at the top of cmd/server/main.go, BEFORE database.Connect, "+
+			"so that none can be constructed holding a POOLED repository: three of a capability's four record "+
+			"hooks run inside a transaction that holds a FOR UPDATE row lock, and a pooled read taken there "+
+			"waits for a free connection forever on a capped pool. Register it in RegisterEOCapabilities and "+
+			"read other records through the EOCapabilityReader the engine hands each hook.", c.Key()))
+	}
 	if _, dup := r.caps[c.Key()]; dup {
 		panic(fmt.Sprintf("eo: RegisterCapability: %q is already registered", c.Key()))
 	}
 	r.caps[c.Key()] = c
+}
+
+// seal closes the registry to further registration. It is what makes "a
+// capability cannot hold a pooled repository" a property of the code rather
+// than a convention: without it, RegisterCapability is exported and the
+// registry is mutable at any time, so the natural place to wire a
+// repository-backed capability would be the EO block of main, several hundred
+// lines below, where eoRecordRepo and eoTypeRepo are in scope and the deadlock
+// is one constructor argument away. Sealed, that fails the server's boot —
+// loudly, at the only moment somebody is looking.
+func (r *eoCapabilityRegistry) seal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealed = true
 }
 
 // eoCapabilityEntry is one element of EORecordType.Capabilities.
@@ -137,9 +161,15 @@ func CapabilitiesFor(t *models.EORecordType) ([]EOEnabledCapability, error) {
 }
 
 // RegisterEOCapabilities is the explicit wiring call: main calls it once at
-// startup. There is deliberately no init() registration.
+// startup, before the database connect. There is deliberately no init()
+// registration.
+//
+// It SEALS the registry on the way out, so this function is the only place a
+// capability can be added. See eoCapabilityRegistry.seal for why that matters
+// and eoCapabilityRegistry.register for what a late caller is told.
 func RegisterEOCapabilities() {
 	RegisterCapability(NewEOApprovalCapability())
+	eoDefaultCapabilities.seal()
 }
 
 // eoCapabilityResolver is how a service finds a type's capabilities. Nil means

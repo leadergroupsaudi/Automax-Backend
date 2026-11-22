@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,9 +265,17 @@ const eoReadCapKey = "eo_read_probe"
 // B3 will have: decisions_base reads standing records of a type other than the
 // draft's, referral_tree reads a letter's referrals and their typed links.
 //
-// It deliberately does NOT embed Capability. The two no-op bases complete its
-// method set, which is what those bases are for — and it means a method added
-// to Capability breaks this build instead of panicking at run time.
+// It deliberately does NOT embed Capability, and so departs from the
+// convention of the three fakes above it (eoCapFake, eoWireCap, eoBridgeCap).
+// That convention exists so a fake cannot become more capable than the thing
+// it stands in for — a repository concern, and the repository fakes in this
+// file and the next all still follow it. A CAPABILITY fake is the other way
+// round: its method set is fixed by the interface, embedding buys nothing but
+// a run-time panic when the interface grows, and here the two no-op bases are
+// themselves production code under test. Completing the set from them means a
+// method added to Capability breaks this build instead of panicking at run
+// time, and it exercises the bases the way a real §7.9 capability will use
+// them. Same reasoning for eoMergeCap below.
 type eoReadCap struct {
 	eoReservesNoKeys
 	eoConstrainsNoWorkflow
@@ -540,23 +549,29 @@ func TestCapabilityReadsGoThroughTheTransactionBoundHandle(t *testing.T) {
 	})
 }
 
-// TestRegistrationOrderAllowsARepositoryBackedCapability pins the premise the
+// TestCapabilityRegistrationRunsBeforeTheDatabaseExists pins the premise the
 // whole design rests on. A capability that needs to read other records is
 // registered where registration happens today — at cmd/server/main.go, BEFORE
 // database.Connect — and still resolves and reads, because the read path is
 // handed to it per call by the engine rather than built into it at
 // construction. Nothing is "repository-backed"; that is the point, and the
-// second subtest is what keeps it that way.
-func TestRegistrationOrderAllowsARepositoryBackedCapability(t *testing.T) {
-	t.Run("a capability that needs other records registers with no database and resolves", func(t *testing.T) {
+// second and third subtests are what keep it that way.
+//
+// (The task brief named this TestRegistrationOrderAllowsARepositoryBackedCapability,
+// for the design option where a capability is constructed with a repository.
+// That option was not taken, so the brief's name would describe something the
+// code deliberately forbids.)
+func TestCapabilityRegistrationRunsBeforeTheDatabaseExists(t *testing.T) {
+	t.Run("a capability that reads other records resolves and runs with no database at registration", func(t *testing.T) {
 		saved := eoDefaultCapabilities
 		eoDefaultCapabilities = newEOCapabilityRegistry()
 		defer func() { eoDefaultCapabilities = saved }()
-		// The real wiring call, running with no *gorm.DB in scope, exactly as
-		// main does it.
-		RegisterEOCapabilities()
+		// Registered the way main does it: inside the one wiring call, with
+		// no *gorm.DB in scope. RegisterEOCapabilities seals the registry on
+		// the way out, so the probe goes in first.
 		c := &eoReadCap{childTypeKey: "eo_stage"}
 		RegisterCapability(c)
+		RegisterEOCapabilities()
 
 		f := eoNewTxFixture(t)
 		f.records.txTimers = &eoBridgeTimers{}
@@ -583,7 +598,7 @@ func TestRegistrationOrderAllowsARepositoryBackedCapability(t *testing.T) {
 	// repository in scope, so a capability CANNOT be constructed with a pooled
 	// one. Move registration after the connect and that guard is gone — which
 	// is precisely the single-line change that makes this fail.
-	t.Run("registration still runs before the database connect in main", func(t *testing.T) {
+	t.Run("registration runs before the database connect in main", func(t *testing.T) {
 		const src = "../../cmd/server/main.go"
 		fset := token.NewFileSet()
 		file, err := parser.ParseFile(fset, src, nil, 0)
@@ -629,6 +644,33 @@ func TestRegistrationOrderAllowsARepositoryBackedCapability(t *testing.T) {
 		if register > connect {
 			t.Errorf("services.RegisterEOCapabilities() runs AFTER database.Connect(). A capability can now be constructed with a pooled repository, which is the deadlock this task exists to prevent; capability reads go through the reader the engine hands each hook instead.")
 		}
+	})
+
+	// Being out of scope at main.go:52 is only a convention: RegisterCapability
+	// is exported and the registry is mutable, so the natural place to wire a
+	// repository-backed capability is the EO block of main, several hundred
+	// lines below, where eoRecordRepo and eoTypeRepo are in scope. The subtest
+	// above would stay green through exactly that mistake. The seal is what
+	// makes the convention a property of the code.
+	t.Run("the registry is sealed once wiring has run, so nothing can register after the database exists", func(t *testing.T) {
+		saved := eoDefaultCapabilities
+		eoDefaultCapabilities = newEOCapabilityRegistry()
+		defer func() { eoDefaultCapabilities = saved }()
+		RegisterEOCapabilities()
+
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Error("a capability registered after the wiring call was accepted; it could have been built with a pooled repository, and nothing would have said so")
+				return
+			}
+			msg, ok := r.(string)
+			if !ok || !strings.Contains(msg, "sealed the registry") {
+				t.Errorf("panic = %v, want one that says the registry is sealed and why", r)
+			}
+		}()
+		// What a later author would write in main's EO wiring block.
+		RegisterCapability(&eoReadCap{childTypeKey: "eo_stage"})
 	})
 }
 

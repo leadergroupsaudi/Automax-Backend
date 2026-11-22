@@ -645,6 +645,31 @@ findable but does not make them questions; these are the questions.
   link uniqueness, the subtree walk, the indexed workflow read, or the
   end-to-end acceptance test. They all skip, and the suite still prints `ok`.
 
+### Opened by Task B1 (the capability read seam)
+
+- **`EOCapabilityReader.Record` reads across every partition and applies no
+  row-level visibility.** It delegates to `EORecordRepository.GetAnyByID`, the
+  same method the formula engine's ancestor walk uses, and neither is scoped to
+  the requesting user — §7.11 visibility lives in `applyEORecordFilters`, which
+  only `List` goes through. So a capability can derive a value **onto a record
+  the caller can see, out of a record they cannot**. There is a defensible
+  reading that engine reads should not be user-scoped (a roll-up over children
+  must not change with who asks), and B1 did not change the property. **Where it
+  first becomes a product question: Task B2.** `decisions_base` populates
+  `related_refs` from other Decision Records, and a reference is exactly the
+  kind of value that leaks — the caller would see that a decision exists, and
+  its reference, without being entitled to the record. Decide there whether
+  `related_refs` is filtered on read, filtered at derivation, or declared
+  non-confidential by the client; do not decide it by default.
+- **`EOCapabilityReader.Children` resolves the record type key on every call**
+  (`GetByKey` then `Children`). A referral-tree recursion therefore issues one
+  `GetByKey` per node for a key it resolved at the root. Inside a transaction
+  these are all on the one connection, so it is not the pool hazard — it is
+  N round trips where one would do. **Memo for Task B3:** resolve the type once
+  with `EOCapabilityReader.RecordType` and, if the per-node cost matters, that
+  is the point at which a type-id-taking reader method earns its place. Do not
+  work around it with a pooled repository.
+
 ---
 
 ## Deferred minors, by area
