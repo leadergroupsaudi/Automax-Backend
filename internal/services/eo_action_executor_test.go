@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -108,6 +111,9 @@ func (s *eoAxRecSvc) Create(_ context.Context, req *models.EORecordCreateRequest
 	}
 	child := models.EORecord{ID: uuid.New(), RecordTypeID: req.RecordTypeID, ParentRecordID: req.ParentRecordID}
 	s.repo.children = append(s.repo.children, child)
+	if req.ParentRecordID != nil {
+		s.repo.links = append(s.repo.links, models.EORecordLink{FromRecordID: child.ID, ToRecordID: *req.ParentRecordID, LinkTypeKey: req.ParentLinkTypeKey})
+	}
 	return &child, nil
 }
 
@@ -121,7 +127,18 @@ func (s *eoAxRecSvc) Update(_ context.Context, id uuid.UUID, req *models.EORecor
 type eoAxRepo struct {
 	repository.EORecordRepository
 	children []models.EORecord
+	links    []models.EORecordLink
 	history  []models.EORecordHistory
+}
+
+func (r *eoAxRepo) LinksFrom(_ context.Context, id uuid.UUID) ([]models.EORecordLink, error) {
+	var out []models.EORecordLink
+	for _, l := range r.links {
+		if l.FromRecordID == id {
+			out = append(out, l)
+		}
+	}
+	return out, nil
 }
 
 func (r *eoAxRepo) Children(_ context.Context, parentID uuid.UUID, typeID *uuid.UUID) ([]models.EORecord, error) {
@@ -365,6 +382,7 @@ func TestExecuteActionsWebhookPostsEscapedBody(t *testing.T) {
 	defer srv.Close()
 
 	f := eoAxNewFixture(t)
+	f.exec.httpClient = srv.Client() // the guarded client would refuse the loopback test server
 	f.rec.SubjectAr = `say "hi"`
 	a := eoAxAction("webhook", 1, map[string]any{"url": srv.URL, "headers": map[string]string{"X-Token": "abc"}, "body": `{"ref":"{{reference}}","subject":"{{subject_ar}}"}`})
 	if err := f.exec.ExecuteActions(context.Background(), f.rec, eoAxTransition(a), f.actor); err != nil {
@@ -379,6 +397,79 @@ func TestExecuteActionsWebhookPostsEscapedBody(t *testing.T) {
 	}
 	if parsed["subject"] != `say "hi"` || parsed["ref"] != "EO-DIR-2026-001" {
 		t.Fatalf("body = %v", parsed)
+	}
+}
+
+func TestExecuteActionsWebhookRefusesInternalDestinations(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
+	defer srv.Close() // 127.0.0.1
+
+	cases := map[string]string{
+		"loopback":         srv.URL,
+		"localhost name":   strings.Replace(srv.URL, "127.0.0.1", "localhost", 1),
+		"private 10/8":     "http://10.0.0.5:8080/hook",
+		"private 192.168":  "http://192.168.1.1/hook",
+		"metadata":         "http://169.254.169.254/latest/meta-data/",
+		"unspecified":      "http://0.0.0.0:9/hook",
+		"ipv6 loopback":    "http://[::1]:9/hook",
+		"ipv6 ula private": "http://[fd00::1]:9/hook",
+	}
+	for name, u := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := eoAxNewFixture(t) // default, guarded client
+			a := eoAxAction("webhook", 1, map[string]any{"url": u, "body": "{}"})
+			err := f.exec.executeWebhook(context.Background(), &a, f.rec, eoAxTransition(a), f.actor)
+			if err == nil || !strings.Contains(err.Error(), "not allowed") {
+				t.Fatalf("err = %v, want a refusal", err)
+			}
+			// and through the dispatcher: logged, never failing the transition
+			if err := f.exec.ExecuteActions(context.Background(), f.rec, eoAxTransition(a), f.actor); err != nil {
+				t.Fatalf("ExecuteActions = %v", err)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Fatalf("the internal server was reached %d times", hits)
+	}
+}
+
+func TestEOWebhookIPAllowed(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"8.8.8.8": true, "93.184.216.34": true, "2606:4700::1111": true,
+		"127.0.0.1": false, "10.1.2.3": false, "172.16.0.1": false, "172.31.255.255": false, "192.168.0.1": false,
+		"169.254.169.254": false, "224.0.0.1": false, "0.0.0.0": false, "::1": false, "fe80::1": false, "fd12::1": false,
+		"::ffff:10.0.0.1": false,
+	} {
+		if got := eoWebhookIPAllowed(net.ParseIP(ip)); got != want {
+			t.Errorf("%s allowed = %v, want %v", ip, got, want)
+		}
+	}
+}
+
+func TestExecuteActionsWebhookDoesNotFollowRedirects(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targetHits++ }))
+	defer target.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redir.Close()
+
+	f := eoAxNewFixture(t)
+	// Same redirect policy as the real client, without the dial guard that
+	// would otherwise refuse the loopback test servers first.
+	f.exec.httpClient = &http.Client{CheckRedirect: eoWebhookNoRedirect}
+	a := eoAxAction("webhook", 1, map[string]any{"url": redir.URL, "body": "{}"})
+	err := f.exec.executeWebhook(context.Background(), &a, f.rec, eoAxTransition(a), f.actor)
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("err = %v, want a redirect refusal", err)
+	}
+	if targetHits != 0 {
+		t.Fatalf("redirect was followed")
+	}
+	if eoNewWebhookClient().CheckRedirect == nil {
+		t.Fatalf("the real client must carry the redirect policy")
 	}
 }
 
@@ -502,15 +593,58 @@ func TestSpawnRecordIdempotencyIsPerParentAndPerTargetType(t *testing.T) {
 	// A child of the same type under ANOTHER parent, and a child of ANOTHER type
 	// under this one, must not suppress the spawn.
 	other := uuid.New()
-	f.repo.children = []models.EORecord{
-		{ID: uuid.New(), RecordTypeID: f.taskType.ID, ParentRecordID: &other},
-		{ID: uuid.New(), RecordTypeID: uuid.New(), ParentRecordID: &f.rec.ID},
+	c1 := models.EORecord{ID: uuid.New(), RecordTypeID: f.taskType.ID, ParentRecordID: &other}
+	c2 := models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), ParentRecordID: &f.rec.ID}
+	f.repo.children = []models.EORecord{c1, c2}
+	f.repo.links = []models.EORecordLink{
+		{FromRecordID: c1.ID, ToRecordID: other, LinkTypeKey: "spawned_task"},
+		{FromRecordID: c2.ID, ToRecordID: f.rec.ID, LinkTypeKey: "spawned_task"},
 	}
 	if err := f.exec.ExecuteActions(context.Background(), f.rec, eoAxTransition(eoAxSpawn(1, map[string]any{"subject_ar": "x"})), f.actor); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.svc.created) != 1 {
 		t.Fatalf("created %d, want 1", len(f.svc.created))
+	}
+}
+
+func TestSpawnRecordSkipKeyIncludesTheLinkType(t *testing.T) {
+	f := eoAxNewFixture(t)
+	a := eoAxAction("spawn_record", 1, map[string]any{"target_type": "task", "link_type": "link_a", "field_map": map[string]any{"subject_ar": "x"}})
+	b := eoAxAction("spawn_record", 2, map[string]any{"target_type": "task", "link_type": "link_b", "field_map": map[string]any{"subject_ar": "x"}})
+	c := eoAxAction("spawn_record", 3, map[string]any{"target_type": "task", "link_type": "link_b", "field_map": map[string]any{"subject_ar": "x"}})
+	tr := eoAxTransition(a, b, c)
+	for i := 0; i < 2; i++ {
+		if err := f.exec.ExecuteActions(context.Background(), f.rec, tr, f.actor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var keys []string
+	for _, r := range f.svc.created {
+		keys = append(keys, r.ParentLinkTypeKey)
+	}
+	if !reflect.DeepEqual(keys, []string{"link_a", "link_b"}) {
+		t.Fatalf("created via %v, want one child per link type, and no repeats on re-run", keys)
+	}
+}
+
+func TestSpawnRecordLogsEverySkip(t *testing.T) {
+	f := eoAxNewFixture(t)
+	tr := eoAxTransition(eoAxSpawn(1, map[string]any{"subject_ar": "x"}))
+	if err := f.exec.ExecuteActions(context.Background(), f.rec, tr, f.actor); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	if err := f.exec.ExecuteActions(context.Background(), f.rec, tr, f.actor); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"SKIPPED", f.rec.Reference, `"task"`, `"spawned_task"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("skip log %q lacks %s", out, want)
+		}
 	}
 }
 

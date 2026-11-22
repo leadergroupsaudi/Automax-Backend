@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/automax/backend/internal/models"
@@ -82,7 +84,49 @@ func NewEOActionExecutor(
 	return &eoActionExecutor{
 		recordSvc: recordSvc, records: records, types: types,
 		users: users, depts: depts, notifier: notifier,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: eoNewWebhookClient(),
+	}
+}
+
+// eoWebhookIPAllowed reports whether a webhook may connect to ip. Loopback,
+// private (RFC 1918 and IPv6 ULA), link-local (which includes the
+// 169.254.169.254 metadata endpoint), multicast and unspecified addresses are
+// refused: an EO administrator configures a URL, and must not be able to point
+// the server at the network it sits in.
+func eoWebhookIPAllowed(ip net.IP) bool {
+	return !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified())
+}
+
+// eoWebhookControl runs on the dialer AFTER the hostname has been resolved,
+// against the address actually being connected to, so a name that resolves to
+// a forbidden address (including by DNS rebinding between a check and the
+// connect) is refused too.
+func eoWebhookControl(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("webhook: bad address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !eoWebhookIPAllowed(ip) {
+		return fmt.Errorf("webhook: connecting to %s is not allowed", host)
+	}
+	return nil
+}
+
+// eoWebhookNoRedirect stops a 302 from walking the request to an address the
+// first URL would not have been allowed to reach.
+func eoWebhookNoRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+func eoNewWebhookClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: eoWebhookControl}
+	return &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: eoWebhookNoRedirect,
+		// Proxy is left nil on purpose: a proxy would be the connection
+		// target, and the destination would never be checked.
+		Transport: &http.Transport{DialContext: dialer.DialContext},
 	}
 }
 
@@ -464,8 +508,8 @@ func (e *eoActionExecutor) executeWebhook(ctx context.Context, action *models.Tr
 		return fmt.Errorf("webhook request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("webhook returned error status: %d", resp.StatusCode)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook returned status %d (redirects are not followed)", resp.StatusCode)
 	}
 	return nil
 }
@@ -523,12 +567,15 @@ var eoWholePlaceholderRE = regexp.MustCompile(`^\s*\{\{\s*([A-Za-z0-9_]+)\s*\}\}
 // Idempotency. A transition must not spawn a second child when it is
 // dispatched again, so before creating anything the executor looks for an
 // existing direct child of this record of the target type, and spawns only if
-// there is none. The check is by parent and type because the marker has to
-// live somewhere that needs no schema: a child's values accept only keys its
-// type defines. The cost is that a record which legitimately re-enters the
-// transition does not spawn a second child while the first exists, and that
-// two spawn_record actions to the same target type from one record collapse
-// into one.
+// there is none. The skip key is (parent, target type, link type), found
+// through the child's link row, because the marker has to live somewhere that
+// needs no schema: a child's values accept only keys its type defines. The
+// cost is that a record which legitimately re-enters the transition does not
+// spawn a second child while the first exists, and that two spawn_record
+// actions to the same target type through the SAME link type collapse into
+// one (carried to the seeding plan: a spawned_by_action_id column on
+// eo_record_links is the real fix). A skip is always logged, naming the
+// parent, target type and link type.
 //
 // A misconfigured action — unknown target type, no link type, a field-map key
 // the target type does not define — spawns nothing, and says so twice: the
@@ -584,12 +631,13 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 		return fmt.Errorf("field_map writes %s, which %q does not define", strings.Join(unknown, ", "), cfg.TargetType)
 	}
 
-	existing, err := e.records.Children(ctx, rec.ID, &target.ID)
+	existing, err := e.spawnedChild(ctx, rec, target, cfg.LinkType)
 	if err != nil {
 		return fmt.Errorf("look for an existing child: %w", err)
 	}
-	if len(existing) > 0 {
-		log.Printf("eo: record %s: spawn_record %q skipped: already has a %q child (%s)", rec.Reference, action.Name, cfg.TargetType, existing[0].ID)
+	if existing != nil {
+		log.Printf("eo: record %s (%s): spawn_record %q SKIPPED, nothing was created: it already has a %q child (%s) linked by %q",
+			rec.Reference, rec.ID, action.Name, cfg.TargetType, existing.ID, cfg.LinkType)
 		return nil
 	}
 
@@ -621,6 +669,27 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 		return fmt.Errorf("create %q record: %w", cfg.TargetType, err)
 	}
 	return nil
+}
+
+// spawnedChild finds a direct child of rec of the target type that is tied to
+// it by this link type — the skip key is (parent, target type, link type).
+func (e *eoActionExecutor) spawnedChild(ctx context.Context, rec *models.EORecord, target *models.EORecordType, linkType string) (*models.EORecord, error) {
+	children, err := e.records.Children(ctx, rec.ID, &target.ID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range children {
+		links, err := e.records.LinksFrom(ctx, children[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range links {
+			if l.LinkTypeKey == linkType && l.ToRecordID == rec.ID {
+				return &children[i], nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (e *eoActionExecutor) recordSpawnFailure(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User, cause error) {
