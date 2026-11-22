@@ -91,8 +91,8 @@ func (f *eoSvcRecordRepo) EnteredStateIDs(_ context.Context, _, _ uuid.UUID) (ma
 	return f.entered, nil
 }
 
-func (f *eoSvcRecordRepo) Transaction(ctx context.Context, fn func(repository.EORecordRepository) error) error {
-	return fn(f)
+func (f *eoSvcRecordRepo) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository) error) error {
+	return fn(f, nil)
 }
 
 type eoSvcTypeRepo struct {

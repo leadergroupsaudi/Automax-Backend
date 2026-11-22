@@ -40,6 +40,9 @@ type eoTxRecordRepo struct {
 	// a pool-starvation deadlock waiting to happen, and the two counters are
 	// what makes that visible.
 	childrenTotal int
+	// txTypes is the transaction-bound type repository Transaction hands its
+	// closure: the same data as the service's, but a distinct object.
+	txTypes repository.EORecordTypeRepository
 	childrenInTx  int
 	// getAnyTotal / getAnyInTx do the same for GetAnyByID, which is how an
 	// ancestor-scoped roll-up walks upwards — the other half of the same
@@ -128,13 +131,16 @@ func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.E
 	return b.eoTxRecordRepo.GetAnyByID(ctx, id)
 }
 
-func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository) error) error {
-	if err := fn(&eoTxBoundRepo{f}); err != nil {
+func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository) error) error {
+	if err := fn(&eoTxBoundRepo{f}, f.txTypes); err != nil {
 		return err
 	}
 	f.committed = true
 	return nil
 }
+
+// eoTxBoundTypes is the type repository as the transaction sees it.
+type eoTxBoundTypes struct{ *eoTxTypeRepo }
 
 type eoTxTypeRepo struct {
 	repository.EORecordTypeRepository
@@ -273,6 +279,7 @@ func eoNewTxFixture(t *testing.T) *eoTxFixture {
 		},
 		role: models.Role{ID: uuid.New(), Code: "executive_office"},
 	}
+	f.records.txTypes = &eoTxBoundTypes{f.types}
 	f.actions = &eoTxActionSpy{records: f.records}
 	f.actor = &models.User{ID: uuid.New(), Username: "eo.officer", Roles: []models.Role{f.role}}
 

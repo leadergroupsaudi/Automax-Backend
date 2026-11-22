@@ -261,7 +261,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	ctx = WithEOActor(ctx, actor)
 
 	var updated *models.EORecord
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository) error {
 		// The row lock is the FIRST statement in the transaction: a
 		// transaction alone does not serialise two transitions under READ
 		// COMMITTED, and a doubly-executed transition would dispatch its
@@ -294,7 +294,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		}
 
 		// 4. open children that block this move (spec §7.6).
-		if err := s.checkBlockingChildren(ctx, r, fresh, transition, toState); err != nil {
+		if err := s.checkBlockingChildren(ctx, r, rt, fresh, transition, toState); err != nil {
 			return err
 		}
 
@@ -365,7 +365,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// lock_timeout does not bound that. It would also put those reads
 		// outside the transaction. (The save pipeline recomputes BEFORE
 		// opening its transaction, so it is no precedent for doing otherwise.)
-		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: s.types})
+		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: rt})
 		if err := eoCapabilitiesDerive(ctx, caps, fresh); err != nil {
 			return err
 		}
@@ -653,7 +653,7 @@ func eoRequirementError(req models.TransitionRequirement, fallback string) error
 // end of a link by membership in the slice and ignores links whose endpoints
 // are both inside it, so a transitive descendant set would silently stop
 // blocking.
-func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repository.EORecordRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) error {
+func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) error {
 	children, err := r.Children(ctx, rec.ID, nil)
 	if err != nil {
 		return err
@@ -690,7 +690,7 @@ func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repos
 		if _, ok := linkTypes[l.LinkTypeKey]; ok {
 			continue
 		}
-		lt, err := s.types.GetLinkTypeByKey(ctx, l.LinkTypeKey)
+		lt, err := types.GetLinkTypeByKey(ctx, l.LinkTypeKey)
 		if err != nil {
 			return err
 		}

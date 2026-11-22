@@ -105,7 +105,7 @@ func TestEOLockForUpdateMissingRecord(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := repo.Transaction(ctx, func(r EORecordRepository) error {
+			err := repo.Transaction(ctx, func(r EORecordRepository, _ EORecordTypeRepository) error {
 				got, err := r.LockForUpdate(ctx, tc.id, tc.typeID)
 				if err != nil {
 					return err

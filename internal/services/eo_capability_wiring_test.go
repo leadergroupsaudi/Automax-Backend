@@ -232,13 +232,15 @@ type eoInTxRecords struct {
 	open *bool
 }
 
-func (r eoInTxRecords) Transaction(ctx context.Context, fn func(repository.EORecordRepository) error) error {
+func (r eoInTxRecords) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository) error) error {
 	*r.open = true
 	defer func() { *r.open = false }()
 	return r.eoTxRecordRepo.Transaction(ctx, fn)
 }
 
-// eoInTxTypes counts type-repository reads taken while a transaction is open.
+// eoInTxTypes is the POOLED type repository, recording every read taken while
+// a transaction is open. The transaction-bound one is a different object
+// (eoTxBoundTypes), so a read that reaches this one went to the wrong handle.
 type eoInTxTypes struct {
 	*eoTxTypeRepo
 	open *bool
@@ -256,6 +258,11 @@ func (r eoInTxTypes) GetByID(ctx context.Context, id uuid.UUID) (*models.EORecor
 	return r.eoTxTypeRepo.GetByID(ctx, id)
 }
 
+func (r eoInTxTypes) GetByKey(ctx context.Context, key string) (*models.EORecordType, error) {
+	r.note("GetByKey")
+	return r.eoTxTypeRepo.GetByKey(ctx, key)
+}
+
 func (r eoInTxTypes) Ancestors(ctx context.Context, t *models.EORecordType) ([]models.EORecordType, error) {
 	r.note("Ancestors")
 	return r.eoTxTypeRepo.Ancestors(ctx, t)
@@ -266,18 +273,44 @@ func (r eoInTxTypes) FieldDefs(ctx context.Context, ids []uuid.UUID) ([]models.E
 	return r.eoTxTypeRepo.FieldDefs(ctx, ids)
 }
 
-// The capability list and the effective fields are read on the pooled handle
-// BEFORE the transaction, never inside it.
+func (r eoInTxTypes) GetLinkTypeByKey(ctx context.Context, key string) (*models.EOLinkType, error) {
+	r.note("GetLinkTypeByKey")
+	return r.eoTxTypeRepo.GetLinkTypeByKey(ctx, key)
+}
+
+// Inside the transaction every repository read goes through the
+// transaction-bound handles. The scenario exercises each read the pipeline can
+// make there: the effective fields and capability list (read before it), the
+// link types behind blocking children, and the type lookups of a roll-up.
 func TestTransitionReadsTypeAndFieldsBeforeTheTransaction(t *testing.T) {
 	f := eoNewTxFixture(t)
+	f.rec.StateID = &f.draft.ID
+	f.records.stored[f.rec.ID] = f.rec
+
+	stage := &models.EORecordType{ID: uuid.New(), Key: "eo_stage", Name: "Stage", IsActive: true}
+	f.types.types[stage.ID] = stage
+	f.types.linkTypes["note_on"] = &models.EOLinkType{Key: "note_on"}
+	child := f.addChild("note_on", false)
+	f.records.children[f.rec.ID][0].RecordTypeID = stage.ID
+	f.records.children[f.rec.ID][0].Values = datatypes.JSON(`{"weeks":2}`)
+	_ = child
+	total := eoDerivedField("total_weeks", "children_eo_stage_sum_weeks",
+		[]map[string]any{{"scope": "child", "type": "eo_stage", "field": "weeks", "aggregates": []string{"sum"}}})
+	total.ID, total.RecordTypeID, total.Kind = uuid.New(), f.recordType.ID, models.EOKindNumber
+	f.types.defs = append(f.types.defs, total)
+
 	open := false
 	var inTx []string
 	svc := NewEOTransitionService(
 		eoInTxRecords{f.records, &open},
 		eoInTxTypes{eoTxTypeRepo: f.types, open: &open, inTx: &inTx},
 		f.workflows, f.actions)
-	if _, err := svc.Execute(context.Background(), f.rec, f.transition("raise").ID, f.actor, models.EOTransitionInput{}); err != nil {
+	got, err := svc.Execute(context.Background(), f.rec, f.transition("submit").ID, f.actor, models.EOTransitionInput{})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if eoSvcValues(t, got.Values)["total_weeks"] != 2.0 {
+		t.Fatalf("the roll-up did not run, so the probe proved nothing for it: %s", got.Values)
 	}
 	if len(inTx) != 0 {
 		t.Fatalf("pooled type reads inside the transaction: %v", inTx)

@@ -71,10 +71,16 @@ type EORecordRepository interface {
 	// whether a record has ever been in a state, and EO workflows have return
 	// and exception paths, so the two answers differ.
 	EnteredStateIDs(ctx context.Context, recordID, recordTypeID uuid.UUID) (map[uuid.UUID]bool, error)
-	// Transaction runs fn against a repository bound to one database
-	// transaction, committing when fn returns nil and rolling back otherwise.
-	// A record, its parent link and its first history entry are one write.
-	Transaction(ctx context.Context, fn func(EORecordRepository) error) error
+	// Transaction runs fn against a record repository AND a record-type
+	// repository, both bound to one database transaction, committing when fn
+	// returns nil and rolling back otherwise. A record, its parent link and its
+	// first history entry are one write.
+	//
+	// Inside fn, every read must go through these two handles. A read on a
+	// pooled repository takes a second connection while the transaction holds
+	// its own plus a row lock, and database/sql waits for a free one forever
+	// when the pool is capped.
+	Transaction(ctx context.Context, fn func(EORecordRepository, EORecordTypeRepository) error) error
 }
 
 type eoRecordRepository struct {
@@ -260,9 +266,9 @@ func (r *eoRecordRepository) EnteredStateIDs(ctx context.Context, recordID, reco
 	return out, nil
 }
 
-func (r *eoRecordRepository) Transaction(ctx context.Context, fn func(EORecordRepository) error) error {
+func (r *eoRecordRepository) Transaction(ctx context.Context, fn func(EORecordRepository, EORecordTypeRepository) error) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return fn(&eoRecordRepository{db: tx})
+		return fn(&eoRecordRepository{db: tx}, &eoRecordTypeRepository{db: tx})
 	})
 }
 
