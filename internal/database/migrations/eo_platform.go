@@ -197,6 +197,23 @@ func MigrateEOPlatform(db *gorm.DB) error {
 		return err
 	}
 
+	// One row per numbering scope (see services.EOSequenceScope). The counter
+	// only ever moves forward and is never derived from eo_records, so
+	// soft-deleting a record can never free its number for reuse.
+	sequencesSQL := `
+	CREATE TABLE IF NOT EXISTS eo_reference_sequences (
+		scope VARCHAR(500) NOT NULL,
+		seq   BIGINT NOT NULL DEFAULT 0,
+		CONSTRAINT pk_eo_reference_sequences PRIMARY KEY (scope)
+	);
+	`
+	if err := db.Exec(sequencesSQL).Error; err != nil {
+		return fmt.Errorf("eo platform: create eo_reference_sequences: %w", err)
+	}
+	if err := assertColumns(db, "eo_reference_sequences", eoReferenceSequencesColumns); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -285,6 +302,11 @@ var (
 		{"new_values", "jsonb", 0, false},
 		{"is_system_action", "boolean", 0, false},
 		{"created_at", "timestamp with time zone", 0, false},
+	}
+
+	eoReferenceSequencesColumns = []eoColumn{
+		{"scope", "character varying", 500, false},
+		{"seq", "bigint", 0, false},
 	}
 )
 
