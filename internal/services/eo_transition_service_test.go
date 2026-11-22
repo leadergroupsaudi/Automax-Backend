@@ -41,6 +41,11 @@ type eoTxRecordRepo struct {
 	// what makes that visible.
 	childrenTotal int
 	childrenInTx  int
+	// getAnyTotal / getAnyInTx do the same for GetAnyByID, which is how an
+	// ancestor-scoped roll-up walks upwards — the other half of the same
+	// deadlock class.
+	getAnyTotal int
+	getAnyInTx  int
 }
 
 func (f *eoTxRecordRepo) LockForUpdate(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
@@ -64,6 +69,7 @@ func (f *eoTxRecordRepo) GetByID(_ context.Context, id, recordTypeID uuid.UUID) 
 }
 
 func (f *eoTxRecordRepo) GetAnyByID(_ context.Context, id uuid.UUID) (*models.EORecord, error) {
+	f.getAnyTotal++
 	rec, ok := f.stored[id]
 	if !ok {
 		return nil, nil
@@ -115,6 +121,11 @@ type eoTxBoundRepo struct {
 func (b *eoTxBoundRepo) Children(ctx context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error) {
 	b.eoTxRecordRepo.childrenInTx++
 	return b.eoTxRecordRepo.Children(ctx, parentID, recordTypeID)
+}
+
+func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.EORecord, error) {
+	b.eoTxRecordRepo.getAnyInTx++
+	return b.eoTxRecordRepo.GetAnyByID(ctx, id)
 }
 
 func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository) error) error {
@@ -1242,6 +1253,75 @@ func TestExecuteLockedFieldIsComparedAgainstThePreTransitionValue(t *testing.T) 
 			t.Fatalf("echoing the stored assignee was refused as a locked-field change: %v", err)
 		}
 	})
+
+	t.Run("a genuine third value is still refused", func(t *testing.T) {
+		f := build(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{
+			Values: map[string]any{"assigned_user_id": uuid.New().String()},
+		}); err == nil {
+			t.Fatal("a locked assignee was reassigned to a new user")
+		}
+	})
+}
+
+func TestExecuteStaticAssignmentSatisfiesRequiredness(t *testing.T) {
+	// The lock comparand must be the PRE-transition value, but the
+	// requiredness check asks a different question of the same map: what will
+	// this field hold once the transition is done. Hiding the static
+	// assignment from BOTH is how "assigned_user_id is required" gets raised
+	// against a transition whose entire job is to assign it.
+	assignee := uuid.New()
+
+	build := func(t *testing.T) *eoTxFixture {
+		t.Helper()
+		f := eoNewTxFixture(t)
+		required := eoTxField("assigned_user_id", models.EOKindUser, models.EORequiredAtState, f.recordType.ID)
+		required.RequiredAtStateIDs = datatypes.JSON(`["` + f.escalated.ID.String() + `"]`)
+		f.types.defs = append(f.types.defs, required)
+		return f
+	}
+
+	t.Run("the transition assigns it, so it is not missing", func(t *testing.T) {
+		f := build(t)
+		// Unassigned record, and the transition declares no field change:
+		// the static assignment is the only thing that fills the field.
+		f.transition("raise").AssignUserID = &assignee
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err != nil {
+			t.Fatalf("a transition carrying the assignment was told the assignee is missing: %v", err)
+		}
+		if rec.AssignedUserID == nil || *rec.AssignedUserID != assignee {
+			t.Errorf("assigned_user_id = %v, want %s", rec.AssignedUserID, assignee)
+		}
+	})
+
+	t.Run("without the assignment it really is missing", func(t *testing.T) {
+		f := build(t)
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err == nil {
+			t.Fatal("an unassigned record reached a state that requires an assignee")
+		}
+		if fields := eoTxFieldErrors(t, err); fields["assigned_user_id"] == "" {
+			t.Fatalf("field errors = %v, want assigned_user_id required", fields)
+		}
+	})
+
+	t.Run("a required-always field the transition assigns", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		body := uuid.New()
+		f.types.defs = append(f.types.defs,
+			eoTxField("owning_body_id", models.EOKindOrgUnit, models.EORequiredAlways, f.recordType.ID))
+		f.transition("raise").AssignDepartmentID = &body
+
+		rec, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err != nil {
+			t.Fatalf("a transition carrying the owning body was told it is missing: %v", err)
+		}
+		if rec.OwningBodyID == nil || *rec.OwningBodyID != body {
+			t.Errorf("owning_body_id = %v, want %s", rec.OwningBodyID, body)
+		}
+	})
 }
 
 func TestExecuteRecomputesDerivedThroughTheTransaction(t *testing.T) {
@@ -1264,21 +1344,47 @@ func TestExecuteRecomputesDerivedThroughTheTransaction(t *testing.T) {
 	total := eoDerivedField("total_weeks", "children_eo_stage_sum_weeks",
 		[]map[string]any{{"scope": "child", "type": "eo_stage", "field": "weeks", "aggregates": []string{"sum"}}})
 	total.ID, total.RecordTypeID, total.Kind = uuid.New(), f.recordType.ID, models.EOKindNumber
-	f.types.defs = append(f.types.defs, total)
+
+	// An ancestor-scoped roll-up walks upwards through GetAnyByID, which is
+	// the other half of the same deadlock class.
+	programme := &models.EORecordType{ID: uuid.New(), Key: "eo_programme", Name: "Programme", IsActive: true}
+	f.types.types[programme.ID] = programme
+	parent := &models.EORecord{
+		ID: uuid.New(), RecordTypeID: programme.ID, Reference: "PROG-1",
+		Values: datatypes.JSON(`{"code":"P-7"}`),
+	}
+	f.records.stored[parent.ID] = parent
+	f.rec.ParentRecordID = &parent.ID
+	f.records.stored[f.rec.ID] = f.rec
+
+	inherited := eoDerivedField("programme_code", "ancestor_eo_programme_code",
+		[]map[string]any{{"scope": "ancestor", "type": "eo_programme", "field": "code"}})
+	inherited.ID, inherited.RecordTypeID, inherited.Kind = uuid.New(), f.recordType.ID, models.EOKindText
+
+	f.types.defs = append(f.types.defs, total, inherited)
 
 	rec, err := f.run("submit", f.actor, models.EOTransitionInput{})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if got := eoTxValues(t, rec.Values)["total_weeks"]; got != 5.0 {
-		t.Fatalf("total_weeks = %v, want 5 rolled up from the children", got)
+	values := eoTxValues(t, rec.Values)
+	if values["total_weeks"] != 5.0 {
+		t.Fatalf("total_weeks = %v, want 5 rolled up from the children", values["total_weeks"])
 	}
-	if f.records.childrenTotal == 0 {
-		t.Fatal("no child read happened at all; the roll-up did not run")
+	if values["programme_code"] != "P-7" {
+		t.Fatalf("programme_code = %v, want P-7 read from the ancestor", values["programme_code"])
+	}
+	if f.records.childrenTotal == 0 || f.records.getAnyTotal == 0 {
+		t.Fatalf("child reads = %d, ancestor reads = %d; the roll-ups did not run",
+			f.records.childrenTotal, f.records.getAnyTotal)
 	}
 	if f.records.childrenInTx != f.records.childrenTotal {
 		t.Errorf("child reads: %d of %d went through the transaction — the rest took a second pooled connection while this one holds a row lock",
 			f.records.childrenInTx, f.records.childrenTotal)
+	}
+	if f.records.getAnyInTx != f.records.getAnyTotal {
+		t.Errorf("ancestor reads: %d of %d went through the transaction — the rest took a second pooled connection while this one holds a row lock",
+			f.records.getAnyInTx, f.records.getAnyTotal)
 	}
 }
 

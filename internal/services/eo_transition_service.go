@@ -738,7 +738,8 @@ func (s *eoTransitionService) applyFieldChanges(
 	if err != nil {
 		return err
 	}
-	fieldErrs, err := ValidateRecordValues(fields, stored, input.Values, &transition.ToStateID, entered, s.eval)
+	baseline := eoValidationBaseline(stored, eoFlattenStored(rec), input.Values)
+	fieldErrs, err := ValidateRecordValues(fields, baseline, input.Values, &transition.ToStateID, entered, s.eval)
 	if err != nil {
 		return err
 	}
@@ -746,6 +747,41 @@ func (s *eoTransitionService) applyFieldChanges(
 		return err
 	}
 	return eoValidationError(eoApplyValues(rec, input.Values))
+}
+
+// eoValidationBaseline builds the one `stored` map ValidateRecordValues takes,
+// which it reads for two different questions that want two different answers
+// once the engine has written something of its own (today: the transition's
+// static assignment).
+//
+//   - The locked-field check compares a SUBMITTED value against stored[key]
+//     to decide whether it is a change. That comparand must be the value the
+//     record held BEFORE this transition touched anything, or the field the
+//     engine just wrote looks unchanged and slips past its own lock.
+//   - Requiredness reads stored[key] as the effective value of a key that was
+//     NOT submitted. That one must be the value the record will actually hold,
+//     or a transition whose whole job is to assign an assignee is told the
+//     assignee is missing.
+//
+// The two never collide on one key, because each is read in the branch the
+// other is not: the lock comparand only when the key is submitted, the
+// effective value only when it is not (eo_fields.go:164-174). So the baseline
+// is `before`, with `current` overlaid for exactly the keys the actor did not
+// submit.
+//
+// before is not modified — the history diff still needs it as the
+// pre-transition snapshot.
+func eoValidationBaseline(before, current, submitted map[string]any) map[string]any {
+	out := make(map[string]any, len(before))
+	for k, v := range before {
+		out[k] = v
+	}
+	for k, v := range current {
+		if _, wasSubmitted := submitted[k]; !wasSubmitted {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // effectiveFields resolves a record type's own fields plus every ancestor's.
