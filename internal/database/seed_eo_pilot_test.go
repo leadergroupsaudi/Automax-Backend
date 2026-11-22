@@ -687,7 +687,7 @@ type eoMatrixRow struct {
 // the helpers below see the inherited table alone for that type — which is
 // the truth: its seventeen inherited fields ARE described by the client's
 // document and its own four are not. What guards the four instead is
-// eoStageMatrixlessFields, the roll-up test that reads `weeks` by name, and
+// eoStageMatrixFields, the roll-up test that reads `weeks` by name, and
 // the shape rules every seeded field passes.
 var eoMatrixSections = map[string]string{
 	eoDirectiveTypeKey:     "Directive",
@@ -2328,7 +2328,7 @@ func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
 	}
 	for _, typeKey := range eoPilotChildTypeKeys() {
 		if typeKey == eoStageTypeKey {
-			continue // no matrix section; eoStageMatrixlessFields holds it
+			continue // no matrix section; eoStageMatrixFields holds it
 		}
 		t.Run(typeKey, func(t *testing.T) {
 			rows := matrix[eoMatrixSections[typeKey]]
@@ -2897,6 +2897,27 @@ func TestEoReferralVisibilityIsEnforcedByTheLiveClause(t *testing.T) {
 			def.Provenance, def.Formula)
 	}
 
+	// THE SINGLE FACT THE WHOLE CONTROL RESTS ON, asserted where the control
+	// is tested rather than only in the matrix sweep, which lives in another
+	// test that never mentions visibility.
+	//
+	// services.eoEnvValue DROPS a blank string from the derive environment,
+	// so a Referral saved with an empty `referred_body` does not evaluate the
+	// formula to "" — it raises eoformula.ErrUnresolvedReference, the derived
+	// key is left out of the result, and eoApplyDerived LOGS AND CARRIES ON
+	// (it never blocks a save). The record is then stored with no visible_to
+	// at all, and repository.applyEORecordVisibility treats an absent key as
+	// UNRESTRICTED. The derivation therefore FAILS OPEN, and
+	// `referred_body` being required at creation is the only thing standing
+	// between a blank body and a referral the whole organisation can read.
+	//
+	// Mutation: change `referred_body`'s `required:` in eoPilotChildTypes
+	// from models.EORequiredAlways to models.EORequiredNever.
+	if src := eoEffectiveField(t, db, eoReferralTypeKey, "referred_body"); src.RequiredMode != models.EORequiredAlways {
+		t.Errorf("referred_body is %q, want %q: the visibility key is derived from it and a blank body derives NOTHING, which the repository reads as unrestricted",
+			src.RequiredMode, models.EORequiredAlways)
+	}
+
 	// The formula resolves against the type's own values.
 	referred, other := uuid.New(), uuid.New()
 	got, err := eoformula.New(0).Eval(def.Formula, eoReferralVisibilityEnv(t, db, referred.String()))
@@ -2976,10 +2997,15 @@ func TestEoReferralVisibilityIsEnforcedByTheLiveClause(t *testing.T) {
 		})
 	}
 
-	// The control that makes the first row mean something: the SAME records
+	// The control that makes the rows above mean something: the SAME records
 	// stored under the matrix's spelling are visible to everyone, because the
 	// clause reads a key that is then not there. This is the bug the fix
 	// closes, reproduced.
+	//
+	// IT IS AN ATTRIBUTION, NOT A REVERT DETECTOR. Reverting the production
+	// fix trips the t.Fatalf at the top of this function and the subtest
+	// below never runs; what it proves is that the passing rows above are
+	// caused by the KEY NAME and not by some other property of the records.
 	t.Run("stored under the matrix spelling, nothing is restricted", func(t *testing.T) {
 		mk("IN-2026-0002-R1", `{"visibility":"`+referred.String()+`"}`)
 		got := list(models.EORecordFilter{UserID: uuid.New(), VisibleToDepartmentIDs: []uuid.UUID{uuid.New()}})

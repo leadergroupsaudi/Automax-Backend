@@ -207,8 +207,10 @@ in the link-type model can express "a record of this type must have a parent".
 A4 should seed its link types and leave this item OPEN; closing it means a rule
 in the create path (a type that declares a parent link must be created with
 one), and whoever does it owns the decision about Task, whose parent may be of
-any type in any subsystem. Recorded in `eoEngineKeyDecisions` with the same
-words.
+any type in any subsystem. `eoEngineKeyDecisions` (`eo_task.parent_ticket`) and
+`eoChildConditionalDecisions` (`eo_decision_record.parent_ticket`) now say the
+same; until fix round 2 both still pointed at A4's link type as the answer,
+which is the kind of cross-reference a later task ticks off without reading.
 
 **The matrix has five "one per parent" child types whose reference patterns
 cannot be rendered, and the fix is engine work, not five edits (owner: engine,
@@ -293,9 +295,39 @@ spelling, `visibility`, which the engine has never heard of: the configuration
 looked like a confidentiality control and every Referral in a government
 register would have been visible to everyone. It is now seeded under
 `visible_to`, provenance `derived`, formula `referred_body` — the matrix's "the
-referred body only" computed on every save — and proved end to end against the
-live clause. **Nothing here is outstanding; the entry is kept so that nobody
-rediscovers the false version of it.**
+referred body only" computed on every save — and the control is exercised
+against the live repository clause, with a record stored under the old
+spelling kept as a control to show the engine really does not read it. The
+entry is kept so that nobody rediscovers the false version of it.
+
+**What is NOT closed: the control FAILS OPEN, and one field's requiredness is
+what holds it shut.** `repository.applyEORecordVisibility` treats an ABSENT
+`visible_to` as unrestricted, and `services.eoApplyDerived` never blocks a
+save — a derived field that cannot resolve is logged and dropped. So a Referral
+whose `visible_to` fails to derive is stored readable by everyone, with a line
+in the log and no error to the caller. The thing that prevents it is that
+`referred_body` is `required_mode: always` on this type: `services.eoEnvValue`
+drops a blank string from the derive environment, so a blank body does not
+evaluate to `""` — it raises `ErrUnresolvedReference` and the key goes absent.
+**Changing `referred_body` to optional silently opens every referral saved
+without one**; `TestEoReferralVisibilityIsEnforcedByTheLiveClause` asserts the
+requiredness for that reason, and the seed comment says the same.
+
+Two things narrow the window, both verified: a non-empty but WRONG
+`visible_to` fails closed (`->>` yields a string matching no body, so only the
+creator and admins see the record), and a later failed recompute cannot re-open
+an already-restricted record, because `eoApplyValues` merges and never deletes,
+so the stale value survives. The exposure is first-save only.
+
+**Outstanding, and it is an ENGINE question rather than a configuration one: a
+restriction key that fails to derive should refuse the save.** Today the derive
+pipeline has one policy for every derived field — compute what you can, log the
+rest — which is right for a roll-up that is merely stale and wrong for a key
+that decides who may read the record. Either derived fields gain a
+"required to resolve" flag that makes `eoApplyDerived` fail the save, or
+row-level visibility stops depending on a derived value. Until one of those,
+the configuration is as tight as configuration can make it and the residual
+risk is in the engine.
 
 **Task A5 must call `eoLockDraftFieldsAfterState` or delete it.** The Draft
 Decision Study's `draft_text` and `draft_file` are the pilot's only field-level

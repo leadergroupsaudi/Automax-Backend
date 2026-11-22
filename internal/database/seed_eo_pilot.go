@@ -84,11 +84,13 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// TASK A3's five. Each is a matrix cell an ENGINE MECHANISM reads or
 	// writes UNDER A DIFFERENT SPELLING — four of them an eo_records COLUMN,
 	// and one (`visibility`) a values-bag key the repository reads by a name
-	// of its own. Seeded under the matrix spelling each would be a values-bag key
-	// that shadows nothing, sitting empty beside the column the engine had
-	// already written — and nothing would report the discrepancy. See
-	// eoEngineKeyDecisions, which names the mechanism for each and is
-	// checked against the seeded rows.
+	// of its own. Seeded under the matrix spelling, the four WRITTEN ones
+	// would be values-bag keys that shadow nothing, sitting empty beside the
+	// column the engine had already written; the one READ one would be a
+	// confidentiality control that looks configured while the mechanism
+	// searches for a word that is not there. Nothing reports either. See
+	// eoEngineKeyDecisions, which names the mechanism for each, says which
+	// direction the value travels, and is checked against the seeded rows.
 	//
 	// Referral's `deadline` is "Derived / Counted back from the sender's
 	// deadline" (matrix:300) and services.DeriveDeadlineFromParent, the only
@@ -135,8 +137,15 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 }
 
 // eoMatrixKey translates a key as the client's field matrix spells it into the
-// engine's. A pilot type's fields must be seeded under engineKey: a field
-// keyed with the matrix spelling lands in the values bag and shadows nothing.
+// engine's. A pilot type's fields must be seeded under engineKey.
+//
+// WHAT GOES WRONG WITHOUT IT depends on which way the value travels, and the
+// column story is only one of the two. A key the engine WRITES, seeded under
+// the matrix spelling, lands in the values bag and shadows nothing: the clerk
+// reads an empty field beside the column the engine already filled. A key the
+// engine READS — Referral's `visibility`, which the repository knows as
+// `visible_to` — is worse: the configuration looks enforced while the
+// mechanism searches for a word that is not there. See eoEngineKeyDecisions.
 //
 //	isColumn        — the value lives in an eo_records column.
 //	isEngineManaged — the engine owns the key (see eoMatrixKeyEntry).
@@ -1433,7 +1442,7 @@ var eoEngineKeyDecisions = []eoEngineKeyDecision{
 	{eoTaskTypeKey, "parent_ticket", "parent_record_id", true, "Yes",
 		"the create request's parent_record_id",
 		models.EORequiredNever, models.EOProvenanceAuto,
-		"The matrix marks it Yes — \"Hangs off anything, including across subsystems\" — and the key is the parent_record_id COLUMN, whose base definition is provenance `auto` because the client chooses the parent on the create REQUEST, not as a value. services.ValidateRecordValues EXEMPTS auto fields from requiredness entirely (it rejects a submitted value and moves on before the required check), so `always` here would be configuration that looks like enforcement and can never refuse anything — this programme's signature defect. It is seeded `never` and the requirement is recorded here instead. WHAT DOES ENFORCE IT: the four parent-derived types and the stage type cannot be created without a parent at all, because services.RenderReference refuses a parent-derived pattern with no parent reference (TestEoPilotReferencePatternsRenderAndRefuse pins this). Task takes its OWN sequence, so that refusal does not apply to it: nothing today stops a parentless Task. Task A4's link type for Task — target `any`, blocks_parent_closure — is where that becomes real."},
+		"The matrix marks it Yes — \"Hangs off anything, including across subsystems\" — and the key is the parent_record_id COLUMN, whose base definition is provenance `auto` because the client chooses the parent on the create REQUEST, not as a value. services.ValidateRecordValues EXEMPTS auto fields from requiredness entirely (it rejects a submitted value and moves on before the required check), so `always` here would be configuration that looks like enforcement and can never refuse anything — this programme's signature defect. It is seeded `never` and the requirement is recorded here instead. WHAT DOES ENFORCE IT: the four parent-derived types and the stage type cannot be created without a parent at all, because services.RenderReference refuses a parent-derived pattern with no parent reference (TestEoPilotReferencePatternsRenderAndRefuse pins this). Task takes its OWN sequence, so that refusal does not apply to it: nothing today stops a parentless Task. CLOSING IT NEEDS A CREATE-PATH RULE, AND A LINK TYPE CANNOT DO IT: EOLinkType.Cardinality is an UPPER bound (services.ValidateLink reads it as \"at most one outgoing link of this type\"), and ValidateLink is only reached when a parent was supplied at all — eoRecordService.applyLinkRules returns early on a nil parent. So Task A4 should seed Task's polymorphic link type and leave this item OPEN; the work is a rule in the create path, and whoever writes it owns the Task question, whose parent may be of any type in any subsystem."},
 
 	{eoTaskTypeKey, "due_date", "due_date", true, "Yes",
 		"the clerk types it; services.eoRecordColumnWriters writes rec.DueDate",
@@ -1735,11 +1744,25 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			// visible_to, so no clerk can widen or narrow the visibility of
 			// their own referral.
 			//
-			// It cannot do worse than `auto`: if the formula ever failed to
-			// resolve, the key would be absent and the record unrestricted,
-			// which is exactly what `auto` with nothing writing it gives.
-			// `referred_body` is required `always` on this type, so on any
-			// save that succeeds the formula has its input.
+			// IT FAILS OPEN, and `referred_body` being `always` is what
+			// holds it shut. applyEORecordVisibility reads an ABSENT
+			// visible_to as unrestricted, and eoApplyDerived never blocks a
+			// save — a derived field that cannot resolve is logged and
+			// dropped. services.eoEnvValue also DROPS a blank string from the
+			// env, so a blank referred_body does not evaluate to "": it
+			// raises ErrUnresolvedReference and the key goes absent. The
+			// requiredness below is therefore load-bearing, not incidental,
+			// and TestEoReferralVisibilityIsEnforcedByTheLiveClause asserts
+			// it beside this field for exactly that reason.
+			//
+			// The exposure is FIRST SAVE ONLY: a non-empty but wrong value
+			// fails closed (it matches no body, so only the creator and
+			// admins see the record), and a later failed recompute cannot
+			// re-open a restricted record, because eoApplyValues merges and
+			// never deletes. It still cannot do worse than `auto`, which
+			// leaves the key absent on every save rather than on one.
+			// Whether the engine should REFUSE a save whose restriction key
+			// did not derive is carried forward as an engine question.
 			{matrixKey: "visibility", label: "Visible to",
 				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceDerived, required: models.EORequiredNever,
 				formula:     "referred_body",
@@ -1943,7 +1966,7 @@ func eoChildConditionalDecisions() []eoConditionalDecision {
 		{eoDecisionTypeKey, "parent_ticket",
 			"Mandatory on every sub and sub-sub type.",
 			models.EORequiredNever,
-			"True for this type and ENFORCED BY NOTHING, unlike the parent-derived sub types: a Decision Record takes its own DEC sequence, so RenderReference never asks for a parent reference and a parentless record numbers cleanly. The matrix's own `source_study` row (Auto, \"The parent draft study\") is the same statement from the other side, and it is the narrowing of parent_record_id. Closing this needs the link type Task A4 seeds, or a create-path rule that a type with a configured parent link must have a parent; requiredness on an auto field cannot."},
+			"True for this type and ENFORCED BY NOTHING, unlike the parent-derived sub types: a Decision Record takes its own DEC sequence, so RenderReference never asks for a parent reference and a parentless record numbers cleanly. The matrix's own `source_study` row (Auto, \"The parent draft study\") is the same statement from the other side, and it is the narrowing of parent_record_id. Closing this needs a CREATE-PATH RULE — a type that declares a parent link must be created with one. Requiredness on an auto field cannot do it, and NEITHER CAN A LINK TYPE: Cardinality is an upper bound (\"at most one\"), and services.ValidateLink is only reached when a parent was supplied, because applyLinkRules returns early on a nil parent. See eo_task.parent_ticket in eoEngineKeyDecisions, which says the same."},
 		{eoOutgoingTypeKey, "parent_ticket",
 			"Mandatory on every sub and sub-sub type.",
 			models.EORequiredNever,
