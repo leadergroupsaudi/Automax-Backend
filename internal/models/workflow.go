@@ -20,6 +20,8 @@ type Workflow struct {
 	IsActive      bool      `gorm:"default:true" json:"is_active"`
 	IsDefault     bool      `gorm:"default:false" json:"is_default"`
 	RecordType    string    `gorm:"size:20;default:'incident'" json:"record_type"` // 'incident', 'request', 'complaint', 'query', 'evidence', 'both', 'all'
+	// RecordTypeID binds an EO record type to this workflow. Nullable: existing rows keep the RecordType string.
+	RecordTypeID *uuid.UUID `gorm:"type:uuid;index" json:"record_type_id,omitempty"`
 
 	// Matching criteria - stored as JSON arrays, empty/null means matches any value
 	// Sources: ["email", "phone", "web", "mobile", "emergency_hotline", etc.]
