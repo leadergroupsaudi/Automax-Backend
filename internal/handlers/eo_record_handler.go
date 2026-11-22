@@ -340,16 +340,27 @@ func (h *EORecordHandler) Update(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
 	}
-	if req.RecordTypeID == uuid.Nil {
-		// The primary key is composite; the service reads the record with it.
-		// It is taken from the stored record rather than demanded of the
-		// caller when it can be resolved.
-		stored, loaded, loadErr := h.eoLoadRecord(c, id, user)
-		if !loaded {
-			return loadErr
-		}
-		req.RecordTypeID = stored.RecordTypeID
+	// The record is loaded under the CALLER'S SCOPE unconditionally, before
+	// anything else. It is not enough to do this only when the body omits
+	// record_type_id: that made the visibility gate optional, because the
+	// caller chooses whether to supply the field that skips it. Anyone who
+	// knew (or guessed) an id and its type could then update a record that
+	// GET /eo-records/:id would correctly answer 404 for.
+	stored, loaded, loadErr := h.eoLoadRecord(c, id, user)
+	if !loaded {
+		return loadErr
 	}
+	// A supplied type that does not match the stored one gets the SAME answer
+	// as a record that is not there: a 400 saying "wrong record_type_id"
+	// would confirm the record exists and that the guess was close, which is
+	// exactly the probing oracle eoLoadRecord's 404 avoids.
+	if req.RecordTypeID != uuid.Nil && req.RecordTypeID != stored.RecordTypeID {
+		return utils.ErrorResponse(c, fiber.StatusNotFound, i18n.T(c.UserContext(), "eo_record_not_found"))
+	}
+	// The primary key is composite; the service reads the record with it. It
+	// comes from the stored record, never from the request.
+	req.RecordTypeID = stored.RecordTypeID
+
 	rec, err := h.recordSvc.Update(c.UserContext(), id, &req, user)
 	if err != nil {
 		return eoServiceError(c, err)
@@ -414,6 +425,17 @@ func (h *EORecordHandler) Transition(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_transition_executed"), out)
 }
 
+// Children lists the direct children of the record in the path.
+//
+// It goes through List with a parent_record_id filter, NOT through
+// repository.EORecordRepository.Children. Children takes no actor and has no
+// visibility clause, so serving it raw would mean that seeing a parent yields
+// every record beneath it — including the ones §7.11 restricts to a body the
+// caller does not belong to. In a register where sensitivity CASCADES down
+// the tree, the children are precisely the rows the rule is protecting.
+//
+// Both queries select on parent_record_id, so this is the same set of records,
+// minus the ones the caller may not see. It is paginated, because List is.
 func (h *EORecordHandler) Children(c *fiber.Ctx) error {
 	user, ok, err := eoActor(c)
 	if !ok {
@@ -423,25 +445,21 @@ func (h *EORecordHandler) Children(c *fiber.Ctx) error {
 	if !ok {
 		return err
 	}
+	// The parent itself must be visible: the children of a record the caller
+	// may not see are not the caller's to enumerate either.
 	if _, loaded, loadErr := h.eoLoadRecord(c, id, user); !loaded {
 		return loadErr
 	}
-	var ofType *uuid.UUID
-	if raw := c.Query("record_type_id"); raw != "" {
-		parsed, err := uuid.Parse(raw)
-		if err != nil {
-			return eoFieldErrors(c, map[string]string{"record_type_id": i18n.T(c.UserContext(), "invalid_id")})
-		}
-		ofType = &parsed
+	var filter models.EORecordFilter
+	if err := c.QueryParser(&filter); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
 	}
-	children, err := h.records.Children(c.UserContext(), id, ofType)
-	if err != nil {
-		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
-	}
-	if children == nil {
-		children = []models.EORecord{}
-	}
-	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_children_retrieved"), children)
+	// The parent is the route, not a default the caller may widen.
+	parentID := id.String()
+	filter.ParentID = &parentID
+	// h.list validates, clamps page and limit, applies the caller's scope and
+	// answers with the paginated envelope — the one place all of that lives.
+	return h.list(c, &filter, user)
 }
 
 // eoLinkRequest asks for one typed link from the record in the path to another

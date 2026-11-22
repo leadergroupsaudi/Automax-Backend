@@ -1194,7 +1194,6 @@ var messages = map[string][2]string{
 	"eo_transition_not_available":   {"This transition is not available from the record's current stage", "هذا الانتقال غير متاح من المرحلة الحالية للسجل"},
 	"eo_transition_not_permitted":   {"You may not run this transition", "لا يسمح لك بتنفيذ هذا الانتقال"},
 	"eo_transition_blocked":         {"An open child record blocks this transition", "يوجد سجل فرعي مفتوح يمنع هذا الانتقال"},
-	"eo_children_retrieved":         {"Child records retrieved", "تم استرجاع السجلات الفرعية"},
 	"eo_link_created":               {"Link created", "تم إنشاء الربط"},
 	"eo_link_type_required":         {"A link type is required", "نوع الربط مطلوب"},
 	"eo_link_type_unknown":          {"No such link type", "نوع الربط غير معروف"},

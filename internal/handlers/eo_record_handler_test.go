@@ -50,12 +50,34 @@ type eoFakeRecordRepo struct {
 	listOut    []models.EORecord
 	listTotal  int64
 	listErr    error
+	anyByID    *models.EORecord
+	// visibleRows is what the register returns for a scoped read. It stands
+	// in for applyEORecordVisibility's WHERE clause and is NOT a second
+	// implementation of it: the rule itself is the repository's and is
+	// covered there (repository.TestEORecordListFilterByParentID).
+	visibleRows   []models.EORecord
+	visibleTotal  int64
+	childrenCalls int
 }
 
 func (f *eoFakeRecordRepo) List(_ context.Context, filter *models.EORecordFilter) ([]models.EORecord, int64, error) {
 	copied := *filter
 	f.listFilter = &copied
+	if f.visibleRows != nil {
+		return f.visibleRows, f.visibleTotal, f.listErr
+	}
 	return f.listOut, f.listTotal, f.listErr
+}
+
+func (f *eoFakeRecordRepo) GetAnyByID(_ context.Context, _ uuid.UUID) (*models.EORecord, error) {
+	return f.anyByID, nil
+}
+
+// Children is overridden only to prove nothing calls it any more: it takes no
+// actor and applies no visibility, so the children endpoint must not use it.
+func (f *eoFakeRecordRepo) Children(_ context.Context, _ uuid.UUID, _ *uuid.UUID) ([]models.EORecord, error) {
+	f.childrenCalls++
+	return nil, nil
 }
 
 type eoFakeTypeRepo struct {
@@ -446,5 +468,184 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		if strings.Contains(src, banned) {
 			t.Errorf("cmd/server/main.go contains %q: that constructor passes a nil policy repository, so SLA clocks never start", banned)
 		}
+	}
+}
+
+// ── authorization ───────────────────────────────────────────────────────────
+
+// TestUpdateEORecordHonoursVisibilityEvenWithARecordTypeID covers the gate
+// that was bypassable: the visibility check used to run only when the body
+// omitted record_type_id, so a caller who supplied the right one skipped it
+// entirely and could update a record GET would 404 for.
+func TestUpdateEORecordHonoursVisibilityEvenWithARecordTypeID(t *testing.T) {
+	eoInitValidator(t)
+	hidden := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-009"}
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"with the correct record_type_id", map[string]any{
+			"record_type_id": hidden.RecordTypeID.String(),
+			"values":         map[string]any{"subject_en": "taken over"},
+		}},
+		{"with no record_type_id", map[string]any{
+			"values": map[string]any{"subject_en": "taken over"},
+		}},
+		{"with a wrong record_type_id", map[string]any{
+			"record_type_id": uuid.New().String(),
+			"values":         map[string]any{"subject_en": "taken over"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The record exists across the partitions, but the register
+			// returns nothing for this caller: it is restricted to a body
+			// they do not belong to.
+			repo := &eoFakeRecordRepo{anyByID: hidden, visibleRows: []models.EORecord{}, visibleTotal: 0}
+			svc := &eoFakeRecordService{updated: hidden}
+			h := NewEORecordHandler(svc, nil, repo, &eoFakeTypeRepo{})
+
+			app := fiber.New()
+			// NOT a super admin: row-level visibility is in play.
+			app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+			app.Put("/eo-records/:id", h.Update)
+
+			raw, _ := json.Marshal(tc.body)
+			req := httptest.NewRequest("PUT", "/eo-records/"+hidden.ID.String(), bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusNotFound {
+				t.Errorf("status = %d, want 404", resp.StatusCode)
+			}
+			// A 404 that still called the service would mean the record was
+			// modified before the response was written.
+			if svc.updateCalls != 0 {
+				t.Errorf("service Update calls = %d, want 0", svc.updateCalls)
+			}
+		})
+	}
+}
+
+// TestUpdateEORecordUsesTheStoredRecordType proves the composite key the
+// service is handed comes from the stored record, never from the request.
+func TestUpdateEORecordUsesTheStoredRecordType(t *testing.T) {
+	eoInitValidator(t)
+	rec := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-010"}
+	repo := &eoFakeRecordRepo{anyByID: rec}
+	svc := &eoFakeRecordService{updated: rec}
+	h := NewEORecordHandler(svc, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(eoTestUser()))
+	app.Put("/eo-records/:id", h.Update)
+
+	raw, _ := json.Marshal(map[string]any{"values": map[string]any{"subject_en": "revised"}})
+	req := httptest.NewRequest("PUT", "/eo-records/"+rec.ID.String(), bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if svc.updateCalls != 1 {
+		t.Errorf("service Update calls = %d, want 1", svc.updateCalls)
+	}
+}
+
+// TestEOChildrenAreVisibilityScoped covers the leak: the parent was checked
+// and then every child was returned raw from a repository method that takes no
+// actor. The children now come from the register's own scoped query.
+func TestEOChildrenAreVisibilityScoped(t *testing.T) {
+	eoInitValidator(t)
+	parent := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-001"}
+	actor := &models.User{ID: uuid.New(), DepartmentID: &[]uuid.UUID{uuid.New()}[0]}
+	// Two children exist; the register returns only the one this caller may
+	// see. The other is restricted to a body they do not belong to.
+	visibleChild := models.EORecord{ID: uuid.New(), RecordTypeID: parent.RecordTypeID, Reference: "EO-DIR-2026-001-A"}
+
+	repo := &eoFakeRecordRepo{
+		anyByID:      parent,
+		visibleRows:  []models.EORecord{visibleChild},
+		visibleTotal: 1,
+	}
+	h := NewEORecordHandler(&eoFakeRecordService{}, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(actor))
+	app.Get("/eo-records/:id/children", h.Children)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+parent.ID.String()+"/children", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Data       []models.EORecord `json:"data"`
+		TotalItems int64             `json:"total_items"`
+		Limit      int               `json:"limit"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Data) != 1 || out.Data[0].Reference != visibleChild.Reference {
+		t.Errorf("children = %v, want exactly the visible one", out.Data)
+	}
+	if out.Limit < 1 {
+		t.Errorf("limit = %d, want >= 1: PaginatedSuccessResponse divides by it", out.Limit)
+	}
+	// The unscoped repository method must not be reached at all.
+	if repo.childrenCalls != 0 {
+		t.Errorf("repository Children calls = %d, want 0: it applies no visibility", repo.childrenCalls)
+	}
+	// The LAST List call is the children query (the first was the parent's
+	// own visibility check).
+	if repo.listFilter == nil {
+		t.Fatal("the register was never queried for the children")
+	}
+	if repo.listFilter.ParentID == nil || *repo.listFilter.ParentID != parent.ID.String() {
+		t.Errorf("filter.ParentID = %v, want the parent in the path", repo.listFilter.ParentID)
+	}
+	// The three scope fields are what make visibility unforgeable; they must
+	// be filled on this path too.
+	if repo.listFilter.UserID != actor.ID {
+		t.Errorf("filter.UserID = %v, want the actor %v", repo.listFilter.UserID, actor.ID)
+	}
+	if repo.listFilter.IsAdmin {
+		t.Errorf("filter.IsAdmin = true, want false for a non-admin actor")
+	}
+	if len(repo.listFilter.VisibleToDepartmentIDs) != 1 || repo.listFilter.VisibleToDepartmentIDs[0] != *actor.DepartmentID {
+		t.Errorf("filter.VisibleToDepartmentIDs = %v, want the actor's body", repo.listFilter.VisibleToDepartmentIDs)
+	}
+}
+
+// TestEOChildrenRefuseAnInvisibleParent: the children of a record the caller
+// may not see are not theirs to enumerate.
+func TestEOChildrenRefuseAnInvisibleParent(t *testing.T) {
+	eoInitValidator(t)
+	parent := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-002"}
+	repo := &eoFakeRecordRepo{anyByID: parent, visibleRows: []models.EORecord{}, visibleTotal: 0}
+	h := NewEORecordHandler(&eoFakeRecordService{}, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+	app.Get("/eo-records/:id/children", h.Children)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+parent.ID.String()+"/children", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+	if repo.childrenCalls != 0 {
+		t.Errorf("repository Children calls = %d, want 0", repo.childrenCalls)
 	}
 }
