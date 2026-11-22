@@ -51,7 +51,7 @@ const maxNodes = 500
 
 // allowedBuiltins is the whole set of expr builtins a formula can reach. Every
 // other builtin is disabled at compile time.
-var allowedBuiltins = []string{"abs", "ceil", "floor", "round", "min", "max", "int", "float", "date"}
+var allowedBuiltins = []string{"abs", "ceil", "floor", "round", "min", "max", "date"}
 
 // Evaluator evaluates formulas. The zero value has no timeout; use New.
 type Evaluator struct {
@@ -68,7 +68,7 @@ func New(timeout time.Duration) *Evaluator {
 }
 
 // helperNames are the custom functions (not expr builtins) exposed to formulas.
-var helperNames = map[string]bool{"days": true, "weeks": true, "hours": true, "days_between": true}
+var helperNames = map[string]bool{"int": true, "float": true, "days": true, "weeks": true, "hours": true, "days_between": true}
 
 func compileOptions(env map[string]any) []expr.Option {
 	opts := []expr.Option{
@@ -90,6 +90,10 @@ func compileOptions(env map[string]any) []expr.Option {
 		expr.Function("weeks", unitFn("weeks", 7*24*time.Hour)),
 		expr.Function("hours", unitFn("hours", time.Hour)),
 		expr.Function("days_between", daysBetween),
+		// int/float replace the builtins: the builtin int() turns +-Inf/NaN into
+		// a Go int, which would slip past the non-finite result check.
+		expr.Function("int", convFn("int", func(f float64) any { return int(f) })),
+		expr.Function("float", convFn("float", func(f float64) any { return f })),
 	)
 }
 
@@ -103,6 +107,22 @@ func unitFn(name string, unit time.Duration) func(params ...any) (any, error) {
 			return nil, fmt.Errorf("%s() needs a number, got %T", name, params[0])
 		}
 		return time.Duration(n * float64(unit)), nil
+	}
+}
+
+func convFn(name string, conv func(float64) any) func(params ...any) (any, error) {
+	return func(params ...any) (any, error) {
+		if len(params) != 1 {
+			return nil, fmt.Errorf("%s() takes 1 argument, got %d", name, len(params))
+		}
+		f, ok := toFloat(params[0])
+		if !ok {
+			return nil, fmt.Errorf("%s() needs a number, got %T", name, params[0])
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, fmt.Errorf("%s() of a non-finite value", name)
+		}
+		return conv(f), nil
 	}
 }
 
@@ -155,8 +175,17 @@ func (c *refCollector) Visit(node *ast.Node) {
 			c.banned = "closure"
 		}
 	case *ast.CallNode:
+		// Only calls to our own helpers are allowed. A MemberNode callee is a
+		// method call on an env value (visit_date.Format(...)), which expr
+		// resolves by reflection at run time.
 		if id, ok := n.Callee.(*ast.IdentifierNode); ok && helperNames[id.Value] {
 			c.callees[id] = true
+		} else if c.banned == "" {
+			c.banned = "method call"
+		}
+	case *ast.BinaryNode:
+		if n.Operator == ".." && c.banned == "" {
+			c.banned = "range operator"
 		}
 	}
 }
@@ -226,7 +255,11 @@ func (e *Evaluator) Eval(expression string, env map[string]any) (any, error) {
 		return nil, fmt.Errorf("%w: %s", ErrUnresolvedReference, strings.Join(missing, ", "))
 	}
 
-	out, err := runWithTimeout(e.Timeout, func() (any, error) {
+	timeout := e.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	out, err := runWithTimeout(timeout, func() (any, error) {
 		return expr.Run(program, env)
 	})
 	if err != nil {

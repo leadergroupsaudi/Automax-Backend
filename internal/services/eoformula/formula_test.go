@@ -116,6 +116,9 @@ func TestEvaluateRejectsNonFinite(t *testing.T) {
 		{"divide by zero", "a / b"},
 		{"negative over zero", "-a / b"},
 		{"zero over zero", "b / b"},
+		{"int of infinity", "int(a / b)"},
+		{"int of huge power", "int(9 ** 9 ** 9)"},
+		{"float of infinity", "float(a / b)"},
 	}
 	env := map[string]any{"a": 1.0, "b": 0.0}
 	for _, tt := range tests {
@@ -240,7 +243,7 @@ func TestEveryNonAllowlistedBuiltinIsRejected(t *testing.T) {
 		allowed[n] = true
 	}
 	for _, name := range builtin.Names {
-		if allowed[name] {
+		if allowed[name] || helperNames[name] {
 			continue
 		}
 		t.Run(name, func(t *testing.T) {
@@ -250,5 +253,44 @@ func TestEveryNonAllowlistedBuiltinIsRejected(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type secretHolder struct{}
+
+func (secretHolder) Reveal() string { return "pwned" }
+
+func TestEvaluateRejectsMethodCallsAndRange(t *testing.T) {
+	env := map[string]any{
+		"visit_date": time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC),
+		"secret":     secretHolder{},
+		"rec":        map[string]any{"b": 2.0},
+	}
+	for _, expr := range []string{
+		`visit_date.Format("2006-01-02")`,
+		`visit_date.AddDate(1, 0, 0)`,
+		`visit_date.String()`,
+		`visit_date.Location().String()`,
+		`date("2026-01-01").Format("2006")`,
+		`secret.Reveal()`,
+		`1..100000`,
+	} {
+		t.Run(expr, func(t *testing.T) {
+			if got, err := New(time.Second).Eval(expr, env); err == nil {
+				t.Errorf("Eval(%q) = %v, want error", expr, got)
+			}
+		})
+	}
+	// Plain member access is not a call and keeps working.
+	for _, expr := range []string{`rec.b`, `rec["b"]`} {
+		if got, err := New(time.Second).Eval(expr, env); err != nil || got != 2.0 {
+			t.Errorf("Eval(%q) = %v, %v; want 2", expr, got, err)
+		}
+	}
+}
+
+func TestZeroValueEvaluatorHasDeadline(t *testing.T) {
+	if got, err := (&Evaluator{}).Eval("1 + 1", nil); err != nil || got != 2 {
+		t.Fatalf("zero-value Eval = %v, %v", got, err)
 	}
 }
