@@ -983,7 +983,7 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 	result = db.Where("code = ?", "manager").First(&managerRole)
 	if result.Error == gorm.ErrRecordNotFound {
 		var managerPerms []models.Permission
-		db.Where("action IN ?", []string{"view", "create", "update", "delete", "assign", "approve"}).Find(&managerPerms)
+		db.Where("action IN ? AND module <> ?", []string{"view", "create", "update", "delete", "assign", "approve"}, "eo").Find(&managerPerms) // EO records are restricted to the EO roles
 		// targets:reject uses action "reject" (mirroring perf:reject), which
 		// isn't in the action list above — without this, splitting Reject out
 		// of targets:approve into its own permission would silently take away
@@ -1003,7 +1003,7 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		db.Create(&managerRole)
 	} else if db.Model(&managerRole).Association("Permissions").Count() == 0 {
 		var managerPerms []models.Permission
-		db.Where("action IN ?", []string{"view", "create", "update", "delete", "assign", "approve"}).Find(&managerPerms)
+		db.Where("action IN ? AND module <> ?", []string{"view", "create", "update", "delete", "assign", "approve"}, "eo").Find(&managerPerms) // EO records are restricted to the EO roles
 		var managerRejectPerm models.Permission
 		if db.Where("code = ?", "targets:reject").First(&managerRejectPerm).Error == nil {
 			managerPerms = append(managerPerms, managerRejectPerm)
