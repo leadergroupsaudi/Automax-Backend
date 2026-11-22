@@ -20,6 +20,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.98
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/twilio/twilio-go v1.30.1
+	github.com/valyala/fasthttp v1.51.0
 	github.com/xuri/excelize/v2 v2.10.1
 	golang.org/x/crypto v0.48.0
 	golang.org/x/image v0.45.0
@@ -98,7 +99,6 @@ require (
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	github.com/valyala/fasthttp v1.51.0 // indirect
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	github.com/xuri/efp v0.0.1 // indirect
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect

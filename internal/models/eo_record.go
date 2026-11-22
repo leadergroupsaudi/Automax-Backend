@@ -172,8 +172,10 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 // EORecordFilter selects and pages the records of one register (spec §7.7).
 //
 // The query-tagged fields are client-settable. The json:"-" fields are filled
-// by the handler from the authenticated session and are never read from a
-// request body, following IncidentFilter. A zero-value filter is the most
+// by the handler from the authenticated session. They carry query:"-" as well
+// as json:"-": json:"-" stops body binding only, and Fiber's QueryParser falls
+// back to the Go field name, so without it ?IsAdmin=true would switch
+// row-level visibility off. A zero-value filter is the most
 // restrictive one: IsAdmin false and an empty VisibleToDepartmentIDs hide every
 // record that is restricted to a body (§7.11).
 type EORecordFilter struct {
@@ -208,7 +210,7 @@ type EORecordFilter struct {
 	// Set by the handler. VisibleToDepartmentIDs are the bodies the caller
 	// belongs to; UserID is the caller, who always sees records they created;
 	// IsAdmin bypasses row-level visibility.
-	UserID                 uuid.UUID   `json:"-"`
-	IsAdmin                bool        `json:"-"`
-	VisibleToDepartmentIDs []uuid.UUID `json:"-"`
+	UserID                 uuid.UUID   `query:"-" json:"-"`
+	IsAdmin                bool        `query:"-" json:"-"`
+	VisibleToDepartmentIDs []uuid.UUID `query:"-" json:"-"`
 }

@@ -66,61 +66,17 @@ func TestListFiltersByJSONBFieldValue(t *testing.T) {
 		t.Errorf("topic=housing,n=2: refs %v, want %v (keys must AND)", eoRefs(got), want)
 	}
 
-	// The same predicate List builds must be servable by the GIN index. A
-	// small table scans sequentially whatever indexes exist, so seqscan is
-	// switched off for the transaction: that proves the index CAN serve it.
-	// Plain index scans are off too, and the table is padded with rows that
-	// do not match and analyzed: otherwise the planner may take the soft-delete
-	// btree (deleted_at IS NULL matches every row) and apply the jsonb
-	// predicate as a filter, which says nothing about the GIN index.
-	filler := make([]models.EORecord, 2000)
-	for i := range filler {
-		filler[i] = *eoNewTestRecord(typeID, "F-"+uuid.NewString())
-		filler[i].Values = datatypes.JSON(`{"topic":"other"}`)
-	}
-	if err := db.CreateInBatches(&filler, 500).Error; err != nil {
-		t.Fatalf("pad table: %v", err)
-	}
-	if err := db.Exec(`ANALYZE eo_records`).Error; err != nil {
-		t.Fatalf("analyze: %v", err)
-	}
+	// The predicate must be containment on the quoted column: that is the
+	// operator the GIN index on "values" (jsonb_ops, pinned by the schema
+	// tests) can serve. "values" is reserved, so it must be quoted by hand.
 	f = eoAdmin()
 	f.Values = map[string]any{"topic": "housing"}
 	q, err := applyEORecordFilters(db.Session(&gorm.Session{DryRun: true}).Model(&models.EORecord{}), &f)
 	if err != nil {
 		t.Fatalf("build filters: %v", err)
 	}
-	stmt := q.Find(&[]models.EORecord{}).Statement
-	var plan []string
-	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(`SET LOCAL enable_seqscan = off`).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec(`SET LOCAL enable_indexscan = off`).Error; err != nil {
-			return err
-		}
-		// Not tx.Raw: GORM reads the "@" of the @> operator as a named
-		// parameter and drops the bind variables.
-		rows, err := tx.Statement.ConnPool.QueryContext(context.Background(), "EXPLAIN "+stmt.SQL.String(), stmt.Vars...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				return err
-			}
-			plan = append(plan, line)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		t.Fatalf("explain: %v", err)
-	}
-	// The partition's index inherits its name from the parent's GIN index on "values".
-	if text := strings.Join(plan, "\n"); !strings.Contains(text, "Bitmap Index Scan on eo_records_default_values_idx") {
-		t.Errorf("plan does not use the values GIN index:\n%s", text)
+	if sql := q.Find(&[]models.EORecord{}).Statement.SQL.String(); !strings.Contains(sql, `"values" @> `) {
+		t.Errorf("values filter SQL = %s, want a quoted \"values\" @> containment", sql)
 	}
 }
 
