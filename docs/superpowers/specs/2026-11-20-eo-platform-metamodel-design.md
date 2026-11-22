@@ -566,6 +566,32 @@ whoever holds the permission:
 - Values of a removed field stay in `values` jsonb rather than being deleted, so
   a mistaken removal is recoverable.
 
+**The type's own identity and structure are destructive too.** (Added
+2026-11-22, during implementation. The list above enumerates *field* edits only,
+because until the designer API existed no route could change any of these four.)
+Each is refused while records of the type exist, and freely allowed before the
+first record is written:
+- `workflow_id` — the worst of the four. Every record stores a `state_id`
+  belonging to its workflow's state set, so repointing the workflow strands every
+  existing record in a state its workflow does not contain. There is no way back
+  through the API: no transition in the new workflow has their current state as
+  its `from`, so the records cannot be moved at all. Giving a type a workflow it
+  lacked, or taking one away, counts the same.
+- `key` — feeds the reference prefix, and cross-type prefix uniqueness is what
+  makes `reference` globally unique on a per-partition constraint (§7.7).
+  Re-keying a populated type breaks that invariant retroactively, for references
+  already issued and already quoted in correspondence.
+- `parent_type_id` — determines which field definitions are inherited.
+  Re-parenting changes the effective field set under records already written
+  against the old one, so stored values can lose the definition that gives them
+  meaning.
+- `is_abstract` — an abstract type is one that may not hold records, so setting
+  it on a populated type asserts something already false.
+
+The rule for all four, as for the field edits above, is "not once records exist",
+not "never": a type still being designed may be freely re-keyed, re-parented,
+pointed at a different workflow, or flipped between abstract and concrete.
+
 **Two invariants the storage layout depends on** (§7.7):
 - *Reference prefixes are unique across types.* `reference` is unique per
   partition, not globally, so global uniqueness rests on every type carrying its
