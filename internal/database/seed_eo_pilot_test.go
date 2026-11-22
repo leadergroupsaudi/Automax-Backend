@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
 	"github.com/automax/backend/internal/database/migrations"
@@ -665,6 +667,11 @@ type eoMatrixRow struct {
 	// Key is the matrix's spelling; run it through eoMatrixKey for the
 	// engine's.
 	Key string
+	// Kind is the "Field type" cell verbatim: Text, Long text, Dropdown,
+	// Date, and — for the one row spec §7.3 drops from the catalogue —
+	// "Table (stage, weeks, body, output)", whose parenthesis is the only
+	// description the client's document gives of the stage child type.
+	Kind string
 	// Required is the Required cell verbatim: Yes, No, Conditional, Auto,
 	// Derived or "Yes at closure" (the matrix's own five-valued column, plus
 	// No).
@@ -754,6 +761,7 @@ func eoReadFieldMatrix(t *testing.T) map[string][]eoMatrixRow {
 		}
 		out[section] = append(out[section], eoMatrixRow{
 			Key:      keys[1],
+			Kind:     strings.TrimSpace(cells[2]),
 			Required: strings.TrimSpace(cells[3]),
 		})
 	}
@@ -1727,6 +1735,15 @@ func TestEOPilotFieldDefsRefusesUnusableSpecs(t *testing.T) {
 			{matrixKey: "deadline", label: "Deadline", kind: models.EOKindDate,
 				provenance: models.EOProvenanceUser, required: models.EORequiredNever},
 		}}},
+		// An INHERITED VALUES-BAG key, which is not a column and so slipped
+		// through the first version of this guard. It is not dropped — it is
+		// written as a second, hand-made definition that shadows the base row
+		// while freezing its kind, config and Arabic. Task A2 shipped exactly
+		// this for `attachments` on Incoming Correspondence.
+		{"an inherited values-bag key declared under fields:", eoPilotTypeSpec{key: "t", fields: []eoPilotFieldSpec{
+			{matrixKey: "attachments", label: "Attachments", kind: models.EOKindMultiFile,
+				provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
+		}}},
 		{"narrowing to a provenance a narrowing may not set", eoPilotTypeSpec{key: "t",
 			narrowed: []eoInheritedNarrowing{{matrixKey: "due_date", required: models.EORequiredNever,
 				provenance: models.EOProvenanceDerived}}}},
@@ -1769,9 +1786,9 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 		decided[d.TypeKey+"."+d.MatrixKey] = d
 	}
 
-	columnBacked := map[string]eoColumnBackedDecision{}
-	for _, d := range eoColumnBackedDecisions {
-		columnBacked[d.TypeKey+"."+d.MatrixKey] = d
+	renamed := map[string]eoEngineKeyDecision{}
+	for _, d := range eoEngineKeyDecisions {
+		renamed[d.TypeKey+"."+d.MatrixKey] = d
 	}
 
 	checked := 0
@@ -1792,7 +1809,7 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				// against the database, so this is not a way round the
 				// matrix — it is the place where "the matrix says Derived and
 				// the engine writes a column" is written down.
-				if d, ok := columnBacked[typeKey+"."+row.Key]; ok {
+				if d, ok := renamed[typeKey+"."+row.Key]; ok {
 					if d.EngineKey != engineKey {
 						t.Errorf("the decision says %q lives in column %q; the matrix key resolves to %q", row.Key, d.EngineKey, engineKey)
 					}
@@ -1872,21 +1889,59 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 
 // ── Task A3: the eight child types ──────────────────────────────────────────
 
-// eoStageMatrixlessFields is the ONE type the client's document does not
-// describe, written out here because nothing else can check it.
+// eoStageMatrixFields READS the stage type's four field names out of the
+// client's document, from the only place it describes them: the parenthesis of
+// Execution Plan's `plan_stages` kind cell, "Table (stage, weeks, body,
+// output)" (matrix:95).
 //
-// HOW THE ROW-COUNT GUARD STAYS HONEST FOR IT. Every other pilot type is
-// checked against a parsed section of the matrix whose row count is pinned, so
-// a parser that silently stopped matching fails loudly. eo_execution_plan_stage
-// has no section, so that guard cannot reach its four own fields — it still
-// reaches its seventeen INHERITED ones, through eoMatrixExpectations. The four
-// are held instead by three things that are not transcriptions of each other:
-// this list (what the matrix's `Table (stage, weeks, body, output)` cell
-// names, in the cell's own order); the roll-up test below, which fails if
-// `weeks` is renamed, removed or made non-numeric, because Execution Plan's
-// total_weeks formula addresses it by key; and the shape rules every seeded
-// field of every type passes.
-var eoStageMatrixlessFields = []string{"stage", "weeks", "body", "output"}
+// HOW THE ROW-COUNT GUARD STAYS HONEST FOR A TYPE THE CLIENT DID NOT DESCRIBE.
+// Every other pilot type is checked against a parsed section whose row count is
+// pinned, so a parser that silently stopped matching fails loudly.
+// eo_execution_plan_stage has no section of its own — it is a consequence of
+// spec §7.3 dropping the `table` kind — so that guard cannot reach its four own
+// fields. It still reaches its seventeen INHERITED ones through
+// eoMatrixExpectations. The four are held by three things that are not
+// transcriptions of each other:
+//
+//	this function, which PARSES the client's own cell rather than restating it,
+//	so renaming a seeded field and its expectation together no longer passes;
+//
+//	the roll-up test, which fails if `weeks` is renamed, removed or made
+//	non-numeric, because Execution Plan's total_weeks addresses it by key;
+//
+//	and the shape rules every seeded field of every type passes.
+//
+// It carries its own guard, like every other reading of the matrix: four names
+// out of a parenthesis of a Table cell, or the row has changed shape and this
+// proves nothing.
+func eoStageMatrixFields(t *testing.T) []string {
+	t.Helper()
+	m := eoReadFieldMatrix(t)
+	for _, r := range m[eoMatrixSections[eoExecutionPlanTypeKey]] {
+		if r.Key != "plan_stages" {
+			continue
+		}
+		if !strings.HasPrefix(r.Kind, "Table") {
+			t.Fatalf("the `plan_stages` kind cell is %q; the stage child type exists because spec §7.3 drops the `table` kind, and this is no longer that row", r.Kind)
+		}
+		lo, hi := strings.Index(r.Kind, "("), strings.LastIndex(r.Kind, ")")
+		if lo < 0 || hi < lo {
+			t.Fatalf("the `plan_stages` kind cell is %q and names no columns in parentheses; the stage type's fields are described nowhere else", r.Kind)
+		}
+		var out []string
+		for _, part := range strings.Split(r.Kind[lo+1:hi], ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				out = append(out, p)
+			}
+		}
+		if len(out) != 4 {
+			t.Fatalf("the `plan_stages` kind cell %q names %d columns, want 4", r.Kind, len(out))
+		}
+		return out
+	}
+	t.Fatalf("the matrix has no `plan_stages` row under %q", eoMatrixSections[eoExecutionPlanTypeKey])
+	return nil
+}
 
 // eoParentDerivedChildTypes are the pilot types whose reference extends their
 // parent's, from the matrix's own patterns (addendum 4). They are EXEMPT from
@@ -2117,10 +2172,11 @@ func TestExecutionPlanHasNoTableField(t *testing.T) {
 	for _, d := range eoOwnFieldDefs(t, db, eoStageTypeKey) {
 		got[d.Key] = d
 	}
-	for _, key := range eoStageMatrixlessFields {
+	stageFields := eoStageMatrixFields(t)
+	for _, key := range stageFields {
 		d, ok := got[key]
 		if !ok {
-			t.Errorf("the stage type has no %q field; the matrix's table cell names (stage, weeks, body, output)", key)
+			t.Errorf("the stage type has no %q field; the matrix's `plan_stages` cell names %v", key, stageFields)
 			continue
 		}
 		// The whole cell is one row marked Required Yes, so every column of
@@ -2130,8 +2186,8 @@ func TestExecutionPlanHasNoTableField(t *testing.T) {
 				key, d.RequiredMode, models.EORequiredAlways)
 		}
 	}
-	if len(got) != len(eoStageMatrixlessFields) {
-		t.Errorf("the stage type declares %d own fields, want exactly the %d of the matrix's table cell", len(got), len(eoStageMatrixlessFields))
+	if len(got) != len(stageFields) {
+		t.Errorf("the stage type declares %d own fields, want exactly the %d of the matrix's `plan_stages` cell %v", len(got), len(stageFields), stageFields)
 	}
 }
 
@@ -2219,7 +2275,7 @@ func TestEoPilotReferencePatternsRenderAndRefuse(t *testing.T) {
 					t.Error("the pattern renders against a parent one level too deep")
 				}
 			} else if _, isChild := eoOwnSequenceChildTypes[key]; isChild {
-				// The other side of eoColumnBackedDecisions' Task entry: an
+				// The other side of eoEngineKeyDecisions' Task entry: an
 				// own-sequence child numbers cleanly with NO parent, so
 				// nothing in the engine refuses a parentless one. Recorded as
 				// a gap, pinned here so it cannot be closed silently or
@@ -2252,9 +2308,23 @@ func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
 	seedEOPilot(db)
 	matrix := eoReadFieldMatrix(t)
 
-	inherited := map[string]bool{}
-	for _, d := range eoOwnFieldDefs(t, db, eoBaseTypeKey) {
-		inherited[d.Key] = true
+	// The escape below is the keys each spec actually lists in `narrowed:`,
+	// NOT every inherited key. Excusing the whole inherited seventeen would
+	// mean a spurious own definition keyed `priority` or `source` — a
+	// hand-written shadow of an inherited row, which is what `narrowed:`
+	// exists to prevent — was reported by nothing.
+	narrowedBySpec := map[string]bool{}
+	for _, spec := range eoPilotChildTypes {
+		for _, n := range spec.narrowed {
+			key, _, _ := eoMatrixKey(n.matrixKey)
+			narrowedBySpec[spec.key+"."+key] = true
+		}
+	}
+	// A renamed cell is skipped from `want` under its matrix spelling, so its
+	// ENGINE spelling must be allowed here — that is the whole point of the
+	// rename. The registry's own test checks the field itself.
+	for _, d := range eoEngineKeyDecisions {
+		narrowedBySpec[d.TypeKey+"."+d.EngineKey] = true
 	}
 	for _, typeKey := range eoPilotChildTypeKeys() {
 		if typeKey == eoStageTypeKey {
@@ -2265,20 +2335,20 @@ func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
 			if len(rows) == 0 {
 				t.Fatalf("no matrix rows parsed for %q", typeKey)
 			}
-			columnBacked := map[string]bool{}
-			for _, d := range eoColumnBackedDecisions {
-				columnBacked[d.TypeKey+"."+d.MatrixKey] = true
+			renamed := map[string]bool{}
+			for _, d := range eoEngineKeyDecisions {
+				renamed[d.TypeKey+"."+d.MatrixKey] = true
 			}
 			want := map[string]bool{}
 			for _, r := range rows {
 				if eoMatrixFieldIsNotSeeded(typeKey, r.Key) {
 					continue
 				}
-				if columnBacked[typeKey+"."+r.Key] {
+				if renamed[typeKey+"."+r.Key] {
 					// A column-backed cell is declared as its COLUMN, which
 					// may or may not need a narrowing of its own (the base's
 					// definition sometimes already says what the matrix
-					// wants). TestEoColumnBackedFieldsAreDeclaredAsTheirColumn
+					// wants). TestEoEngineKeyDecisionsAreDeclaredAsTheEngineSpellsThem
 					// checks the effective field for every one of them, which
 					// is the question that matters; checking for a row ON
 					// THIS TYPE would force a redundant override.
@@ -2300,8 +2370,8 @@ func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
 				}
 			}
 			for k := range got {
-				if !want[k] && !inherited[k] {
-					t.Errorf("field %q is seeded but is not in the matrix for this type", k)
+				if !want[k] && !narrowedBySpec[typeKey+"."+k] {
+					t.Errorf("field %q is seeded but is neither in the matrix for this type nor listed in its `narrowed:`", k)
 				}
 			}
 		})
@@ -2343,15 +2413,15 @@ func TestEoChildTypeFieldsMatchTheMatrix(t *testing.T) {
 // Mutation: delete the `"deadline": {"due_date", true, false}` entry from
 // eoMatrixKeys (the Referral's deadline then becomes a values-bag field of its
 // own and the narrowing disappears).
-func TestEoColumnBackedFieldsAreDeclaredAsTheirColumn(t *testing.T) {
+func TestEoEngineKeyDecisionsAreDeclaredAsTheEngineSpellsThem(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	if len(eoColumnBackedDecisions) == 0 {
+	if len(eoEngineKeyDecisions) == 0 {
 		t.Fatal("the registry is empty")
 	}
 	seen := map[string]bool{}
-	for _, d := range eoColumnBackedDecisions {
+	for _, d := range eoEngineKeyDecisions {
 		id := d.TypeKey + "." + d.MatrixKey
 		if seen[id] {
 			t.Errorf("two decisions for %s", id)
@@ -2369,8 +2439,14 @@ func TestEoColumnBackedFieldsAreDeclaredAsTheirColumn(t *testing.T) {
 			if managed {
 				t.Fatalf("%q is engine-managed; no type may declare it at all", d.MatrixKey)
 			}
-			if !isColumn {
-				t.Errorf("eoMatrixKey says %q is a values-bag key; the decision says it is the column %q, and a values-bag field would shadow nothing", d.MatrixKey, d.EngineKey)
+			// The registry and the key map must agree about WHERE the value
+			// lives, in both directions: a column entry marked values-bag
+			// would excuse the naive sweep for a field that really is
+			// inherited, and a values-bag entry marked column would reinstate
+			// exactly the column-only blindness that let the §7.11 visibility
+			// control through.
+			if isColumn != d.IsColumn {
+				t.Errorf("eoMatrixKey says is_column=%v for %q; the decision says %v", isColumn, d.MatrixKey, d.IsColumn)
 			}
 			if key != d.EngineKey {
 				t.Errorf("eoMatrixKey maps %q to %q; the decision says %q", d.MatrixKey, key, d.EngineKey)
@@ -2699,4 +2775,222 @@ func TestEoSeedRefusesAnIncoherentTypeSpec(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ── Task A3 fix round 1 ─────────────────────────────────────────────────────
+
+// A type-specific rename in eoMatrixKeys is keyed by the MATRIX SPELLING
+// alone, so it applies to every type that uses that word. Each of the five
+// occurs exactly once in the client's document today — but `deadline`,
+// `visibility` and `standing` are generic words, and a later CFF type meaning
+// something else by one of them would be folded into the engine key of this
+// one, silently, with the field it actually wanted never seeded.
+//
+// This is the cheap half of the fix: prove the premise the key map rests on.
+// The expensive half — keying renames by (type, matrix key) — is not worth its
+// weight while the premise holds, and this test is what tells the next task
+// when it stops holding.
+// Mutation: add `"standing": {"state_id", true, true}` to eoMatrixKeys
+// (`standing` occurs in Decision Record and would then need a type scope), or
+// re-spell any OTHER matrix section's row as one of the renamed keys.
+func TestEoTypeSpecificRenamesAreUnambiguousAcrossTheMatrix(t *testing.T) {
+	m := eoReadFieldMatrix(t)
+
+	// The renames are the entries whose engine key differs from the matrix
+	// key; the inherited block's identical entries are not renames.
+	renames := map[string]string{}
+	for matrixKey, e := range eoMatrixKeys {
+		if e.engineKey != matrixKey {
+			renames[matrixKey] = e.engineKey
+		}
+	}
+	// Fourteen: Task A1's six Global Constraints renames (classification,
+	// owner_department, assigned_user, closed_on, created_by, parent_ticket),
+	// the two engine-managed keys whose engine name differs (ticket_type,
+	// state), and the six TYPE-SPECIFIC ones — A2's sender_deadline and A3's
+	// deadline, decision_number, out_ref, source_study and visibility. The
+	// count is the guard on this test: a rename added without being listed
+	// below would otherwise be checked by nothing.
+	if len(renames) != 14 {
+		t.Fatalf("eoMatrixKeys holds %d renames, want 14: %v", len(renames), renames)
+	}
+
+	// Where each matrix key appears, by section.
+	where := map[string][]string{}
+	for section, rows := range m {
+		if section == eoMatrixInheritedSection {
+			continue // the inherited block is every type's, by definition
+		}
+		for _, r := range rows {
+			where[r.Key] = append(where[r.Key], section)
+		}
+	}
+
+	// Only the TYPE-SPECIFIC renames are at risk: the inherited six are
+	// declared once in the inherited block and mean the same thing on every
+	// type by construction.
+	typeSpecific := []string{"sender_deadline", "deadline", "decision_number", "out_ref", "source_study", "visibility"}
+	for _, key := range typeSpecific {
+		t.Run(key, func(t *testing.T) {
+			if _, ok := renames[key]; !ok {
+				t.Fatalf("%q is not a rename in eoMatrixKeys; this list and the map disagree", key)
+			}
+			sections := where[key]
+			sort.Strings(sections)
+			if len(sections) == 0 {
+				t.Fatalf("no section of the matrix has a %q row, so the rename applies to nothing", key)
+			}
+			if len(sections) > 1 {
+				t.Errorf("%q appears in %v; the rename is keyed by matrix spelling alone, so every one of those types is folded onto the engine key %q — key the rename by (type, matrix key) before seeding any of them",
+					key, sections, renames[key])
+			}
+		})
+	}
+}
+
+// eoReferralVisibilityEnv is the environment services.eoOwnEnv builds for a
+// derived field: the record's own values. The formula on `visible_to` must
+// RESOLVE against it — eoformula treats an identifier absent from the env as a
+// hard error, so a formula naming a field the type does not have would fail at
+// the first referral rather than here.
+//
+// It cannot call RecomputeDerived: package services imports package database,
+// so this package cannot import services. The evaluator is the same one
+// (eoformula.New(0)), which is what RecomputeDerived itself uses.
+func eoReferralVisibilityEnv(t *testing.T, db *gorm.DB, body string) map[string]any {
+	t.Helper()
+	env := map[string]any{}
+	for _, d := range eoOwnFieldDefs(t, db, eoBaseTypeKey) {
+		env[d.Key] = ""
+	}
+	for _, d := range eoOwnFieldDefs(t, db, eoReferralTypeKey) {
+		if d.Provenance == models.EOProvenanceDerived {
+			continue // eoOwnEnv deletes derived keys from the env
+		}
+		env[d.Key] = ""
+	}
+	env["referred_body"] = body
+	return env
+}
+
+// THE CRITICAL FIX. §7.11 row-level visibility is live in the repository and
+// reads ONE values key, repository.eoVisibleToKey = "visible_to". A Referral
+// seeded under the matrix's own `visibility` would be a confidentiality
+// control that looks configured and enforces nothing.
+//
+// This proves the control end to end against the REAL clause — the repository
+// is importable from here, unlike package services — rather than proving the
+// key is spelled right. It also proves the clause can refuse, so a passing
+// first half is not a filter that lets everything through.
+// Mutation: change the eoMatrixKeys entry to `"visibility": {"visibility",
+// false, false}`, or drop it altogether.
+func TestEoReferralVisibilityIsEnforcedByTheLiveClause(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	def := eoEffectiveField(t, db, eoReferralTypeKey, "visibility")
+	if def.Key != "visible_to" {
+		t.Fatalf("the field is keyed %q; repository.applyEORecordVisibility reads %q and nothing else", def.Key, "visible_to")
+	}
+	if def.Provenance != models.EOProvenanceDerived || strings.TrimSpace(def.Formula) == "" {
+		t.Fatalf("provenance %q / formula %q: nothing writes the key, so every referral is unrestricted",
+			def.Provenance, def.Formula)
+	}
+
+	// The formula resolves against the type's own values.
+	referred, other := uuid.New(), uuid.New()
+	got, err := eoformula.New(0).Eval(def.Formula, eoReferralVisibilityEnv(t, db, referred.String()))
+	if err != nil {
+		t.Fatalf("formula %q over a referral's own values: %v", def.Formula, err)
+	}
+	if got != referred.String() {
+		t.Errorf("the formula computed %v, want the referred body %v", got, referred)
+	}
+
+	// And the live clause restricts a record carrying what it computes. The
+	// records are written directly: the save pipeline lives in package
+	// services, which cannot be imported here, and the question is what the
+	// REPOSITORY does with a stored value.
+	ty := eoRootType(t, db, eoReferralTypeKey)
+	office := uuid.New()
+	mk := func(ref string, values string) {
+		t.Helper()
+		rec := models.EORecord{
+			ID: uuid.New(), RecordTypeID: ty.ID, Reference: ref,
+			SubjectAr: "x", Priority: "normal", Sensitivity: "internal", Source: "correspondence",
+			CreatedByID: office, Values: datatypes.JSON(values),
+		}
+		if err := db.Create(&rec).Error; err != nil {
+			t.Fatalf("insert %s: %v", ref, err)
+		}
+	}
+	mk("IN-2026-0001-R1", `{"`+def.Key+`":"`+referred.String()+`"}`)
+	mk("IN-2026-0001-R2", `{"`+def.Key+`":"`+other.String()+`"}`)
+
+	repo := repository.NewEORecordRepository(db)
+	list := func(f models.EORecordFilter) []string {
+		t.Helper()
+		f.RecordTypeID = []string{ty.ID.String()}
+		f.SortBy, f.SortDir = "reference", "asc"
+		recs, _, err := repo.List(context.Background(), &f)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, r.Reference)
+		}
+		return out
+	}
+
+	tests := []struct {
+		name   string
+		filter models.EORecordFilter
+		want   []string
+	}{
+		{"the referred body sees its own referral and nothing more",
+			models.EORecordFilter{UserID: uuid.New(), VisibleToDepartmentIDs: []uuid.UUID{referred}},
+			[]string{"IN-2026-0001-R1"}},
+		{"another body sees neither of them",
+			models.EORecordFilter{UserID: uuid.New(), VisibleToDepartmentIDs: []uuid.UUID{uuid.New()}},
+			nil},
+		{"the Office that issued them sees both, to consolidate",
+			models.EORecordFilter{UserID: office},
+			[]string{"IN-2026-0001-R1", "IN-2026-0001-R2"}},
+		{"an admin sees both",
+			models.EORecordFilter{IsAdmin: true},
+			[]string{"IN-2026-0001-R1", "IN-2026-0001-R2"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := list(tc.filter)
+			if len(got) != len(tc.want) {
+				t.Fatalf("saw %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("saw %v, want %v", got, tc.want)
+					break
+				}
+			}
+		})
+	}
+
+	// The control that makes the first row mean something: the SAME records
+	// stored under the matrix's spelling are visible to everyone, because the
+	// clause reads a key that is then not there. This is the bug the fix
+	// closes, reproduced.
+	t.Run("stored under the matrix spelling, nothing is restricted", func(t *testing.T) {
+		mk("IN-2026-0002-R1", `{"visibility":"`+referred.String()+`"}`)
+		got := list(models.EORecordFilter{UserID: uuid.New(), VisibleToDepartmentIDs: []uuid.UUID{uuid.New()}})
+		found := false
+		for _, r := range got {
+			if r == "IN-2026-0002-R1" {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("a record keyed `visibility` was restricted, so the engine does read that key after all and the rename is wrong")
+		}
+	})
 }

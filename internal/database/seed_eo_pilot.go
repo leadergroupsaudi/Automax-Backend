@@ -81,12 +81,13 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// engine's key already (the fall-through below), so an entry here is a
 	// deliberate statement that two names are one field.
 	//
-	// TASK A3's four, all of the same shape as `sender_deadline` below: a
-	// matrix cell whose value an ENGINE MECHANISM writes to an eo_records
-	// COLUMN. Seeded under the matrix spelling each would be a values-bag key
+	// TASK A3's five. Each is a matrix cell an ENGINE MECHANISM reads or
+	// writes UNDER A DIFFERENT SPELLING — four of them an eo_records COLUMN,
+	// and one (`visibility`) a values-bag key the repository reads by a name
+	// of its own. Seeded under the matrix spelling each would be a values-bag key
 	// that shadows nothing, sitting empty beside the column the engine had
 	// already written — and nothing would report the discrepancy. See
-	// eoColumnBackedDecisions, which names the mechanism for each and is
+	// eoEngineKeyDecisions, which names the mechanism for each and is
 	// checked against the seeded rows.
 	//
 	// Referral's `deadline` is "Derived / Counted back from the sender's
@@ -105,6 +106,22 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// draft study" (matrix:179) — the record's parent, which is
 	// parent_record_id, taken from the create request.
 	"source_study": {"parent_record_id", true, false},
+	// Referral's `visibility` is the one rename that is NOT a column, and it
+	// is why this table's rule is "a different SPELLING" rather than "a
+	// column". Spec §7.11's row-level visibility is LIVE and reads one values
+	// key: repository.eoVisibleToKey = "visible_to"
+	// (internal/repository/eo_record_repository.go:295), enforced by
+	// applyEORecordVisibility against EORecordFilter.VisibleToDepartmentIDs,
+	// which the record handler sets from the caller's bodies on every list
+	// path. That constant's own doc comment quotes this matrix row: "the
+	// values key a record carries when it is restricted to one body".
+	//
+	// Seeded as `visibility` the field is a values-bag key the engine has
+	// never heard of: the configuration would LOOK like a confidentiality
+	// control while every Referral shipped unrestricted, in a government
+	// register, with nothing reporting it — and models.ValidateTypeEdit makes
+	// the key permanent at the first Referral record.
+	"visibility": {"visible_to", false, false},
 
 	// `sender_deadline` IS the engine's due_date for Incoming Correspondence.
 	// The matrix says of it "every internal clock is derived from this date"
@@ -1189,16 +1206,27 @@ func eoPilotFieldDefs(spec eoPilotTypeSpec, typeID uuid.UUID, baseFields []model
 	order := 100
 	for _, f := range spec.fields {
 		key, isColumn, isEngineManaged := eoMatrixKey(f.matrixKey)
-		if isColumn {
-			// REFUSED, not skipped. A column key is declared by the base type
-			// already, so a second definition here would either be ignored or
-			// shadow the inherited one with a hand-written copy. Until Task
-			// A3 this branch DROPPED the entry silently — no error, no log —
-			// so a type that spelled a column-backed field in `fields:`
-			// instead of `narrowed:` lost it entirely and nothing said so.
-			// Every legitimate narrowing goes through spec.narrowed, which
-			// copies the base's stored definition.
-			return nil, fmt.Errorf("record type %q declares %q (matrix %q) under `fields:`, but it is an eo_records COLUMN the base type already defines; narrow it through `narrowed:` instead, or the definition is lost", spec.key, key, f.matrixKey)
+		// REFUSED, not skipped, for ANY key the base type defines — not only
+		// for a COLUMN key. The two failures differ and both are silent:
+		//
+		//   a COLUMN key written here used to be DROPPED outright (no error,
+		//   no log), so the type lost the field entirely;
+		//
+		//   a VALUES-BAG key the base defines — `attachments` is the only one
+		//   today — is not dropped, it is written as a second, hand-made
+		//   definition that shadows the inherited row at the ancestor's slot
+		//   while freezing the kind, config and Arabic of the day it was
+		//   typed. That is the drift `narrowed:` exists to prevent, and
+		//   Task A2 shipped exactly it before addendum 3.
+		//
+		// The base type's STORED definitions are the authority here, not
+		// eoMatrixKey's isColumn flag, which only knows about columns.
+		if _, inherited := eoFindFieldDef(baseFields, key); inherited {
+			what := "an inherited field"
+			if isColumn {
+				what = "an eo_records COLUMN"
+			}
+			return nil, fmt.Errorf("record type %q declares %q (matrix %q) under `fields:`, but it is %s the base type already defines; narrow it through `narrowed:` instead, which copies the base's stored row", spec.key, key, f.matrixKey, what)
 		}
 		if isEngineManaged {
 			// Never declarable by a pilot type: the engine owns the value
@@ -1330,31 +1358,43 @@ func eoMatrixFieldIsNotSeeded(typeKey, matrixKey string) bool {
 	return false
 }
 
-// eoColumnBackedDecision records one matrix cell whose value an ENGINE
-// MECHANISM writes to an eo_records COLUMN rather than to a values-bag key.
+// eoEngineKeyDecision records one matrix cell that AN ENGINE MECHANISM READS
+// OR WRITES UNDER A SPELLING DIFFERENT FROM THE MATRIX'S.
 //
-// This is the trap addendum 1 names, generalised. Seeded under its matrix
-// spelling such a field is a values-bag key that shadows nothing: the clerk
-// reads an empty field on a record whose value the engine has already written
-// into the column beside it, and NOTHING reports the discrepancy — not
-// validation, which sees a well-formed optional field, and not the derive
-// classifier, which was never asked. Every one of them is therefore declared
-// under the ENGINE key, as a narrowing of the inherited definition, carrying
-// the matrix's own label.
+// THE RULE WAS ORIGINALLY STATED TOO NARROWLY — "a field the matrix marks
+// Derived or Auto whose value an engine mechanism writes to a COLUMN" — and a
+// confidentiality control slipped through it in Task A3's first round.
+// Referral's `visibility` is not a column and is not written by the engine at
+// all: it is a VALUES-BAG key the repository READS, under the name
+// `visible_to`, to decide who may see the record. A column-shaped rule is
+// structurally blind to it. The rule is therefore: ANY KEY AN ENGINE
+// MECHANISM READS OR WRITES UNDER A DIFFERENT SPELLING, whichever direction
+// the value travels and whichever storage it uses.
 //
-// The registry is the statement of which cells those are and what writes each.
-// TestEoColumnBackedFieldsAreDeclaredAsTheirColumn checks every entry against
-// the seeded rows, and the required-mode sweep consults it before applying its
-// naive matrix-to-engine mapping, so an entry cannot drift from what was
-// seeded and a cell cannot be excused from the sweep without one.
-type eoColumnBackedDecision struct {
+// Why it matters in both directions. A key the engine WRITES, seeded under the
+// matrix spelling, leaves the clerk reading an empty field beside a column the
+// engine has already filled. A key the engine READS, seeded under the matrix
+// spelling, is worse: the configuration looks enforced and the mechanism never
+// fires, because it is looking for a word that is not there. Neither is
+// reported by anything — validation sees a well-formed field in both cases.
+//
+// The registry is the statement of which cells those are and what reads or
+// writes each. TestEoEngineKeyDecisionsAreDeclaredAsTheEngineSpellsThem checks
+// every entry against the seeded rows, and the required-mode sweep consults it
+// before applying its naive matrix-to-engine mapping, so an entry cannot drift
+// from what was seeded and a cell cannot be excused from the sweep without one.
+type eoEngineKeyDecision struct {
 	TypeKey   string
 	MatrixKey string
-	// EngineKey is the eo_records column the value lives in.
+	// EngineKey is the key the engine knows the value by.
 	EngineKey string
+	// IsColumn is true when EngineKey is an eo_records column rather than a
+	// values-bag key. It is checked against eoMatrixKey, so the registry and
+	// the key map cannot disagree about where a value lives.
+	IsColumn bool
 	// MatrixRequired is the Required cell verbatim.
 	MatrixRequired string
-	// Mechanism names the code that writes the column.
+	// Mechanism names the code that reads or writes the key.
 	Mechanism string
 	// SeededMode and SeededProvenance are what the narrowing actually says.
 	SeededMode       string
@@ -1362,48 +1402,54 @@ type eoColumnBackedDecision struct {
 	Why              string
 }
 
-// eoColumnBackedDecisions is the registry, total over the pilot — Task A2's
+// eoEngineKeyDecisions is the registry, total over the pilot — Task A2's
 // `sender_deadline` included, so that the inventory is in one place.
-var eoColumnBackedDecisions = []eoColumnBackedDecision{
-	{eoIncomingTypeKey, "sender_deadline", "due_date", "Yes",
+var eoEngineKeyDecisions = []eoEngineKeyDecision{
+	{eoIncomingTypeKey, "sender_deadline", "due_date", true, "Yes",
 		"the clerk types it; services.eoRecordColumnWriters writes rec.DueDate",
 		models.EORequiredAlways, models.EOProvenanceUser,
 		"Task A2's. \"Every internal clock is derived from this date\" (matrix:282), and the only mechanism that derives a child's deadline reads parent.DueDate, the column. Kept here so the inventory is complete."},
 
-	{eoReferralTypeKey, "deadline", "due_date", "Derived",
+	{eoReferralTypeKey, "deadline", "due_date", true, "Derived",
 		"services.DeriveDeadlineFromParent, applied by the save pipeline from the parent LINK TYPE's derive_deadline_from_parent and its offset; it writes rec.DueDate",
 		models.EORequiredNever, models.EOProvenanceAuto,
 		"\"Counted back from the sender's deadline\" (matrix:300) and \"Deadline derived from the parent, not typed\" (matrix:295). Provenance `auto`, not `derived`: services.ValidateRecordValues refuses a submitted value for an auto field, which is exactly what \"not typed\" means — while `derived` additionally demands a §7.5 FORMULA, and the mechanism here is a link rule. A formula would compute a second value for a column something else already writes. REQUIRES TASK A4: the mechanism is armed by the link type between Incoming Correspondence and Referral, and until that link type carries derive_deadline_from_parent no Referral gets a deadline at all and no clerk may type one. DeriveDeadlineFromParent returns nil silently when the parent has no due date, which is why Incoming's sender_deadline is `always`."},
 
-	{eoDecisionTypeKey, "decision_number", "reference", "Auto",
+	{eoDecisionTypeKey, "decision_number", "reference", true, "Auto",
 		"services.RenderReference, through eoRecordService.allocateReference, which renders this type's ReferencePattern into rec.Reference",
 		models.EORequiredNever, models.EOProvenanceAuto,
 		"The matrix's Options cell IS the reference pattern (DEC-YYYY-NNN, matrix:171) and the type's own sequence renders it. A separate auto-number field would be a number nothing allocates, sitting blank beside the reference the engine had already issued. Seeded as a narrowing that carries the matrix's label, \"Decision number\", over the inherited `reference`."},
 
-	{eoOutgoingTypeKey, "out_ref", "reference", "Auto",
+	{eoOutgoingTypeKey, "out_ref", "reference", true, "Auto",
 		"services.RenderReference, through eoRecordService.allocateReference",
 		models.EORequiredNever, models.EOProvenanceAuto,
 		"OUT-YYYY-NNNN (matrix:316) is this type's own reference pattern; see eo_decision_record.decision_number."},
 
-	{eoDecisionTypeKey, "source_study", "parent_record_id", "Auto",
+	{eoDecisionTypeKey, "source_study", "parent_record_id", true, "Auto",
 		"the create request's parent_record_id, denormalised onto eo_records (spec §7.6)",
 		models.EORequiredNever, models.EOProvenanceAuto,
 		"\"Link (ticket) / Auto / The parent draft study\" (matrix:179) is the record's parent, and the parent is a column. A values-bag `source_study` would be a second, hand-typed pointer at the record the hierarchy already names, free to disagree with it."},
 
-	{eoTaskTypeKey, "parent_ticket", "parent_record_id", "Yes",
+	{eoTaskTypeKey, "parent_ticket", "parent_record_id", true, "Yes",
 		"the create request's parent_record_id",
 		models.EORequiredNever, models.EOProvenanceAuto,
 		"The matrix marks it Yes — \"Hangs off anything, including across subsystems\" — and the key is the parent_record_id COLUMN, whose base definition is provenance `auto` because the client chooses the parent on the create REQUEST, not as a value. services.ValidateRecordValues EXEMPTS auto fields from requiredness entirely (it rejects a submitted value and moves on before the required check), so `always` here would be configuration that looks like enforcement and can never refuse anything — this programme's signature defect. It is seeded `never` and the requirement is recorded here instead. WHAT DOES ENFORCE IT: the four parent-derived types and the stage type cannot be created without a parent at all, because services.RenderReference refuses a parent-derived pattern with no parent reference (TestEoPilotReferencePatternsRenderAndRefuse pins this). Task takes its OWN sequence, so that refusal does not apply to it: nothing today stops a parentless Task. Task A4's link type for Task — target `any`, blocks_parent_closure — is where that becomes real."},
 
-	{eoTaskTypeKey, "due_date", "due_date", "Yes",
+	{eoTaskTypeKey, "due_date", "due_date", true, "Yes",
 		"the clerk types it; services.eoRecordColumnWriters writes rec.DueDate",
 		models.EORequiredAlways, models.EOProvenanceUser,
 		"\"The clock that drives reminders and escalation\" (matrix:526). An ordinary narrowing of the inherited column to `always`: the clock really does watch a Task, so the inherited Conditional holds unconditionally here."},
 
-	{eoTaskTypeKey, "owner_department", "owning_body_id", "Yes",
+	{eoTaskTypeKey, "owner_department", "owning_body_id", true, "Yes",
 		"the clerk types it; services.eoRecordColumnWriters writes rec.OwningBodyID",
 		models.EORequiredAlways, models.EOProvenanceUser,
-		"One of Task A1's six renames, and the base type ALREADY seeds owning_body_id `always`+`user`. No narrowing is seeded, deliberately: an override that changes nothing is a second row to keep in step with the first for no gain. Listed here because it is a column-backed matrix cell and the inventory is meant to be total."},
+		"One of Task A1's six renames, and the base type ALREADY seeds owning_body_id `always`+`user`. No narrowing is seeded, deliberately: an override that changes nothing is a second row to keep in step with the first for no gain. Listed here because it is a renamed matrix cell and the inventory is meant to be total."},
+
+	// The entry that the column-only rule could not see.
+	{eoReferralTypeKey, "visibility", "visible_to", false, "Auto",
+		"repository.applyEORecordVisibility READS it (internal/repository/eo_record_repository.go:438-463) through repository.eoVisibleToKey, on every list, against EORecordFilter.VisibleToDepartmentIDs; the pilot seed writes it, as a §7.5 own-scope derivation from referred_body",
+		models.EORequiredNever, models.EOProvenanceDerived,
+		"Spec §7.11's row-level visibility, and the ONE registry entry whose engine key is a values-bag key rather than a column — which is why the rule is now about SPELLING rather than storage. The engine does not write this key; it READS it, so a field seeded under the matrix's `visibility` is not an empty field beside a full column but something worse: a confidentiality control that looks configured while the mechanism searches for a word that is not there, and every Referral in a government register is visible to everyone. Seeded `derived` with the formula `referred_body` so the matrix's \"the referred body only\" is computed on every save rather than waiting for a writer that does not exist, and so that ValidateRecordValues refuses a clerk's attempt to set their own record's visibility. The repository's own clause treats an ABSENT visible_to as unrestricted, so a derivation that failed would fail OPEN — which is why referred_body being `always` on this type is load-bearing, not incidental."},
 }
 
 // eoPilotChildTypes is the eight sub types, in the matrix's order within each
@@ -1444,10 +1490,25 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 		// rejected for not ending in YYYY then a run of N. Seeded verbatim it
 		// would not misnumber a plan — it would make every Execution Plan
 		// UNCREATABLE, at allocateReference, with no plan ever reaching the
-		// database to show it. The `#` is added and the sequence it renders
-		// is per parent, so the matrix's "one per directive" reads as
-		// EO-DIR-2026-001-P1 and a replan is -P2, which is what `supersedes`
-		// is for. Recorded in the task report.
+		// database to show it.
+		//
+		// Adding the `#` is right rather than merely expedient, for two
+		// reasons. EOSequenceScope partitions the counter PER PARENT
+		// (pattern + "|" + parentRef), so -P1 is the first plan on THAT
+		// directive and the client's "one per directive" is satisfied by the
+		// number always reading 1; a replan is -P2, which is what
+		// `supersedes` is for. And relaxing the grammar instead would be
+		// worse: RenderReference would emit no sequence at all, so two plans
+		// on one directive would collide on a `reference` that is unique per
+		// PARTITION only.
+		//
+		// IT IS NOT A ONE-OFF. Four more matrix types use the same
+		// unrenderable bare-suffix form, all of them "one per parent":
+		// CMT-YYYY-NN-R (:256), MED-YYYY-NNN-BP (:357), REQ-YYYY-NNNN-APT
+		// (:416) and REQ-YYYY-NNNN-DIR (:430). The designed answer is a
+		// parent-derived SINGLETON pattern with a cardinality guarantee,
+		// which is engine work; see the carry-forward doc, where it is framed
+		// for the client as a choice rather than as a patch to one reference.
 		pattern: "EO-DIR-YYYY-NNN-P#",
 		fields: []eoPilotFieldSpec{
 			{matrixKey: "plan_summary", label: "Plan summary",
@@ -1585,7 +1646,7 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			// `decision_number` and `source_study` are NOT here: both are
 			// eo_records columns, and eoPilotFieldDefs now REFUSES a column
 			// key written under `fields:` rather than dropping it. They are
-			// the narrowings below. See eoColumnBackedDecisions.
+			// the narrowings below. See eoEngineKeyDecisions.
 			{matrixKey: "decision_text", label: "Decision text",
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			{matrixKey: "issued_by", label: "Issued by",
@@ -1645,7 +1706,7 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			{matrixKey: "instruction", label: "Instruction",
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			// `deadline` is NOT here: it is the inherited due_date COLUMN,
-			// narrowed below. See eoColumnBackedDecisions.
+			// narrowed below. See eoEngineKeyDecisions.
 			{matrixKey: "response", label: "View submitted",
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			{matrixKey: "response_files", label: "Response attachments",
@@ -1653,16 +1714,36 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 			{matrixKey: "parent_referral", label: "Parent referral",
 				kind: models.EOKindLink, provenance: models.EOProvenanceUser, required: models.EORequiredNever,
 				config: `{"target_type_key":"` + eoReferralTypeKey + `"}`},
-			// Marked Auto by the matrix and WRITTEN BY NOTHING TODAY. Spec
-			// §7.11 names it as the second of three access-control
-			// mechanisms, "row-level visibility ... enforced in the
-			// repository layer", and no such column, filter or clause exists
-			// in the engine: models.EORecord has no visibility column and
-			// models.EORecordFilter no clause. Provenance `auto` is what
-			// keeps a clerk from typing a visibility nothing enforces; the
-			// gap itself is reported, not papered over.
+			// THE §7.11 ROW-LEVEL VISIBILITY CONTROL, and it is live.
+			// eoMatrixKey seeds it under the engine's spelling,
+			// `visible_to`, which repository.applyEORecordVisibility reads
+			// on every list: a record with a visible_to value is shown only
+			// to an admin, to its creator (the Office must see its own
+			// referrals to consolidate them) and to callers whose bodies
+			// include that body. Under the matrix's own spelling the field
+			// would be a key the engine has never heard of and every
+			// Referral would be visible to everyone.
+			//
+			// DERIVED, not auto, and that is the difference between a
+			// control and a label. "The referred body only" is literally
+			// `visible_to = referred_body`, which is a §7.5 own-scope
+			// dependency — the one derivation in the pilot that needs no
+			// other record — so the value is computed on every save from the
+			// body the clerk already named, rather than left for a mechanism
+			// that does not exist to write one day. Provenance `derived` also
+			// makes services.ValidateRecordValues REFUSE a submitted
+			// visible_to, so no clerk can widen or narrow the visibility of
+			// their own referral.
+			//
+			// It cannot do worse than `auto`: if the formula ever failed to
+			// resolve, the key would be absent and the record unrestricted,
+			// which is exactly what `auto` with nothing writing it gives.
+			// `referred_body` is required `always` on this type, so on any
+			// save that succeeds the formula has its input.
 			{matrixKey: "visibility", label: "Visible to",
-				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceAuto, required: models.EORequiredNever},
+				kind: models.EOKindOrgUnit, provenance: models.EOProvenanceDerived, required: models.EORequiredNever,
+				formula:     "referred_body",
+				recomputeOn: `[{"scope":"own","field":"referred_body"}]`},
 		},
 		narrowed: []eoInheritedNarrowing{
 			{matrixKey: "deadline", required: models.EORequiredNever,
@@ -1707,7 +1788,7 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 				kind: models.EOKindLongText, provenance: models.EOProvenanceUser, required: models.EORequiredAlways},
 			// `parent_ticket`, `owner_department` and `due_date` are NOT
 			// here: all three are eo_records columns. See
-			// eoColumnBackedDecisions, which also says why only two of them
+			// eoEngineKeyDecisions, which also says why only two of them
 			// are narrowed.
 			//
 			// `origin_cff` is Auto and "taken from the parent", and it is NOT
@@ -1870,7 +1951,7 @@ func eoChildConditionalDecisions() []eoConditionalDecision {
 		{eoTaskTypeKey, "parent_ticket",
 			"Mandatory on every sub and sub-sub type.",
 			models.EORequiredNever,
-			"Own sequence (TSK) and the matrix marks the type's OWN `parent_ticket` row Required Yes, not Conditional — the universal type \"hangs off anything\". Both statements reach the same column and the same answer; see eoColumnBackedDecisions, which carries the full reasoning and the enforcement gap."},
+			"Own sequence (TSK) and the matrix marks the type's OWN `parent_ticket` row Required Yes, not Conditional — the universal type \"hangs off anything\". Both statements reach the same column and the same answer; see eoEngineKeyDecisions, which carries the full reasoning and the enforcement gap."},
 
 		// `due_date`: "required on any type the clock watches". Per type,
 		// which clock — if any — watches it.
@@ -1897,7 +1978,7 @@ func eoChildConditionalDecisions() []eoConditionalDecision {
 		{eoReferralTypeKey, "due_date",
 			"Required on any type the clock watches.",
 			models.EORequiredNever,
-			"The clock DOES watch a referral — and this field IS that clock, under the matrix's own name for it, `deadline`. It is `never` rather than `always` because the matrix marks it Derived and \"not typed\": requiring it of the clerk is precisely what the client's document refuses. The narrowing sets provenance `auto` so a clerk cannot supply one, and services.DeriveDeadlineFromParent writes the column. See eoColumnBackedDecisions, including what Task A4 must seed for that to happen at all."},
+			"The clock DOES watch a referral — and this field IS that clock, under the matrix's own name for it, `deadline`. It is `never` rather than `always` because the matrix marks it Derived and \"not typed\": requiring it of the clerk is precisely what the client's document refuses. The narrowing sets provenance `auto` so a clerk cannot supply one, and services.DeriveDeadlineFromParent writes the column. See eoEngineKeyDecisions, including what Task A4 must seed for that to happen at all."},
 		{eoOutgoingTypeKey, "due_date",
 			"Required on any type the clock watches.",
 			models.EORequiredNever,

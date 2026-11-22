@@ -116,6 +116,53 @@ edit. **Get the answer before the pilot's first Directive.** The plausible
 reading is "when `directive_origin` is `committee` or `weekly_meeting`", but the
 matrix does not say so.
 
+**The rule for finding renamed keys is about SPELLING, not storage (A3 fix
+round 1).** Task A3's brief stated it as "any field the matrix marks Derived or
+Auto whose value an engine mechanism writes to a **column**", and a
+confidentiality control went straight through that wording: Referral's
+`visibility` is not a column, is not marked Derived in the Required column, and
+is not *written* by the engine at all — it is a values-bag key the repository
+**reads**, under the name `visible_to`. A column-shaped rule is structurally
+blind to it.
+
+**The rule any later task should apply is: any key an engine mechanism READS OR
+WRITES under a spelling different from the client matrix's, whichever direction
+the value travels and whichever storage it uses.** The two failures differ, and
+both are silent. A key the engine *writes*, seeded under the matrix spelling,
+leaves a clerk reading an empty field beside a column the engine already
+filled. A key the engine *reads*, seeded under the matrix spelling, is worse:
+the configuration looks enforced and the mechanism never fires, because it is
+looking for a word that is not there. Validation sees a well-formed field in
+both cases and reports neither. `eoEngineKeyDecisions` in
+`internal/database/seed_eo_pilot.go` is the register of the ones found so far,
+and the way to look for more is to grep the engine for values-key string
+literals rather than to reason from the matrix outwards.
+
+**Found by that wider rule, and NOT acted on: the approval capability's two
+input fields (owner: whoever gives a type the `approval` capability).** The
+`approval` capability — the only one registered today
+(`services.NewEOApprovalCapability`) — reads and writes two DECLARED input
+fields named `<stamp_key>_authority` and `<stamp_key>_delegation_note`
+(`internal/services/eo_capability_approval.go:24-35`, whose own comment says
+"the seeding task must declare them"), with `stamp_key` defaulting to
+`approval`. The client's matrix names the same two things on Outgoing Reply as
+`approved_by` ("H.E. or his delegate") and `delegation_note` ("recorded when
+H.E. delegates the signature") — which is precisely the capability's purpose:
+"two identities that must stay distinguishable … H.E. never logs in, so
+authority is never inferred from the actor". **The stamp key is configurable
+but the suffixes are not**, so no `stamp_key` makes `delegation_note` the
+capability's input field.
+
+Task A3 did NOT re-key those fields, deliberately: no pilot type carries any
+capability (`Capabilities` is `[]` on all eleven), so nothing reads them today,
+and whether Outgoing Reply gets the `approval` capability is a decision for the
+task that assigns capabilities, not for the task that seeds fields. **But if
+that capability is ever put on Outgoing Reply — or on any of the eight "user +
+date" sign-off points spec §7.3 counts — the two fields must be keyed
+`<stamp>_authority` and `<stamp>_delegation_note`, and re-keying them is
+destructive once records exist.** Decide it before the pilot's first Outgoing
+Reply.
+
 **Client sign-off: the Decision Record's subject taxonomy
 (named obligation, owner: the client, WITH A DEADLINE).** The matrix gives
 Decision Record a `keywords` field, Multi-select, Required Yes, with the
@@ -141,15 +188,68 @@ link type, every Referral has an empty deadline and no clerk may supply one** �
 `DeriveDeadlineFromParent` returns nil silently when nothing arms it, and an
 absent deadline is not an error anywhere in the engine.
 
-**Nothing refuses a parentless Decision Record, Outgoing Reply or Task.** The
-matrix marks `parent_ticket` mandatory on every sub type. On the five
-parent-derived types that is enforced for free, because
-`services.RenderReference` refuses to number a record whose parent reference is
-missing. The three own-sequence children number cleanly without a parent, and
-`parent_record_id` is provenance `auto`, which `ValidateRecordValues` exempts
-from requiredness entirely — so requiredness cannot carry it. It needs A4's
-link types (Task's is the polymorphic `any` one) or a create-path rule, and it
-is recorded in `eoColumnBackedDecisions` with the same words.
+**Nothing refuses a parentless Decision Record, Outgoing Reply or Task, and a
+link type CANNOT close it.** The matrix marks `parent_ticket` mandatory on
+every sub type. On the five parent-derived types it is enforced for free,
+because `services.RenderReference` refuses to number a record whose parent
+reference is missing. The three own-sequence children number cleanly without a
+parent, and `parent_record_id` is provenance `auto`, which
+`ValidateRecordValues` exempts from requiredness entirely — so requiredness
+cannot carry it either.
+
+**The required work is a CREATE-PATH RULE, not a link type.** This is worth
+being blunt about, because the obvious reading of "A4 seeds the link types"
+is that A4 closes this, and A4 cannot. `EOLinkType.Cardinality` is `one|many`
+and is an **upper** bound — `ValidateLink` reads it as "at most one outgoing
+link of this type" — and `ValidateLink` is only reached at all when a parent
+*was* supplied (`applyLinkRules` returns early when `parent == nil`). Nothing
+in the link-type model can express "a record of this type must have a parent".
+A4 should seed its link types and leave this item OPEN; closing it means a rule
+in the create path (a type that declares a parent link must be created with
+one), and whoever does it owns the decision about Task, whose parent may be of
+any type in any subsystem. Recorded in `eoEngineKeyDecisions` with the same
+words.
+
+**The matrix has five "one per parent" child types whose reference patterns
+cannot be rendered, and the fix is engine work, not five edits (owner: engine,
+then client sign-off).** `services.parseEOPattern` reads a parent-derived
+pattern as the parent's segments followed by one segment of letters then `#`.
+Five of the matrix's patterns end in a bare suffix with no `#`:
+
+| Pattern | Type | Matrix |
+| --- | --- | --- |
+| `EO-DIR-YYYY-NNN-P` | Execution Plan | :90 |
+| `CMT-YYYY-NN-R` | Committee Report | :256 |
+| `MED-YYYY-NNN-BP` | Briefing Pack | :357 |
+| `REQ-YYYY-NNNN-APT` | Appointment | :416 |
+| `REQ-YYYY-NNNN-DIR` | Office Direction | :430 |
+
+Every one is a "one per parent" type, and every one is **unrenderable**: the
+pattern falls through to the own-sequence branch and is rejected for not ending
+in `YYYY` then a run of `N`. A type seeded with one is not mis-numbered, it is
+**uncreatable** — the refusal happens in `allocateReference`, so no record ever
+reaches the database to show it.
+
+Task A3 seeded Execution Plan as `EO-DIR-YYYY-NNN-P#`, and two things make that
+the right stop-gap rather than a fudge. `EOSequenceScope` partitions the
+counter **per parent** (`pattern + "|" + parentRef`), so `-P1` is the first
+plan *on that directive* and the client's "one per directive" is satisfied by
+the number always reading 1. And relaxing the grammar to accept a bare suffix
+would be actively worse: `RenderReference` would then emit no sequence at all,
+so two plans on one directive would collide on a `reference` that is unique per
+PARTITION only.
+
+**So `-P1` is a precedent for four more types, and it should be designed rather
+than repeated.** The engine wants a parent-derived SINGLETON form — a pattern
+that renders `EO-DIR-2026-001-P` with a guarantee of at most one child of that
+type per parent, enforced where the sequence is allocated rather than hoped for
+— and until that exists, every one of the five carries a visible `1` the client
+did not ask for. Put it to the client that way: not "we added a `#` to your
+plan reference", but "the five one-per-parent types either carry a sequence
+number or the engine grows a cardinality-guaranteed singleton pattern; which do
+you want, and do you want it before the pilot?" It is cheap now and permanent
+later — `ValidateTypeEdit` makes a reference pattern destructive to change once
+records exist.
 
 **Task A5 must call `eoRequireAtClosureState` or delete it.** The matrix's
 fifth Required value, "Yes at closure", appears twice in the pilot:
@@ -171,16 +271,31 @@ recorded rather than fixed here, but Plan 2's per-type gate will find them
 absent rather than present and granted, which is the opposite of what the §7.11
 note assumes.
 
-**Three fields are marked Auto and written by nothing.** Referral's
-`visibility` (spec §7.11's "row-level visibility … enforced in the repository
-layer" — no column, no filter clause and no enforcement exists), Task's
-`origin_cff` ("taken from the parent", which cannot be a §7.5 ancestor
-dependency because a Task hangs off any type in any subsystem, so no single
-ancestor type can be named), and Task's `completion_rate` ("rolls up to the
-parent's completion rate" — the pilot's only roll-up is the Directive's, over
-assignments, so a Task's rate reaches no parent). All three are provenance
-`auto` or `user`+optional, so nothing breaks and nothing lies to a clerk about
-being editable; what is absent is the mechanism.
+**Two fields are marked Auto and written by nothing.** Task's `origin_cff`
+("taken from the parent", which cannot be a §7.5 ancestor dependency because a
+Task hangs off any type in any subsystem, so no single ancestor type can be
+named) and Task's `completion_rate` ("rolls up to the parent's completion
+rate" — the pilot's only roll-up is the Directive's, over assignments, so a
+Task's rate reaches no parent). Both are provenance `auto` or
+`user`+optional, so nothing lies to a clerk about being editable; what is
+absent is the mechanism.
+
+**Correction (A3 fix round 1): §7.11 row-level visibility EXISTS AND IS LIVE.**
+An earlier version of this file said no column, filter clause or enforcement
+existed for Referral's `visibility`. That was wrong, and it was wrong in the
+direction that gets a control shipped disabled. `applyEORecordVisibility`
+(`internal/repository/eo_record_repository.go:438-463`) filters every list
+against `EORecordFilter.VisibleToDepartmentIDs`, which the record handler sets
+from the caller's bodies, and it reads ONE values key —
+`repository.eoVisibleToKey = "visible_to"`. The repository's own tests already
+cover the referral case. A3 originally seeded the field under the matrix's
+spelling, `visibility`, which the engine has never heard of: the configuration
+looked like a confidentiality control and every Referral in a government
+register would have been visible to everyone. It is now seeded under
+`visible_to`, provenance `derived`, formula `referred_body` — the matrix's "the
+referred body only" computed on every save — and proved end to end against the
+live clause. **Nothing here is outstanding; the entry is kept so that nobody
+rediscovers the false version of it.**
 
 **Task A5 must call `eoLockDraftFieldsAfterState` or delete it.** The Draft
 Decision Study's `draft_text` and `draft_file` are the pilot's only field-level
