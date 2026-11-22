@@ -148,6 +148,11 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		&models.WebhookCallbackConfig{},
 		// MOMRA CRM outbound integration
 		&models.MOMRAStatusMapping{},
+		// EO platform models (parents before children). EORecord is NOT listed:
+		// it is created by raw SQL as a partitioned table.
+		&models.EORecordType{},
+		&models.EOFieldDef{},
+		&models.EOLinkType{},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to run migrations: %w", err)
