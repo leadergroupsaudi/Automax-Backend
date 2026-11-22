@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1142,6 +1143,10 @@ type eoFolderCall struct {
 type eoFakeDocumenta struct {
 	storage.DocumentaClient
 
+	// mu guards everything below: the concurrency test calls this fake from
+	// several goroutines at once, and the race detector runs over it.
+	mu sync.Mutex
+
 	// root is what ListFiles answers for the workspace root.
 	root []storage.DmsFile
 	// listErr fails ListFiles, standing in for a transient Documenta outage
@@ -1159,8 +1164,12 @@ type eoFakeDocumenta struct {
 	// record folder each need their own guard, hence the call number.
 	emptyIDFrom int
 	// onCall runs on entry to every call, so a test can observe what was true
-	// of the service at the moment it reached out.
+	// of the service at the moment it reached out. It runs under the fake's
+	// lock.
 	onCall func()
+	// onList runs on entry to ListFiles, OUTSIDE the lock, so a test can keep
+	// callers parked inside the listing and observe how many got there.
+	onList func()
 
 	lists   []eoFolderCall
 	creates []eoFolderCall
@@ -1168,17 +1177,28 @@ type eoFakeDocumenta struct {
 }
 
 func (c *eoFakeDocumenta) ListFiles(_ context.Context, workspace, parent string) (*storage.DmsListResult, error) {
+	c.mu.Lock()
 	if c.onCall != nil {
 		c.onCall()
 	}
 	c.lists = append(c.lists, eoFolderCall{workspace: workspace, parent: parent})
-	if c.listErr != nil {
-		return nil, c.listErr
+	onList, listErr, root := c.onList, c.listErr, c.root
+	c.mu.Unlock()
+	// onList runs OUTSIDE the lock: it is how a test holds callers inside the
+	// listing, and holding the fake's lock there would serialise them and
+	// hide the very interleaving under test.
+	if onList != nil {
+		onList()
 	}
-	return &storage.DmsListResult{Files: c.root}, nil
+	if listErr != nil {
+		return nil, listErr
+	}
+	return &storage.DmsListResult{Files: root}, nil
 }
 
 func (c *eoFakeDocumenta) CreateFolder(_ context.Context, workspace, parent, name string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.onCall != nil {
 		c.onCall()
 	}
@@ -1214,10 +1234,18 @@ func eoCreateForFolder(t *testing.T, f *eoSvcFixture, subjectEn string) (*models
 }
 
 // eoFolderNotes returns the history rows that report a missing folder.
+//
+// The prefix is written out rather than taken from eoFolderFailureNote. The
+// constant's whole job is to be a STABLE string an operator and a backfill
+// grep for, so a test that matched on the constant would follow it anywhere
+// and pin nothing — the same defect as a clip test that derives its
+// expectation from the limit it is testing.
+const eoFolderNoteLiteral = "documenta folder not created"
+
 func eoFolderNotes(history []models.EORecordHistory) []models.EORecordHistory {
 	var out []models.EORecordHistory
 	for _, h := range history {
-		if strings.Contains(h.Comment, eoFolderFailureNote) {
+		if strings.Contains(h.Comment, eoFolderNoteLiteral) {
 			out = append(out, h)
 		}
 	}
@@ -1584,6 +1612,16 @@ func TestEOFolderNamesAreLegibleAndBounded(t *testing.T) {
 			rec:  models.EORecord{Reference: "EO-DIR-2026-004", SubjectEn: long},
 			want: "EO-DIR-2026-004 - " + strings.Repeat("ت", 120) + "…",
 		},
+		{
+			// The cut lands inside a run of spaces. Without the trim the name
+			// reads "…word   …", which is the clip showing through.
+			name: "the clip does not leave the whitespace it cut to",
+			rec: models.EORecord{
+				Reference: "EO-DIR-2026-005",
+				SubjectEn: strings.Repeat("a", 118) + "    " + strings.Repeat("b", 60),
+			},
+			want: "EO-DIR-2026-005 - " + strings.Repeat("a", 118) + "…",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1599,6 +1637,26 @@ func TestEOFolderNamesAreLegibleAndBounded(t *testing.T) {
 		}
 		if got := eoAnchorFolderName(&models.EORecordType{Key: "eo_directive", Name: "Directive"}); got != "Directive" {
 			t.Errorf("eoAnchorFolderName() = %q, want the name", got)
+		}
+	})
+
+	t.Run("the anchor name is bounded too", func(t *testing.T) {
+		// A record type's name column holds 255 characters and its key 100,
+		// so both can outrun the limit. An unclipped anchor is worse than an
+		// unclipped record folder: every record of the type is filed under it.
+		for _, tc := range []struct {
+			name string
+			typ  models.EORecordType
+			want string
+		}{
+			{"from the name", models.EORecordType{Key: "k", Name: strings.Repeat("n", 300)}, strings.Repeat("n", 120) + "…"},
+			{"from the key", models.EORecordType{Key: strings.Repeat("k", 300)}, strings.Repeat("k", 120) + "…"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := eoAnchorFolderName(&tc.typ); got != tc.want {
+					t.Errorf("eoAnchorFolderName() = %q (%d runes), want it clipped to %d", got, len([]rune(got)), len([]rune(tc.want)))
+				}
+			})
 		}
 	})
 }
@@ -1666,5 +1724,205 @@ func TestEOFolderCallCarriesTheActingUserAndWorkspace(t *testing.T) {
 		if g.workspace != "eo-workspace" {
 			t.Errorf("request %d workspace = %q, want the per-call workspace name %q", i, g.workspace, "eo-workspace")
 		}
+	}
+}
+
+// TestEOConcurrentCreatesOfATypeMakeOneAnchor is the four-anchor case: before
+// the in-flight guard, anchorFor released the memo lock before listing and
+// relocked only to store, so concurrent creates of the same type ALL missed
+// the cache, ALL listed, ALL saw no anchor and ALL created one. The realistic
+// trigger is not an exotic interleaving — it is the first burst of creates
+// after a deploy, when every listing is in flight at once.
+//
+// It drives anchorFor directly rather than Create, because the repository
+// fakes are not safe for concurrent use and the defect is entirely here. The
+// collaborator is taken from a service built by the real constructor, so the
+// test cannot drift from how production initialises it.
+func TestEOConcurrentCreatesOfATypeMakeOneAnchor(t *testing.T) {
+	const callers = 4
+
+	client := &eoFakeDocumenta{}
+	// Park every caller that reaches the listing until either all of them are
+	// there (which is the bug) or a short grace period passes (which is the
+	// fix: only one ever arrives). Both outcomes are deterministic — the
+	// barrier guarantees that nobody completes a resolution while others are
+	// still ahead of the cache check — and neither can hang.
+	entered := make(chan struct{}, callers)
+	release := make(chan struct{})
+	client.onList = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	go func() {
+		grace := time.After(250 * time.Millisecond)
+		for i := 0; i < callers; i++ {
+			select {
+			case <-entered:
+			case <-grace:
+				close(release)
+				return
+			}
+		}
+		close(release)
+	}()
+
+	svc, ok := NewEORecordService(
+		eoNewSvcRecordRepo(), &eoSvcTypeRepo{}, &eoSvcSequenceRepo{}, &eoWorkflowFakeRepo{},
+		EOWithDocumentaFolders(client, "eo-workspace"),
+	).(*eoRecordService)
+	if !ok {
+		t.Fatalf("NewEORecordService did not return *eoRecordService")
+	}
+	if svc.folders == nil {
+		t.Fatalf("the option wired no folders")
+	}
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	ids := make([]string, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = svc.folders.anchorFor(context.Background(), recordType)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	roots := 0
+	for _, c := range client.creates {
+		if c.parent == "" {
+			roots++
+		}
+	}
+	if roots != 1 {
+		t.Errorf("root-level folders created = %d (%+v), want exactly 1: concurrent creates of a type must share one anchor", roots, client.creates)
+	}
+	if len(client.lists) != 1 {
+		t.Errorf("ListFiles calls = %d, want 1: a caller that finds a resolution in flight takes its result rather than starting another", len(client.lists))
+	}
+	for i, id := range ids {
+		if id != ids[0] {
+			t.Errorf("caller %d got anchor %q, caller 0 got %q; every record of a type is filed under one anchor", i, id, ids[0])
+		}
+	}
+}
+
+// TestEOAFailedAnchorResolutionIsNotRemembered pins the other half of the
+// in-flight guard: a resolution that failed must not be memoised, or a single
+// outage would leave the type anchorless for the process's lifetime, and the
+// waiters must see the failure rather than an empty id that looks like one.
+func TestEOAFailedAnchorResolutionIsNotRemembered(t *testing.T) {
+	client := &eoFakeDocumenta{listErr: errors.New("documenta: connection refused")}
+	svc := NewEORecordService(
+		eoNewSvcRecordRepo(), &eoSvcTypeRepo{}, &eoSvcSequenceRepo{}, &eoWorkflowFakeRepo{},
+		EOWithDocumentaFolders(client, "eo-workspace"),
+	).(*eoRecordService)
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	if _, err := svc.folders.anchorFor(context.Background(), recordType); err == nil {
+		t.Fatal("a failed listing resolved an anchor")
+	}
+	// Documenta comes back, and the next caller must try again rather than be
+	// served a remembered failure or a remembered empty id.
+	client.listErr = nil
+	client.root = []storage.DmsFile{{UUID: "existing-anchor", Name: "Directive", Type: "folder"}}
+	got, err := svc.folders.anchorFor(context.Background(), recordType)
+	if err != nil {
+		t.Fatalf("anchorFor after recovery: %v", err)
+	}
+	if got != "existing-anchor" {
+		t.Errorf("anchor = %q, want the one in the workspace", got)
+	}
+	if len(client.lists) != 2 {
+		t.Errorf("ListFiles calls = %d, want 2: the failure must not have been cached", len(client.lists))
+	}
+}
+
+func TestEOCheckDocumentaBaseURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{name: "an https url", raw: "https://mydocs.example.gov"},
+		{name: "an http url with a port and path", raw: "http://10.0.0.4:8090/docs"},
+		{name: "surrounding whitespace is tolerated", raw: "  https://mydocs.example.gov  "},
+		{name: "empty", raw: "", wantErr: "is empty"},
+		{name: "whitespace only", raw: "   ", wantErr: "is empty"},
+		// The one the empty check alone let through: it parses, and
+		// NewHTTPDocumentaClient builds "mydocs.internal/api/v1", which fails
+		// on every request instead of at boot.
+		{name: "no scheme", raw: "mydocs.internal", wantErr: "no http(s) scheme"},
+		{name: "a bare host and port", raw: "mydocs.internal:8090", wantErr: "no http(s) scheme"},
+		{name: "the wrong scheme", raw: "ftp://mydocs.internal", wantErr: "no http(s) scheme"},
+		{name: "a scheme with no host", raw: "https://", wantErr: "no host"},
+		{name: "not a url at all", raw: "http://[::1", wantErr: "is not a URL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := EOCheckDocumentaBaseURL(tc.raw)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("EOCheckDocumentaBaseURL(%q) = %v, want it accepted", tc.raw, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("EOCheckDocumentaBaseURL(%q) accepted it, want %q", tc.raw, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("EOCheckDocumentaBaseURL(%q) = %v, want it to mention %q", tc.raw, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestEOACancelledCallerDoesNotWaitOutAnothersResolution covers the other arm
+// of the in-flight wait. Sharing one resolution between concurrent callers is
+// only safe if a waiter can still give up: without the ctx arm, a request
+// whose client has gone away would sit through another request's 30-second
+// Documenta timeout, holding its own goroutine and its own HTTP handler.
+func TestEOACancelledCallerDoesNotWaitOutAnothersResolution(t *testing.T) {
+	client := &eoFakeDocumenta{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.onList = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+
+	svc := NewEORecordService(
+		eoNewSvcRecordRepo(), &eoSvcTypeRepo{}, &eoSvcSequenceRepo{}, &eoWorkflowFakeRepo{},
+		EOWithDocumentaFolders(client, "eo-workspace"),
+	).(*eoRecordService)
+	recordType := &models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive"}
+
+	// The first caller parks inside the listing, so its resolution is
+	// registered as in flight before the second caller arrives.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.folders.anchorFor(context.Background(), recordType)
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := svc.folders.anchorFor(ctx, recordType); !errors.Is(err, context.Canceled) {
+		t.Errorf("anchorFor on a cancelled context = %v, want it to carry context.Canceled", err)
+	}
+	// The cancelled caller must not have started a listing of its own.
+	close(release)
+	<-done
+	if len(client.lists) != 1 {
+		t.Errorf("ListFiles calls = %d, want 1: a cancelled waiter starts nothing", len(client.lists))
 	}
 }

@@ -239,24 +239,33 @@ func main() {
 	// redisClient is deliberately nil: the HTTP client's Redis keys (token and
 	// folder cache) carry no client identity, so sharing Redis would serve this
 	// client another client's token and cached folder ids.
-	var eoDocumentaClient storage.DocumentaClient
+	//
+	// When EO Documenta is DISABLED — the default, and what the pilot runs
+	// today — NO client is wired and the option stays nil, so every record is
+	// created with an empty documenta_folder_id.
+	//
+	// The STUB IS DELIBERATELY NOT USED HERE, unlike goal_service.go:
+	// StubDocumentaClient.CreateFolder invents "stub-folder-<uuid>", and
+	// persisting that into eo_records would file every record of a disabled
+	// deployment under an id that resolves to nothing. Empty is the register's
+	// documented no-folder value and the handle its backfill selects on
+	// (services.eoFolderFailureNote, and the empty documenta_folder_id), so a
+	// fabricated id would make those records LOOK filed and hide them from the
+	// backfill. Goals has no such contract to break; this register does.
+	var eoFolderOption services.EORecordOption
 	if cfg.EODocumenta.Enabled {
-		// NewHTTPDocumentaClient appends "/api/v1" to whatever it is given, so
-		// an empty base URL builds a client whose every request goes to the
-		// relative path "/api/v1" and fails. The other two Documenta blocks
-		// have a default URL that hides this; the EO block deliberately has
-		// none. Refusing at boot is the only loud failure available: a record
-		// folder that cannot be created does not block the record (see
-		// EOWithDocumentaFolders), so a misconfigured deployment would
-		// otherwise run for months filing nothing.
-		if strings.TrimSpace(cfg.EODocumenta.BaseURL) == "" {
-			log.Fatalf("EO_DOCUMENTA_ENABLED=true but EO_DOCUMENTA_BASE_URL is empty: set the URL or disable EO Documenta")
+		if err := services.EOCheckDocumentaBaseURL(cfg.EODocumenta.BaseURL); err != nil {
+			log.Fatalf("EO_DOCUMENTA_ENABLED=true but %v: set the URL or disable EO Documenta", err)
 		}
-		eoDocumentaClient = storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)
-		log.Println("EO Documenta HTTP client enabled")
+		// The workspace name is passed per call because NewHTTPDocumentaClient
+		// ignores cfg.WorkspaceName; it is the only route
+		// EO_DOCUMENTA_WORKSPACE_NAME has to Documenta, and even then the OAuth
+		// token's workspace_uuid claim takes precedence over it.
+		eoFolderOption = services.EOWithDocumentaFolders(
+			storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil), cfg.EODocumenta.WorkspaceName)
+		log.Println("EO Documenta HTTP client enabled: every EO record gets a folder")
 	} else {
-		eoDocumentaClient = storage.NewStubDocumentaClient()
-		log.Println("EO Documenta stub client (EO_DOCUMENTA_ENABLED=false)")
+		log.Println("EO Documenta disabled (EO_DOCUMENTA_ENABLED=false): EO records are created with no Documenta folder")
 	}
 
 	// Ready-to-Close service
@@ -523,12 +532,11 @@ func main() {
 	eoTypeRepo := repository.NewEORecordTypeRepository(db)
 	eoSequenceRepo := repository.NewEOSequenceRepository(db)
 
-	// The workspace name is passed per call because NewHTTPDocumentaClient
-	// ignores cfg.WorkspaceName; it is the only route EO_DOCUMENTA_WORKSPACE_NAME
-	// has to Documenta, and even then the OAuth token's workspace_uuid claim
-	// takes precedence over it.
+	// eoFolderOption is nil unless EO Documenta is enabled; the constructor
+	// skips a nil option, so the default deployment creates records with no
+	// folder rather than with a fabricated one.
 	eoRecordService := services.NewEORecordServiceWithSLA(eoRecordRepo, eoTypeRepo, eoSequenceRepo, workflowRepo, escalationPolicyRepo,
-		services.EOWithDocumentaFolders(eoDocumentaClient, cfg.EODocumenta.WorkspaceName))
+		eoFolderOption)
 	eoActionExecutor := services.NewEOActionExecutor(eoRecordService, eoRecordRepo, eoTypeRepo, userRepo, departmentRepo, notificationService)
 	eoTransitionService := services.NewEOTransitionServiceWithSLA(eoRecordRepo, eoTypeRepo, workflowRepo, eoActionExecutor, escalationPolicyRepo)
 	// Closes the construction cycle the two services make: the transition

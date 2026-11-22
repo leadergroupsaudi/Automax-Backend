@@ -554,12 +554,20 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		// workspace name is part of the pin because the client constructor
 		// ignores cfg.WorkspaceName — the per-call argument is the only way
 		// EO_DOCUMENTA_WORKSPACE_NAME reaches Documenta.
-		"services.EOWithDocumentaFolders(eoDocumentaClient, cfg.EODocumenta.WorkspaceName)",
-		// The boot guard: EO_DOCUMENTA_ENABLED=true with no base URL builds a
-		// client pointed at the relative path "/api/v1". A folder failure does
-		// not block a record, so without this the deployment would file
+		//
+		// It is built INSIDE the cfg.EODocumenta.Enabled branch, and the stub
+		// client is not used for EO at all: the stub invents
+		// "stub-folder-<uuid>", and persisting that would file every record of
+		// a disabled deployment — the default — under an id that resolves to
+		// nothing, and hide it from the backfill that selects records whose
+		// documenta_folder_id is empty.
+		"services.EOWithDocumentaFolders(\n\t\t\tstorage.NewHTTPDocumentaClient(cfg.EODocumenta, nil), cfg.EODocumenta.WorkspaceName)",
+		"var eoFolderOption services.EORecordOption",
+		"escalationPolicyRepo,\n\t\teoFolderOption)",
+		// The boot guard. A folder failure does not block a record, so without
+		// this a deployment with a broken EO_DOCUMENTA_BASE_URL would file
 		// nothing and say so only in the history of each record.
-		`log.Fatalf("EO_DOCUMENTA_ENABLED=true but EO_DOCUMENTA_BASE_URL is empty`,
+		"services.EOCheckDocumentaBaseURL(cfg.EODocumenta.BaseURL)",
 		"services.NewEORecordServiceWithSLA(",
 		"services.NewEOActionExecutor(",
 		"services.NewEOTransitionServiceWithSLA(",

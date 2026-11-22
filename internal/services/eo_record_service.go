@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -403,6 +404,30 @@ type eoDocumentaFolders struct {
 	// by name, so renaming a type does not strand the records already filed
 	// under the anchor this process is using.
 	anchors map[uuid.UUID]string
+	// resolving holds the resolution in flight for a record type, if any.
+	//
+	// Without it the memo does not serialise anything: concurrent creates of
+	// the same type all miss the cache, all list, all see no anchor and all
+	// create one. That is not a rare interleaving — it is the FIRST BURST OF
+	// CREATES AFTER A DEPLOY, when every listing is in flight at once, and it
+	// yields one root-level anchor per concurrent create.
+	//
+	// Callers that arrive while a resolution is running wait for it and take
+	// ITS result, rather than queueing to run their own. That distinction
+	// matters when Documenta is down: a per-type lock held across the call
+	// would make N concurrent creates wait N consecutive 30-second timeouts,
+	// so the last one blocks for minutes. Sharing the outcome costs one
+	// timeout for all of them. (This is singleflight for one key space,
+	// written out to avoid promoting an indirect dependency to a direct one.)
+	resolving map[uuid.UUID]*eoAnchorResolve
+}
+
+// eoAnchorResolve is one in-flight anchor resolution. done is closed when id
+// and err are final; nothing writes them after that.
+type eoAnchorResolve struct {
+	done chan struct{}
+	id   string
+	err  error
 }
 
 // createFor creates the record's own folder and returns its id. The context
@@ -430,12 +455,47 @@ func (f *eoDocumentaFolders) createFor(ctx context.Context, t *models.EORecordTy
 // shown not to contain it.
 func (f *eoDocumentaFolders) anchorFor(ctx context.Context, t *models.EORecordType) (string, error) {
 	f.mu.Lock()
-	cached, ok := f.anchors[t.ID]
-	f.mu.Unlock()
-	if ok {
+	if cached, ok := f.anchors[t.ID]; ok {
+		f.mu.Unlock()
 		return cached, nil
 	}
+	if inflight, ok := f.resolving[t.ID]; ok {
+		// Someone else is already resolving this type. Wait for their answer
+		// instead of starting a second listing that would create a second
+		// anchor. The context is honoured so a cancelled request does not
+		// wait out another request's remote timeout.
+		f.mu.Unlock()
+		select {
+		case <-inflight.done:
+			return inflight.id, inflight.err
+		case <-ctx.Done():
+			return "", fmt.Errorf("wait for the anchor folder of %q: %w", t.Key, ctx.Err())
+		}
+	}
+	inflight := &eoAnchorResolve{done: make(chan struct{})}
+	f.resolving[t.ID] = inflight
+	f.mu.Unlock()
 
+	id, err := f.resolveAnchor(ctx, t)
+
+	f.mu.Lock()
+	delete(f.resolving, t.ID)
+	if err == nil {
+		// Memoised only on success: a failed resolution must not be cached,
+		// or one outage would leave the type anchorless for the process's
+		// lifetime.
+		f.anchors[t.ID] = id
+	}
+	f.mu.Unlock()
+
+	inflight.id, inflight.err = id, err
+	close(inflight.done)
+	return id, err
+}
+
+// resolveAnchor is the remote half of anchorFor, run by exactly one caller per
+// record type at a time. It holds no lock: the calls are HTTP.
+func (f *eoDocumentaFolders) resolveAnchor(ctx context.Context, t *models.EORecordType) (string, error) {
 	name := eoAnchorFolderName(t)
 	// The parent listing, with its error RETURNED. This is the one call
 	// EnsureFolder ignores the failure of.
@@ -445,6 +505,12 @@ func (f *eoDocumentaFolders) anchorFor(ctx context.Context, t *models.EORecordTy
 	}
 	anchorID := ""
 	if listing != nil {
+		// The listing pages nothing and carries no total, so its length is
+		// the only overflow signal there is: an anchor that scrolls off the
+		// one page Documenta returns would be silently re-created. Logged at
+		// resolve time — once per type per process — so an operator can see
+		// the root growing before that happens.
+		log.Printf("[EO] documenta workspace root holds %d entries (resolving the %q folder)", len(listing.Files), name)
 		for _, file := range listing.Files {
 			if file.Type == "folder" && file.Name == name {
 				anchorID = file.UUID
@@ -461,11 +527,38 @@ func (f *eoDocumentaFolders) anchorFor(ctx context.Context, t *models.EORecordTy
 			return "", fmt.Errorf("documenta returned an empty folder id for %q", name)
 		}
 	}
-
-	f.mu.Lock()
-	f.anchors[t.ID] = anchorID
-	f.mu.Unlock()
 	return anchorID, nil
+}
+
+// EOCheckDocumentaBaseURL refuses an EO_DOCUMENTA_BASE_URL that cannot address
+// Documenta. NewHTTPDocumentaClient does nothing but append "/api/v1" to it,
+// so an empty value builds a client pointed at the relative path "/api/v1",
+// and a scheme-less one ("mydocs.internal") builds "mydocs.internal/api/v1" —
+// both of which parse fine and fail on every request instead of at boot. The
+// other two Documenta blocks have a default URL that hides this; the EO block
+// deliberately has none.
+//
+// It is a boot check, called from cmd/server/main.go, and it matters MORE
+// because of the failure handling this task chose: a folder that cannot be
+// created does not stop a record, so a misconfigured deployment would
+// otherwise run for months filing nothing and saying so only in each record's
+// history.
+func EOCheckDocumentaBaseURL(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return errors.New("EO_DOCUMENTA_BASE_URL is empty")
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("EO_DOCUMENTA_BASE_URL %q is not a URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("EO_DOCUMENTA_BASE_URL %q has no http(s) scheme", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("EO_DOCUMENTA_BASE_URL %q has no host", raw)
+	}
+	return nil
 }
 
 // eoAnchorFolderName is the per-type anchor's name: the type's display name,
@@ -556,6 +649,7 @@ func EOWithDocumentaFolders(client storage.DocumentaClient, workspaceName string
 			client:        client,
 			workspaceName: workspaceName,
 			anchors:       map[uuid.UUID]string{},
+			resolving:     map[uuid.UUID]*eoAnchorResolve{},
 		}
 	}
 }
