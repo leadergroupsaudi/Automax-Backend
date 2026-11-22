@@ -657,6 +657,11 @@ type IncidentSummary struct {
 	CreatedAt          time.Time `json:"created_at"`
 }
 
+// IncidentFilter is bound from the query string with Fiber's QueryParser.
+// Fields the SERVER fills must carry query:"-" as well as json:"-": json:"-"
+// stops request-BODY binding only, and QueryParser falls back to the Go field
+// name when no query alias is present, so a bare json:"-" would leave
+// ?IsAdmin=true (and friends) settable by any caller.
 type IncidentFilter struct {
 	Search              string     `query:"search" json:"search" validate:"omitempty"`
 	WorkflowID          []string   `query:"workflow_id" json:"workflow_id" validate:"omitempty,dive,uuid"`
@@ -698,10 +703,10 @@ type IncidentFilter struct {
 	// RadiusMeters). Used by the summary search so its total matches the list recurrence badge.
 	RecurrenceOfIncidentID *uuid.UUID `query:"recurrence_of_incident_id" json:"recurrence_of_incident_id" validate:"omitempty,uuid"`
 	// CreatedBefore keeps only incidents created strictly before this time (set by the handler).
-	CreatedBefore *time.Time `json:"-"`
+	CreatedBefore *time.Time `query:"-" json:"-"`
 	// ExactRecordType matches incidents.record_type only (set by the handler); unlike RecordType
 	// it does not also require the incident's workflow to be of that record type.
-	ExactRecordType *string `json:"-"`
+	ExactRecordType *string `query:"-" json:"-"`
 	// Transition filters
 	TransitionID *uuid.UUID `query:"transition_id" json:"transition_id" validate:"omitempty,uuid"`
 	FromStateID  *uuid.UUID `query:"from_state_id" json:"from_state_id" validate:"omitempty"`
@@ -710,22 +715,22 @@ type IncidentFilter struct {
 	MomraRef     string     `query:"momra_ref" json:"momra_ref" validate:"omitempty,max=100"` // filter by momra_incident_no in custom_fields
 	// CustomFieldFilters holds repeatable cf=key:value filters. Parsed manually in handler.
 	// Each filter does: custom_fields::jsonb ->> 'key' ILIKE '%value%'. Multiple are AND-ed.
-	CustomFieldFilters []CustomFieldFilter `json:"-"`
+	CustomFieldFilters []CustomFieldFilter `query:"-" json:"-"`
 	// SortBy controls the list's ordering (always descending — newest first
 	// by whichever field). Restricted to a small allow-list so it's safe to
 	// interpolate directly into an ORDER BY clause.
 	SortBy      string      `query:"sort_by" json:"sort_by" validate:"omitempty,oneof=created_at updated_at"`
 	Page        int         `query:"page" json:"page" validate:"omitempty,min=1"`
 	Limit       int         `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`
-	UserRoleIDs []uuid.UUID `json:"-"`     // For filtering stats by user's roles
-	FilterType  string      `query:"type"` // created | assigned
-	UserID      uuid.UUID   `json:"-"`
-	IsAdmin     bool        `json:"-"` // Super admin bypasses user-scoped assigned filter
+	UserRoleIDs []uuid.UUID `query:"-" json:"-"` // For filtering stats by user's roles
+	FilterType  string      `query:"type"`       // created | assigned
+	UserID      uuid.UUID   `query:"-" json:"-"`
+	IsAdmin     bool        `query:"-" json:"-"` // Super admin bypasses user-scoped assigned filter
 	// IncludeUnassignedDepartment: when true, the DepartmentID filter also
 	// matches incidents with no department that are in an initial or
 	// terminal state (never triaged), but only when UserID is their reporter, creator or assignee. Set by the handler when DepartmentID was derived purely
 	// from the user's scope (no explicit department filter requested).
-	IncludeUnassignedDepartment bool `json:"-"`
+	IncludeUnassignedDepartment bool `query:"-" json:"-"`
 }
 
 // Merge Incident Types
