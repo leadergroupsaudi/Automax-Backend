@@ -65,6 +65,12 @@ const (
 	EOReferenceModeParent = "parent"
 )
 
+// Link cardinality: how many targets a source record may link to via a link type.
+const (
+	EOCardinalityOne  = "one"
+	EOCardinalityMany = "many"
+)
+
 // EORecordType describes a configurable record type.
 type EORecordType struct {
 	ID               uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
@@ -138,12 +144,13 @@ func (x *EOFieldDef) BeforeCreate(tx *gorm.DB) error {
 // BlocksParentTransitionKey, when set, names the transition that is blocked
 // instead of closure.
 type EOLinkType struct {
-	ID                        uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
-	Key                       string         `gorm:"size:100;not null;uniqueIndex:idx_eo_link_types_key,where:deleted_at IS NULL" json:"key"`
-	Label                     string         `gorm:"size:255;not null" json:"label"`
-	LabelAr                   string         `gorm:"size:255" json:"label_ar"`
-	SourceTypeIDs             datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"source_type_ids"`
-	TargetTypeIDs             datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"target_type_ids"`
+	ID            uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
+	Key           string         `gorm:"size:100;not null;uniqueIndex:idx_eo_link_types_key,where:deleted_at IS NULL" json:"key"`
+	Label         string         `gorm:"size:255;not null" json:"label"`
+	LabelAr       string         `gorm:"size:255" json:"label_ar"`
+	SourceTypeIDs datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"source_type_ids"`
+	TargetTypeIDs datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"target_type_ids"`
+	// Cardinality is EOCardinalityOne or EOCardinalityMany.
 	Cardinality               string         `gorm:"size:50" json:"cardinality"`
 	DeriveDeadlineFromParent  bool           `gorm:"default:false" json:"derive_deadline_from_parent"`
 	DeadlineOffsetDays        int            `gorm:"default:0" json:"deadline_offset_days"`
@@ -168,6 +175,9 @@ func (x *EOLinkType) BeforeCreate(tx *gorm.DB) error {
 // a prefix of (or is prefixed by) an existing type's prefix, case-insensitively.
 // reference is unique only within a partition, so global uniqueness rests
 // entirely on prefixes never overlapping. Types without a prefix are ignored.
+//
+// On an update, the caller MUST exclude the type being edited from existing,
+// otherwise a type that keeps its own prefix is rejected against itself.
 func ValidateReferencePrefix(prefix string, existing []EORecordType) error {
 	p := strings.ToUpper(strings.TrimSpace(prefix))
 	if p == "" {
