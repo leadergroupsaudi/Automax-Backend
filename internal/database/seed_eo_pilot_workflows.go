@@ -2,8 +2,12 @@ package database
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
+	"sort"
+	"strings"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -1054,4 +1058,416 @@ func eoLogUnconfirmedStateMachines(db *gorm.DB) {
 	if len(set) > 0 {
 		log.Printf("EO pilot: %d workflow states and transitions await client sign-off (workflow_states/workflow_transitions.eo_client_unconfirmed)", len(set))
 	}
+}
+
+// ── Task A7: the spawn_record actions ───────────────────────────────────────
+//
+// SPEC §7.8 NAMES THIS PATTERN AND §12 NAMES THE PILOT'S INSTANCE. "spawn_record
+// deserves a name: it is the `On-air Commitment → Task`, `Visitor Direction →
+// Task`, `Official Visit → Protocol Task` pattern, which recurs in four CFFs",
+// and §12's mechanism table gives the pilot's proof as "Directive and Visitor
+// Direction → Task". Plan 1 built the executor; nothing has ever configured it,
+// so this is the first time that code runs against real configuration.
+//
+// WHY A STEP OF ITS OWN AND NOT A FIELD ON eoTransitionSpec. The `seed_workflows`
+// applied row already exists on every database that has booted Task A5, so a
+// spawn folded into eoSeedPilotTransition would be written on a fresh database
+// and on no real one — configuration that is complete in CI and absent in
+// production. That is why close_parent could live on the transition spec (A5
+// wrote the transitions in the same step) and this cannot. The key is a
+// PERMANENT identifier like every other in eoPilotSteps.
+//
+// HOW IT CAN STILL FAIL, STATED HERE BECAUSE IT IS NOT VISIBLE FROM THE ROWS:
+// the action is dispatched AFTER THE COMMIT and its error is logged, not
+// retried — the same position A5's close_parent is in. A transition that
+// succeeds and a child that never appears is therefore a reachable outcome.
+// Two things stand against it. The executor writes a note on the PARENT's
+// history naming the action and the reason (services.recordSpawnFailure), so
+// the person looking at the directive sees that the task they expected never
+// appeared; and eoCheckSpawnFieldMap below refuses, AT SEED TIME, a map that
+// could not satisfy the target type's own creation requirements — which is the
+// spawn's form of the rule A5's review derived for close_parent.
+
+// eoSpawnRecordActionType is the action type services.eoActionExecutor
+// dispatches. IT IS A SHARED STRING AND THE EXECUTOR'S SWITCH IS THE OTHER
+// SIDE OF IT: an action type the executor does not know is logged as "unknown
+// action type" while the transition succeeds, so a mismatch here is a
+// configured spawn that runs nowhere. TestEoSpawnRecordActionTypeMatchesTheEngine
+// reads the executor's source and compares, because package database cannot
+// import package services.
+const eoSpawnRecordActionType = "spawn_record"
+
+// eoSeedSpawnActionsStepKey is this step's PERMANENT identifier in
+// eoPilotSteps. Renaming it makes the step run again on every existing
+// database; the per-row check below makes that converge rather than collide,
+// but the rename would still be a step that has never run.
+const eoSeedSpawnActionsStepKey = "seed_spawn_actions"
+
+// eoSpawnConfig is the action's config blob, and must stay in step with
+// services.eoSpawnConfig, which decodes it.
+type eoSpawnConfig struct {
+	// TargetType is the record type KEY of the child to create.
+	TargetType string `json:"target_type"`
+	// LinkType is the link type the child hangs off its parent by. The link
+	// type carries the rules — the blocking, the derived deadline — so the
+	// executor refuses a config without one.
+	LinkType string `json:"link_type"`
+	// FieldMap is target field key -> value. The pilot writes only whole
+	// {{placeholders}}; see eoSpawnSpec.fieldMap.
+	FieldMap map[string]any `json:"field_map"`
+}
+
+// eoSpawnWholePlaceholder mirrors services.eoWholePlaceholderRE: a string that
+// is EXACTLY one {{key}} takes the source record's value with its own type,
+// rather than being rendered as text.
+var eoSpawnWholePlaceholder = regexp.MustCompile(`^\s*\{\{\s*([A-Za-z0-9_]+)\s*\}\}\s*$`)
+
+// eoSpawnSpec is one configured spawn.
+type eoSpawnSpec struct {
+	// sourceTypeKey and transitionCode name the transition that spawns.
+	sourceTypeKey, transitionCode string
+	// targetTypeKey and linkTypeKey name what is created and how it hangs.
+	targetTypeKey, linkTypeKey string
+	name, description          string
+	// fieldMap is target field key -> a WHOLE {{placeholder}} naming a field
+	// of the source type. It is map[string]string, not map[string]any, on
+	// purpose: a literal here would be a value the client never typed,
+	// appearing on a statutory register with nothing recording where it came
+	// from, and the pilot has no use for one. eoCheckSpawnFieldMap refuses
+	// anything that is not a whole placeholder.
+	fieldMap map[string]string
+}
+
+// eoPilotSpawnActions is the whole of it: ONE action, EO-DIR's Directive → Task.
+//
+// WHY `assign_directly` AND NOT `plan_approved`. Both transitions enter
+// `in_execution`, and the choice is the client's own Q1. When `plan_required`
+// is no — which is exactly what `assign_directly` means — there is no Execution
+// Plan, no stage and nothing else in the configuration that carries the work or
+// holds the directive open; the §7.8 pattern's "a promise becomes a task with
+// an owner and a date" has nothing else to be. When Q1 is yes the plan, its
+// stages and its assignments ARE that structure, and the matrix already gives
+// each of them a blocking rule (matrix:88, matrix:105); a Task spawned there as
+// well would be a SECOND blocker on the directive's closure that no row of the
+// client's document asks for. It is a configuration choice and not a reading of
+// the matrix, which gives the Directive no spawned-task row at all — the
+// authority is spec §12's mechanism table — so it is in the Task A7 report and
+// in the carry-forward as a client question.
+//
+// WHAT IT COSTS, SAID PLAINLY: eo_task_parent carries "Always blocks its parent
+// from closing" (matrix:520), so from now on a directive taking the no-plan
+// path CANNOT be closed until the task this action created has been verified
+// and closed. That is the client's own rule about Tasks meeting the client's
+// own rule about Directives ("closes only when every child is closed"), and it
+// is what makes the spawn more than a row — but it is a live behaviour change
+// for every record of the pilot's root type, so it is reported rather than
+// slipped in.
+var eoPilotSpawnActions = []eoSpawnSpec{
+	{
+		sourceTypeKey:  eoDirectiveTypeKey,
+		transitionCode: "assign_directly",
+		targetTypeKey:  eoTaskTypeKey,
+		linkTypeKey:    eoTaskLinkKey,
+		name:           "Open the directive's task",
+		description:    "Spec §12: `spawn_record` is proved by Directive -> Task. Q1 = no means the work is assigned with no Execution Plan, so the Task is the tracked unit of work and the thing that holds the directive open until it is verified.",
+		// EVERY KEY HERE HAS A FIELD DEFINITION ON eo_task AS THE SEED STANDS
+		// (A6 removed `related_refs` from another type and B2/B3 reserve keys,
+		// so this is checked against the database rather than the matrix), and
+		// every ALWAYS-required user field of eo_task is here: the seven
+		// inherited ones the base type requires, plus the type's own
+		// `task_text` and `owner`, plus `due_date`, which eo_task narrows to
+		// Always ("The clock that drives reminders and escalation",
+		// matrix:520). Each is filled from a field the Directive ALSO requires
+		// always, so the map cannot fail for want of a value on the parent.
+		fieldMap: map[string]string{
+			"subject_ar":     "{{subject_ar}}",
+			"subject_en":     "{{subject_en}}",
+			"priority":       "{{priority}}",
+			"sensitivity":    "{{sensitivity}}",
+			"source":         "{{source}}",
+			"owning_body_id": "{{owning_body_id}}",
+			// matrix:520 — "The clock that drives reminders and escalation".
+			// The directive's own due date, not a new one: a task invented
+			// with no deadline would be required_mode Always with nothing to
+			// fill it, and the whole spawn would fail at Create.
+			"due_date": "{{due_date}}",
+			// matrix:520 — "The universal unit of tracked work". The
+			// instruction AS GIVEN (matrix:68, 1.1) is what the work is.
+			"task_text": "{{directive_text}}",
+			// matrix:520 — "Every task has an owner and a date"; matrix:68,
+			// 1.3 — "who runs it inside the owning body".
+			"owner": "{{responsible_officer}}",
+		},
+	},
+}
+
+// eoSeedPilotSpawnActions is the pilot seed's "seed_spawn_actions" step.
+//
+// FAIL-CLOSED THROUGHOUT, like every other step: a missing transition, a link
+// type that would not admit the child, a field-map key the target type does
+// not define and a required field of the target that the map does not fill are
+// all errors that roll the whole pilot seed back. The alternative in every case
+// is an action that looks configured and creates nothing — and it would create
+// nothing POST-COMMIT, where the only trace is a log line.
+func eoSeedPilotSpawnActions(tx *gorm.DB) (bool, error) {
+	for _, spec := range eoPilotSpawnActions {
+		if err := eoSeedOneSpawnAction(tx, spec); err != nil {
+			return false, fmt.Errorf("the spawn_record action on %s.%s: %w", spec.sourceTypeKey, spec.transitionCode, err)
+		}
+	}
+	return true, nil
+}
+
+func eoSeedOneSpawnAction(tx *gorm.DB, spec eoSpawnSpec) error {
+	sourceID, err := eoRecordTypeID(tx, spec.sourceTypeKey)
+	if err != nil {
+		return err
+	}
+	targetID, err := eoRecordTypeID(tx, spec.targetTypeKey)
+	if err != nil {
+		return err
+	}
+
+	// The transition, on the workflow A5 bound to the source type. Exactly
+	// one: a code that matches none would be an action attached to nothing,
+	// and a code that matches two would attach it to whichever row came back
+	// first.
+	code := eoWorkflowCode(spec.sourceTypeKey)
+	var transitions []models.WorkflowTransition
+	if err := tx.
+		Joins("JOIN workflows w ON w.id = workflow_transitions.workflow_id").
+		Where("w.code = ? AND workflow_transitions.code = ?", code, spec.transitionCode).
+		Find(&transitions).Error; err != nil {
+		return fmt.Errorf("read transition %q of workflow %q: %w", spec.transitionCode, code, err)
+	}
+	if len(transitions) != 1 {
+		return fmt.Errorf("workflow %q has %d transitions with the code %q, want exactly 1", code, len(transitions), spec.transitionCode)
+	}
+	transition := transitions[0]
+
+	if err := eoCheckSpawnLinkType(tx, spec, sourceID, targetID); err != nil {
+		return err
+	}
+	if err := eoCheckSpawnFieldMap(tx, spec); err != nil {
+		return err
+	}
+
+	fieldMap := make(map[string]any, len(spec.fieldMap))
+	for k, v := range spec.fieldMap {
+		fieldMap[k] = v
+	}
+	cfg, err := json.Marshal(eoSpawnConfig{
+		TargetType: spec.targetTypeKey,
+		LinkType:   spec.linkTypeKey,
+		FieldMap:   fieldMap,
+	})
+	if err != nil {
+		return fmt.Errorf("encode the spawn_record config: %w", err)
+	}
+
+	// Idempotency keyed on (transition, action type, NAME) rather than on
+	// (transition, action type) as close_parent's is: a transition may
+	// legitimately carry two spawns of different target types, and keying
+	// without the name would silently write only the first.
+	var existing int64
+	if err := tx.Model(&models.TransitionAction{}).
+		Where("transition_id = ? AND action_type = ? AND name = ?", transition.ID, eoSpawnRecordActionType, spec.name).
+		Count(&existing).Error; err != nil {
+		return fmt.Errorf("check the spawn_record action: %w", err)
+	}
+	if existing > 0 {
+		return nil
+	}
+	if err := tx.Create(&models.TransitionAction{
+		ID:           uuid.New(),
+		TransitionID: transition.ID,
+		ActionType:   eoSpawnRecordActionType,
+		Name:         spec.name,
+		Description:  spec.description,
+		Config:       string(cfg),
+		// SYNCHRONOUS, for the reason close_parent is: the child's existence
+		// is part of what this step MEANS, and an async failure's log line
+		// would arrive after the request had returned. It is still dispatched
+		// after the commit — see the note at the top of this section.
+		IsAsync:  false,
+		IsActive: true,
+		// After any field_update on the same transition, so the child is
+		// filled from the parent as it finally stands. The same order
+		// close_parent uses; nothing on this transition writes fields today.
+		ExecutionOrder: 10,
+	}).Error; err != nil {
+		return fmt.Errorf("create the spawn_record action: %w", err)
+	}
+	return nil
+}
+
+// eoCheckSpawnLinkType refuses a link type that would not admit the child the
+// action creates. services.eoRecordService.Create writes the link FROM the
+// child TO the parent, so the TARGET type must be the link type's source and
+// the SOURCE type must be among its targets (or the polymorphic sentinel).
+// Without this the spawn fails at validation, post-commit, every time.
+func eoCheckSpawnLinkType(tx *gorm.DB, spec eoSpawnSpec, sourceID, targetID uuid.UUID) error {
+	var lt models.EOLinkType
+	if err := tx.Where("key = ?", spec.linkTypeKey).Limit(1).Find(&lt).Error; err != nil {
+		return fmt.Errorf("read link type %q: %w", spec.linkTypeKey, err)
+	}
+	if lt.ID == uuid.Nil {
+		return fmt.Errorf("names link type %q, which is not seeded", spec.linkTypeKey)
+	}
+	var sources, targets []string
+	if err := json.Unmarshal(lt.SourceTypeIDs, &sources); err != nil {
+		return fmt.Errorf("source_type_ids of link type %q: %w", spec.linkTypeKey, err)
+	}
+	if err := json.Unmarshal(lt.TargetTypeIDs, &targets); err != nil {
+		return fmt.Errorf("target_type_ids of link type %q: %w", spec.linkTypeKey, err)
+	}
+	if len(sources) != 1 || sources[0] != targetID.String() {
+		return fmt.Errorf("creates a %q through link type %q, whose source types are %v; the child carries the link, so the spawned type must be its only source", spec.targetTypeKey, spec.linkTypeKey, sources)
+	}
+	for _, raw := range targets {
+		if raw == eoAnyTargetType || raw == sourceID.String() {
+			return nil
+		}
+	}
+	return fmt.Errorf("hangs the new %q off a %q through link type %q, whose target types are %v; services.ValidateLink would refuse every spawn", spec.targetTypeKey, spec.sourceTypeKey, spec.linkTypeKey, targets)
+}
+
+// eoCheckSpawnFieldMap is the guard the plan names, and its mirror.
+//
+// THE PLAN'S HALF: Plan 1 rejects a field-map key with no field definition on
+// the target type, and a misconfigured map fails the WHOLE spawn. A6 has just
+// removed a field definition and B2/B3 reserve keys, so this asks the seeded
+// field definitions rather than the client's matrix.
+//
+// THE MIRROR, which is the half that decides whether a spawn FIRES AND FAILS
+// rather than never firing: every `always`-required user field of the target
+// type must be in the map, and whatever fills one must name a field that is
+// ITSELF always-required and user-provided on the source type. Otherwise a
+// parent that happens to have left an optional field blank commits its
+// transition and the child is refused at Create — post-commit, logged, not
+// retried. This is the spawn's form of the rule Task A5's review derived for
+// close_parent: what an action needs must be satisfiable from what the record
+// it runs on always has.
+func eoCheckSpawnFieldMap(tx *gorm.DB, spec eoSpawnSpec) error {
+	if len(spec.fieldMap) == 0 {
+		return errors.New("has an empty field map, so the spawned record would carry nothing")
+	}
+	targetDefs, err := eoEffectiveFieldDefs(tx, spec.targetTypeKey)
+	if err != nil {
+		return err
+	}
+	sourceDefs, err := eoEffectiveFieldDefs(tx, spec.sourceTypeKey)
+	if err != nil {
+		return err
+	}
+
+	required := map[string]bool{}
+	var missing []string
+	for key, d := range targetDefs {
+		if d.Provenance == models.EOProvenanceUser && d.RequiredMode == models.EORequiredAlways {
+			required[key] = true
+			if _, mapped := spec.fieldMap[key]; !mapped {
+				missing = append(missing, key)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("the field map does not fill %s, which %q requires on every record at creation; the transition would commit and the spawn would be refused at Create, after the commit, with nothing retried",
+			strings.Join(missing, ", "), spec.targetTypeKey)
+	}
+
+	keys := make([]string, 0, len(spec.fieldMap))
+	for k := range spec.fieldMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		d, defined := targetDefs[key]
+		if !defined {
+			return fmt.Errorf("the field map writes %q, which %q does not define; services.eoActionExecutor.spawn fails the WHOLE spawn for it", key, spec.targetTypeKey)
+		}
+		if d.Provenance != models.EOProvenanceUser {
+			return fmt.Errorf("the field map writes %q, whose provenance on %q is %q; services.ValidateRecordValues rejects a submitted value for an auto or derived field, so the whole spawn would fail at Create", key, spec.targetTypeKey, d.Provenance)
+		}
+		m := eoSpawnWholePlaceholder.FindStringSubmatch(spec.fieldMap[key])
+		if m == nil {
+			return fmt.Errorf("the field map fills %q with %q; the pilot's maps are whole {{placeholders}} naming a field of %q, never literals", key, spec.fieldMap[key], spec.sourceTypeKey)
+		}
+		src, defined := sourceDefs[m[1]]
+		if !defined {
+			return fmt.Errorf("the field map fills %q from {{%s}}, which %q does not define; the executor fails the whole spawn on an unknown reference", key, m[1], spec.sourceTypeKey)
+		}
+		if required[key] && (src.Provenance != models.EOProvenanceUser || src.RequiredMode != models.EORequiredAlways) {
+			return fmt.Errorf("the field map fills %q — which %q requires — from %q.%s, which is %s/%s rather than user/always; a %s with that field blank would commit its transition and then fail to spawn",
+				key, spec.targetTypeKey, spec.sourceTypeKey, m[1], src.Provenance, src.RequiredMode, spec.sourceTypeKey)
+		}
+	}
+	return nil
+}
+
+// eoRecordTypeID resolves a record type key, refusing one the pilot has not
+// seeded rather than writing configuration that names nothing.
+func eoRecordTypeID(tx *gorm.DB, typeKey string) (uuid.UUID, error) {
+	var ty models.EORecordType
+	if err := tx.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
+		return uuid.Nil, fmt.Errorf("read record type %q: %w", typeKey, err)
+	}
+	if ty.ID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("record type %q is not seeded", typeKey)
+	}
+	return ty.ID, nil
+}
+
+// eoEffectiveFieldDefs is a type's effective field set keyed by field key —
+// spec §7.2's resolution, the same one services.ResolveEffectiveFields
+// performs: the ancestor chain root-first, each type's own definition
+// replacing an ancestor's of the same key.
+//
+// It is the DATABASE's answer and not the seed's registries, which is the
+// whole point: A6 removes a field definition in a seed step, B2 and B3 reserve
+// keys, and "what this type defines" is therefore a question only the seeded
+// rows can answer.
+func eoEffectiveFieldDefs(tx *gorm.DB, typeKey string) (map[string]models.EOFieldDef, error) {
+	type chainRow struct {
+		ID    uuid.UUID
+		Depth int
+	}
+	var chain []chainRow
+	err := tx.Raw(`
+		WITH RECURSIVE chain AS (
+			SELECT id, parent_type_id, 0 AS depth FROM eo_record_types WHERE key = ? AND deleted_at IS NULL
+			UNION ALL
+			SELECT p.id, p.parent_type_id, c.depth + 1 FROM eo_record_types p
+			JOIN chain c ON p.id = c.parent_type_id WHERE p.deleted_at IS NULL
+		)
+		SELECT id, depth FROM chain ORDER BY depth DESC`, typeKey).Scan(&chain).Error
+	if err != nil {
+		return nil, fmt.Errorf("read the inheritance chain of record type %q: %w", typeKey, err)
+	}
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("record type %q is not seeded, so it has no effective fields", typeKey)
+	}
+	ids := make([]uuid.UUID, 0, len(chain))
+	for _, c := range chain {
+		ids = append(ids, c.ID)
+	}
+	var defs []models.EOFieldDef
+	if err := tx.Where("record_type_id IN ?", ids).Find(&defs).Error; err != nil {
+		return nil, fmt.Errorf("read the field definitions of record type %q: %w", typeKey, err)
+	}
+	byType := map[uuid.UUID][]models.EOFieldDef{}
+	for _, d := range defs {
+		byType[d.RecordTypeID] = append(byType[d.RecordTypeID], d)
+	}
+	out := make(map[string]models.EOFieldDef, len(defs))
+	for _, c := range chain { // farthest ancestor first, so the type's own wins
+		for _, d := range byType[c.ID] {
+			out[d.Key] = d
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("record type %q has no field definitions at all", typeKey)
+	}
+	return out, nil
 }

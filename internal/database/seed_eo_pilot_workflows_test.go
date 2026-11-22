@@ -1042,3 +1042,498 @@ func eoPilotWorkflowSpecCounts() eoPilotWorkflowSpecCount {
 	}
 	return c
 }
+
+// ── Task A7: the spawn_record actions, as data ──────────────────────────────
+//
+// WHAT A TEST OVER HERE CAN AND CANNOT SHOW. These read the seeded rows and
+// the field definitions they name; the one that shows a Directive REALLY
+// creating a Task is services.TestEoDirectiveSpawnsATaskOnItsTransition,
+// because package database cannot import package services. The division is
+// Task A4's and A5's, and this task follows it.
+
+// eoSeededSpawn is one seeded spawn_record action with the configuration
+// around it already resolved: which type carries the transition, and what the
+// action's config says.
+type eoSeededSpawn struct {
+	sourceTypeKey  string
+	transitionCode string
+	action         models.TransitionAction
+	cfg            eoSpawnConfig
+}
+
+// eoSeededSpawns reads back every spawn_record action on the pilot's
+// workflows, by the action type the engine's dispatch switch matches.
+func eoSeededSpawns(t *testing.T, db *gorm.DB) []eoSeededSpawn {
+	t.Helper()
+	var out []eoSeededSpawn
+	got := eoSeededWorkflows(t, db)
+	for _, typeKey := range eoPilotTypeKeys {
+		w := got[typeKey]
+		for _, tr := range w.transitions {
+			var actions []models.TransitionAction
+			if err := db.Where("transition_id = ? AND action_type = ?", tr.ID, eoSpawnRecordActionType).
+				Order("execution_order").Find(&actions).Error; err != nil {
+				t.Fatalf("read the actions of %q: %v", tr.Code, err)
+			}
+			for _, a := range actions {
+				var cfg eoSpawnConfig
+				if err := json.Unmarshal([]byte(a.Config), &cfg); err != nil {
+					t.Fatalf("%s.%s: spawn config %q does not decode: %v", typeKey, tr.Code, a.Config, err)
+				}
+				out = append(out, eoSeededSpawn{sourceTypeKey: typeKey, transitionCode: tr.Code, action: a, cfg: cfg})
+			}
+		}
+	}
+	return out
+}
+
+// eoReadEffectiveFieldDefs is the test's own resolution of a type's effective
+// field set, written out of the inheritance chain rather than borrowed from
+// the seed, so that a bug in eoEffectiveFieldDefs cannot hide itself here.
+func eoReadEffectiveFieldDefs(t *testing.T, db *gorm.DB, typeKey string) map[string]models.EOFieldDef {
+	t.Helper()
+	type row struct {
+		models.EOFieldDef
+		Depth int
+	}
+	var rows []row
+	err := db.Raw(`
+		WITH RECURSIVE chain AS (
+			SELECT id, parent_type_id, 0 AS depth FROM eo_record_types WHERE key = ? AND deleted_at IS NULL
+			UNION ALL
+			SELECT p.id, p.parent_type_id, c.depth + 1 FROM eo_record_types p
+			JOIN chain c ON p.id = c.parent_type_id WHERE p.deleted_at IS NULL
+		)
+		SELECT f.*, c.depth FROM eo_field_defs f JOIN chain c ON c.id = f.record_type_id
+		WHERE f.deleted_at IS NULL ORDER BY c.depth DESC`, typeKey).Scan(&rows).Error
+	if err != nil {
+		t.Fatalf("read the effective fields of %q: %v", typeKey, err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("record type %q has no field definitions at all", typeKey)
+	}
+	out := map[string]models.EOFieldDef{}
+	for _, r := range rows { // farthest ancestor first, so the type's own wins
+		out[r.Key] = r.EOFieldDef
+	}
+	return out
+}
+
+// THE TRAP THE PLAN NAMES. services.eoActionExecutor.spawn refuses a field_map
+// key that the TARGET type does not define, and the refusal fails the WHOLE
+// spawn — not the one key. A6 has just removed `related_refs` and B2/B3
+// reserve keys, so "defined on the target type" is a moving target and this
+// test asks the DATABASE AS THE SEED LEAVES IT rather than the client matrix.
+//
+// It also refuses an `auto` or `derived` target key, which is the same defect
+// one step further on: the key IS defined, so the executor's own check passes,
+// and ValidateRecordValues then rejects it with "is set by the system and
+// cannot be written" — failing the whole spawn at Create instead, post-commit,
+// where the only trace is a log line and a history note.
+//
+// Mutation: add any key to the field map of a spawn in database.eoPilotSpawnActions
+// that eo_task does not define (`related_refs`), or map `origin_cff`, which it
+// defines as `auto`.
+func TestEoSpawnFieldMapUsesOnlyDefinedKeys(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	spawns := eoSeededSpawns(t, db)
+	// The pilot configures exactly one: EO-DIR's Directive -> Task (spec §12).
+	// Without this the loop below would pass over an empty set.
+	if len(spawns) != 1 {
+		t.Fatalf("%d spawn_record actions are seeded, want 1 (EO-DIR's Directive -> Task); spec §12 names it and §7.8 calls it the pattern that recurs in four CFFs", len(spawns))
+	}
+	for _, s := range spawns {
+		t.Run(s.sourceTypeKey+"."+s.transitionCode, func(t *testing.T) {
+			if !s.action.IsActive {
+				t.Errorf("the action is inactive, so the configured spawn runs nowhere")
+			}
+			if strings.TrimSpace(s.cfg.TargetType) == "" || strings.TrimSpace(s.cfg.LinkType) == "" {
+				t.Fatalf("config %+v names no target type or no link type; the executor refuses both", s.cfg)
+			}
+			if len(s.cfg.FieldMap) == 0 {
+				t.Fatalf("the field map is empty, so the spawned record would carry nothing")
+			}
+			defs := eoReadEffectiveFieldDefs(t, db, s.cfg.TargetType)
+			for key := range s.cfg.FieldMap {
+				d, ok := defs[key]
+				if !ok {
+					t.Errorf("field_map writes %q, which %q does not define; services.eoActionExecutor.spawn fails the WHOLE spawn for it", key, s.cfg.TargetType)
+					continue
+				}
+				if d.Provenance != models.EOProvenanceUser {
+					t.Errorf("field_map writes %q, whose provenance on %q is %q; ValidateRecordValues rejects a submitted value for an auto or derived field and the whole spawn fails at Create",
+						key, s.cfg.TargetType, d.Provenance)
+				}
+			}
+		})
+	}
+}
+
+// THE OTHER HALF OF THE SAME QUESTION, and the one that decides whether a
+// seeded spawn FIRES AND FAILS rather than never firing. The action is
+// dispatched POST-COMMIT and its failure is logged, not retried, so a map that
+// leaves a required field of the target unset produces a transition that
+// succeeds and a child that never exists.
+//
+// Two rules, both fail-closed in eoSeedOneSpawnAction as well:
+//
+//	every `always`-required USER field of the TARGET type is in the map; and
+//	whatever fills one of those is a whole {{placeholder}} naming a field that
+//	is itself `always`-required and USER-provided on the SOURCE type.
+//
+// The second is the spawn's form of the rule A5's review derived for
+// close_parent — "a requirement at a state an action closes into must be
+// satisfiable from what is already STORED on the parent". Here: a required
+// field of the child must be satisfiable from a field the parent always has.
+//
+// Mutation: drop any entry from the Directive's field map in
+// database.eoPilotSpawnActions, or point `owner` at `{{decision_reference}}`,
+// which the Directive defines but does not always require.
+func TestEoSpawnFieldMapFillsEveryAlwaysRequiredTargetField(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	for _, s := range eoSeededSpawns(t, db) {
+		t.Run(s.sourceTypeKey+"."+s.transitionCode, func(t *testing.T) {
+			targetDefs := eoReadEffectiveFieldDefs(t, db, s.cfg.TargetType)
+			sourceDefs := eoReadEffectiveFieldDefs(t, db, s.sourceTypeKey)
+
+			required := map[string]bool{}
+			for key, d := range targetDefs {
+				if d.Provenance == models.EOProvenanceUser && d.RequiredMode == models.EORequiredAlways {
+					required[key] = true
+					if _, mapped := s.cfg.FieldMap[key]; !mapped {
+						t.Errorf("%q is required on every %q at creation and the field map does not fill it; the transition would commit and the spawn would fail at Create, post-commit, with nothing retried",
+							key, s.cfg.TargetType)
+					}
+				}
+			}
+			if len(required) == 0 {
+				t.Fatalf("%q has no always-required user field, so this test proves nothing", s.cfg.TargetType)
+			}
+
+			for key, raw := range s.cfg.FieldMap {
+				expr, ok := raw.(string)
+				if !ok {
+					continue // a literal: it carries its own value
+				}
+				m := eoSpawnWholePlaceholder.FindStringSubmatch(expr)
+				if m == nil {
+					t.Errorf("field_map[%q] = %q; the pilot's maps are whole {{placeholders}} only, so that the check below can be made at all", key, expr)
+					continue
+				}
+				src, defined := sourceDefs[m[1]]
+				if !defined {
+					t.Errorf("field_map[%q] reads {{%s}}, which %q does not define; the executor fails the WHOLE spawn on an unknown reference", key, m[1], s.sourceTypeKey)
+					continue
+				}
+				if !required[key] {
+					continue
+				}
+				if src.Provenance != models.EOProvenanceUser || src.RequiredMode != models.EORequiredAlways {
+					t.Errorf("field_map[%q] fills a field %q requires, out of %q.%s, which is %s/%s rather than user/always; a %s with that field blank would commit its transition and then fail to spawn, post-commit and unretried",
+						key, s.cfg.TargetType, s.sourceTypeKey, m[1], src.Provenance, src.RequiredMode, s.sourceTypeKey)
+				}
+			}
+		})
+	}
+}
+
+// THE ACTION TYPE AND ITS CONFIG KEYS ARE STRINGS SHARED WITH AN ENGINE SWITCH
+// IN ANOTHER PACKAGE, and package database cannot import package services. An
+// action type the executor does not know is logged as "unknown action type"
+// while the transition succeeds — a configured spawn that runs nowhere, which
+// is the exact shape this programme keeps catching. So this reads the
+// executor's source and compares, as TestEoCloseParentActionTypeMatchesTheEngine
+// does for close_parent.
+//
+// Mutation: rename eoSpawnRecordActionType, or the case label in
+// services.eoActionExecutor.dispatch, or any json tag on services.eoSpawnConfig.
+func TestEoSpawnRecordActionTypeMatchesTheEngine(t *testing.T) {
+	const src = "../services/eo_action_executor.go"
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	want := fmt.Sprintf("case %q:", eoSpawnRecordActionType)
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("%s has no %s in its dispatch switch: an action seeded under %q would be logged as an unknown action type and the transition would succeed with no child created",
+			src, want, eoSpawnRecordActionType)
+	}
+	for _, tag := range []string{`json:"target_type"`, `json:"link_type"`, `json:"field_map"`} {
+		if !strings.Contains(string(raw), tag) {
+			t.Errorf("%s does not decode %s, which the seeded config carries", src, tag)
+		}
+	}
+}
+
+// DECISION 3, `spawned_by_action_id`, AS A STANDING CHECK RATHER THAN A
+// SENTENCE IN A REPORT. Plan 1's skip key is (parent, target type, link type),
+// so two shapes of configuration would silently collapse into one child:
+//
+//	(a) two spawn_record actions on ONE transition naming the same target type
+//	    through the same link type; and
+//	(b) a record RE-ENTERING a spawning transition through a return loop.
+//
+// Task A7 answers "the pilot does not exercise it". This is that answer, kept
+// true: (a) is counted over the seeded actions, (b) is a reachability walk
+// over eoPilotWorkflows. The day either becomes false, the column is owed.
+//
+// Mutation: add a second spawn to the Directive's `assign_directly` in
+// eoPilotSpawnActions; or add a transition from `in_execution` back to
+// `recorded` in eoPilotWorkflows.
+func TestEoSpawnsCannotCollapseInThePilotConfiguration(t *testing.T) {
+	t.Run("no two spawns on one transition share a target type and link type", func(t *testing.T) {
+		db := eoPilotDB(t)
+		seedEOPilot(db)
+		seen := map[string]string{}
+		for _, s := range eoSeededSpawns(t, db) {
+			k := s.action.TransitionID.String() + "|" + s.cfg.TargetType + "|" + s.cfg.LinkType
+			if prev, dup := seen[k]; dup {
+				t.Errorf("%s.%s carries both %q and %q, which name one target type through one link type; Plan 1's skip key cannot tell them apart and only one child would ever be created",
+					s.sourceTypeKey, s.transitionCode, prev, s.action.Name)
+			}
+			seen[k] = s.action.Name
+		}
+	})
+
+	t.Run("no spawning transition can be re-entered", func(t *testing.T) {
+		spawning := map[string]map[string]bool{} // type key -> transition code
+		for _, s := range eoPilotSpawnActions {
+			if spawning[s.sourceTypeKey] == nil {
+				spawning[s.sourceTypeKey] = map[string]bool{}
+			}
+			spawning[s.sourceTypeKey][s.transitionCode] = true
+		}
+		if len(spawning) == 0 {
+			t.Fatalf("eoPilotSpawnActions is empty, so this test proves nothing")
+		}
+		for _, spec := range eoPilotWorkflows {
+			codes := spawning[spec.typeKey]
+			if len(codes) == 0 {
+				continue
+			}
+			for _, tr := range spec.transitions {
+				if !codes[tr.code] {
+					continue
+				}
+				t.Run(spec.typeKey+"."+tr.code, func(t *testing.T) {
+					if eoStateReaches(spec, tr.to, tr.from) {
+						t.Errorf("state %q reaches %q again, so a record can re-enter %q; the second run would find the first child and skip, and nothing would be created for the second round",
+							tr.to, tr.from, tr.code)
+					}
+				})
+			}
+		}
+	})
+}
+
+// eoStateReaches reports whether `to` can reach `from` by following this
+// workflow's transitions — a return loop, in other words.
+func eoStateReaches(spec eoWorkflowSpec, start, target string) bool {
+	seen := map[string]bool{start: true}
+	queue := []string{start}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, tr := range spec.transitions {
+			if tr.from != cur || seen[tr.to] {
+				continue
+			}
+			if tr.to == target {
+				return true
+			}
+			seen[tr.to] = true
+			queue = append(queue, tr.to)
+		}
+	}
+	return false
+}
+
+// The spawn actions are their OWN step of the pilot seed, not an extension of
+// seed_workflows: that step's applied row already exists on every database
+// that has booted Task A5, so an action folded into it would never be written
+// there — configuration that is complete on a fresh database and absent on
+// every real one. The key is a permanent identifier like every other.
+//
+// The second half is the same per-row idempotency the workflow step has: with
+// the applied row removed the step runs again and must converge.
+//
+// Mutation: remove the step from eoPilotSteps; or drop the `existing > 0`
+// early return from eoSeedOneSpawnAction.
+func TestEoSpawnSeedingIsAStepOfThePilotSeedAndConverges(t *testing.T) {
+	found := false
+	for _, st := range eoPilotSteps {
+		if st.key == eoSeedSpawnActionsStepKey {
+			found = true
+		}
+	}
+	if !found {
+		keys := make([]string, len(eoPilotSteps))
+		for i, st := range eoPilotSteps {
+			keys[i] = st.key
+		}
+		t.Fatalf("eoPilotSteps is %v and has no %q step; the spawn actions would be seeded on a fresh database only, and never on one that has already booted Task A5", keys, eoSeedSpawnActionsStepKey)
+	}
+
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	before := eoWorkflowCounts(t, db)
+	if err := db.Where("key = ?", eoSeedSpawnActionsStepKey).Delete(&models.EOSeedStep{}).Error; err != nil {
+		t.Fatalf("remove the applied-step row: %v", err)
+	}
+	seedEOPilot(db)
+	if after := eoWorkflowCounts(t, db); before != after {
+		t.Errorf("a re-run without the applied row changed the configuration: before %+v, after %+v", before, after)
+	}
+}
+
+// THE FAIL-CLOSED GUARDS, EXERCISED. eoCheckSpawnFieldMap and
+// eoCheckSpawnLinkType are the seed's refusals, and with the real registry
+// every one of their branches is unreachable — which is how a guard ends up
+// present, plausible and incapable of firing. These drive them with
+// deliberately broken specs against the REAL seeded configuration, so each
+// refusal is shown to refuse and to say why.
+//
+// Each case is one edit away from the shipped spec, and the message asserted
+// is the one an operator would read out of a rolled-back boot.
+func TestEoSpawnSeedRefusesAMisconfiguredSpawn(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	// The shipped spec, copied so a case can break one thing about it.
+	base := func(edit func(*eoSpawnSpec)) eoSpawnSpec {
+		s := eoPilotSpawnActions[0]
+		fm := make(map[string]string, len(s.fieldMap))
+		for k, v := range s.fieldMap {
+			fm[k] = v
+		}
+		s.fieldMap = fm
+		if edit != nil {
+			edit(&s)
+		}
+		return s
+	}
+
+	t.Run("the field map", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			edit func(*eoSpawnSpec)
+			want string
+		}{
+			{"the shipped spec is accepted", nil, ""},
+			{"an empty map", func(s *eoSpawnSpec) { s.fieldMap = map[string]string{} },
+				"empty field map"},
+			{"a required field of the target left unfilled", func(s *eoSpawnSpec) { delete(s.fieldMap, "owner") },
+				"does not fill owner"},
+			{"a key the target type does not define", func(s *eoSpawnSpec) { s.fieldMap["related_refs"] = "{{directive_text}}" },
+				`writes "related_refs", which "eo_task" does not define`},
+			{"a key the target type defines as auto", func(s *eoSpawnSpec) { s.fieldMap["origin_cff"] = "{{directive_text}}" },
+				`whose provenance on "eo_task" is "auto"`},
+			{"a literal instead of a placeholder", func(s *eoSpawnSpec) { s.fieldMap["task_text"] = "do the thing" },
+				"whole {{placeholders}}"},
+			{"a placeholder the source type does not define", func(s *eoSpawnSpec) { s.fieldMap["task_text"] = "{{nope}}" },
+				`from {{nope}}, which "eo_directive" does not define`},
+			{"a required field filled from an optional one", func(s *eoSpawnSpec) { s.fieldMap["owner"] = "{{decision_reference}}" },
+				"rather than user/always"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := eoCheckSpawnFieldMap(db, base(tc.edit))
+				if tc.want == "" {
+					if err != nil {
+						t.Fatalf("the shipped spec was refused: %v", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("accepted, and the spawn would then fail at Create after the commit with nothing retried")
+				}
+				if !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("refused with %q, which does not contain %q", err, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("the link type", func(t *testing.T) {
+		directiveID, err := eoRecordTypeID(db, eoDirectiveTypeKey)
+		if err != nil {
+			t.Fatalf("read the directive type: %v", err)
+		}
+		taskID, err := eoRecordTypeID(db, eoTaskTypeKey)
+		if err != nil {
+			t.Fatalf("read the task type: %v", err)
+		}
+		for _, tc := range []struct {
+			name string
+			edit func(*eoSpawnSpec)
+			want string
+		}{
+			{"the shipped spec is accepted", nil, ""},
+			{"a link type nothing seeded", func(s *eoSpawnSpec) { s.linkTypeKey = "eo_task_parent_v2" },
+				"which is not seeded"},
+			{"a link type whose source is another type", func(s *eoSpawnSpec) { s.linkTypeKey = eoReferralLinkKey },
+				"must be its only source"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := eoCheckSpawnLinkType(db, base(tc.edit), directiveID, taskID)
+				if tc.want == "" {
+					if err != nil {
+						t.Fatalf("the shipped spec was refused: %v", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("accepted, and services.ValidateLink would then refuse every spawn, post-commit")
+				}
+				if !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("refused with %q, which does not contain %q", err, tc.want)
+				}
+			})
+		}
+
+		// The branch that needs a DIFFERENT spawn to reach: a link type whose
+		// targets name neither the source type nor the `any` sentinel. The
+		// Objection's link type is the one seeded pair that has that shape —
+		// an objection hangs off a Draft Decision Study and off nothing else.
+		t.Run("a link type that does not admit this parent", func(t *testing.T) {
+			objectionID, err := eoRecordTypeID(db, eoObjectionTypeKey)
+			if err != nil {
+				t.Fatalf("read the objection type: %v", err)
+			}
+			spec := base(func(s *eoSpawnSpec) {
+				s.targetTypeKey, s.linkTypeKey = eoObjectionTypeKey, eoObjectionLinkKey
+			})
+			err = eoCheckSpawnLinkType(db, spec, directiveID, objectionID)
+			if err == nil {
+				t.Fatalf("a directive was allowed to spawn an objection through %q, whose only target is the draft study", eoObjectionLinkKey)
+			}
+			if !strings.Contains(err.Error(), "would refuse every spawn") {
+				t.Errorf("refused with %q, which does not name the consequence", err)
+			}
+		})
+	})
+
+	// And the seed function above them, which is what a boot actually runs:
+	// a transition code no workflow carries is an action attached to nothing.
+	t.Run("a transition code the source type's workflow does not have", func(t *testing.T) {
+		err := eoSeedOneSpawnAction(db, base(func(s *eoSpawnSpec) { s.transitionCode = "assign_indirectly" }))
+		if err == nil {
+			t.Fatalf("accepted a transition code no workflow carries; the action would be attached to nothing")
+		}
+		if !strings.Contains(err.Error(), "want exactly 1") {
+			t.Errorf("refused with %q, which does not say that the transition was not found", err)
+		}
+	})
+	t.Run("a record type the pilot does not seed", func(t *testing.T) {
+		err := eoSeedOneSpawnAction(db, base(func(s *eoSpawnSpec) { s.targetTypeKey = "eo_protocol_task" }))
+		if err == nil {
+			t.Fatalf("accepted a target type nothing seeded")
+		}
+		if !strings.Contains(err.Error(), "is not seeded") {
+			t.Errorf("refused with %q, which does not say the type is missing", err)
+		}
+	})
+}

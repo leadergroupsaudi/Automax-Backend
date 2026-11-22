@@ -304,6 +304,14 @@ var eoPilotSteps = []eoPilotStep{
 	// it removes a field definition an earlier step wrote.
 	{eoSeedTypePermissionsStepKey, eoSeedPilotTypePermissions},
 	{eoEnableCapabilitiesStepKey, eoEnableCapabilities},
+	// TASK A7. A STEP OF ITS OWN, not a field on eoTransitionSpec: the
+	// `seed_workflows` applied row already exists on every database that has
+	// booted Task A5, so a spawn_record action folded into that step would be
+	// written on a fresh database and on no real one. It comes LAST because it
+	// reads what every step before it wrote — the transition A5 seeded, the
+	// link type A4 seeded, and the field definitions of the target type AS
+	// TASK A6 LEFT THEM, which is the check the plan names.
+	{eoSeedSpawnActionsStepKey, eoSeedPilotSpawnActions},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every

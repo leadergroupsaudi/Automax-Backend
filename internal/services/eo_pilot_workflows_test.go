@@ -745,3 +745,210 @@ func TestEoPilotCloseParentOnAnAlreadyClosedParentIsANoOp(t *testing.T) {
 		t.Errorf("the second dispatch wrote %d failure notes on a letter that was already correctly closed", notes)
 	}
 }
+
+// ── Task A7: spawn_record, against the real seeded configuration ────────────
+//
+// THIS IS THE FIRST TIME PLAN 1'S spawn_record EXECUTOR RUNS AGAINST SEEDED
+// CONFIGURATION. Spec §12 names the pilot's instance — "spawn_record |
+// Directive and Visitor Direction → Task" — and §7.8 calls it "the On-air
+// Commitment → Task, Visitor Direction → Task, Official Visit → Protocol Task
+// pattern, which recurs in four CFFs". database.eoPilotSpawnActions puts it on
+// the Directive's `assign_directly`, the Q1 = no step where the work is
+// assigned with no Execution Plan to carry it.
+//
+// The database-side tests check the configuration as rows. These four show the
+// engine doing the work, or visibly failing to.
+func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
+	// The values that make the mapping checkable: each is distinct, so a map
+	// that filled the task from the wrong source would not pass by accident.
+	origin := map[string]any{
+		"directive_text":      "Issue building permits within five working days",
+		"responsible_officer": "officer-99",
+		"priority":            "urgent",
+		"sensitivity":         "confidential",
+		"source":              "weekly_meeting",
+		"subject_ar":          "تقليص مدة إصدار التراخيص",
+		"subject_en":          "Shorten the permit cycle",
+	}
+
+	// eoA7TaskChildren reads the Tasks hanging off a record, through the same
+	// link the executor's own idempotency check reads.
+	children := func(t *testing.T, f *eoWfFixture, parent *models.EORecord) []models.EORecord {
+		t.Helper()
+		taskTypeID := f.typeIDs[eoPilotTaskTypeKey]
+		kids, err := f.repo.Children(context.Background(), parent.ID, &taskTypeID)
+		if err != nil {
+			t.Fatalf("read the tasks under %s: %v", parent.Reference, err)
+		}
+		return kids
+	}
+
+	t.Run("the transition creates the task, filled from the directive", func(t *testing.T) {
+		f := eoWfNewFixture(t)
+		directive := f.create(t, eoPilotDirectiveTypeKey, nil, "", origin)
+		if n := len(children(t, f, directive)); n != 0 {
+			t.Fatalf("a new directive already has %d tasks", n)
+		}
+
+		f.move(t, directive, "assign_directly", models.EOTransitionInput{})
+
+		kids := children(t, f, directive)
+		if len(kids) != 1 {
+			t.Fatalf("the directive has %d tasks after `assign_directly`, want 1; the configured spawn created nothing", len(kids))
+		}
+		task := kids[0]
+		if !strings.HasPrefix(task.Reference, "TSK-") {
+			t.Errorf("the task's reference is %q, want the seeded TSK- pattern; it was not created through the real pipeline", task.Reference)
+		}
+		// THE LINK, not merely the parent column: the link type is what
+		// carries the rules, and Create refuses a parent given without one.
+		links, err := f.repo.LinksFrom(context.Background(), task.ID)
+		if err != nil {
+			t.Fatalf("read the task's links: %v", err)
+		}
+		if len(links) != 1 || links[0].LinkTypeKey != eoPilotTaskLinkKey || links[0].ToRecordID != directive.ID {
+			t.Fatalf("the task's links = %+v, want one %q link to %s", links, eoPilotTaskLinkKey, directive.ID)
+		}
+		// The initial state of the TASK's own workflow, because it went
+		// through Create and not through an insert.
+		if task.StateID == nil {
+			t.Errorf("the spawned task has no state")
+		}
+
+		bag := map[string]any{}
+		if len(task.Values) > 0 {
+			if err := json.Unmarshal(task.Values, &bag); err != nil {
+				t.Fatalf("decode the task's values: %v", err)
+			}
+		}
+		for _, tc := range []struct {
+			name, got, want string
+		}{
+			{"task_text from directive_text", eoA7String(bag["task_text"]), origin["directive_text"].(string)},
+			{"owner from responsible_officer", eoA7String(bag["owner"]), origin["responsible_officer"].(string)},
+			{"subject_ar", task.SubjectAr, origin["subject_ar"].(string)},
+			{"subject_en", task.SubjectEn, origin["subject_en"].(string)},
+			{"priority", task.Priority, origin["priority"].(string)},
+			{"sensitivity", task.Sensitivity, origin["sensitivity"].(string)},
+			{"source", task.Source, origin["source"].(string)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.got != tc.want {
+					t.Errorf("got %q, want %q", tc.got, tc.want)
+				}
+			})
+		}
+		if task.OwningBodyID == nil || *task.OwningBodyID != f.bodyID {
+			t.Errorf("the task's owning body is %v, want the directive's %s", task.OwningBodyID, f.bodyID)
+		}
+		// The due date is the column the clock reads, and it is the
+		// directive's own: the Task's `due_date` is narrowed to Always, so a
+		// spawn that did not carry it would have failed at Create.
+		fresh := f.reread(t, directive)
+		if task.DueDate == nil || fresh.DueDate == nil || !task.DueDate.Equal(*fresh.DueDate) {
+			t.Errorf("the task's due date is %v, want the directive's %v", task.DueDate, fresh.DueDate)
+		}
+	})
+
+	t.Run("the spawned task holds the directive open until it is verified", func(t *testing.T) {
+		// This is what makes the spawn more than a row: eo_task_parent
+		// carries "Always blocks its parent from closing" (matrix:520), so
+		// the task the TRANSITION created is a real blocking child.
+		f := eoWfNewFixture(t)
+		directive := f.create(t, eoPilotDirectiveTypeKey, nil, "", origin)
+		f.move(t, directive, "assign_directly", models.EOTransitionInput{})
+		kids := children(t, f, directive)
+		if len(kids) != 1 {
+			t.Fatalf("the directive has %d tasks, want 1", len(kids))
+		}
+		task := &kids[0]
+
+		d := f.move(t, f.reread(t, directive), "submit_for_verification", models.EOTransitionInput{})
+		_, err := f.try(t, f.reread(t, d), "close", models.EOTransitionInput{
+			Comment: "checked",
+			Values:  map[string]any{"verification_notes": "sampled ten permits"},
+		})
+		if err == nil {
+			t.Fatalf("the directive closed with its spawned task still open; the task the spawn created blocks nothing")
+		}
+
+		task = f.move(t, task, "start", models.EOTransitionInput{})
+		f.move(t, f.reread(t, task), "verify_and_close", models.EOTransitionInput{
+			Comment: "verified",
+			Values:  map[string]any{"evidence": []any{"file-1"}, "verified_by": "officer-99"},
+		})
+		if _, err := f.try(t, f.reread(t, d), "close", models.EOTransitionInput{
+			Comment: "checked",
+			Values:  map[string]any{"verification_notes": "sampled ten permits"},
+		}); err != nil {
+			t.Fatalf("the directive still refuses to close once its spawned task is closed: %v", err)
+		}
+	})
+
+	t.Run("a second dispatch does not spawn a second task", func(t *testing.T) {
+		// Plan 1's skip key is (parent, target type, link type) and it has no
+		// schema behind it, so this is the property decision 3 turns on.
+		f := eoWfNewFixture(t)
+		directive := f.create(t, eoPilotDirectiveTypeKey, nil, "", origin)
+		f.move(t, directive, "assign_directly", models.EOTransitionInput{})
+
+		var action models.TransitionAction
+		if err := f.db.Where("action_type = ?", "spawn_record").Limit(1).Find(&action).Error; err != nil {
+			t.Fatalf("read the spawn action: %v", err)
+		}
+		if action.ID == uuid.Nil {
+			t.Fatalf("no spawn_record action is seeded")
+		}
+		var tr models.WorkflowTransition
+		if err := f.db.Preload("Actions").Where("id = ?", action.TransitionID).Limit(1).Find(&tr).Error; err != nil {
+			t.Fatalf("read the transition: %v", err)
+		}
+		exec := NewEOActionExecutor(f.records, f.repo, f.types, repository.NewUserRepository(f.db), repository.NewDepartmentRepository(f.db), nil)
+		exec.SetTransitions(f.transits)
+		if err := exec.ExecuteActions(context.Background(), f.reread(t, directive), &tr, f.actor); err != nil {
+			t.Fatalf("re-dispatch: %v", err)
+		}
+		if n := len(children(t, f, directive)); n != 1 {
+			t.Errorf("the directive has %d tasks after the action ran twice, want 1", n)
+		}
+	})
+
+	t.Run("a spawn that fails is written to the directive's own history", func(t *testing.T) {
+		// THE ANSWER TO "CAN A SPAWN FAIL THE WAY close_parent CAN": yes. The
+		// dispatch is post-commit, the error is logged and nothing retries,
+		// so the transition succeeds and the task never appears. What the
+		// operator sees is this note, on the record they are looking at.
+		//
+		// The failure is forced the least artificial way available: the
+		// target type is deactivated, which is a thing an administrator can
+		// do in the designer, and eoRecordService.Create refuses it.
+		f := eoWfNewFixture(t)
+		if err := f.db.Model(&models.EORecordType{}).
+			Where("key = ?", eoPilotTaskTypeKey).Update("is_active", false).Error; err != nil {
+			t.Fatalf("deactivate the task type: %v", err)
+		}
+		directive := f.create(t, eoPilotDirectiveTypeKey, nil, "", origin)
+		if _, err := f.try(t, directive, "assign_directly", models.EOTransitionInput{}); err != nil {
+			t.Fatalf("the transition itself failed: a failing action must never undo a committed state change: %v", err)
+		}
+		if n := len(children(t, f, directive)); n != 0 {
+			t.Fatalf("a task was created although its type is inactive")
+		}
+		var notes []models.EORecordHistory
+		if err := f.db.Where("record_id = ? AND comment LIKE ?", directive.ID, "spawn_record%").Find(&notes).Error; err != nil {
+			t.Fatalf("read the directive's history: %v", err)
+		}
+		if len(notes) == 0 {
+			t.Fatalf("the spawn failed and wrote nothing to the directive's history; the task that never appeared would be invisible to the person looking at the record")
+		}
+		if !strings.Contains(notes[0].Comment, "did not create a record") {
+			t.Errorf("the note is %q, which does not say that nothing was created", notes[0].Comment)
+		}
+	})
+}
+
+// eoA7String renders a values-bag entry for comparison.
+func eoA7String(v any) string {
+	s, _ := v.(string)
+	return s
+}

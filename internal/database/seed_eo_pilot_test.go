@@ -3466,6 +3466,16 @@ func TestEoLinkEndpointsNameSeededTypes(t *testing.T) {
 // set of link types is not a matter of taste — one per sub type is what makes
 // the eight seeded types usable at all.
 //
+// TASK A7 ALSO RESTS ON THE "EXACTLY ONE" HALF OF THIS, so do not weaken it to
+// "at least one". Plan 1 deferred models.EOLinkType's DefaultParentLinkTypeKey
+// because a client chooses ParentLinkTypeKey on the create request and could
+// name a permitted-but-ruleless link type instead of the one carrying the
+// derived deadline or the blocks_parent_closure. A7 answered that the pilot
+// does not need the server-side default, and THIS TEST IS THE WHOLE REASON:
+// with one link type per child type there is no second key to name, and
+// services.ValidateLink refuses every other. A second link type on any pilot
+// child type makes that default owed.
+//
 // Mutation: delete any entry from eoPilotLinkTypes.
 func TestEoEveryPilotChildTypeHasOneParentLinkType(t *testing.T) {
 	bySource := map[string][]string{}
