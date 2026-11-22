@@ -112,6 +112,20 @@ type EORecordUpdateRequest struct {
 	Values       map[string]any `json:"values"`
 }
 
+// EOTransitionInput is what an actor supplies when running a transition: the
+// comment and attachments the transition's requirements ask for, and the
+// values of the fields the transition declares as field changes.
+//
+// Values is keyed by FIELD KEY, like the create and update requests, and only
+// keys the transition declares in its FieldChanges may appear: the transition
+// modal is a form the configuration describes, not a second edit path around
+// the field rules.
+type EOTransitionInput struct {
+	Comment     string         `json:"comment"`
+	Attachments []uuid.UUID    `json:"attachments"`
+	Values      map[string]any `json:"values"`
+}
+
 // EORecordLink is one typed relationship between two records (spec §7.6).
 // Both endpoints carry the record's type because a foreign key referencing a
 // partitioned table must name the partition key; the link resolver reads the

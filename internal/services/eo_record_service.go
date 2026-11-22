@@ -600,7 +600,14 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 // effectiveFields resolves a type's own fields plus every ancestor's. Nothing
 // is copied at configuration time, so this runs on every save (spec §7.2).
 func (s *eoRecordService) effectiveFields(ctx context.Context, t *models.EORecordType) ([]models.EOFieldDef, error) {
-	ancestors, err := s.types.Ancestors(ctx, t)
+	return eoEffectiveFields(ctx, s.types, t)
+}
+
+// eoEffectiveFields is the shared resolution the save pipeline and the
+// transition executor both need: a type's own field definitions plus every
+// ancestor's, resolved at read time (spec §7.2).
+func eoEffectiveFields(ctx context.Context, types repository.EORecordTypeRepository, t *models.EORecordType) ([]models.EOFieldDef, error) {
+	ancestors, err := types.Ancestors(ctx, t)
 	if err != nil {
 		return nil, err
 	}
@@ -609,7 +616,7 @@ func (s *eoRecordService) effectiveFields(ctx context.Context, t *models.EORecor
 	for _, a := range ancestors {
 		ids = append(ids, a.ID)
 	}
-	defs, err := s.types.FieldDefs(ctx, ids)
+	defs, err := types.FieldDefs(ctx, ids)
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -225,6 +226,15 @@ type WorkflowTransition struct {
 	// If manual_select_user=true: user performing transition manually selects the assignee from dropdown
 	ViewAssigneUserList bool `gorm:"default:false" json:"view_assigne_user_list"`
 	// If auto_match_user=true and view_assigne_user_list=true: expose the list of matched users in the transition response
+
+	// EOActorRules permits the user(s) named in a FIELD of the record, or of
+	// one of its ancestors, to run this transition — the third actor rule of
+	// spec §7.15, beside AllowedRoles and RequireAssignee. It is a jsonb list
+	// of {"field_key":"...","from":"self|parent|root"};
+	// services.ParseTransitionActorRules decodes it, and only the EO
+	// transition engine reads it, so the incident path is unchanged. The
+	// column is additive and nullable, exactly as Workflow.RecordTypeID is.
+	EOActorRules datatypes.JSON `gorm:"column:eo_actor_rules;type:jsonb;default:'[]'::jsonb" json:"eo_actor_rules,omitempty"`
 
 	// Requirements, Actions and Field Changes
 	Requirements []TransitionRequirement `gorm:"foreignKey:TransitionID" json:"requirements,omitempty"`
