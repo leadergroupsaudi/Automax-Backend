@@ -455,24 +455,8 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			if err := timers.CancelForRecordByCapability(ctx, fresh.ID, key); err != nil {
 				return err
 			}
-			capTimers, err := c.Timers(ctx, fresh, c.Config)
-			if err != nil {
-				return fmt.Errorf("capability %q timers: %w", key, err)
-			}
-			for i := range capTimers {
-				t := capTimers[i]
-				// A timer is cancelled by its capability key, so one stamped
-				// with another capability's key would be cancelled by that
-				// capability's state change while its owner never knew.
-				if t.CapabilityKey != "" && t.CapabilityKey != key {
-					return fmt.Errorf("capability %q returned a timer keyed %q", key, t.CapabilityKey)
-				}
-				t.RecordID = fresh.ID
-				t.RecordTypeID = fresh.RecordTypeID
-				t.CapabilityKey = key
-				if err := timers.Schedule(ctx, &t); err != nil {
-					return err
-				}
+			if err := eoArmCapabilityTimers(ctx, c, fresh, timers); err != nil {
+				return err
 			}
 		}
 		updated = fresh
@@ -939,4 +923,43 @@ func eoStateForSLA(ctx context.Context, policies repository.EscalationPolicyRepo
 	cp := *state
 	cp.EscalationPolicy = policy
 	return &cp, nil
+}
+
+// eoArmCapabilityTimers asks one capability for the timers of the state rec is
+// in and schedules them on timers, which must be the transaction's own handle.
+// It is shared by the transition and create paths so the stamping contract
+// cannot drift between them.
+//
+// RecordID, RecordTypeID and CapabilityKey are stamped when the capability left
+// them empty. One it set to somebody else's value is a capability bug and is
+// refused, not silently rewritten: a timer is cancelled by its capability key,
+// so one carrying another capability's key would be cancelled by that
+// capability's state change while its owner never knew.
+func eoArmCapabilityTimers(ctx context.Context, c EOEnabledCapability, rec *models.EORecord, timers repository.EOTimerRepository) error {
+	key := c.Key()
+	capTimers, err := c.Timers(ctx, rec, c.Config)
+	if err != nil {
+		return fmt.Errorf("capability %q timers: %w", key, err)
+	}
+	for i := range capTimers {
+		// A copy: Schedule mutates what it is given, and a capability may
+		// return a cached slice.
+		t := capTimers[i]
+		if t.CapabilityKey != "" && t.CapabilityKey != key {
+			return fmt.Errorf("capability %q returned a timer keyed %q", key, t.CapabilityKey)
+		}
+		if t.RecordID != uuid.Nil && t.RecordID != rec.ID {
+			return fmt.Errorf("capability %q returned a timer for record %s, not %s", key, t.RecordID, rec.ID)
+		}
+		if t.RecordTypeID != uuid.Nil && t.RecordTypeID != rec.RecordTypeID {
+			return fmt.Errorf("capability %q returned a timer for record type %s, not %s", key, t.RecordTypeID, rec.RecordTypeID)
+		}
+		t.RecordID = rec.ID
+		t.RecordTypeID = rec.RecordTypeID
+		t.CapabilityKey = key
+		if err := timers.Schedule(ctx, &t); err != nil {
+			return fmt.Errorf("capability %q schedule timer: %w", key, err)
+		}
+	}
+	return nil
 }

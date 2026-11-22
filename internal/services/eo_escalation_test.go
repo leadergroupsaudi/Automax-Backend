@@ -440,7 +440,10 @@ func TestTransitionFailsWhenTheSLAClockCannotBeScheduled(t *testing.T) {
 }
 
 func TestTransitionWithoutSLAWiringTouchesNoTimers(t *testing.T) {
-	f := eoNewTxFixture(t) // txTimers is nil: touching it would panic
+	// txTimers is nil: touching it would panic. That also relies on this
+	// fixture's record type enabling no capabilities, since each one cancels
+	// its timers on every transition.
+	f := eoNewTxFixture(t)
 	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
 		t.Fatalf("raise: %v", err)
 	}

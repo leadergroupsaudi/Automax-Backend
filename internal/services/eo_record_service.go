@@ -556,7 +556,16 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		// The SLA clock starts with the record, on the transaction's timer
 		// handle, so a failed create leaves no timer behind.
 		if slaState != nil {
-			return ScheduleStateSLA(ctx, rec, slaState, timers)
+			if err := ScheduleStateSLA(ctx, rec, slaState, timers); err != nil {
+				return err
+			}
+		}
+		// Capability timers for the initial state, last, on the same handle.
+		// No cancel: a new record has no earlier timers.
+		for _, c := range caps {
+			if err := eoArmCapabilityTimers(ctx, c, rec, timers); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

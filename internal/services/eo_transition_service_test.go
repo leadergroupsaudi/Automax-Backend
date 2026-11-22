@@ -1581,6 +1581,9 @@ type eoBridgeCap struct {
 	timers []models.EOTimer
 	err    error
 	calls  int
+	// what Timers was handed
+	seenState *uuid.UUID
+	seenCfg   datatypes.JSON
 }
 
 func (c *eoBridgeCap) Key() string { return c.key }
@@ -1599,8 +1602,9 @@ func (c *eoBridgeCap) OnTransition(context.Context, *models.EORecord, *models.Wo
 	return nil
 }
 
-func (c *eoBridgeCap) Timers(context.Context, *models.EORecord, datatypes.JSON) ([]models.EOTimer, error) {
+func (c *eoBridgeCap) Timers(_ context.Context, rec *models.EORecord, cfg datatypes.JSON) ([]models.EOTimer, error) {
 	c.calls++
+	c.seenState, c.seenCfg = rec.StateID, cfg
 	return c.timers, c.err
 }
 
@@ -1625,6 +1629,8 @@ func (f *eoBridgeTimers) Schedule(_ context.Context, t *models.EOTimer) error {
 	return nil
 }
 
+const eoBridgeCfg = `{"after_hours":4}`
+
 func eoBridgeFixture(t *testing.T, caps ...Capability) (*eoTxFixture, *eoBridgeTimers) {
 	t.Helper()
 	f := eoNewTxFixture(t)
@@ -1633,7 +1639,7 @@ func eoBridgeFixture(t *testing.T, caps ...Capability) (*eoTxFixture, *eoBridgeT
 	f.svc.(*eoTransitionService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {
 		out := make([]EOEnabledCapability, len(caps))
 		for i, c := range caps {
-			out[i] = EOEnabledCapability{Capability: c}
+			out[i] = EOEnabledCapability{Capability: c, Config: datatypes.JSON(eoBridgeCfg)}
 		}
 		return out, nil
 	}
@@ -1659,6 +1665,12 @@ func TestEoTransitionSchedulesCapabilityTimers(t *testing.T) {
 	}
 	if got.CapabilityKey != "eo.bridge" {
 		t.Errorf("CapabilityKey = %q, want eo.bridge", got.CapabilityKey)
+	}
+	if c.seenState == nil || *c.seenState != f.escalated.ID {
+		t.Errorf("Timers saw state %v, want the state entered (%v)", c.seenState, f.escalated.ID)
+	}
+	if string(c.seenCfg) != eoBridgeCfg {
+		t.Errorf("Timers saw config %s, want %s", c.seenCfg, eoBridgeCfg)
 	}
 	if !got.FireAt.Equal(fireAt) || string(got.Payload) != `{"n":1}` {
 		t.Errorf("FireAt/Payload not carried through: %v %s", got.FireAt, got.Payload)
@@ -1733,3 +1745,44 @@ func TestEoTransitionCapabilityTimerErrorAbortsTransition(t *testing.T) {
 		t.Errorf("scheduled %d timers", len(timers.scheduled))
 	}
 }
+
+func TestEoTransitionRejectsForeignRecordIdentity(t *testing.T) {
+	cases := []struct {
+		name  string
+		timer models.EOTimer
+	}{
+		{"foreign record id", models.EOTimer{FireAt: time.Now(), RecordID: uuid.New()}},
+		{"foreign record type id", models.EOTimer{FireAt: time.Now(), RecordTypeID: uuid.New()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &eoBridgeCap{key: "eo.mine", timers: []models.EOTimer{tc.timer}}
+			f, timers := eoBridgeFixture(t, c)
+			_, err := f.run("raise", f.actor, models.EOTransitionInput{})
+			if err == nil || !strings.Contains(err.Error(), "eo.mine") {
+				t.Fatalf("err = %v, want one naming the capability", err)
+			}
+			if len(timers.scheduled) != 0 {
+				t.Errorf("scheduled %d timers, want none", len(timers.scheduled))
+			}
+		})
+	}
+}
+
+func TestEoTransitionScheduleErrorNamesTheCapability(t *testing.T) {
+	c := &eoBridgeCap{key: "eo.mine", timers: []models.EOTimer{{FireAt: time.Now()}}}
+	f, timers := eoBridgeFixture(t, c)
+	boom := errors.New("fire_at required")
+	f.records.txTimers = &eoBridgeFailingTimers{eoBridgeTimers: timers, err: boom}
+	_, err := f.run("raise", f.actor, models.EOTransitionInput{})
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "eo.mine") {
+		t.Errorf("err = %v, want %v naming eo.mine", err, boom)
+	}
+}
+
+type eoBridgeFailingTimers struct {
+	*eoBridgeTimers
+	err error
+}
+
+func (f *eoBridgeFailingTimers) Schedule(context.Context, *models.EOTimer) error { return f.err }

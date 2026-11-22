@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -990,5 +991,62 @@ func TestUpdateRejectsAnUnknownRecord(t *testing.T) {
 	}, f.actor)
 	if !errors.Is(err, ErrEORecordNotFound) {
 		t.Errorf("error = %v, want %v", err, ErrEORecordNotFound)
+	}
+}
+
+// ── capability timers at creation ───────────────────────────────────────────
+
+func eoCreateBridgeFixture(t *testing.T, c Capability) (*eoSvcFixture, *eoBridgeTimers) {
+	t.Helper()
+	f := eoNewSvcFixture(t)
+	timers := &eoBridgeTimers{}
+	f.records.txTimers = timers
+	f.svc.(*eoRecordService).caps = func(*models.EORecordType) ([]EOEnabledCapability, error) {
+		return []EOEnabledCapability{{Capability: c, Config: datatypes.JSON(eoBridgeCfg)}}, nil
+	}
+	return f, timers
+}
+
+func eoCreateBridgeRecord(f *eoSvcFixture) (*models.EORecord, error) {
+	return f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+		RecordTypeID: f.recordType.ID, Values: map[string]any{"subject_ar": "x"},
+	}, f.actor)
+}
+
+func TestEoCreateSchedulesCapabilityTimers(t *testing.T) {
+	c := &eoBridgeCap{key: "eo.bridge", timers: []models.EOTimer{{FireAt: time.Now(), Payload: datatypes.JSON(`{}`)}}}
+	f, timers := eoCreateBridgeFixture(t, c)
+	rec, err := eoCreateBridgeRecord(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(timers.scheduled) != 1 {
+		t.Fatalf("scheduled %d timers, want 1", len(timers.scheduled))
+	}
+	got := timers.scheduled[0]
+	if got.RecordID != rec.ID || got.RecordTypeID != rec.RecordTypeID || got.CapabilityKey != "eo.bridge" {
+		t.Errorf("timer not stamped: %+v", got)
+	}
+	if c.seenState == nil || *c.seenState != f.initial.ID {
+		t.Errorf("Timers saw state %v, want the initial state %v", c.seenState, f.initial.ID)
+	}
+	if string(c.seenCfg) != eoBridgeCfg {
+		t.Errorf("Timers saw config %s, want %s", c.seenCfg, eoBridgeCfg)
+	}
+	for _, op := range timers.ops {
+		if strings.HasPrefix(op, "cancel:") {
+			t.Errorf("create issued %q; a new record has nothing to cancel", op)
+		}
+	}
+}
+
+func TestEoCreateRejectsForeignCapabilityKey(t *testing.T) {
+	c := &eoBridgeCap{key: "eo.mine", timers: []models.EOTimer{{FireAt: time.Now(), CapabilityKey: "eo.other"}}}
+	f, timers := eoCreateBridgeFixture(t, c)
+	if _, err := eoCreateBridgeRecord(f); err == nil {
+		t.Fatal("a timer keyed to another capability was accepted")
+	}
+	if len(timers.scheduled) != 0 {
+		t.Errorf("scheduled %d timers, want none", len(timers.scheduled))
 	}
 }
