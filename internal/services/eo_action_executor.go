@@ -376,6 +376,12 @@ func eoActionVars(rec *models.EORecord, transition *models.WorkflowTransition, p
 	vars["record_id"] = rec.ID.String()
 	vars["record_type_id"] = rec.RecordTypeID.String()
 	vars["reference"] = rec.Reference
+	// Always present, empty when unknown: whether a spawn_record map that
+	// names one of these is valid must not depend on whether a repository
+	// happened to preload the relation.
+	vars["transition_code"], vars["transition_name"] = "", ""
+	vars["from_state"], vars["to_state"] = "", ""
+	vars["performed_by_name"], vars["performed_by_email"] = "", ""
 	if transition != nil {
 		vars["transition_code"] = transition.Code
 		vars["transition_name"] = transition.Name
@@ -603,8 +609,10 @@ type eoSpawnConfig struct {
 	// FieldMap is target field key -> value. A string that is exactly one
 	// {{key}} takes the source record's value of that key with its own type;
 	// a string with {{key}} inside is rendered as text; anything else is a
-	// literal. A {{key}} whose source value is unset leaves the target field
-	// unset rather than writing an empty one.
+	// literal. A {{key}} naming a field the source type defines but this
+	// record has not filled leaves the target field unset (and renders empty
+	// inside text); one that no field definition and no variable knows fails
+	// the spawn.
 	FieldMap map[string]any `json:"field_map"`
 }
 
@@ -700,6 +708,23 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 
 	source := eoFlattenStored(rec)
 	vars := eoActionVars(rec, transition, by)
+	// A custom field defined on the SOURCE type but not yet filled on this
+	// record is absent from the values bag, hence from source and vars. It is
+	// known-with-no-value, not a typo: whether a map spawns must not depend on
+	// which optional fields this particular record happens to have filled.
+	// Only a key that no definition and no variable knows is fatal.
+	srcDefs, err := e.sourceFieldKeys(ctx, rec)
+	if err != nil {
+		return err
+	}
+	for k := range srcDefs {
+		if _, present := vars[k]; !present {
+			vars[k] = ""
+		}
+	}
+	unknownRef := func(key, ref string) error {
+		return fmt.Errorf("field_map %q refers to {{%s}}, which is not a field of the record's type or a known variable", key, ref)
+	}
 	values := make(map[string]any, len(cfg.FieldMap))
 	for key, raw := range cfg.FieldMap {
 		s, isString := raw.(string)
@@ -715,15 +740,18 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 				}
 				continue
 			}
+			if srcDefs[m[1]] {
+				continue // defined, unfilled: leave the target unset
+			}
 			if v, known := vars[m[1]]; known { // transition_code, record_id, ...
 				values[key] = v
 				continue
 			}
-			return fmt.Errorf("field_map %q refers to {{%s}}, which is not a field of the record or a known variable", key, m[1])
+			return unknownRef(key, m[1])
 		}
 		for _, m := range eoPlaceholderRE.FindAllStringSubmatch(s, -1) {
 			if _, known := vars[m[1]]; !known {
-				return fmt.Errorf("field_map %q refers to {{%s}}, which is not a field of the record or a known variable", key, m[1])
+				return unknownRef(key, m[1])
 			}
 		}
 		values[key] = eoRender(s, vars, nil)
@@ -739,6 +767,27 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 		return fmt.Errorf("create %q record: %w", cfg.TargetType, err)
 	}
 	return nil
+}
+
+// sourceFieldKeys is the set of field keys the record's own type defines
+// (own and inherited).
+func (e *eoActionExecutor) sourceFieldKeys(ctx context.Context, rec *models.EORecord) (map[string]bool, error) {
+	t, err := e.types.GetByID(ctx, rec.RecordTypeID)
+	if err != nil {
+		return nil, fmt.Errorf("load the record's type: %w", err)
+	}
+	if t == nil {
+		return nil, fmt.Errorf("record type %s not found", rec.RecordTypeID)
+	}
+	defs, err := eoEffectiveFields(ctx, e.types, t)
+	if err != nil {
+		return nil, fmt.Errorf("resolve fields of the record's type: %w", err)
+	}
+	out := make(map[string]bool, len(defs))
+	for _, d := range defs {
+		out[d.Key] = true
+	}
+	return out, nil
 }
 
 // spawnedChild finds a direct child of rec of the target type that is tied to

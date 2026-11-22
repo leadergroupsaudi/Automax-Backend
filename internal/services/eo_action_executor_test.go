@@ -174,12 +174,19 @@ func (r *eoAxRepo) CreateHistory(_ context.Context, h *models.EORecordHistory) e
 
 type eoAxTypes struct {
 	repository.EORecordTypeRepository
-	byKey  map[string]*models.EORecordType
-	fields []models.EOFieldDef
+	byKey    map[string]*models.EORecordType
+	fields   []models.EOFieldDef
+	sourceID uuid.UUID
 }
 
 func (t *eoAxTypes) GetByKey(_ context.Context, key string) (*models.EORecordType, error) {
 	return t.byKey[key], nil
+}
+func (t *eoAxTypes) GetByID(_ context.Context, id uuid.UUID) (*models.EORecordType, error) {
+	if id == t.sourceID {
+		return &models.EORecordType{ID: id, Key: "source", IsActive: true}, nil
+	}
+	return &models.EORecordType{ID: id}, nil
 }
 func (t *eoAxTypes) Ancestors(context.Context, *models.EORecordType) ([]models.EORecordType, error) {
 	return nil, nil
@@ -227,8 +234,12 @@ func eoAxNewFixture(t *testing.T) *eoAxFixture {
 	users := &eoAxUsers{byID: map[uuid.UUID]*models.User{assignee.ID: assignee, creator.ID: creator, manager.ID: manager}}
 	depts := &eoAxDepts{byID: map[uuid.UUID]*models.Department{dept.ID: dept}}
 	types := &eoAxTypes{
-		byKey: map[string]*models.EORecordType{"task": taskType},
+		sourceID: typeID,
+		byKey:    map[string]*models.EORecordType{"task": taskType},
 		fields: []models.EOFieldDef{
+			// the source type defines "budget" (filled on rec) and "venue" (never filled)
+			{RecordTypeID: typeID, Key: "budget", Kind: "text"},
+			{RecordTypeID: typeID, Key: "venue", Kind: "text"},
 			{RecordTypeID: taskType.ID, Key: "subject_ar", Kind: "text"},
 			{RecordTypeID: taskType.ID, Key: "priority", Kind: "text"},
 			{RecordTypeID: taskType.ID, Key: "task_budget", Kind: "text"},
@@ -535,6 +546,42 @@ func TestFieldUpdateIsVisibleToLaterActionsInTheSameDispatch(t *testing.T) {
 	}
 	if f.rec.Priority != "high" {
 		t.Fatalf("the caller's record must not be mutated, priority = %q", f.rec.Priority)
+	}
+}
+
+func TestSpawnRecordUnfilledBagFieldOfTheSourceTypeIsNotAnError(t *testing.T) {
+	f := eoAxNewFixture(t)
+	// "venue" is a custom field of the source type, absent from this record's
+	// values bag. The same map must spawn whether or not it is filled.
+	a := eoAxSpawn(1, map[string]any{"subject_ar": "{{reference}}", "priority": "{{venue}}", "task_budget": "at [{{venue}}] for {{budget}}"})
+	if err := f.exec.ExecuteActions(context.Background(), f.rec, eoAxTransition(a), f.actor); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.svc.created) != 1 {
+		t.Fatalf("an unfilled optional field must not stop the spawn; created %d, history %+v", len(f.svc.created), f.repo.history)
+	}
+	v := f.svc.created[0].Values
+	if _, set := v["priority"]; set {
+		t.Errorf("whole-value placeholder of an unfilled field must leave the target unset, got %v", v["priority"])
+	}
+	if v["task_budget"] != "at [] for 1200" {
+		t.Errorf("mixed render = %q", v["task_budget"])
+	}
+	if len(f.repo.history) != 0 {
+		t.Errorf("no failure should be recorded: %+v", f.repo.history)
+	}
+}
+
+func TestEOActionVarsAlwaysCarryTheRelationKeys(t *testing.T) {
+	vars := eoActionVars(&models.EORecord{ID: uuid.New()}, &models.WorkflowTransition{Code: "c"}, nil)
+	for _, k := range []string{"transition_code", "transition_name", "from_state", "to_state", "performed_by_name", "performed_by_email"} {
+		if _, ok := vars[k]; !ok {
+			t.Errorf("vars lacks %q when the relation is not loaded", k)
+		}
+	}
+	vars = eoActionVars(&models.EORecord{ID: uuid.New()}, nil, nil)
+	if _, ok := vars["from_state"]; !ok {
+		t.Errorf("vars lacks from_state with no transition")
 	}
 }
 
