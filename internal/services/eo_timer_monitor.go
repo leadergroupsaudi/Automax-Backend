@@ -199,6 +199,15 @@ func (m *eoTimerMonitor) release(timers []models.EOTimer) {
 	}
 }
 
+// eoClaimedAt is the claim's identity. A timer without one (never the case for
+// a ClaimDue result) matches no row, so its writes are refused, not misapplied.
+func eoClaimedAt(tm models.EOTimer) time.Time {
+	if tm.ClaimedAt == nil {
+		return time.Time{}
+	}
+	return *tm.ClaimedAt
+}
+
 // bookkeepingCtx detaches from parent's cancellation but keeps a deadline.
 func (m *eoTimerMonitor) bookkeepingCtx(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(parent), eoTimerBookkeepingTimeout)
@@ -216,7 +225,7 @@ func (m *eoTimerMonitor) fire(ctx, batchCtx context.Context, tm models.EOTimer) 
 	defer cancel()
 	switch {
 	case err == nil:
-		if err := m.repo.MarkFired(bctx, tm.ID); err != nil {
+		if err := m.repo.MarkFired(bctx, tm.ID, eoClaimedAt(tm)); err != nil {
 			// Cancelled while the handler ran: nothing to record.
 			if errors.Is(err, repository.ErrEOTimerNotClaimed) {
 				return nil
@@ -236,7 +245,7 @@ func (m *eoTimerMonitor) fire(ctx, batchCtx context.Context, tm models.EOTimer) 
 	default:
 		// Stays claimed and is re-delivered after the lease, until it has used
 		// its attempts, when the repository marks it failed.
-		failed, rerr := m.repo.RecordFailure(bctx, tm.ID, err.Error())
+		failed, rerr := m.repo.RecordFailure(bctx, tm.ID, eoClaimedAt(tm), err.Error())
 		if rerr != nil && !errors.Is(rerr, repository.ErrEOTimerNotClaimed) {
 			err = errors.Join(err, rerr)
 		}

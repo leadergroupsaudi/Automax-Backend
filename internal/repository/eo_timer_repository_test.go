@@ -277,13 +277,18 @@ func TestMarkFiredAndCancelForRecord(t *testing.T) {
 		}
 	}
 
-	if err := repo.MarkFired(ctx, a.ID); !errors.Is(err, ErrEOTimerNotClaimed) {
+	if err := repo.MarkFired(ctx, a.ID, time.Now()); !errors.Is(err, ErrEOTimerNotClaimed) {
 		t.Fatalf("MarkFired on a pending timer = %v, want ErrEOTimerNotClaimed", err)
 	}
-	if _, err := repo.ClaimDue(ctx, now, 10); err != nil { // claims a and fired
+	claimed, err := repo.ClaimDue(ctx, now, 10) // claims a and fired
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.MarkFired(ctx, fired.ID); err != nil {
+	claimedAt := map[uuid.UUID]time.Time{}
+	for _, c := range claimed {
+		claimedAt[c.ID] = *c.ClaimedAt
+	}
+	if err := repo.MarkFired(ctx, fired.ID, claimedAt[fired.ID]); err != nil {
 		t.Fatalf("MarkFired: %v", err)
 	}
 	if s := eoTimerStatus(t, db, fired.ID); s != models.EOTimerFired {
@@ -304,7 +309,7 @@ func TestMarkFiredAndCancelForRecord(t *testing.T) {
 		}
 	}
 	// A timer cancelled while its handler ran cannot then be marked fired.
-	if err := repo.MarkFired(ctx, a.ID); !errors.Is(err, ErrEOTimerNotClaimed) {
+	if err := repo.MarkFired(ctx, a.ID, claimedAt[a.ID]); !errors.Is(err, ErrEOTimerNotClaimed) {
 		t.Errorf("MarkFired on a cancelled timer = %v, want ErrEOTimerNotClaimed", err)
 	}
 }
@@ -389,7 +394,7 @@ func TestTimerGivesUpAfterMaxAttempts(t *testing.T) {
 		if len(got) != 1 || got[0].Attempts != attempt {
 			t.Fatalf("attempt %d: got %d timers (attempts %v)", attempt, len(got), got)
 		}
-		failed, err := repo.RecordFailure(ctx, tm.ID, "handler exploded")
+		failed, err := repo.RecordFailure(ctx, tm.ID, *got[0].ClaimedAt, "handler exploded")
 		if err != nil {
 			t.Fatalf("RecordFailure: %v", err)
 		}
@@ -420,17 +425,19 @@ func TestTimerSucceedingOnALaterAttemptIsNotFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for attempt := 1; attempt < EOTimerMaxAttempts; attempt++ {
-		if got := eoTimerRound(t, repo, &clock); len(got) != 1 {
+		got := eoTimerRound(t, repo, &clock)
+		if len(got) != 1 {
 			t.Fatalf("attempt %d: not redelivered", attempt)
 		}
-		if failed, err := repo.RecordFailure(ctx, tm.ID, "transient"); err != nil || failed {
+		if failed, err := repo.RecordFailure(ctx, tm.ID, *got[0].ClaimedAt, "transient"); err != nil || failed {
 			t.Fatalf("attempt %d: failed=%v err=%v", attempt, failed, err)
 		}
 	}
-	if got := eoTimerRound(t, repo, &clock); len(got) != 1 {
+	last := eoTimerRound(t, repo, &clock)
+	if len(last) != 1 {
 		t.Fatal("last attempt not redelivered")
 	}
-	if err := repo.MarkFired(ctx, tm.ID); err != nil {
+	if err := repo.MarkFired(ctx, tm.ID, *last[0].ClaimedAt); err != nil {
 		t.Fatalf("MarkFired: %v", err)
 	}
 	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFired {
@@ -649,5 +656,53 @@ func TestReleaseCannotStealAReclaimedTimer(t *testing.T) {
 	}
 	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerPending {
 		t.Errorf("the owner's Release did not work: status %q", s)
+	}
+}
+
+// MarkFired and RecordFailure, like Release, belong to the claim's owner. A
+// worker whose handler outlived its lease must not mark fired, or fail, a timer
+// another worker now holds; and the owner's own write must still land.
+func TestStaleWorkerCannotMarkFiredOrFailAReclaimedTimer(t *testing.T) {
+	db := eoTimerTestDB(t)
+	repo := NewEOTimerRepository(db)
+	ctx := context.Background()
+	clock := time.Now()
+	tm := eoNewTimer(clock.Add(-time.Hour))
+	if err := repo.Schedule(ctx, tm); err != nil {
+		t.Fatal(err)
+	}
+	first := eoTimerRound(t, repo, &clock)  // worker A
+	second := eoTimerRound(t, repo, &clock) // lease expired, worker B
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("claims: %d, %d", len(first), len(second))
+	}
+	a, b := *first[0].ClaimedAt, *second[0].ClaimedAt
+	if a.Equal(b) {
+		t.Fatal("both claims carry the same claimed_at")
+	}
+
+	if err := repo.MarkFired(ctx, tm.ID, a); !errors.Is(err, ErrEOTimerNotClaimed) {
+		t.Errorf("stale MarkFired = %v, want ErrEOTimerNotClaimed", err)
+	}
+	if failed, err := repo.RecordFailure(ctx, tm.ID, a, "stale"); !errors.Is(err, ErrEOTimerNotClaimed) || failed {
+		t.Errorf("stale RecordFailure = %v, %v", failed, err)
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerClaimed {
+		t.Fatalf("a stale write changed B's claim: status %q", s)
+	}
+	var msg string
+	db.Raw(`SELECT last_error FROM eo_timers WHERE id = ?`, tm.ID).Scan(&msg)
+	if msg != "" {
+		t.Errorf("a stale RecordFailure wrote last_error %q", msg)
+	}
+
+	if _, err := repo.RecordFailure(ctx, tm.ID, b, "owner failure"); err != nil {
+		t.Errorf("owner RecordFailure: %v", err)
+	}
+	if err := repo.MarkFired(ctx, tm.ID, b); err != nil {
+		t.Errorf("owner MarkFired: %v", err)
+	}
+	if s := eoTimerStatus(t, db, tm.ID); s != models.EOTimerFired {
+		t.Errorf("owner's MarkFired did not land: status %q", s)
 	}
 }

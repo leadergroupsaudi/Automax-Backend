@@ -30,6 +30,7 @@ type eoFakeTimerRepo struct {
 	failedNow  bool
 	released   []uuid.UUID
 	releasedAt []time.Time
+	markedAt   map[uuid.UUID]time.Time
 }
 
 func (f *eoFakeTimerRepo) Schedule(context.Context, *models.EOTimer) error { return nil }
@@ -55,7 +56,7 @@ func (f *eoFakeTimerRepo) ClaimDue(_ context.Context, _ time.Time, limit int) ([
 	return out, nil
 }
 
-func (f *eoFakeTimerRepo) MarkFired(ctx context.Context, id uuid.UUID) error {
+func (f *eoFakeTimerRepo) MarkFired(ctx context.Context, id uuid.UUID, claimedAt time.Time) error {
 	if err := ctx.Err(); err != nil { // like a real database
 		return err
 	}
@@ -65,16 +66,24 @@ func (f *eoFakeTimerRepo) MarkFired(ctx context.Context, id uuid.UUID) error {
 		return f.fireErr
 	}
 	f.fired = append(f.fired, id)
+	if f.markedAt == nil {
+		f.markedAt = map[uuid.UUID]time.Time{}
+	}
+	f.markedAt[id] = claimedAt
 	return nil
 }
 
-func (f *eoFakeTimerRepo) RecordFailure(ctx context.Context, id uuid.UUID, msg string) (bool, error) {
+func (f *eoFakeTimerRepo) RecordFailure(ctx context.Context, id uuid.UUID, claimedAt time.Time, msg string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failures == nil {
 		f.failures = map[uuid.UUID]string{}
 	}
 	f.failures[id] = msg
+	if f.markedAt == nil {
+		f.markedAt = map[uuid.UUID]time.Time{}
+	}
+	f.markedAt[id] = claimedAt
 	return f.failedNow, nil
 }
 
@@ -355,5 +364,25 @@ func TestTimerMonitorReleasesWithTheClaimItWasIssued(t *testing.T) {
 	_ = NewEOTimerMonitor(repo, h, time.Hour).RunOnce(ctx)
 	if len(repo.released) != 1 || len(repo.releasedAt) != 1 || repo.releasedAt[0].IsZero() {
 		t.Fatalf("released %v at %v: Release must carry the claimed_at the claim returned", repo.released, repo.releasedAt)
+	}
+}
+
+// Outcome writes must carry the claimed_at the claim returned, or the
+// repository's ownership predicate has nothing to compare.
+func TestTimerMonitorOutcomeWritesCarryTheClaim(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		repo := &eoFakeTimerRepo{queue: eoTimers(1)}
+		h := eoNoopHandler
+		if fail {
+			h = func(context.Context, models.EOTimer) error { return errors.New("x") }
+		}
+		_ = NewEOTimerMonitor(repo, h, time.Hour).RunOnce(context.Background())
+		var got time.Time
+		for _, v := range repo.markedAt {
+			got = v
+		}
+		if got.IsZero() {
+			t.Errorf("fail=%v: the outcome write carried no claimed_at", fail)
+		}
 	}
 }

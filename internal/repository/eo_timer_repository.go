@@ -38,13 +38,20 @@ type EOTimerRepository interface {
 	// not waited for. Timers whose claim is older than EOTimerClaimLease are
 	// claimable again.
 	ClaimDue(ctx context.Context, now time.Time, limit int) ([]models.EOTimer, error)
+	// MarkFired, RecordFailure and Release are the writes of the claim's
+	// owner, so all three match on the claimed_at ClaimDue returned: a worker
+	// whose lease expired and whose timer another worker re-claimed (a handler
+	// that outlived its budget) writes nothing, and gets ErrEOTimerNotClaimed
+	// (Release: nil), instead of marking fired, failing or releasing a run it
+	// no longer owns.
+	//
 	// MarkFired records that a claimed timer's handler succeeded.
-	MarkFired(ctx context.Context, id uuid.UUID) error
+	MarkFired(ctx context.Context, id uuid.UUID, claimedAt time.Time) error
 	// RecordFailure notes that a claimed timer's handler failed. It stores the
 	// message and, once the timer has used EOTimerMaxAttempts attempts, marks
 	// it failed (terminal); otherwise it stays claimed and is re-delivered
 	// after the lease. It returns whether the timer is now failed.
-	RecordFailure(ctx context.Context, id uuid.UUID, msg string) (failed bool, err error)
+	RecordFailure(ctx context.Context, id uuid.UUID, claimedAt time.Time, msg string) (failed bool, err error)
 	// Release hands a claimed-but-unprocessed timer back (pending, the attempt
 	// uncounted), but only while the caller still holds the claim: claimedAt
 	// is the claimed_at that ClaimDue returned. If the lease expired and
@@ -155,9 +162,9 @@ func (r *eoTimerRepository) ClaimDue(ctx context.Context, now time.Time, limit i
 	return out, nil
 }
 
-func (r *eoTimerRepository) MarkFired(ctx context.Context, id uuid.UUID) error {
+func (r *eoTimerRepository) MarkFired(ctx context.Context, id uuid.UUID, claimedAt time.Time) error {
 	res := r.db.WithContext(ctx).Exec(
-		`UPDATE eo_timers SET status = 'fired' WHERE id = ? AND status = 'claimed'`, id)
+		`UPDATE eo_timers SET status = 'fired' WHERE id = ? AND status = 'claimed' AND claimed_at = ?`, id, claimedAt)
 	if res.Error != nil {
 		return fmt.Errorf("mark timer fired: %w", res.Error)
 	}
@@ -167,13 +174,13 @@ func (r *eoTimerRepository) MarkFired(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (r *eoTimerRepository) RecordFailure(ctx context.Context, id uuid.UUID, msg string) (bool, error) {
+func (r *eoTimerRepository) RecordFailure(ctx context.Context, id uuid.UUID, claimedAt time.Time, msg string) (bool, error) {
 	var status string
 	res := r.db.WithContext(ctx).Raw(
 		`UPDATE eo_timers SET last_error = ?,
 			status = CASE WHEN attempts >= ? THEN 'failed' ELSE status END
-		 WHERE id = ? AND status = 'claimed'
-		 RETURNING status`, msg, EOTimerMaxAttempts, id).Scan(&status)
+		 WHERE id = ? AND status = 'claimed' AND claimed_at = ?
+		 RETURNING status`, msg, EOTimerMaxAttempts, id, claimedAt).Scan(&status)
 	if res.Error != nil {
 		return false, fmt.Errorf("record timer failure: %w", res.Error)
 	}
@@ -183,6 +190,9 @@ func (r *eoTimerRepository) RecordFailure(ctx context.Context, id uuid.UUID, msg
 	return status == models.EOTimerFailed, nil
 }
 
+// CancelForRecord is deliberately NOT keyed on a claim, unlike the three writes
+// above: it cancels by record, for a caller that is deleting the record and so
+// is not competing for any one timer. It must win over whoever holds a claim.
 func (r *eoTimerRepository) CancelForRecord(ctx context.Context, recordID uuid.UUID) error {
 	if err := r.db.WithContext(ctx).Exec(
 		`UPDATE eo_timers SET status = 'cancelled' WHERE record_id = ? AND status IN ('pending', 'claimed')`,
