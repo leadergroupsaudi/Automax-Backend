@@ -283,7 +283,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	// The entered state's escalation policy is read here for the same reason:
 	// the state is fixed by the transition, and a pooled read inside the
 	// transaction waits forever for a connection if the pool is capped.
-	slaState, err := s.stateForSLA(ctx, toState)
+	slaState, err := eoStateForSLA(ctx, s.policies, toState)
 	if err != nil {
 		return nil, fmt.Errorf("execute transition %q on record %s: %w", transition.Code, rec.ID, err)
 	}
@@ -882,18 +882,18 @@ func eoStateByID(wf *models.Workflow, id uuid.UUID) *models.WorkflowState {
 	return nil
 }
 
-// stateForSLA returns a copy of the state with its escalation policy loaded, or
+// eoStateForSLA returns a copy of the state with its escalation policy loaded, or
 // nil when entering it starts no SLA clock: SLAs are not wired, the state has no
 // SLA or no policy, or it is terminal (a closed record does not escalate).
 //
 // A policy that has since been deleted is logged and skipped rather than
 // failing the transition: refusing every move into the state over a
 // configuration gap would stop the work the SLA exists to protect.
-func (s *eoTransitionService) stateForSLA(ctx context.Context, state *models.WorkflowState) (*models.WorkflowState, error) {
-	if s.policies == nil || IsTerminal(state) || state.SLADuration() <= 0 || state.EscalationPolicyID == nil {
+func eoStateForSLA(ctx context.Context, policies repository.EscalationPolicyRepository, state *models.WorkflowState) (*models.WorkflowState, error) {
+	if policies == nil || IsTerminal(state) || state.SLADuration() <= 0 || state.EscalationPolicyID == nil {
 		return nil, nil
 	}
-	policy, err := s.policies.FindByID(ctx, *state.EscalationPolicyID)
+	policy, err := policies.FindByID(ctx, *state.EscalationPolicyID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		log.Printf("eo: state %q references escalation policy %s, which no longer exists; no SLA clock started", state.Code, *state.EscalationPolicyID)
 		return nil, nil

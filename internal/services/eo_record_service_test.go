@@ -31,6 +31,11 @@ type eoSvcRecordRepo struct {
 	updated      []models.EORecord
 	createdLinks []models.EORecordLink
 	history      []models.EORecordHistory
+	// txTimers is the timer repository Transaction hands its closure; nil
+	// unless a test wires SLA clocks.
+	txTimers repository.EOTimerRepository
+	// historyErr fails CreateHistory, to test what a failed create leaves.
+	historyErr error
 }
 
 func eoNewSvcRecordRepo() *eoSvcRecordRepo {
@@ -83,6 +88,9 @@ func (f *eoSvcRecordRepo) LinksFrom(_ context.Context, _ uuid.UUID) ([]models.EO
 }
 
 func (f *eoSvcRecordRepo) CreateHistory(_ context.Context, entry *models.EORecordHistory) error {
+	if f.historyErr != nil {
+		return f.historyErr
+	}
 	f.history = append(f.history, *entry)
 	return nil
 }
@@ -92,7 +100,7 @@ func (f *eoSvcRecordRepo) EnteredStateIDs(_ context.Context, _, _ uuid.UUID) (ma
 }
 
 func (f *eoSvcRecordRepo) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
-	return fn(f, nil, nil)
+	return fn(f, nil, f.txTimers)
 }
 
 type eoSvcTypeRepo struct {

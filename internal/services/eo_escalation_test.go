@@ -455,3 +455,176 @@ func TestTransitionSkipsAMissingPolicyInsteadOfBlockingTheMove(t *testing.T) {
 		t.Errorf("scheduled %d timers from a policy that does not exist", len(timers.scheduled))
 	}
 }
+
+// ── creation starts the initial state's clock ──────────────────────────────
+
+// eoSLAStatefulTimers keeps each timer's status, so a create and a later
+// transition can share one and the test can ask what is still pending.
+type eoSLAStatefulTimers struct {
+	repository.EOTimerRepository
+	timers []models.EOTimer
+}
+
+func (f *eoSLAStatefulTimers) Schedule(_ context.Context, t *models.EOTimer) error {
+	c := *t
+	c.Status = models.EOTimerPending
+	f.timers = append(f.timers, c)
+	return nil
+}
+
+func (f *eoSLAStatefulTimers) CancelForRecordByCapability(_ context.Context, id uuid.UUID, key string) error {
+	for i := range f.timers {
+		if f.timers[i].RecordID == id && f.timers[i].CapabilityKey == key && f.timers[i].Status == models.EOTimerPending {
+			f.timers[i].Status = models.EOTimerCancelled
+		}
+	}
+	return nil
+}
+
+func (f *eoSLAStatefulTimers) pending() []models.EOTimer {
+	var out []models.EOTimer
+	for _, t := range f.timers {
+		if t.Status == models.EOTimerPending {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// eoSLACreateFixture is the record-service fixture whose initial state carries
+// the given SLA and a three-step ladder (delays 0, 96, 264 hours).
+func eoSLACreateFixture(t *testing.T, sla *int, unit string) (*eoSvcFixture, *eoSLAStatefulTimers, *eoFakePolicies) {
+	t.Helper()
+	eoSLAFreezeClock(t)
+	f := eoNewSvcFixture(t)
+	timers := &eoSLAStatefulTimers{}
+	f.records.txTimers = timers
+	st := eoSLAState(sla, unit, 0, 96, 264)
+	policies := &eoFakePolicies{policy: st.EscalationPolicy}
+	s := &f.workflows.workflows[0].States[0]
+	s.SLAHours, s.SLAUnit, s.EscalationPolicyID = st.SLAHours, st.SLAUnit, st.EscalationPolicyID
+	f.svc = NewEORecordServiceWithSLA(f.records, f.types, f.sequences, f.workflows, policies)
+	return f, timers, policies
+}
+
+func eoSLACreate(f *eoSvcFixture) (*models.EORecord, error) {
+	return f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+		RecordTypeID: f.recordType.ID,
+		Values:       map[string]any{"subject_ar": "توجيه"},
+	}, f.actor)
+}
+
+func TestCreateStartsTheInitialStatesSLAClock(t *testing.T) {
+	cases := []struct {
+		unit string
+		sla  int
+		want time.Duration
+	}{
+		{"minutes", 3, 3 * time.Minute},
+		{"hours", 3, 3 * time.Hour},
+		{"days", 3, 72 * time.Hour},
+		{"months", 1, 30 * 24 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.unit, func(t *testing.T) {
+			f, timers, _ := eoSLACreateFixture(t, eoSLAInt(tc.sla), tc.unit)
+			rec, err := eoSLACreate(f)
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if len(timers.timers) != 3 {
+				t.Fatalf("scheduled %d timers at creation, want 3", len(timers.timers))
+			}
+			for i, tm := range timers.timers {
+				if tm.RecordID != rec.ID || tm.RecordTypeID != rec.RecordTypeID {
+					t.Errorf("timer %d is for %s/%s, want the created record", i, tm.RecordID, tm.RecordTypeID)
+				}
+				delay := []time.Duration{0, 96 * time.Hour, 264 * time.Hour}[i]
+				if got := tm.FireAt.Sub(eoSLAEpoch); got != tc.want+delay {
+					t.Errorf("timer %d fires %v after creation, want %v", i, got, tc.want+delay)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateWithNilOrZeroSLAOrNoneSchedulesNothing(t *testing.T) {
+	for name, sla := range map[string]*int{"nil": nil, "zero": eoSLAInt(0)} {
+		t.Run(name, func(t *testing.T) {
+			f, timers, policies := eoSLACreateFixture(t, sla, "days")
+			if _, err := eoSLACreate(f); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if len(timers.timers) != 0 || policies.loads != 0 {
+				t.Errorf("scheduled %d timers (policy loads %d) for a state with no SLA, want none", len(timers.timers), policies.loads)
+			}
+		})
+	}
+	t.Run("no policy", func(t *testing.T) {
+		f, timers, _ := eoSLACreateFixture(t, eoSLAInt(3), "days")
+		f.workflows.workflows[0].States[0].EscalationPolicyID = nil
+		if _, err := eoSLACreate(f); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(timers.timers) != 0 {
+			t.Errorf("scheduled %d timers with no policy, want 0", len(timers.timers))
+		}
+	})
+}
+
+func TestCreateWithoutSLAWiringTouchesNoTimers(t *testing.T) {
+	f := eoNewSvcFixture(t) // txTimers is nil: touching it would panic
+	if _, err := eoSLACreate(f); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+}
+
+func TestCreateLeavesNoTimerWhenTheCreateFails(t *testing.T) {
+	f, timers, _ := eoSLACreateFixture(t, eoSLAInt(3), "days")
+	f.records.historyErr = errors.New("db down")
+	if _, err := eoSLACreate(f); err == nil {
+		t.Fatal("create succeeded despite a failed history write")
+	}
+	if len(timers.timers) != 0 {
+		t.Errorf("a failed create scheduled %d timers", len(timers.timers))
+	}
+}
+
+func TestCreateFailsWhenTheSLAClockCannotBeScheduled(t *testing.T) {
+	f, _, _ := eoSLACreateFixture(t, eoSLAInt(3), "days")
+	f.records.txTimers = &eoSLATimers{scheduleErr: errors.New("db down")}
+	if _, err := eoSLACreate(f); err == nil {
+		t.Fatal("a record was created without its SLA clock")
+	}
+}
+
+// The first timers belong to the initial state; leaving it must cancel them.
+func TestTransitionOutOfTheInitialStateCancelsTheClockCreationStarted(t *testing.T) {
+	cf, timers, _ := eoSLACreateFixture(t, eoSLAInt(3), "days")
+	created, err := eoSLACreate(cf)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got := len(timers.pending()); got != 3 {
+		t.Fatalf("pending after create = %d, want 3", got)
+	}
+
+	// Move the same record out of draft, through the transition service, onto
+	// the same timer store.
+	tf := eoNewTxFixture(t)
+	tf.records.txTimers = timers
+	tf.svc = NewEOTransitionServiceWithSLA(tf.records, tf.types, tf.workflows, tf.actions, &eoFakePolicies{})
+	tf.rec.ID, tf.rec.StateID = created.ID, &tf.draft.ID
+	tf.records.stored[tf.rec.ID] = tf.rec
+	if _, err := tf.run("submit", tf.actor, models.EOTransitionInput{Values: map[string]any{"he_reason": "r", "priority": "p"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got := len(timers.pending()); got != 0 {
+		t.Errorf("%d creation timers still pending after the record left its initial state, want 0", got)
+	}
+	for _, tm := range timers.timers {
+		if tm.Status != models.EOTimerCancelled {
+			t.Errorf("timer status = %q, want cancelled", tm.Status)
+		}
+	}
+}

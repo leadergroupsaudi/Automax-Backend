@@ -373,6 +373,9 @@ type eoRecordService struct {
 	// caps resolves a type's enabled capabilities; nil means the process-wide
 	// registry. A test seam, like eval.
 	caps eoCapabilityResolver
+	// policies loads the initial state's escalation policy. Nil means SLA
+	// clocks are not wired: creation schedules no timer.
+	policies repository.EscalationPolicyRepository
 }
 
 func NewEORecordService(
@@ -381,7 +384,22 @@ func NewEORecordService(
 	sequences repository.EOSequenceRepository,
 	workflows repository.WorkflowRepository,
 ) EORecordService {
+	return NewEORecordServiceWithSLA(records, types, sequences, workflows, nil)
+}
+
+// NewEORecordServiceWithSLA is NewEORecordService plus SLA clocks: a record is
+// created with the escalation timers of its initial state already scheduled, in
+// the create transaction. An untouched record is the one that must escalate, so
+// the clock cannot wait for the first transition.
+func NewEORecordServiceWithSLA(
+	records repository.EORecordRepository,
+	types repository.EORecordTypeRepository,
+	sequences repository.EOSequenceRepository,
+	workflows repository.WorkflowRepository,
+	policies repository.EscalationPolicyRepository,
+) EORecordService {
 	return &eoRecordService{
+		policies:  policies,
 		records:   records,
 		types:     types,
 		sequences: sequences,
@@ -511,7 +529,13 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 
 	// 6. persist. The record, its parent link and the history row that says
 	// it entered its initial state are one write.
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
+	// The initial state's policy is read before the transaction: a pooled read
+	// inside it would take a second connection.
+	slaState, err := eoStateForSLA(ctx, s.policies, initial)
+	if err != nil {
+		return nil, fmt.Errorf("create eo record %q: %w", rec.Reference, err)
+	}
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, timers repository.EOTimerRepository) error {
 		if err := r.Create(ctx, rec); err != nil {
 			return err
 		}
@@ -520,13 +544,21 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 				return err
 			}
 		}
-		return r.CreateHistory(ctx, &models.EORecordHistory{
+		if err := r.CreateHistory(ctx, &models.EORecordHistory{
 			RecordID:      rec.ID,
 			RecordTypeID:  rec.RecordTypeID,
 			ToStateID:     &initial.ID,
 			PerformedByID: &actor.ID,
 			Comment:       "record created",
-		})
+		}); err != nil {
+			return err
+		}
+		// The SLA clock starts with the record, on the transaction's timer
+		// handle, so a failed create leaves no timer behind.
+		if slaState != nil {
+			return ScheduleStateSLA(ctx, rec, slaState, timers)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create eo record %q: %w", rec.Reference, err)
