@@ -149,7 +149,9 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		// MOMRA CRM outbound integration
 		&models.MOMRAStatusMapping{},
 		// EO platform models (parents before children). EORecord is NOT listed:
-		// it is created by raw SQL as a partitioned table.
+		// it is created by raw SQL as a partitioned table, by
+		// migrations.MigrateEOPlatform below. EOTimer and EOEscalationEvent are
+		// declared but have no table yet.
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
@@ -466,6 +468,14 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 	// Composite index for the incident communication history query (filter by incident_id, sort by created_at)
 	if err := migrations.MigrateNotificationLogIncidentIndex(db); err != nil {
 		log.Printf("Warning: notification_log incident index migration failed: %v", err)
+	}
+
+	// EO platform record storage: the LIST-partitioned eo_records table, its
+	// DEFAULT partition, eo_record_links and eo_record_history. Raw SQL because
+	// AutoMigrate cannot express partitioning, which is why models.EORecord is
+	// absent from the AutoMigrate list above. Idempotent on every boot.
+	if err := migrations.MigrateEOPlatform(db); err != nil {
+		log.Printf("Warning: EO platform migration failed: %v", err)
 	}
 
 	// Default SMS templates replacing formerly hardcoded SMS text (idempotent, never overwrites edits).
