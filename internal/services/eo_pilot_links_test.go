@@ -110,6 +110,12 @@ func eoPilotNewFixture(t *testing.T) *eoPilotFixture {
 	if err := db.AutoMigrate(&models.EOSeedStep{}); err != nil {
 		t.Fatalf("create the pilot seed's applied-step table: %v", err)
 	}
+	// TASK A6 gave the seeded types capability entries, and
+	// CapabilitiesFor errors on a key nothing registered — so without
+	// this call every create and every transition on the Draft Decision
+	// Study and on Incoming Correspondence fails. main.go registers them
+	// at startup; this is the same wiring, scoped to one test.
+	eoPilotRegisterCapabilities(t)
 	database.SeedEOPilot(db)
 
 	body := models.Department{Name: "Executive Office", Code: "EO", IsActive: true}

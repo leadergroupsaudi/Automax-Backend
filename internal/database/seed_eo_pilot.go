@@ -296,7 +296,22 @@ var eoPilotSteps = []eoPilotStep{
 	// that guard vacuous for ever — and the guard exists precisely to catch a
 	// raise-to-H.E. transition seeded under the wrong code.
 	{eoSeedWorkflowsStepKey, eoSeedPilotWorkflows},
+	// TASK A6. The per-type permission codes come FIRST because they are
+	// independent of everything after them and must exist for every concrete
+	// type the seed has created by now; the capability enablement comes LAST
+	// because it is the step that decides whether those types are usable, and
+	// it removes a field definition an earlier step wrote.
+	{eoSeedTypePermissionsStepKey, eoSeedPilotTypePermissions},
+	{eoEnableCapabilitiesStepKey, eoEnableCapabilities},
 }
+
+// The two step keys Task A6 adds. They are PERMANENT identifiers, like every
+// other key in the list above: a renamed key is a step that has never run, so
+// it would execute again on every database that has already booted.
+const (
+	eoSeedTypePermissionsStepKey = "seed_type_permissions"
+	eoEnableCapabilitiesStepKey  = "enable_capabilities"
+)
 
 // eoPilotSeedNeeded is the fast path: one count of applied-step rows.
 func eoPilotSeedNeeded(db *gorm.DB) (bool, error) {
@@ -1382,6 +1397,10 @@ type eoMatrixFieldNotSeeded struct {
 
 // eoMatrixFieldsNotSeeded is the whole of it.
 var eoMatrixFieldsNotSeeded = []eoMatrixFieldNotSeeded{
+	{eoDraftStudyTypeKey, "related_refs",
+		"the decisions_base capability, which WRITES the key and reserves it",
+		"TASK A6. Task A3 seeded it, as the matrix asks: Auto, multi_link, \"Related references\". Task B2's decisions_base returns `related_refs` from ReservedKeys, and services.eoCapabilitiesCheckConfig refuses a record type whose field definitions name a reserved key — at the FIRST REQUEST against the type, not at seed time. The capability and the declaration cannot both stand, and ReservedKeys is the only guard against a request writing a key the capability owns (a transition field change needs no field definition to be admitted), so the declaration goes. It is removed by eoEnableCapabilities, in the same step that enables the capability, rather than by editing A3's spec: A3's applied row means a spec edit would never re-run on a database that has booted, and the two changes must land together or the type is unusable in between. THE COST, which the client can see: the matrix lists `related_refs` as a labelled field and the seeded configuration now has no label, no Arabic and no entry in the effective field set for it, so a definition-driven UI has nothing to render the capability-written value with. That is an engine gap — a capability that owns a key should be able to describe it — and not a reason to keep a declaration that disables the type. See eoCapabilityReservedFieldRemovals.",
+	},
 	{eoExecutionPlanTypeKey, "plan_stages",
 		"the child record type " + eoStageTypeKey,
 		"The matrix gives it the kind `Table (stage, weeks, body, output)` and spec §7.3 DROPS `table` from the kind catalogue: Assignment's `from_stage` is a `Link (plan stage)`, and a link needs a RECORD to point at — you cannot cleanly reference a row inside a table field. So the four columns become the four fields of a child type, the plan's stages are its child records, and `total_weeks` (`Sum of the stages`) is a real roll-up over them instead of arithmetic over a blob nothing can address.",
@@ -2592,4 +2611,282 @@ var eoLinkRuleDecisions = []eoLinkRuleDecision{
 		"target types = the \"" + eoAnyTargetType + "\" sentinel, blocks_parent_closure",
 		"services.eoTypeAllowed, which accepts the sentinel for any target type; services.BlockingChildren for the block",
 		"The polymorphic type, and the one place where leaving a field UNSET would have produced this programme's signature defect in its purest form: an empty target list permits nothing, so a Task \"hanging off anything\" would have been refused by everything. The sentinel is the literal string services.eoAnyType carries, repeated here because that constant is unexported in a package this one cannot import, and tied to it by TestEoAnyTargetSentinelMatchesTheEngineConstant. WHAT THIS DOES NOT CLOSE: nothing refuses a PARENTLESS Task. Cardinality is an upper bound and applyLinkRules returns early on a nil parent, so ValidateLink is never reached; the work is a create-path rule. That item stays OPEN — see eoEngineKeyDecisions (eo_task.parent_ticket)."},
+}
+
+// ── Task A6: the capability entries (spec §7.9) ─────────────────────────────
+//
+// A capability is behaviour a record type cannot express as configuration: a
+// Go module registered by key, enabled per record type, handed that type's
+// config blob on every call (services.Capability). Up to this task every
+// pilot type carried `Capabilities: []` — the two capabilities Tasks B2 and
+// B3 built were registered and enabled nowhere, which is "present, plausible,
+// wired to nothing". This is where they are turned on.
+//
+// THE KEYS AND THE CONFIG SHAPES ARE REPEATED HERE AS LITERALS because they
+// are defined in package services, which this package cannot import (services
+// imports database). Nothing here can type-check against them, so the pairing
+// is held by the tests in internal/services/eo_pilot_capabilities_test.go,
+// which resolve EVERY seeded type through services.CapabilitiesFor and parse
+// every config: both decode with DisallowUnknownFields, so a stray or
+// misspelled key is a hard error — raised at the FIRST REQUEST against the
+// type, not at seed time, which is exactly why that test exists.
+//
+// WHICH TYPES, AND WHY NOT THE OTHERS. The task text asks for `approval`
+// "where the matrix has a sign-off" as well. It is enabled on NO type, and
+// that is a decision rather than an omission: see
+// eoApprovalCapabilityNotEnabled below.
+const (
+	// eoDecisionsBaseCapabilityKey is services.EODecisionsBaseKey.
+	eoDecisionsBaseCapabilityKey = "decisions_base"
+	// eoReferralTreeCapabilityKey is services.EOReferralTreeKey.
+	eoReferralTreeCapabilityKey = "referral_tree"
+	// eoApprovalCapabilityKey is services.EOApprovalKey. Nothing enables it;
+	// it is named so the decision below can be grepped from the key.
+	eoApprovalCapabilityKey = "approval"
+)
+
+// eoCapabilityEnablement is one capability turned on for one record type.
+//
+// The order within a type is the order the engine runs the hooks in
+// (services.eoCapabilityRegistry.resolve preserves it), so the slice order is
+// configuration, not presentation.
+type eoCapabilityEnablement struct {
+	TypeKey string
+	// CapabilityKey is the registry key, as services registers it.
+	CapabilityKey string
+	// Config is the blob the capability is handed, verbatim.
+	Config string
+	// Why is the client sentence or spec clause this implements.
+	Why string
+}
+
+// eoPilotCapabilities is every capability the pilot enables.
+var eoPilotCapabilities = []eoCapabilityEnablement{
+	{
+		TypeKey:       eoDraftStudyTypeKey,
+		CapabilityKey: eoDecisionsBaseCapabilityKey,
+		Config: `{"base_type_key":"` + eoDecisionTypeKey + `",` +
+			`"subject_key":"keywords",` +
+			`"standing_key":"standing","standing_values":["in_force"]}`,
+		Why: "EO-DRF step 2.1, \"the platform pulls up what bears on the subject\": the Draft Decision Study's `related_refs` row is Auto, and the standing base it is pulled from is the Decision Record (matrix:165, \"joins the base that checks the next draft\"). `standing_key`/`standing_values` are that type's own `standing` dropdown, whose three options are in_force, superseded and revoked — only the first is standing, and the capability's filter is POSITIVE, so a record with no standing is left out rather than pulled up. `target_key` is left at its default, `related_refs`, which is the matrix's own key and the one the field definition removed by eoCapabilityReservedFieldRemovals used to carry. `max_refs` is left at its default of 50. WHAT THIS DOES NOT DO YET, said plainly rather than papered over: `subject_key` names `keywords`, which Decision Record HAS (Required Yes, Options \"Subject taxonomy\") and the Draft Decision Study DOES NOT — the matrix gives the draft no subject-taxonomy field at all — and the taxonomy itself is a client vocabulary that exists in no document here. So the capability writes an EMPTY list on every save until the client supplies the taxonomy and the draft type gains the field. That is Task B2's designed degradation (a first draft against an empty base must still save) and it is recorded as an open obligation, not as a working conflict check.",
+	},
+	{
+		TypeKey:       eoIncomingTypeKey,
+		CapabilityKey: eoReferralTreeCapabilityKey,
+		Config:        `{"branch_type_key":"` + eoReferralTypeKey + `"}`,
+		Why:           "EO-COM step 6.1, the consolidation: one letter is referred to several bodies and each referral may be referred on again, and the Office answers once. `branch_type_key` is the seeded Referral type; `parent_key` is left at its default, `parent_referral`, which is the VALUES key the matrix gives a sub-referral (no `parent_referral` link type is seeded, and EORecordHandler.CreateLink refuses a link type that resolves to none, so the shape cannot live in eo_record_links); `target_key` is left at its default, `referral_tree`, which no seeded field definition claims — unlike decisions_base's key, this one needed no cleanup. The letter's own `consolidated` field is left alone: it is the officer's prose, and the capability refuses it as a target by name.",
+	},
+}
+
+// eoCapabilityNotEnabled records a registered capability that NO pilot type
+// carries, and why. It exists so that "nothing enables this" is a stated
+// decision with a reason attached rather than an absence nobody can tell from
+// an oversight — the shape eoMatrixFieldsNotSeeded and eoLinkRuleDecisions
+// already use for the same question about fields and link rules.
+//
+// TestEoCapabilitiesNotEnabledAreRecordedAndAbsent checks both halves against
+// the seeded rows: the reason is non-empty, and no type enables the key.
+type eoCapabilityNotEnabled struct {
+	CapabilityKey string
+	// Deadline is the moment after which the decision can no longer be
+	// revisited cheaply. Empty when there is none.
+	Deadline string
+	Why      string
+}
+
+// eoCapabilitiesNotEnabled is the whole of it.
+var eoCapabilitiesNotEnabled = []eoCapabilityNotEnabled{
+	{
+		CapabilityKey: eoApprovalCapabilityKey,
+		Deadline:      "before the pilot's first Outgoing Reply record",
+		Why: "THE TASK TEXT ASKS FOR `approval` \"where the matrix has a sign-off\" AND IT IS ENABLED NOWHERE. " +
+			"THE FACT: services.eoApprovalCapability reads and writes two DECLARED input fields named " +
+			"`<stamp_key>_authority` and `<stamp_key>_delegation_note`. The suffixes are string-concatenated in Go " +
+			"and are not configurable, and `parse` substitutes \"approval\" for an empty `stamp_key`, so NO " +
+			"configuration makes the capability read a field called `delegation_note`. The client's matrix names the " +
+			"two things on Outgoing Reply (6.2, \"one signature on the way out: H.E. or his delegate\") `approved_by` " +
+			"and `delegation_note`. " +
+			"SO ENABLING IT MEANS RE-KEYING TWO CELLS OF THE CLIENT'S MATRIX, and in this codebase that is not a " +
+			"two-line change: eoMatrixKeys is keyed by MATRIX SPELLING ALONE and `approved_by` appears on Execution " +
+			"Plan as well as on Outgoing Reply, so a rename there would fold both types onto one engine key — which " +
+			"TestEoTypeSpecificRenamesAreUnambiguousAcrossTheMatrix refuses in as many words: \"key the rename by " +
+			"(type, matrix key) before seeding any of them\". A type-keyed rename mechanism, a re-key step, a values " +
+			"backfill and entries in eoEngineKeyDecisions are the real cost. " +
+			"AND THE WINDOW IS NOT ONE-WAY, which is the premise that argued for doing it now regardless: " +
+			"models.ValidateTypeEdit refuses removing a field while records exist, but it governs the API type-edit " +
+			"path, and a SEED STEP writes field definitions directly and is not subject to it — this very task " +
+			"deletes `related_refs` that way, records or no records. A later enablement is a seed step plus one jsonb " +
+			"UPDATE moving two values per record, not a blocked migration. " +
+			"WHAT WOULD MAKE THE QUESTION GO AWAY, and the recommendation: two optional keys on " +
+			"services.eoApprovalConfig — `authority_key` and `delegation_note_key`, defaulting to today's suffixes. " +
+			"The client keeps `approved_by` and `delegation_note`, the stamp keeps its sealed key, and no type is ever " +
+			"renamed. That is a Plan 1 engine change and so not this task's to make. " +
+			"THE RESIDUAL WHILE IT IS NOT ENABLED: `approved_by` on an Outgoing Reply is an ordinary editable user " +
+			"field. Nothing records WHO typed the approval or WHEN, and nothing stops it being changed after the " +
+			"reply is approved or sent. On a statutory register that is the control 6.2 describes and the pilot does " +
+			"not have.",
+	},
+}
+
+// eoCapabilityReservedFieldRemoval is a field definition the pilot seeded and
+// an enabled capability's ReservedKeys requires gone.
+//
+// WHY A REMOVAL IS EVER NEEDED. A capability's reserved keys are the values
+// keys it writes itself, and services.eoCapabilitiesCheckConfig refuses a
+// record type whose field definitions name one — "field %q is written by the
+// capability and must not be defined". The refusal fires at the FIRST REQUEST
+// against the type, not at seed time: a type enabled with the declaration
+// still standing is seeded looking healthy and is dead on arrival, loudly,
+// naming the key. A derived value needs no field definition (capability
+// values are written through eoApplyValues, not the request path), which is
+// how the approval stamp's sealed key already works.
+//
+// WHY A STEP OF THIS SEED RATHER THAN AN EDIT TO THE SPEC THAT SEEDED IT.
+// The step that seeded the field has already written its applied row on every
+// database that has booted, so editing its spec would never re-run there: the
+// field would survive, and the capability enabled beside it would make the
+// type unusable. The removal and the enablement therefore land in ONE step,
+// which is also what keeps them from being separable by accident.
+//
+// WHAT IT COSTS, recorded rather than worked around. With no field definition
+// nothing describes the key — no label, no Arabic, no entry in the effective
+// field set — so a definition-driven UI has nothing to render the
+// capability-written value with. The client's matrix lists it as a labelled
+// field, so this is visible to them. It is an engine gap (a capability that
+// owns a key should be able to describe it), not something to fix by keeping
+// a declaration that disables the type.
+type eoCapabilityReservedFieldRemoval struct {
+	TypeKey string
+	// FieldKey is the ENGINE key of the definition removed.
+	FieldKey string
+	// MatrixKey is the client matrix's spelling, for eoMatrixFieldsNotSeeded.
+	MatrixKey string
+	// CapabilityKey is the capability that reserves it.
+	CapabilityKey string
+	Why           string
+}
+
+// eoCapabilityReservedFieldRemovals is the whole of it.
+var eoCapabilityReservedFieldRemovals = []eoCapabilityReservedFieldRemoval{
+	{
+		TypeKey:       eoDraftStudyTypeKey,
+		FieldKey:      "related_refs",
+		MatrixKey:     "related_refs",
+		CapabilityKey: eoDecisionsBaseCapabilityKey,
+		Why:           "Task A3 declares `related_refs` on the Draft Decision Study as an Auto multi_link field, because the matrix gives it a label and a kind. Task B2's decisions_base returns the same key from ReservedKeys, because it is the key the capability writes. Both are right and they cannot both stand: ReservedKeys is the ONLY guard against a request writing a key the capability owns — a transition field change needs no field definition to be admitted — so the reservation is what must survive, and the declaration goes.",
+	},
+}
+
+// eoEnableCapabilities is Task A6's step: it removes the field definitions an
+// enabled capability reserves and then writes each type's capability blob.
+//
+// THE TWO HALVES MUST NOT BE SEPARATED. Enabling a capability while a type
+// still declares one of its reserved keys makes that type unusable at the
+// first request against it, so they are one step with one applied row: there
+// is no ordering in which a database is left with one half applied.
+//
+// It is fail-closed throughout, like every other step: a type key that
+// resolves to nothing is an error that rolls the whole pilot seed back, not a
+// capability silently enabled on nothing.
+func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
+	for _, r := range eoCapabilityReservedFieldRemovals {
+		var ty models.EORecordType
+		if err := tx.Where("key = ?", r.TypeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", r.TypeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			return false, fmt.Errorf("capability %q reserves %q on record type %q, which is not seeded", r.CapabilityKey, r.FieldKey, r.TypeKey)
+		}
+		// Unscoped: a soft-deleted definition still occupies the
+		// (record_type_id, key) unique index, and the point is that the key
+		// is owned by the capability from here on.
+		res := tx.Unscoped().Where("record_type_id = ? AND key = ?", ty.ID, r.FieldKey).Delete(&models.EOFieldDef{})
+		if res.Error != nil {
+			return false, fmt.Errorf("remove field definition %q from %q: %w", r.FieldKey, r.TypeKey, res.Error)
+		}
+		log.Printf("EO pilot: removed field definition %q from %q: capability %q writes that key and reserves it (%d row(s))",
+			r.FieldKey, r.TypeKey, r.CapabilityKey, res.RowsAffected)
+	}
+
+	byType := map[string][]eoCapabilityEnablement{}
+	order := []string{}
+	for _, e := range eoPilotCapabilities {
+		if _, seen := byType[e.TypeKey]; !seen {
+			order = append(order, e.TypeKey)
+		}
+		byType[e.TypeKey] = append(byType[e.TypeKey], e)
+	}
+	for _, typeKey := range order {
+		blob, err := eoCapabilityBlob(byType[typeKey])
+		if err != nil {
+			return false, err
+		}
+		var ty models.EORecordType
+		if err := tx.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", typeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			return false, fmt.Errorf("capabilities are enabled on record type %q, which is not seeded", typeKey)
+		}
+		if err := tx.Model(&models.EORecordType{}).Where("id = ?", ty.ID).
+			Update("capabilities", datatypes.JSON(blob)).Error; err != nil {
+			return false, fmt.Errorf("enable capabilities on %q: %w", typeKey, err)
+		}
+		keys := make([]string, 0, len(byType[typeKey]))
+		for _, e := range byType[typeKey] {
+			keys = append(keys, e.CapabilityKey)
+		}
+		log.Printf("EO pilot: record type %q enables %v", typeKey, keys)
+	}
+	return true, nil
+}
+
+// eoCapabilityBlob renders one type's entries as the list
+// services.eoCapabilityRegistry.resolve decodes: [{key, config}, ...].
+//
+// Each Config is parsed before it is embedded, so a malformed blob is a seed
+// failure rather than a column of text the engine rejects on the first
+// request. It cannot check the config against the capability that reads it —
+// that is what the services-side test does — but it can refuse what is not
+// JSON at all.
+func eoCapabilityBlob(entries []eoCapabilityEnablement) ([]byte, error) {
+	type wire struct {
+		Key    string          `json:"key"`
+		Config json.RawMessage `json:"config"`
+	}
+	out := make([]wire, 0, len(entries))
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if e.CapabilityKey == "" {
+			return nil, fmt.Errorf("record type %q enables a capability with no key", e.TypeKey)
+		}
+		if seen[e.CapabilityKey] {
+			return nil, fmt.Errorf("record type %q enables capability %q twice", e.TypeKey, e.CapabilityKey)
+		}
+		seen[e.CapabilityKey] = true
+		if !json.Valid([]byte(e.Config)) {
+			return nil, fmt.Errorf("record type %q: the config for capability %q is not JSON: %s", e.TypeKey, e.CapabilityKey, e.Config)
+		}
+		out = append(out, wire{Key: e.CapabilityKey, Config: json.RawMessage(e.Config)})
+	}
+	return json.Marshal(out)
+}
+
+// ── Task A6: the per-type permission codes (spec §7.11) ─────────────────────
+
+// eoSeedPilotTypePermissions writes eo:<type_key>:view|create|update for the
+// pilot's eleven types and grants them to admin and executive_office.
+//
+// IT IS A STEP OF THE PILOT SEED because eoSeedTypePermissions runs inside
+// the PLATFORM seed, which is guarded by the base type's existence and had
+// therefore already run before any pilot type existed: none of the eleven had
+// a single code (docs/superpowers/eo-plan1-carry-forward.md records them as
+// found-absent). The function is reused rather than copied — it lists every
+// CONCRETE type and skips a code that already exists, so running it a second
+// time adds exactly the types seeded since the first.
+//
+// THE CODES ARE INERT and the wording an administrator reads says so; see
+// eoTypePermissionInertEN.
+func eoSeedPilotTypePermissions(tx *gorm.DB) (bool, error) {
+	return true, eoSeedTypePermissions(tx)
 }

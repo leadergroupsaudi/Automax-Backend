@@ -160,6 +160,28 @@ func eoTake(t *testing.T, db *gorm.DB) eoSnapshot {
 // a test ABOUT THE SMOKE REMOVAL, and it must not fail every time a field is
 // added. TestRootTypeFieldsMatchTheMatrix is what holds the count to the
 // client's document.
+// eoTypesAwaitingPermissions counts the CONCRETE record types that do not yet
+// carry spec §7.11's per-type codes. It asks for the `view` code only: the
+// three are written together, in one loop, inside one transaction.
+func eoTypesAwaitingPermissions(t *testing.T, db *gorm.DB) int64 {
+	t.Helper()
+	var types []models.EORecordType
+	if err := db.Where("is_abstract = ?", false).Find(&types).Error; err != nil {
+		t.Fatalf("read concrete record types: %v", err)
+	}
+	var pending int64
+	for _, ty := range types {
+		var n int64
+		if err := db.Model(&models.Permission{}).Where("code = ?", "eo:"+ty.Key+":view").Count(&n).Error; err != nil {
+			t.Fatalf("count the per-type codes of %q: %v", ty.Key, err)
+		}
+		if n == 0 {
+			pending++
+		}
+	}
+	return pending
+}
+
 func eoRootFieldCount(t *testing.T) int64 {
 	t.Helper()
 	base := eoBaseFieldDefs(uuid.New())
@@ -219,16 +241,24 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 	// What is left is the abstract base type with its 17 inherited fields,
 	// plus the three root types this seed adds and their fields.
 	want := eoSnapshot{
-		types:  1 + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes)),
-		fields: 17 + eoRootFieldCount(t),
+		types: 1 + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes)),
+		// Task A6 REMOVES a field definition an enabled capability reserves
+		// (eoCapabilityReservedFieldRemovals), so the root types end the seed
+		// with one fewer than their specs declare.
+		fields: 17 + eoRootFieldCount(t) - int64(len(eoCapabilityReservedFieldRemovals)),
 		// Plan 1's one smoke link type goes; Task A4's eight replace it,
 		// counted from the specs for the same reason eoRootFieldCount is:
 		// this test is about the smoke REMOVAL and must not fail every time
 		// the pilot gains a link type.
-		links:  int64(len(eoPilotLinkTypes)),
-		grants: before.grants - 12,
+		links: int64(len(eoPilotLinkTypes)),
+		// The smoke types' six codes and their twelve grants go; Task A6
+		// seeds three codes per pilot type and grants each to admin and
+		// executive_office. TestEoEveryConcreteTypeHasItsThreePermissions is
+		// what holds those rows to spec §7.11; this is the arithmetic that
+		// stops the smoke removal hiding behind them.
+		grants: before.grants - 12 + 6*int64(len(eoPilotTypeKeys)),
 	}
-	want.perms = before.perms - 6
+	want.perms = before.perms - 6 + 3*int64(len(eoPilotTypeKeys))
 	// Plan 1's two smoke workflows and its one-step escalation policy go;
 	// Task A5's eleven machines and its 3/7/14 ladder replace them, counted
 	// from the specs for the same reason.
@@ -341,6 +371,18 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			want.changes += wfc.fieldChanges
 			want.policies += wfc.policies
 			want.steps += wfc.policySteps
+			// TASK A6's per-type codes: three per concrete type that has
+			// none yet, each granted to admin and executive_office. The
+			// pending count is taken BEFORE the seed and includes the eleven
+			// types it is about to create, because in this test the smoke
+			// types are KEPT — they hold records — and they already carry
+			// theirs, while a type the case above invented does not.
+			pending := eoTypesAwaitingPermissions(t, db) + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes))
+			want.perms += 3 * pending
+			want.grants += 6 * pending
+			// And A6's removal of a field definition an enabled capability
+			// reserves.
+			want.fields -= int64(len(eoCapabilityReservedFieldRemovals))
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != want {
 				t.Errorf("a populated database changed: %+v, want %+v (was %+v)", got, want, snapBefore)
@@ -994,6 +1036,18 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 			// engine-managed, under the ENGINE spelling.
 			want := map[string]bool{}
 			for _, r := range matrix[eoMatrixSections[typeKey]] {
+				// Recorded as deliberately unseeded, with what carries the
+				// matrix's requirement instead. The child-type twin of this
+				// test has consulted the registry since Task A3; the root
+				// types needed it from Task A6, which removes
+				// `related_refs` from the Draft Decision Study because the
+				// decisions_base capability writes and RESERVES that key.
+				// The registry's own subtest in TestEoChildTypeFieldsMatchTheMatrix
+				// checks every entry against the database, so this is a
+				// recorded exemption and not a way round the matrix.
+				if eoMatrixFieldIsNotSeeded(typeKey, r.Key) {
+					continue
+				}
 				key, isColumn, managed := eoMatrixKey(r.Key)
 				if isColumn || managed {
 					continue
@@ -1921,7 +1975,9 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 	// and are not recorded as deliberately unseeded:
 	//
 	//	Directive               15+13   Execution Plan      15+7
-	//	Draft Decision Study    15+21     (8 rows less `plan_stages`)
+	//	Draft Decision Study    15+20     (8 rows less `plan_stages`)
+	//	  (`related_refs` is removed by Task A6: decisions_base WRITES and
+	//	   reserves that key, so no field definition may declare it)
 	//	Incoming Correspondence 15+14   Execution Plan Stage 15+0
 	//	  (`sender_deadline` and          (no matrix section)
 	//	   `attachments` name engine    Assignment          15+10
@@ -1936,8 +1992,8 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 	//
 	// The per-section row counts in eoReadFieldMatrix are the primary guard
 	// against a parse that finds nothing; this is the second.
-	if checked != 28+36+29+22+15+25+21+21+23+22+22 {
-		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+36+29+22+15+25+21+21+23+22+22)
+	if checked != 28+35+29+22+15+25+21+21+23+22+22 {
+		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+35+29+22+15+25+21+21+23+22+22)
 	}
 }
 

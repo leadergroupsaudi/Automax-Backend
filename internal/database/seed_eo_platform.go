@@ -557,6 +557,32 @@ func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 
 // ── the per-type permission codes (spec §7.11) ──────────────────────────────
 
+// eoTypePermissionInertEN and eoTypePermissionInertAR are appended to every
+// per-type permission's description, in both languages.
+//
+// WHY THE WORDING IS PART OF THE SEED. Spec §7.11 names per-type permissions
+// as one of three required mechanisms and the branch ships two: nothing
+// consults eo:<type_key>:view|create|update. Every EO route is gated by the
+// MODULE-level codes and row-level visibility is the repository's §7.11
+// clause, so granting or revoking one of these changes nothing about what
+// anyone can see or do. The permissions UI shows the administrator this
+// Description and nothing else; without these sentences the box reads exactly
+// like a control, and the person ticking it believes they have applied one.
+// Spec §7.11's own words for what they have actually done are an expression
+// of intent.
+//
+// It is appended rather than replacing the text so the administrator still
+// learns WHICH type and WHICH action the code names.
+//
+// WHEN THE PER-TYPE GATE ARRIVES these two sentences must go, in the same
+// change that wires enforcement — a control that says it enforces nothing
+// while enforcing something is the same defect pointing the other way.
+// Pinned by TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem.
+const (
+	eoTypePermissionInertEN = "NOT YET ENFORCED: nothing in the platform consults this code, so granting it records an intention and applies no control."
+	eoTypePermissionInertAR = "غير مُطبَّق بعد: لا شيء في المنصة يقرأ هذا الرمز، ومنحه يسجّل نيّة ولا يطبّق أي ضابط."
+)
+
 // eoSeedTypePermissions writes eo:<type_key>:view|create|update for every
 // CONCRETE record type and grants the lot to admin and executive_office.
 //
@@ -611,8 +637,8 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 				Module:        "eo",
 				Action:        fmt.Sprintf("%s:%s", t.Key, a.action),
 				ActionAr:      a.verbAr,
-				Description:   fmt.Sprintf("%s executive-office records of type %s (%s)", a.verb, t.Name, t.Key),
-				DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s", a.verbAr, t.NameAr),
+				Description:   fmt.Sprintf("%s executive-office records of type %s (%s). %s", a.verb, t.Name, t.Key, eoTypePermissionInertEN),
+				DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s. %s", a.verbAr, t.NameAr, eoTypePermissionInertAR),
 			}
 			var existing int64
 			if err := db.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
