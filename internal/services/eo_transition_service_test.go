@@ -131,8 +131,8 @@ func (b *eoTxBoundRepo) GetAnyByID(ctx context.Context, id uuid.UUID) (*models.E
 	return b.eoTxRecordRepo.GetAnyByID(ctx, id)
 }
 
-func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository) error) error {
-	if err := fn(&eoTxBoundRepo{f}, f.txTypes); err != nil {
+func (f *eoTxRecordRepo) Transaction(_ context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
+	if err := fn(&eoTxBoundRepo{f}, f.txTypes, nil); err != nil {
 		return err
 	}
 	f.committed = true

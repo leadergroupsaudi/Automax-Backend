@@ -264,7 +264,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 	ctx = WithEOActor(ctx, actor)
 
 	var updated *models.EORecord
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
 		// The row lock is the FIRST statement in the transaction: a
 		// transaction alone does not serialise two transitions under READ
 		// COMMITTED, and a doubly-executed transition would dispatch its

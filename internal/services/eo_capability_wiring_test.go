@@ -236,7 +236,7 @@ type eoInTxRecords struct {
 	open *bool
 }
 
-func (r eoInTxRecords) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository) error) error {
+func (r eoInTxRecords) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
 	*r.open = true
 	defer func() { *r.open = false }()
 	return r.eoTxRecordRepo.Transaction(ctx, fn)

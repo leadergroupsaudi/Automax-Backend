@@ -511,7 +511,7 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 
 	// 6. persist. The record, its parent link and the history row that says
 	// it entered its initial state are one write.
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
 		if err := r.Create(ctx, rec); err != nil {
 			return err
 		}
@@ -610,7 +610,7 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 	// whose path has to be traceable, and change_reason is captured for
 	// exactly this. The record and its journal entry are one write.
 	oldValues, newValues := eoDiffValues(before, eoFlattenStored(rec))
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository) error {
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
 		if err := r.Update(ctx, rec); err != nil {
 			return err
 		}

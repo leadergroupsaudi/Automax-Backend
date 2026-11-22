@@ -394,7 +394,7 @@ func TestEORecordTransactionRollsBackEveryWrite(t *testing.T) {
 	rec := eoNewTestRecord(typeID, "EO-DIR-2026-170")
 	boom := errors.New("link rules failed after the record was written")
 
-	err := repo.Transaction(ctx, func(tx EORecordRepository, _ EORecordTypeRepository) error {
+	err := repo.Transaction(ctx, func(tx EORecordRepository, _ EORecordTypeRepository, _ EOTimerRepository) error {
 		if err := tx.Create(ctx, rec); err != nil {
 			return err
 		}
@@ -426,7 +426,7 @@ func TestEORecordTransactionRollsBackEveryWrite(t *testing.T) {
 
 	// And a transaction that returns nil commits everything.
 	committed := eoNewTestRecord(typeID, "EO-DIR-2026-171")
-	if err := repo.Transaction(ctx, func(tx EORecordRepository, _ EORecordTypeRepository) error {
+	if err := repo.Transaction(ctx, func(tx EORecordRepository, _ EORecordTypeRepository, _ EOTimerRepository) error {
 		return tx.Create(ctx, committed)
 	}); err != nil {
 		t.Fatalf("committing transaction: %v", err)

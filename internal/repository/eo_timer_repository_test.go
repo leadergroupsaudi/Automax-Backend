@@ -562,3 +562,48 @@ func TestScheduleResetsAttemptsAndReleaseGivesTheAttemptBack(t *testing.T) {
 		t.Errorf("rescheduled timer carries attempts %d / error %q", attempts, msg)
 	}
 }
+
+// Driven through EORecordRepository.Transaction, the path real callers take, on
+// eoTestDB's ONE-connection pool. That makes it the pooled-handle probe too: a
+// Schedule that went to a pooled handle inside the open transaction would need
+// a second connection and hang, which the deadline turns into a failure.
+func TestTransactionHandsOutATxBoundTimerRepository(t *testing.T) {
+	db := eoTestDB(t)
+	if err := migrations.MigrateEOPlatform(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	records := NewEORecordRepository(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	boom := errors.New("transition failed after the timer was scheduled")
+	rolled := eoNewTimer(time.Now())
+	err := records.Transaction(ctx, func(_ EORecordRepository, _ EORecordTypeRepository, timers EOTimerRepository) error {
+		if err := timers.Schedule(ctx, rolled); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("transaction error = %v, want %v", err, boom)
+	}
+	var n int64
+	db.Raw(`SELECT count(*) FROM eo_timers WHERE id = ?`, rolled.ID).Scan(&n)
+	if n != 0 {
+		t.Error("a timer scheduled inside a rolled-back transaction survived")
+	}
+
+	committed := eoNewTimer(time.Now())
+	if err := records.Transaction(ctx, func(_ EORecordRepository, _ EORecordTypeRepository, timers EOTimerRepository) error {
+		if err := timers.Schedule(ctx, committed); err != nil {
+			return err
+		}
+		return timers.CancelForRecord(ctx, uuid.New()) // another write on the same handle
+	}); err != nil {
+		t.Fatalf("committing transaction: %v", err)
+	}
+	db.Raw(`SELECT count(*) FROM eo_timers WHERE id = ?`, committed.ID).Scan(&n)
+	if n != 1 {
+		t.Error("a timer scheduled in a committed transaction is missing")
+	}
+}
