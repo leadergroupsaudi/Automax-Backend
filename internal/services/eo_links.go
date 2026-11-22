@@ -53,6 +53,14 @@ func eoTypeAllowed(raw []byte, typeID uuid.UUID) (bool, error) {
 // Cardinality is counted per source record: "one" means from may carry at most
 // one outgoing link of this type (a Task has one parent_record); "many" is
 // unbounded.
+// MESSAGES ARE ENGLISH-ONLY, against spec §5's bilingual requirement. The
+// error returned here is passed to the client verbatim by the handler, so a
+// refusal reaches an Arabic UI in English. Noted, not fixed, in the Plan 1 fix
+// wave (2026-11-22): the fix is to return an i18n KEY plus its arguments
+// instead of a sentence, and it belongs with Plan 2's forms, which is where
+// the client-signed Arabic labels for each field and kind arrive. Writing
+// Arabic wording the client has not approved now would only have to be
+// revised then. See spec §5.
 func ValidateLink(lt *models.EOLinkType, from, to *models.EORecord, existing []models.EORecordLink) error {
 	if lt == nil || from == nil || to == nil {
 		return fmt.Errorf("validate link: link type and both records are required")

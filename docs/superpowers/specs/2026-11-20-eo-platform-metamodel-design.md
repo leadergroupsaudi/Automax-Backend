@@ -80,6 +80,17 @@ Things that would make this a failure even if it technically worked:
 
 - Go 1.25 / Fiber / GORM / PostgreSQL / Redis / MinIO, matching the existing stack.
 - Bilingual EN/AR with RTL everywhere; every label, option and template is a pair.
+
+  **Not yet true of validation messages (noted 2026-11-22, Plan 1 fix wave).**
+  `services.ValidateRecordValues`, `models.ValidateTypeEdit`,
+  `models.ValidateReferencePrefix` and `services.ValidateLink` return English
+  prose, and the handlers pass it to the client verbatim — the field-error map
+  of a refused save, and the §7.14 refusals, are English-only. Everything the
+  handlers themselves say goes through `i18n.T` and is a pair. The fix is for
+  those four to return an i18n KEY plus its arguments instead of a sentence,
+  and it belongs with Plan 2's forms, which is where the client-signed Arabic
+  labels for each field and kind arrive; doing it earlier would mean inventing
+  Arabic wording that the client has not approved and then revising it.
 - On-premise government deployment: new infrastructure components are expensive
   to justify and operate. Prefer what the stack already runs.
 - `expr-lang/expr` and `dop251/goja` are already in the dependency tree (indirect).
@@ -257,6 +268,31 @@ transaction, which does not fit the house migration style
 - a field marked `is_indexed` is recorded as *wanted*, and a tooling command
   emits a migration file adding the expression index, applied at the next
   release. The designer shows such a field as "index pending".
+
+**Per-type partitions: promotion is a ONE-WAY DOOR, and it closes at the first
+record.** (Added 2026-11-22, during the Plan 1 fix wave.) Plan 1 creates
+`eo_records` and its `DEFAULT` partition and nothing else: no per-type
+partition is ever created, by the designer or by a command, and every record of
+every type lands in `eo_records_default`. `EORecordType.PartitionPending` is
+set to true on creation and nothing ever clears it.
+
+The tooling promised above is still the right shape, but it has a constraint
+that was not stated when it was promised. When Postgres creates a new partition
+of a table that already has a DEFAULT partition, it SCANS the default partition
+and errors if any row in it would belong to the new one. So:
+
+- promoting a type that has **no** records is free — a plain
+  `CREATE TABLE … PARTITION OF eo_records FOR VALUES IN (…)`;
+- promoting a type that **already has records in the default partition** needs a
+  data move under an `ACCESS EXCLUSIVE` lock: create the partition detached,
+  copy the rows, delete them from the default, attach. That is a maintenance
+  window on the register, not a release step.
+
+Plan 2 must therefore create each type's partition **before that type's first
+record is written** — at type creation, not at the next release — or accept the
+locked migration for every type the pilot has already populated. Nothing in
+Plan 1 enforces the ordering, so a pilot that runs for a month before Plan 2
+ships has already walked through the door.
 
 This keeps "configuration, not a release" true for everything except index
 tuning, which is an operational act anyway.
@@ -522,6 +558,18 @@ Three mechanisms, all required:
   seeded table and `licensing/catalog_test.go` asserts every module is seeded).
   Plus the state-level `ViewableRoles`/`EditableRoles` and transition
   `AllowedRoles` already in the workflow engine.
+
+  **Seeded but NOT ENFORCED in Plan 1** (noted 2026-11-22, during the fix
+  wave). `internal/database/seed_eo_platform.go` writes the three codes for
+  every concrete type and grants them to `admin` and `executive_office`, and
+  nothing anywhere consults them: every EO route is gated by the MODULE-level
+  codes (`eo:view`, `eo:create`, `eo:update`, `eo:transition`,
+  `eo:types:manage`), and row-level visibility is the repository clause above.
+  Granting or revoking `eo:<type_key>:view` today changes nothing about what
+  anyone can see or do. They are seeded anyway so that Plan 2's per-type gate
+  finds them already present and already granted rather than having to invent
+  them against live roles — but an administrator ticking one of those boxes is
+  expressing an intention, not applying a control.
 
 ### 7.12 Documents
 
