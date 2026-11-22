@@ -102,6 +102,7 @@ type eoAxRecSvc struct {
 	createErr   error
 	updateErr   error
 	updateActor []*models.User
+	base        *models.EORecord // the record as Update last returned it
 }
 
 func (s *eoAxRecSvc) Create(_ context.Context, req *models.EORecordCreateRequest, _ *models.User) (*models.EORecord, error) {
@@ -121,7 +122,22 @@ func (s *eoAxRecSvc) Update(_ context.Context, id uuid.UUID, req *models.EORecor
 	s.updated = append(s.updated, req)
 	s.updatedIDs = append(s.updatedIDs, id)
 	s.updateActor = append(s.updateActor, actor)
-	return &models.EORecord{ID: id}, s.updateErr
+	if s.updateErr != nil {
+		return nil, s.updateErr
+	}
+	// What the real service returns: the record with the write applied.
+	out := *s.base
+	vals := eoDecodeValues(out.Values)
+	for k, v := range req.Values {
+		if k == "priority" {
+			out.Priority, _ = v.(string)
+		} else {
+			vals[k] = v
+		}
+	}
+	out.Values, _ = json.Marshal(vals)
+	s.base = &out
+	return &out, nil
 }
 
 type eoAxRepo struct {
@@ -206,7 +222,7 @@ func eoAxNewFixture(t *testing.T) *eoAxFixture {
 	}
 
 	repo := &eoAxRepo{}
-	svc := &eoAxRecSvc{repo: repo}
+	svc := &eoAxRecSvc{repo: repo, base: rec}
 	notifier := &eoAxNotifier{}
 	users := &eoAxUsers{byID: map[uuid.UUID]*models.User{assignee.ID: assignee, creator.ID: creator, manager.ID: manager}}
 	depts := &eoAxDepts{byID: map[uuid.UUID]*models.Department{dept.ID: dept}}
@@ -440,6 +456,11 @@ func TestEOWebhookIPAllowed(t *testing.T) {
 		"127.0.0.1": false, "10.1.2.3": false, "172.16.0.1": false, "172.31.255.255": false, "192.168.0.1": false,
 		"169.254.169.254": false, "224.0.0.1": false, "0.0.0.0": false, "::1": false, "fe80::1": false, "fd12::1": false,
 		"::ffff:10.0.0.1": false,
+		"100.64.0.1":      false, "100.127.255.254": false, "100.128.0.1": true,
+		"198.18.0.1": false, "198.19.255.255": false, "198.20.0.1": true,
+		"192.0.0.1": false, "255.255.255.255": false,
+		"::10.0.0.1": false, "::7f00:1": false, "::808:808": true, "::a00:1": false,
+		"64:ff9b::a00:1": false, "64:ff9b::808:808": false,
 	} {
 		if got := eoWebhookIPAllowed(net.ParseIP(ip)); got != want {
 			t.Errorf("%s allowed = %v, want %v", ip, got, want)
@@ -468,8 +489,9 @@ func TestExecuteActionsWebhookDoesNotFollowRedirects(t *testing.T) {
 	if targetHits != 0 {
 		t.Fatalf("redirect was followed")
 	}
-	if eoNewWebhookClient().CheckRedirect == nil {
-		t.Fatalf("the real client must carry the redirect policy")
+	req, _ := http.NewRequest("GET", target.URL, nil)
+	if got := eoNewWebhookClient().CheckRedirect(req, []*http.Request{req}); got != http.ErrUseLastResponse {
+		t.Fatalf("the real client's redirect policy returned %v, want http.ErrUseLastResponse", got)
 	}
 }
 
@@ -493,6 +515,37 @@ func TestFieldUpdateWritesIntoTheValuesBag(t *testing.T) {
 	}
 	if f.svc.updateActor[0] != f.actor {
 		t.Errorf("update must be attributed to the performing user")
+	}
+}
+
+func TestFieldUpdateIsVisibleToLaterActionsInTheSameDispatch(t *testing.T) {
+	f := eoAxNewFixture(t)
+	fu := eoAxAction("field_update", 1, map[string]any{"field": "priority", "value": "critical"})
+	sp := eoAxSpawn(2, map[string]any{"priority": "{{priority}}", "task_budget": "was {{priority}}"})
+	tr := eoAxTransition(fu, sp)
+	if err := f.exec.ExecuteActions(context.Background(), f.rec, tr, f.actor); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.svc.created) != 1 {
+		t.Fatalf("created %d", len(f.svc.created))
+	}
+	v := f.svc.created[0].Values
+	if v["priority"] != "critical" || v["task_budget"] != "was critical" {
+		t.Fatalf("the spawn rendered from a stale record: %v", v)
+	}
+	if f.rec.Priority != "high" {
+		t.Fatalf("the caller's record must not be mutated, priority = %q", f.rec.Priority)
+	}
+}
+
+func TestSpawnRecordWholeValuePlaceholderResolvesVariablesToo(t *testing.T) {
+	f := eoAxNewFixture(t)
+	a := eoAxSpawn(1, map[string]any{"subject_ar": "{{transition_code}}", "task_budget": "{{performed_by_name}}"})
+	if err := f.exec.ExecuteActions(context.Background(), f.rec, eoAxTransition(a), f.actor); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.svc.created) != 1 || f.svc.created[0].Values["subject_ar"] != "approve" || f.svc.created[0].Values["task_budget"] != "Ann Actor" {
+		t.Fatalf("created = %+v", f.svc.created)
 	}
 }
 
@@ -659,6 +712,8 @@ func TestSpawnRecordMisconfiguredMapSurfaces(t *testing.T) {
 		{"unknown target type", map[string]any{"target_type": "ghost", "link_type": "l", "field_map": map[string]any{}}, "ghost", nil},
 		{"no link type", map[string]any{"target_type": "task", "field_map": map[string]any{}}, "link_type", nil},
 		{"no target type", map[string]any{"link_type": "l", "field_map": map[string]any{}}, "target_type", nil},
+		{"typo in a whole-value placeholder", map[string]any{"target_type": "task", "link_type": "l", "field_map": map[string]any{"subject_ar": "{{refrence}}"}}, "refrence", nil},
+		{"typo inside a mixed placeholder", map[string]any{"target_type": "task", "link_type": "l", "field_map": map[string]any{"subject_ar": "see {{refrence}}"}}, "refrence", nil},
 		{"create rejects", map[string]any{"target_type": "task", "link_type": "l", "field_map": map[string]any{"subject_ar": "x"}}, "required thing missing", errors.New("required thing missing")},
 	}
 	for _, c := range cases {
@@ -666,8 +721,18 @@ func TestSpawnRecordMisconfiguredMapSurfaces(t *testing.T) {
 			f := eoAxNewFixture(t)
 			f.svc.createErr = c.createE
 			tr := eoAxTransition(eoAxAction("spawn_record", 1, c.cfg))
+			var buf strings.Builder
+			log.SetOutput(&buf)
+			defer log.SetOutput(os.Stderr)
 			if err := f.exec.ExecuteActions(context.Background(), f.rec, tr, f.actor); err != nil {
 				t.Fatalf("must not fail the transition: %v", err)
+			}
+			link, _ := c.cfg["link_type"].(string)
+			target, _ := c.cfg["target_type"].(string)
+			for _, want := range []string{"SKIPPED", f.rec.Reference, `target_type="` + target + `"`, `link_type="` + link + `"`, c.want} {
+				if !strings.Contains(buf.String(), want) {
+					t.Errorf("misconfiguration log %q lacks %s", buf.String(), want)
+				}
 			}
 			if c.createE == nil && len(f.svc.created) != 0 {
 				t.Fatalf("a misconfigured spawn must not reach Create")

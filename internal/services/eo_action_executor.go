@@ -94,10 +94,48 @@ func NewEOActionExecutor(
 // refused: an EO administrator configures a URL, and must not be able to point
 // the server at the network it sits in.
 func eoWebhookIPAllowed(ip net.IP) bool {
-	return !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
-		ip.IsMulticast() || ip.IsUnspecified())
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, n := range eoWebhookBlockedNets {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	// IPv4-compatible IPv6 (::a.b.c.d) is not unwrapped by To4, but is
+	// routed by some stacks as the embedded IPv4 address.
+	if ip16 := ip.To16(); ip16 != nil && ip.To4() == nil {
+		allZero := true
+		for _, b := range ip16[:12] {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return eoWebhookIPAllowed(net.IP(ip16[12:]))
+		}
+	}
+	return true
 }
+
+// eoWebhookBlockedNets are the classes net.IP's helpers do not cover:
+// CGNAT (EKS pod networks, many corporate and ISP networks), benchmarking and
+// IETF-protocol ranges, limited broadcast, and NAT64, which on an IPv6-only
+// host translates straight back into RFC 1918.
+var eoWebhookBlockedNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"100.64.0.0/10", "198.18.0.0/15", "192.0.0.0/24", "255.255.255.255/32", "64:ff9b::/96"} {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}()
 
 // eoWebhookControl runs on the dialer AFTER the hostname has been resolved,
 // against the address actually being connected to, so a name that resolves to
@@ -144,22 +182,30 @@ func (e *eoActionExecutor) ExecuteActions(ctx context.Context, rec *models.EORec
 	copy(actions, transition.Actions)
 	sort.SliceStable(actions, func(i, j int) bool { return actions[i].ExecutionOrder < actions[j].ExecutionOrder })
 
+	// The dispatch works on its own copy of the record: a field_update
+	// replaces it with the record Update returned, so a later action sees the
+	// write (field_update at order 1, a spawn mapping that field at order 2),
+	// and the caller's record is never mutated. An async action gets a
+	// snapshot taken when it is launched, so it shares nothing with the
+	// actions that run after it.
+	cur := *rec
 	for i := range actions {
 		action := actions[i]
 		if !action.IsActive {
 			continue
 		}
 		if action.IsAsync {
+			snapshot := cur
 			e.async.Add(1)
 			go func() {
 				defer e.async.Done()
 				// Detached from the request: the caller may be gone by
 				// the time a background action runs.
-				e.runAction(context.WithoutCancel(ctx), &action, rec, transition, performedBy)
+				e.runAction(context.WithoutCancel(ctx), &action, &snapshot, transition, performedBy)
 			}()
 			continue
 		}
-		e.runAction(ctx, &action, rec, transition, performedBy)
+		e.runAction(ctx, &action, &cur, transition, performedBy)
 	}
 	return nil
 }
@@ -534,12 +580,17 @@ func (e *eoActionExecutor) executeFieldUpdate(ctx context.Context, action *model
 	if strings.TrimSpace(cfg.Field) == "" {
 		return errors.New("field update config names no field")
 	}
-	_, err := e.recordSvc.Update(ctx, rec.ID, &models.EORecordUpdateRequest{
+	updated, err := e.recordSvc.Update(ctx, rec.ID, &models.EORecordUpdateRequest{
 		RecordTypeID: rec.RecordTypeID,
 		Values:       map[string]any{cfg.Field: cfg.Value},
 	}, by)
 	if err != nil {
 		return fmt.Errorf("update field %q: %w", cfg.Field, err)
+	}
+	// Later synchronous actions of this dispatch render from rec, so it must
+	// carry what was just written (see ExecuteActions).
+	if updated != nil {
+		*rec = *updated
 	}
 	return nil
 }
@@ -585,6 +636,12 @@ var eoWholePlaceholderRE = regexp.MustCompile(`^\s*\{\{\s*([A-Za-z0-9_]+)\s*\}\}
 func (e *eoActionExecutor) executeSpawnRecord(ctx context.Context, action *models.TransitionAction, rec *models.EORecord, transition *models.WorkflowTransition, by *models.User) error {
 	err := e.spawn(ctx, action, rec, transition, by)
 	if err != nil {
+		// Named here, not only in the generic line runAction writes, so a
+		// skip always says which parent, target type and link type it was.
+		var cfg eoSpawnConfig
+		_ = json.Unmarshal([]byte(action.Config), &cfg)
+		log.Printf("eo: record %s (%s): spawn_record %q SKIPPED, nothing was created: target_type=%q link_type=%q: %v",
+			rec.Reference, rec.ID, action.Name, cfg.TargetType, cfg.LinkType, err)
 		e.recordSpawnFailure(ctx, action, rec, transition, by, err)
 	}
 	return err
@@ -651,10 +708,23 @@ func (e *eoActionExecutor) spawn(ctx context.Context, action *models.TransitionA
 			continue
 		}
 		if m := eoWholePlaceholderRE.FindStringSubmatch(s); m != nil {
-			if v := eoPlain(source[m[1]]); v != nil {
-				values[key] = v
+			if v, known := source[m[1]]; known {
+				// A known field with no value leaves the target unset.
+				if pv := eoPlain(v); pv != nil {
+					values[key] = pv
+				}
+				continue
 			}
-			continue
+			if v, known := vars[m[1]]; known { // transition_code, record_id, ...
+				values[key] = v
+				continue
+			}
+			return fmt.Errorf("field_map %q refers to {{%s}}, which is not a field of the record or a known variable", key, m[1])
+		}
+		for _, m := range eoPlaceholderRE.FindAllStringSubmatch(s, -1) {
+			if _, known := vars[m[1]]; !known {
+				return fmt.Errorf("field_map %q refers to {{%s}}, which is not a field of the record or a known variable", key, m[1])
+			}
 		}
 		values[key] = eoRender(s, vars, nil)
 	}
