@@ -15,6 +15,11 @@ import (
 // link hangs off every record type (spec §7.6).
 const eoAnyType = "any"
 
+// eoMaxAncestorDepth bounds the record ancestry walk. It has the same value as
+// eoMaxInheritanceDepth (which bounds record-TYPE inheritance) but is a
+// separate limit.
+const eoMaxAncestorDepth = 32
+
 // eoTypeAllowed reports whether typeID is permitted by a link type's jsonb
 // type list. The list is either the string "any", an array of type-id strings
 // (which may itself contain "any"), or empty. An empty or malformed list
@@ -113,7 +118,11 @@ func DeriveDeadlineFromParent(lt *models.EOLinkType, parent *models.EORecord) *t
 // BlocksParentTransitionKey count. A child that blocks one does not block the
 // other.
 //
-// A child is the from-end of its link (a Task points at its parent). A child
+// Link direction varies by link type (Task.parent_record points child to
+// parent, spawned_task points parent to child), so a link's child end is found
+// by membership in children, not by position. A link counts only when exactly
+// one endpoint is in children: both outside means it is not about these
+// children, both inside means it relates siblings, not parent to child. A child
 // that is already closed no longer blocks. Each blocking child is returned
 // once, in the order given.
 func BlockingChildren(children []models.EORecord, links []models.EORecordLink, linkTypes map[string]models.EOLinkType, transitionKey string) []models.EORecord {
@@ -124,19 +133,31 @@ func BlockingChildren(children []models.EORecord, links []models.EORecordLink, l
 		return lt.BlocksParentTransitionKey == transitionKey
 	}
 
-	var out []models.EORecord
+	isChild := make(map[uuid.UUID]bool, len(children))
 	for _, c := range children {
-		if c.ClosedAt != nil {
+		isChild[c.ID] = true
+	}
+	blocking := make(map[uuid.UUID]bool)
+	for _, l := range links {
+		fromIn, toIn := isChild[l.FromRecordID], isChild[l.ToRecordID]
+		if fromIn == toIn {
 			continue
 		}
-		for _, l := range links {
-			if l.FromRecordID != c.ID {
-				continue
-			}
-			if lt, ok := linkTypes[l.LinkTypeKey]; ok && blocks(lt) {
-				out = append(out, c)
-				break
-			}
+		lt, ok := linkTypes[l.LinkTypeKey]
+		if !ok || !blocks(lt) {
+			continue
+		}
+		if fromIn {
+			blocking[l.FromRecordID] = true
+		} else {
+			blocking[l.ToRecordID] = true
+		}
+	}
+
+	var out []models.EORecord
+	for _, c := range children {
+		if blocking[c.ID] && c.ClosedAt == nil {
+			out = append(out, c)
 		}
 	}
 	return out
@@ -147,7 +168,7 @@ func BlockingChildren(children []models.EORecord, links []models.EORecordLink, l
 // The walk is untrusted: a cycle or a chain deeper than maxDepth is an error,
 // never a loop, because it runs inside request handlers. It uses the same
 // visited-set-plus-depth-bound shape as ResolveEffectiveFields; a non-positive
-// maxDepth means eoMaxInheritanceDepth.
+// maxDepth means eoMaxAncestorDepth.
 func WalkAncestors(ctx context.Context, rec *models.EORecord, load func(uuid.UUID) (*models.EORecord, error), maxDepth int) ([]models.EORecord, error) {
 	if rec == nil {
 		return nil, fmt.Errorf("walk ancestors: nil record")
@@ -156,7 +177,7 @@ func WalkAncestors(ctx context.Context, rec *models.EORecord, load func(uuid.UUI
 		return nil, fmt.Errorf("walk ancestors: nil loader")
 	}
 	if maxDepth <= 0 {
-		maxDepth = eoMaxInheritanceDepth
+		maxDepth = eoMaxAncestorDepth
 	}
 
 	var out []models.EORecord

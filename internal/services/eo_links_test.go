@@ -223,6 +223,33 @@ func TestBlockingChildrenClosureVsTransition(t *testing.T) {
 			t.Errorf("got %d, want 1", len(got))
 		}
 	})
+	t.Run("parent-to-child link still blocks", func(t *testing.T) {
+		parent := uuid.New()
+		rev := []models.EORecordLink{
+			{FromRecordID: parent, ToRecordID: assignment.ID, LinkTypeKey: "assignment_of"},
+			{FromRecordID: parent, ToRecordID: objection.ID, LinkTypeKey: "objection_to"},
+		}
+		got := BlockingChildren(children, rev, lts, "")
+		if len(got) != 1 || got[0].ID != assignment.ID {
+			t.Errorf("closure: got %d blockers, want the assignment", len(got))
+		}
+		got = BlockingChildren(children, rev, lts, "raise_to_he")
+		if len(got) != 1 || got[0].ID != objection.ID {
+			t.Errorf("raise: got %d blockers, want the objection", len(got))
+		}
+	})
+	t.Run("link with both endpoints outside children is ignored", func(t *testing.T) {
+		stray := []models.EORecordLink{{FromRecordID: uuid.New(), ToRecordID: uuid.New(), LinkTypeKey: "assignment_of"}}
+		if got := BlockingChildren(children, stray, lts, ""); len(got) != 0 {
+			t.Errorf("got %d, want 0", len(got))
+		}
+	})
+	t.Run("link between two children is not a parent link", func(t *testing.T) {
+		sib := []models.EORecordLink{{FromRecordID: assignment.ID, ToRecordID: plain.ID, LinkTypeKey: "assignment_of"}}
+		if got := BlockingChildren(children, sib, lts, ""); len(got) != 0 {
+			t.Errorf("got %d, want 0", len(got))
+		}
+	})
 	t.Run("unknown link type does not block", func(t *testing.T) {
 		unk := []models.EORecordLink{{FromRecordID: assignment.ID, LinkTypeKey: "nope"}}
 		if got := BlockingChildren(children, unk, lts, ""); len(got) != 0 {
