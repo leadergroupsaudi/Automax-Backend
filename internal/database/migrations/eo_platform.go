@@ -23,6 +23,14 @@ import (
 //   - a DEFAULT partition catches every record type that has no partition of
 //     its own, so a type created in the designer works immediately. A tooling
 //     command emits the migration that gives it its own partition later.
+//     THAT COMMAND DOES NOT EXIST IN PLAN 1: no per-type partition is ever
+//     created and every record of every type lives in eo_records_default.
+//     That is fully functional, but promotion is a ONE-WAY DOOR — Postgres
+//     scans the DEFAULT partition when a new partition is created and errors
+//     if any row would belong to it, so a type that already has records can
+//     only be promoted by moving its rows under an ACCESS EXCLUSIVE lock.
+//     Plan 2 must create each type's partition BEFORE its first record. See
+//     spec §7.7 and models.EORecordType.PartitionPending.
 //   - eo_record_links and eo_record_history carry both the record id and the
 //     record type id of each endpoint, because a foreign key referencing a
 //     partitioned table must name the partition key (spec §7.6). AutoMigrate
@@ -154,6 +162,23 @@ func MigrateEOPlatform(db *gorm.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_eo_record_links_from ON eo_record_links (from_record_id);
 	CREATE INDEX IF NOT EXISTS idx_eo_record_links_to ON eo_record_links (to_record_id);
 	CREATE INDEX IF NOT EXISTS idx_eo_record_links_type_key ON eo_record_links (link_type_key);
+
+	-- One link of a given type between a given ordered pair, enforced by the
+	-- DATABASE. services.ValidateLink's duplicate check is application-level
+	-- and runs outside any transaction, so two concurrent POST /:id/links both
+	-- read "not linked yet" and both insert. Uniqueness here is a property of
+	-- the data, not of the handler that happens to write it.
+	--
+	-- A UNIQUE INDEX rather than a table constraint, because the CREATE TABLE
+	-- above is IF NOT EXISTS and so cannot add a constraint to a table that
+	-- already exists, while CREATE UNIQUE INDEX IF NOT EXISTS is idempotent on
+	-- a new and an existing database alike. It adds no column, so
+	-- eoRecordLinksColumns is unchanged. On a database that already holds
+	-- duplicate links this statement FAILS — and with MigrateEOPlatform's
+	-- error now returned by database.Migrate, the server will not start until
+	-- they are removed; see docs/eo-platform-deploying.md.
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_eo_record_links_pair_type
+		ON eo_record_links (from_record_id, to_record_id, link_type_key);
 	`
 	if err := db.Exec(linksSQL).Error; err != nil {
 		return fmt.Errorf("eo platform: create eo_record_links: %w", err)

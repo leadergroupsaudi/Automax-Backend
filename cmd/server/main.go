@@ -484,14 +484,17 @@ func main() {
 		services.NewEOTimerRouter(map[string]services.EOTimerHandler{
 			services.EOEscalationCapabilityKey: services.NewEOEscalationHandler(eoEscalationEventRepo, eoRecordRepo),
 		}),
-		eoTimerInterval(),
+		eoTimerInterval(cfg),
 	)
 	// The worker runs OUTSIDE the HTTP path, so the licence middleware on the
 	// route groups does not reach it: it asks the licence service itself.
 	// This is read once, at startup — activating the feature on a running
 	// server starts serving the routes immediately but does not start the
 	// timer worker until the next restart.
-	if licenseService.IsEnabled() && !licenseService.IsFeatureLicensed(string(licensing.FeatureEOPlatform)) {
+	eoLicensed := !licenseService.IsEnabled() || licenseService.IsFeatureLicensed(string(licensing.FeatureEOPlatform))
+	// The platform has two independent switches; say so when they disagree.
+	eoWarnSwitchDisagreement(cfg, eoLicensed)
+	if !eoLicensed {
 		log.Printf("EO platform: %s is not licensed, the durable-timer worker is not started", licensing.FeatureEOPlatform)
 	} else {
 		eoTimerMonitor.Start(ctx)
@@ -1747,19 +1750,46 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 }
 
 // eoTimerInterval is how often the EO durable-timer worker polls for due
-// timers, from EO_TIMER_INTERVAL_SECONDS. It is deliberately short next to the
-// five-minute incident sweeps: a timer is only as punctual as the poll that
-// finds it. A zero or unreadable value leaves the monitor's own default.
-func eoTimerInterval() time.Duration {
+// timers. It is deliberately short next to the five-minute incident sweeps: a
+// timer is only as punctual as the poll that finds it.
+//
+// The value comes from cfg.EOPlatform.TimerIntervalSeconds, not from a bare
+// os.Getenv here: EO_TIMER_INTERVAL_SECONDS is read by config.Load alongside
+// its sibling EO_PLATFORM, so the two settings of one feature are read the
+// same way and config.Load stays the one place that knows what this server
+// reads from the environment. A non-positive value (which is also what
+// getEnvAsInt yields for an unparseable one) falls back to the default.
+func eoTimerInterval(cfg *config.Config) time.Duration {
 	const def = 30 * time.Second
-	v := os.Getenv("EO_TIMER_INTERVAL_SECONDS")
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		log.Printf("Warning: invalid EO_TIMER_INTERVAL_SECONDS=%q, using default %s", v, def)
+	n := cfg.EOPlatform.TimerIntervalSeconds
+	if n <= 0 {
+		log.Printf("Warning: EO_TIMER_INTERVAL_SECONDS is %d, using default %s", n, def)
 		return def
 	}
 	return time.Duration(n) * time.Second
+}
+
+// eoWarnSwitchDisagreement states, at startup, when the EO platform's two
+// independent switches disagree.
+//
+// EO_PLATFORM gates the SEED (database.Seed writes the base record type, the
+// smoke types and the per-type permission codes). The eo_platform LICENCE
+// gates the HTTP routes and the durable-timer worker. Nothing ties them
+// together, and each mismatch is a quiet failure of its own kind:
+//   - licence, no EO_PLATFORM: the routes are served over an UNSEEDED
+//     platform. There is no base record type, so every create fails on a type
+//     that does not exist, and the designer opens on an empty list.
+//   - EO_PLATFORM, no licence: the types, workflows and permissions are
+//     seeded and then nobody can reach them — every EO route answers from the
+//     licence middleware, and no timer ever fires.
+//
+// Neither is an error: an operator may genuinely be staging one before the
+// other. It is said out loud so it is not discovered from a support ticket.
+func eoWarnSwitchDisagreement(cfg *config.Config, licensed bool) {
+	switch {
+	case licensed && !cfg.EOPlatform.Enabled:
+		log.Printf("Warning: the %s licence is active but EO_PLATFORM is off. The EO routes are served over an UNSEEDED platform: no base record type, no record types, no per-type permissions. Set EO_PLATFORM=true and restart to seed it.", licensing.FeatureEOPlatform)
+	case !licensed && cfg.EOPlatform.Enabled:
+		log.Printf("Warning: EO_PLATFORM is on but the %s licence is not active. The EO configuration is seeded, but every EO route answers 'not licensed' and the durable-timer worker is not started.", licensing.FeatureEOPlatform)
+	}
 }

@@ -474,8 +474,20 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 	// DEFAULT partition, eo_record_links and eo_record_history. Raw SQL because
 	// AutoMigrate cannot express partitioning, which is why models.EORecord is
 	// absent from the AutoMigrate list above. Idempotent on every boot.
+	//
+	// Its failure is RETURNED, not logged. MigrateEOPlatform is built to fail
+	// CLOSED: the relkind guard, assertPartitionKey and assertColumns all
+	// return errors precisely so production and this migration file cannot
+	// drift unnoticed. Downgrading them to a warning would boot the server
+	// anyway — EO routes registered, seed attempted — over a table whose shape
+	// nothing has verified; the first record write would then fail at runtime,
+	// and in the relkind case the table has no composite primary key and no
+	// per-partition UNIQUE (record_type_id, reference), so reference
+	// uniqueness would be silently unenforced while startup looked clean.
+	// Migrate already returns an error on the AutoMigrate path above; this is
+	// the same contract.
 	if err := migrations.MigrateEOPlatform(db); err != nil {
-		log.Printf("Warning: EO platform migration failed: %v", err)
+		return fmt.Errorf("EO platform migration: %w", err)
 	}
 
 	// Default SMS templates replacing formerly hardcoded SMS text (idempotent, never overwrites edits).

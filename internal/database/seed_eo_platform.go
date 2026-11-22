@@ -81,7 +81,20 @@ func seedEOPlatform(db *gorm.DB) {
 	log.Println("Seeding the EO platform base configuration...")
 
 	if err := db.Transaction(eoSeedPlatformTx); err != nil {
-		log.Printf("EO platform seed FAILED and was rolled back; nothing was written and the next boot will try again: %v", err)
+		// Loud, and on its own lines. A single warning in a wall of startup
+		// output is how this failure goes unnoticed, and it is a failure that
+		// LOOKS like a clean boot: the whole seed rolls back, so the platform
+		// is simply absent — no base type, no smoke types, no per-type
+		// permissions — while the server starts and serves EO routes over
+		// nothing. The case that actually produces it is a box that ran an
+		// INTERMEDIATE commit of this branch and holds a partial
+		// configuration: the marker row is missing, so the seed runs again
+		// every boot, and a leftover row (a type key, a permission code, a
+		// workflow code) collides with the one being written and rolls the
+		// whole transaction back, forever, silently.
+		log.Printf("EO platform seed FAILED and was rolled back: %v", err)
+		log.Printf("EO platform: EO CONFIGURATION WAS NOT APPLIED. No record types, workflows or per-type permissions exist; any EO route served now will find an empty platform.")
+		log.Printf("EO platform: this will repeat on every boot until the cause is removed. Inspect the database — see docs/eo-platform-deploying.md, 'Deploying', for the pre-deploy check for environments that ran this branch mid-flight.")
 		return
 	}
 	log.Println("EO platform base configuration seeded")
@@ -543,6 +556,19 @@ func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 
 // eoSeedTypePermissions writes eo:<type_key>:view|create|update for every
 // CONCRETE record type and grants the lot to admin and executive_office.
+//
+// NOT ENFORCED IN PLAN 1. Nothing consults these codes: every EO route is
+// gated by the MODULE-level codes (eo:view, eo:create, eo:update,
+// eo:transition, eo:types:manage) registered in
+// handlers.EORecordHandler.RegisterRoutes, and row-level visibility is the
+// repository's §7.11 clause. Granting or revoking eo:<type_key>:view today
+// changes nothing about what anyone can see or do. They are seeded anyway, and
+// deliberately: they are a seeded table (licensing/catalog_test.go asserts
+// every module a catalogued feature names is seeded), and the per-type gate
+// that will consult them is Plan 2 work, which should find the codes already
+// present and already granted rather than having to invent them against live
+// roles. An administrator reading the permission list should know that
+// checking one of these boxes is, for now, a statement of intent.
 //
 // The module-level eo:* codes seeded in postgres.go gate the API surface;
 // these gate individual types. They are seeded rather than generated at

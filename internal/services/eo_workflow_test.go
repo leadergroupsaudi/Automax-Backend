@@ -12,14 +12,34 @@ import (
 type eoWorkflowFakeRepo struct {
 	repository.WorkflowRepository
 	workflows []models.Workflow
+	// listCalls counts List, which loads EVERY active workflow with seven
+	// preloads. ResolveWorkflowForType runs on every EO write and every
+	// record-detail load and must not use it; the count is what proves so.
+	listCalls int
+	// byTypeCalls counts the indexed read that replaced it.
+	byTypeCalls int
 }
 
 func (f *eoWorkflowFakeRepo) List(_ context.Context, _ bool) ([]models.Workflow, error) {
+	f.listCalls++
 	return f.workflows, nil
 }
 
+// ListByRecordTypeID filters the way the repository's WHERE clause does:
+// record_type_id = ? AND is_active.
+func (f *eoWorkflowFakeRepo) ListByRecordTypeID(_ context.Context, typeID uuid.UUID) ([]models.Workflow, error) {
+	f.byTypeCalls++
+	var out []models.Workflow
+	for _, wf := range f.workflows {
+		if wf.IsActive && wf.RecordTypeID != nil && *wf.RecordTypeID == typeID {
+			out = append(out, wf)
+		}
+	}
+	return out, nil
+}
+
 func eoWfBound(code string, typeID *uuid.UUID, recordType string) models.Workflow {
-	return models.Workflow{ID: uuid.New(), Code: code, RecordType: recordType, RecordTypeID: typeID}
+	return models.Workflow{ID: uuid.New(), Code: code, RecordType: recordType, RecordTypeID: typeID, IsActive: true}
 }
 
 func TestResolveWorkflowIgnoresRecordTypeAllWorkflows(t *testing.T) {

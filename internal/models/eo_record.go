@@ -30,8 +30,8 @@ import (
 // they are filtered, joined and sorted on every register screen (§7.7). The
 // matrix's attachments field lives in Values.
 type EORecord struct {
-	ID           uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	RecordTypeID uuid.UUID `gorm:"type:uuid;primaryKey" json:"record_type_id"`
+	ID           uuid.UUID `gorm:"type:uuid;primary_key" json:"id"`
+	RecordTypeID uuid.UUID `gorm:"type:uuid;primary_key" json:"record_type_id"`
 
 	Reference string `gorm:"size:100;not null" json:"reference"`
 	SubjectAr string `gorm:"size:500;not null" json:"subject_ar"`
@@ -136,7 +136,7 @@ type EOTransitionInput struct {
 // partitioned table must name the partition key; the link resolver reads the
 // type from the row instead of a second lookup.
 type EORecordLink struct {
-	ID               uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	ID               uuid.UUID  `gorm:"type:uuid;primary_key" json:"id"`
 	FromRecordID     uuid.UUID  `gorm:"type:uuid;not null" json:"from_record_id"`
 	FromRecordTypeID uuid.UUID  `gorm:"type:uuid;not null" json:"from_record_type_id"`
 	ToRecordID       uuid.UUID  `gorm:"type:uuid;not null" json:"to_record_id"`
@@ -159,7 +159,7 @@ func (x *EORecordLink) BeforeCreate(tx *gorm.DB) error {
 // changes that came with them. It carries the record's type for the same
 // reason EORecordLink does.
 type EORecordHistory struct {
-	ID           uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
+	ID           uuid.UUID `gorm:"type:uuid;primary_key" json:"id"`
 	RecordID     uuid.UUID `gorm:"type:uuid;not null" json:"record_id"`
 	RecordTypeID uuid.UUID `gorm:"type:uuid;not null" json:"record_type_id"`
 

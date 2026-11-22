@@ -28,7 +28,7 @@ const (
 // interface returns []EOTimer. The table is created by MigrateEOPlatform and
 // EOTimer is not in the AutoMigrate list.
 type EOTimer struct {
-	ID            uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
+	ID            uuid.UUID      `gorm:"type:uuid;primary_key" json:"id"`
 	RecordID      uuid.UUID      `gorm:"type:uuid;not null" json:"record_id"`
 	RecordTypeID  uuid.UUID      `gorm:"type:uuid;not null" json:"record_type_id"`
 	FireAt        time.Time      `gorm:"not null" json:"fire_at"`
@@ -60,7 +60,7 @@ func (x *EOTimer) BeforeCreate(tx *gorm.DB) error {
 // edited, unlike a position in the list. BreachedAt is when the step was due
 // (its timer's fire_at), not when the handler happened to run.
 type EOEscalationEvent struct {
-	ID           uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
+	ID           uuid.UUID  `gorm:"type:uuid;primary_key" json:"id"`
 	RecordID     uuid.UUID  `gorm:"type:uuid;not null" json:"record_id"`
 	RecordTypeID uuid.UUID  `gorm:"type:uuid;not null" json:"record_type_id"`
 	StateID      uuid.UUID  `gorm:"type:uuid;not null" json:"state_id"`

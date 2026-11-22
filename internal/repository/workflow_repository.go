@@ -19,6 +19,19 @@ type WorkflowRepository interface {
 	FindByCode(ctx context.Context, code string) (*models.Workflow, error)
 	List(ctx context.Context, activeOnly bool) ([]models.Workflow, error)
 	ListByRecordType(ctx context.Context, recordType string, activeOnly bool) ([]models.Workflow, error)
+	// ListByRecordTypeID returns the ACTIVE workflows bound to one EO record
+	// type, matched on the record_type_id column (which models.Workflow
+	// indexes) and never on the record_type STRING, whose 'all' and 'both'
+	// wildcards would hand an EO type an incident workflow.
+	//
+	// It exists so services.ResolveWorkflowForType — called on every EO
+	// create, every transition and every record-detail load — does not have to
+	// List every active workflow in the database with seven preloads each and
+	// then filter in Go for one id. Only the two relations the EO engine reads
+	// off the workflow are preloaded: States (the initial and target states)
+	// and Transitions (the candidate set). A transition's own roles are loaded
+	// per transition by FindTransitionByIDWithRelations.
+	ListByRecordTypeID(ctx context.Context, recordTypeID uuid.UUID) ([]models.Workflow, error)
 	ListFiltered(ctx context.Context, filter *models.WorkflowFilter) ([]models.Workflow, int64, error)
 	Update(ctx context.Context, workflow *models.Workflow) error
 	Delete(ctx context.Context, id uuid.UUID) error
@@ -220,6 +233,21 @@ func (r *workflowRepository) List(ctx context.Context, activeOnly bool) ([]model
 	}
 
 	err := query.Order("name").Find(&workflows).Error
+	return workflows, err
+}
+
+// ListByRecordTypeID is one indexed read. It is deliberately NOT built on
+// ListByRecordType: that one matches the record_type string and treats 'all'
+// and 'both' as wildcards, which is exactly the match EO must not make.
+func (r *workflowRepository) ListByRecordTypeID(ctx context.Context, recordTypeID uuid.UUID) ([]models.Workflow, error) {
+	var workflows []models.Workflow
+	err := r.db.WithContext(ctx).
+		Preload("States").
+		Preload("Transitions").
+		Where("record_type_id = ?", recordTypeID).
+		Where("is_active = ?", true).
+		Order("name").
+		Find(&workflows).Error
 	return workflows, err
 }
 

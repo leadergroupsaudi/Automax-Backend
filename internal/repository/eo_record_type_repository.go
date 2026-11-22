@@ -25,6 +25,20 @@ type EORecordTypeRepository interface {
 	// not including t, which is the shape services.ResolveEffectiveFields
 	// takes. A cycle or a chain deeper than eoMaxTypeDepth is an error.
 	Ancestors(ctx context.Context, t *models.EORecordType) ([]models.EORecordType, error)
+	// ChildTypes returns the types that name parentID as their
+	// parent_type_id — DIRECT children only. It is how the designer asks "is
+	// anything inheriting from this type"; no other read answers that, because
+	// Ancestors walks upward.
+	ChildTypes(ctx context.Context, parentID uuid.UUID) ([]models.EORecordType, error)
+	// DescendantIDs is rootID plus every type beneath it, transitively.
+	//
+	// It exists because §7.14's guard rails are conditional on a type's
+	// RECORDS, and an ABSTRACT type never holds any of its own: the records an
+	// edit to it would damage belong to its descendants. Asking only about the
+	// type's own records leaves every base and intermediate type permanently
+	// unguarded. A cycle, or a subtree deeper than eoMaxTypeDepth, is an
+	// error — the same bound Ancestors applies walking the other way.
+	DescendantIDs(ctx context.Context, rootID uuid.UUID) ([]uuid.UUID, error)
 	// FieldDefs returns the field definitions declared by the named types,
 	// each type's own only: inheritance is resolved in the service layer at
 	// read time and nothing is copied (spec §7.2).
@@ -113,6 +127,52 @@ func (r *eoRecordTypeRepository) Ancestors(ctx context.Context, t *models.EOReco
 		visited[pid] = true
 		out = append(out, *parent)
 		cur = parent
+	}
+	return out, nil
+}
+
+func (r *eoRecordTypeRepository) ChildTypes(ctx context.Context, parentID uuid.UUID) ([]models.EORecordType, error) {
+	var out []models.EORecordType
+	if err := r.db.WithContext(ctx).
+		Model(&models.EORecordType{}).
+		Where("eo_record_types.parent_type_id = ?", parentID).
+		Order("eo_record_types.key ASC").
+		Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("list child record types of %s: %w", parentID, err)
+	}
+	return out, nil
+}
+
+// DescendantIDs walks the tree downward, one level per query. It is a
+// breadth-first walk rather than a recursive CTE because the designer's trees
+// are a handful of levels deep and the query stays an ordinary indexed read on
+// parent_type_id, which the model already declares an index for.
+func (r *eoRecordTypeRepository) DescendantIDs(ctx context.Context, rootID uuid.UUID) ([]uuid.UUID, error) {
+	out := []uuid.UUID{rootID}
+	seen := map[uuid.UUID]bool{rootID: true}
+	frontier := []uuid.UUID{rootID}
+	for depth := 0; len(frontier) > 0; depth++ {
+		if depth >= eoMaxTypeDepth {
+			return nil, fmt.Errorf("eo record type descendants: inheritance deeper than %d levels below record type %s", eoMaxTypeDepth, rootID)
+		}
+		var next []uuid.UUID
+		for _, id := range frontier {
+			children, err := r.ChildTypes(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			for _, c := range children {
+				if seen[c.ID] {
+					// A type that is its own ancestor would otherwise loop
+					// here forever; Ancestors refuses the same shape.
+					return nil, fmt.Errorf("eo record type descendants: inheritance cycle at record type %s", c.ID)
+				}
+				seen[c.ID] = true
+				out = append(out, c.ID)
+				next = append(next, c.ID)
+			}
+		}
+		frontier = next
 	}
 	return out, nil
 }

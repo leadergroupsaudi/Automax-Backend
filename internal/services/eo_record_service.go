@@ -610,51 +610,91 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 	}
 	ctx = WithEOActor(ctx, actor)
 
-	// is_locked_after asks whether the record has EVER entered a state, which
-	// only the history answers: EO workflows have return and exception paths,
-	// so the current state is a different question.
-	entered, err := s.records.EnteredStateIDs(ctx, rec.ID, rec.RecordTypeID)
-	if err != nil {
-		return nil, fmt.Errorf("update eo record %s: %w", id, err)
-	}
-
-	// The before-snapshot of the journal, taken while rec still holds what
-	// the database holds.
-	before := eoFlattenStored(rec)
-
-	fieldErrs, err := ValidateRecordValues(fields, before, req.Values, rec.StateID, entered, s.eval)
-	if err != nil {
-		return nil, fmt.Errorf("update eo record %s: %w", id, err)
-	}
-	fieldErrs = eoMergeFieldErrors(fieldErrs, eoUnknownFieldErrors(fields, req.Values))
-	if err := eoValidationError(fieldErrs); err != nil {
-		return nil, err
-	}
-	if err := eoValidationError(eoApplyValues(rec, req.Values)); err != nil {
-		return nil, err
-	}
-	capErrs, err := eoCapabilitiesValidate(ctx, caps, rec)
-	if err != nil {
-		return nil, fmt.Errorf("update eo record %s: %w", id, err)
-	}
-	if err := eoValidationError(capErrs); err != nil {
-		return nil, err
-	}
-
-	s.applyDerived(ctx, fields, rec)
-	if err := eoCapabilitiesDerive(ctx, caps, rec); err != nil {
-		return nil, fmt.Errorf("update eo record %s: %w", id, err)
-	}
-
-	// A field edit is not a transition, so the history row carries no
-	// transition and no state change — but it is still a change to a record
-	// whose path has to be traceable, and change_reason is captured for
-	// exactly this. The record and its journal entry are one write.
-	oldValues, newValues := eoDiffValues(before, eoFlattenStored(rec))
-	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, _ repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
-		if err := r.Update(ctx, rec); err != nil {
+	// Everything from here runs INSIDE one transaction that opens with a row
+	// lock, the same shape EOTransitionService.Execute uses and for the same
+	// reason. Without it, Update read the record on a pooled connection,
+	// validated and merged the edit against that snapshot, then wrote EVERY
+	// column back (eoUpdatableColumns lists them, so that clearing a due date
+	// is not mistaken for leaving it alone). Two concurrent updates therefore
+	// both read the same row, each applied its own keys to its own stale copy,
+	// and the second write silently reverted the first one's edits — including
+	// edits to fields it never mentioned. A transaction alone does not prevent
+	// it: under READ COMMITTED both would still read the pre-image.
+	//
+	// Taking the lock rather than switching to the UpdateValues jsonb merge,
+	// because the merge is not a substitute here. Most of what this pipeline
+	// writes — subject_ar, priority, sensitivity, due_date, assigned_user_id,
+	// change_reason — is a real COLUMN, not a key in the values bag, and
+	// UpdateValues touches only the bag. It would leave the column edits
+	// racing exactly as before while making the code look fixed. The lock also
+	// gives the validation a current baseline: is_locked_after and the
+	// locked-field check compare the submitted value against the STORED one,
+	// and against a stale snapshot they judge the wrong thing.
+	//
+	// The reads that do not change under a concurrent edit — the record type,
+	// the effective fields, the capability set — stay outside, because a
+	// pooled read taken while this transaction holds its connection and a row
+	// lock waits for a free connection indefinitely if the pool is capped.
+	var updated *models.EORecord
+	err = s.records.Transaction(ctx, func(r repository.EORecordRepository, rt repository.EORecordTypeRepository, _ repository.EOTimerRepository) error {
+		fresh, err := r.LockForUpdate(ctx, id, rec.RecordTypeID)
+		if err != nil {
 			return err
 		}
+		if fresh == nil {
+			return fmt.Errorf("record %s of type %s: %w", id, rec.RecordTypeID, ErrEORecordNotFound)
+		}
+
+		// is_locked_after asks whether the record has EVER entered a state,
+		// which only the history answers: EO workflows have return and
+		// exception paths, so the current state is a different question.
+		entered, err := r.EnteredStateIDs(ctx, fresh.ID, fresh.RecordTypeID)
+		if err != nil {
+			return err
+		}
+
+		// The before-snapshot of the journal, taken from the LOCKED row, so it
+		// is what the database holds and no one else can change it until this
+		// transaction ends.
+		before := eoFlattenStored(fresh)
+
+		fieldErrs, err := ValidateRecordValues(fields, before, req.Values, fresh.StateID, entered, s.eval)
+		if err != nil {
+			return err
+		}
+		fieldErrs = eoMergeFieldErrors(fieldErrs, eoUnknownFieldErrors(fields, req.Values))
+		if err := eoValidationError(fieldErrs); err != nil {
+			return err
+		}
+		if err := eoValidationError(eoApplyValues(fresh, req.Values)); err != nil {
+			return err
+		}
+		capErrs, err := eoCapabilitiesValidate(ctx, caps, fresh)
+		if err != nil {
+			return err
+		}
+		if err := eoValidationError(capErrs); err != nil {
+			return err
+		}
+
+		// The dependency loader is built on the TRANSACTION's repositories, as
+		// it is in Execute: a child or ancestor read on the pooled ones would
+		// take a second connection while this transaction holds its own plus
+		// the row lock.
+		eoApplyDerived(ctx, fields, fresh, &eoRecordDeps{records: r, types: rt})
+		if err := eoCapabilitiesDerive(ctx, caps, fresh); err != nil {
+			return err
+		}
+
+		// A field edit is not a transition, so the history row carries no
+		// transition and no state change — but it is still a change to a
+		// record whose path has to be traceable, and change_reason is captured
+		// for exactly this. The record and its journal entry are one write.
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		updated = fresh
+		oldValues, newValues := eoDiffValues(before, eoFlattenStored(fresh))
 		if len(newValues) == 0 {
 			return nil
 		}
@@ -667,18 +707,27 @@ func (s *eoRecordService) Update(ctx context.Context, id uuid.UUID, req *models.
 			return fmt.Errorf("encode new values: %w", err)
 		}
 		return r.CreateHistory(ctx, &models.EORecordHistory{
-			RecordID:      rec.ID,
-			RecordTypeID:  rec.RecordTypeID,
+			RecordID:      fresh.ID,
+			RecordTypeID:  fresh.RecordTypeID,
 			PerformedByID: &actor.ID,
-			Comment:       rec.ChangeReason,
+			Comment:       fresh.ChangeReason,
 			OldValues:     oldJSON,
 			NewValues:     newJSON,
 		})
 	})
 	if err != nil {
+		// A refusal keeps its own identity. The pipeline's validation errors
+		// and ErrEORecordNotFound now come back THROUGH the transaction, and
+		// wrapping them in "update eo record …" prose here would not break
+		// errors.As/errors.Is but would change the message every caller and
+		// test reads for a failure that is not about the update at all.
+		var invalid *EOValidationError
+		if errors.As(err, &invalid) || errors.Is(err, ErrEORecordNotFound) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("update eo record %s: %w", id, err)
 	}
-	return rec, nil
+	return updated, nil
 }
 
 // effectiveFields resolves a type's own fields plus every ancestor's. Nothing

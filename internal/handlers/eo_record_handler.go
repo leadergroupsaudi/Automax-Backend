@@ -77,6 +77,9 @@ func (h *EORecordHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMiddle
 	r.Post("/", perm("eo:create"), h.Create)
 	r.Get("/", perm("eo:view"), h.List)
 	r.Get("/my-assigned", perm("eo:view"), h.MyAssigned)
+	// Search is the only list route that binds a BODY. It is a literal path
+	// and registers before /:id for the same reason my-assigned does.
+	r.Post("/search", perm("eo:view"), h.Search)
 	r.Get("/:id", perm("eo:view"), h.Get)
 	r.Put("/:id", perm("eo:update"), h.Update)
 	r.Get("/:id/transitions", perm("eo:view"), h.AvailableTransitions)
@@ -270,6 +273,26 @@ func (h *EORecordHandler) Create(c *fiber.Ctx) error {
 	if req.RecordTypeID == uuid.Nil {
 		return eoFieldErrors(c, map[string]string{"record_type_id": i18n.T(c.UserContext(), "eo_record_type_required")})
 	}
+	// A parent_record_id is a READ of that record, and §7.11 applies to it.
+	// The service loads the parent with GetAnyByID, which crosses every
+	// partition and knows nothing about who is asking — so without this a
+	// caller holding eo:create who merely KNOWS an id could parent a record
+	// under one that GET /eo-records/:id correctly answers 404 for. Three
+	// things follow from that: hierarchical numbering renders the parent's
+	// reference INSIDE the child's, disclosing a reference the caller may not
+	// read; the child appears in the restricted record's Children; and if the
+	// link type sets blocks_parent_closure, an outsider's child blocks another
+	// body's record from closing.
+	//
+	// CreateLink — the sibling write — already resolves both of its endpoints
+	// through eoLoadRecord. This is the same check, and deliberately returns
+	// the same 404: absence and invisibility stay indistinguishable, as
+	// eoLoadRecord's own doc comment requires.
+	if req.ParentRecordID != nil {
+		if _, visible, loadErr := h.eoLoadRecord(c, *req.ParentRecordID, user); !visible {
+			return loadErr
+		}
+	}
 	rec, err := h.recordSvc.Create(c.UserContext(), &req, user)
 	if err != nil {
 		return eoServiceError(c, err)
@@ -284,6 +307,37 @@ func (h *EORecordHandler) List(c *fiber.Ctx) error {
 	}
 	var filter models.EORecordFilter
 	if err := c.QueryParser(&filter); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
+	}
+	return h.list(c, &filter, user)
+}
+
+// Search is List with the filter in the REQUEST BODY instead of the query
+// string.
+//
+// It exists because five of EORecordFilter's fields — Values, CreatedFrom,
+// CreatedTo, DueFrom, DueTo — are tagged query:"-" and documented "request
+// body only", and until this route no EO endpoint bound a body into an
+// EORecordFilter at all: List, MyAssigned and Children all use QueryParser. So
+// the repository's jsonb containment predicate (eo_records."values" @> ?::jsonb)
+// and its four date predicates could never run, and idx_eo_records_values_gin
+// existed to serve a filter nothing could express.
+//
+// A body, not a longer query string, because a jsonb containment filter is a
+// nested object: ?values[a][b]=c has no agreed encoding, and a URL has a
+// length limit a saved register view would eventually meet.
+//
+// It goes through the SAME h.list as the other list routes, so scope filling,
+// the limit clamp, sort validation and the response envelope stay in one
+// place — including eoScopeFilter, which overwrites the three server-filled
+// fields AFTER binding, exactly as it does everywhere else.
+func (h *EORecordHandler) Search(c *fiber.Ctx) error {
+	user, ok, err := eoActor(c)
+	if !ok {
+		return err
+	}
+	var filter models.EORecordFilter
+	if err := c.BodyParser(&filter); err != nil {
 		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
 	}
 	return h.list(c, &filter, user)

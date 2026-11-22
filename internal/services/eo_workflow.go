@@ -17,10 +17,22 @@ import (
 // fallback, because is_locked_after and required_at_state_ids need an
 // unambiguous state set.
 func ResolveWorkflowForType(ctx context.Context, typeID uuid.UUID, repo repository.WorkflowRepository) (*models.Workflow, error) {
-	all, err := repo.List(ctx, true)
+	// ListByRecordTypeID, not List(ctx, true) filtered in Go. This function is
+	// called from Create, Execute and AvailableTransitions — every EO write
+	// and every record-detail load — and List preloads States, Transitions,
+	// Classifications, Locations, CreatedBy, ConvertToRequestRoles and
+	// MergeAllowedRoles for EVERY active workflow in the database before one
+	// id is picked out of the result. Workflow.RecordTypeID already carries an
+	// index; this is one read against it, with the two relations the EO engine
+	// actually reads off the workflow.
+	all, err := repo.ListByRecordTypeID(ctx, typeID)
 	if err != nil {
 		return nil, fmt.Errorf("list workflows: %w", err)
 	}
+	// The repository filters on record_type_id already; the match is
+	// re-asserted here so this function's stated contract — it matches on
+	// RecordTypeID and never on the RecordType string — holds whatever a
+	// repository hands back.
 	var matches []*models.Workflow
 	for i := range all {
 		if all[i].RecordTypeID != nil && *all[i].RecordTypeID == typeID {

@@ -202,18 +202,34 @@ type eoTxWorkflowRepo struct {
 	transitions map[uuid.UUID]*models.WorkflowTransition
 }
 
-func (f *eoTxWorkflowRepo) List(_ context.Context, _ bool) ([]models.Workflow, error) {
+// eoTxWorkflowPreloaded is f.wf with its Transitions preloaded the way the
+// repository preloads them — Transitions but NOT Transitions.FieldChanges. A
+// fake more generous than the repository hid a guard that never ran in
+// production.
+func (f *eoTxWorkflowRepo) eoTxWorkflowPreloaded() models.Workflow {
 	wf := f.wf
 	wf.Transitions = nil
 	for _, tr := range f.transitions {
-		// Mirrors workflowRepository.List, which preloads Transitions but not
-		// Transitions.FieldChanges. A fake more generous than the repository
-		// hid a guard that never ran in production.
 		cp := *tr
 		cp.FieldChanges = nil
 		wf.Transitions = append(wf.Transitions, cp)
 	}
 	sort.Slice(wf.Transitions, func(i, j int) bool { return wf.Transitions[i].Code < wf.Transitions[j].Code })
+	return wf
+}
+
+func (f *eoTxWorkflowRepo) List(_ context.Context, _ bool) ([]models.Workflow, error) {
+	return []models.Workflow{f.eoTxWorkflowPreloaded()}, nil
+}
+
+// ListByRecordTypeID is what ResolveWorkflowForType calls. It filters on the
+// bound record type as the repository's WHERE clause does, so a workflow bound
+// to another type is absent rather than merely skipped in Go.
+func (f *eoTxWorkflowRepo) ListByRecordTypeID(_ context.Context, typeID uuid.UUID) ([]models.Workflow, error) {
+	wf := f.eoTxWorkflowPreloaded()
+	if wf.RecordTypeID == nil || *wf.RecordTypeID != typeID {
+		return nil, nil
+	}
 	return []models.Workflow{wf}, nil
 }
 

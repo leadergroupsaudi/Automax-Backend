@@ -204,6 +204,16 @@ type GoalManagementConfig struct {
 // and their per-type permission codes.
 type EOPlatformConfig struct {
 	Enabled bool // env: EO_PLATFORM
+	// TimerIntervalSeconds is how often the durable-timer worker polls for due
+	// timers (default 30). It is deliberately short next to the five-minute
+	// incident sweeps: a timer is only as punctual as the poll that finds it.
+	// A zero or unreadable value falls back to the default.
+	//
+	// It lives here, beside Enabled, rather than being read with a bare
+	// os.Getenv at its use site in main.go: the platform's two settings are
+	// read the same way, and config.Load is the one place that knows which
+	// environment variables this server reads. env: EO_TIMER_INTERVAL_SECONDS
+	TimerIntervalSeconds int
 }
 
 type DocumentaConfig struct {
@@ -549,7 +559,8 @@ func Load() *Config {
 			Enabled: getEnvAsBool("GOAL_MANAGEMENT", false),
 		},
 		EOPlatform: EOPlatformConfig{
-			Enabled: getEnvAsBool("EO_PLATFORM", false),
+			Enabled:              getEnvAsBool("EO_PLATFORM", false),
+			TimerIntervalSeconds: getEnvAsInt("EO_TIMER_INTERVAL_SECONDS", 30),
 		},
 		License: LicenseConfig{
 			EncryptionKey:     getEnv("LICENSE_ENCRYPTION_KEY", ""),

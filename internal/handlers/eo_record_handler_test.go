@@ -67,6 +67,11 @@ type eoFakeRecordRepo struct {
 	childrenCalls int
 	linksFrom     []models.EORecordLink
 	createdLinks  []*models.EORecordLink
+	// totalByType, when non-nil, is how many records each record type holds.
+	// List then answers only for the types the filter NAMES, which is what
+	// makes "the ancestor has none of its own, its descendant has some" a
+	// distinguishable case rather than one flat number.
+	totalByType map[uuid.UUID]int64
 }
 
 func (f *eoFakeRecordRepo) List(_ context.Context, filter *models.EORecordFilter) ([]models.EORecord, int64, error) {
@@ -74,6 +79,17 @@ func (f *eoFakeRecordRepo) List(_ context.Context, filter *models.EORecordFilter
 	f.listFilter = &copied
 	if f.listErr != nil {
 		return nil, 0, f.listErr
+	}
+	if f.totalByType != nil {
+		var total int64
+		for _, id := range filter.RecordTypeID {
+			parsed, err := uuid.Parse(id)
+			if err != nil {
+				return nil, 0, err
+			}
+			total += f.totalByType[parsed]
+		}
+		return nil, total, nil
 	}
 	if f.visibleIDs != nil && filter.RecordID != nil {
 		if f.visibleIDs[*filter.RecordID] {
@@ -112,12 +128,21 @@ func (f *eoFakeRecordRepo) Children(_ context.Context, _ uuid.UUID, _ *uuid.UUID
 
 type eoFakeTypeRepo struct {
 	repository.EORecordTypeRepository
-	byID          *models.EORecordType
-	fieldDefs     []models.EOFieldDef
-	all           []models.EORecordType
-	linkTypes     []models.EOLinkType
-	linkTypeByKey *models.EOLinkType
-	updateCalls   int
+	byID             *models.EORecordType
+	fieldDefs        []models.EOFieldDef
+	all              []models.EORecordType
+	linkTypes        []models.EOLinkType
+	linkTypeByKey    *models.EOLinkType
+	updateCalls      int
+	deleteCalls      int
+	createFieldCalls int
+	deleteFieldCalls int
+	// children is the inheritance tree, keyed by parent type id. The §7.14
+	// guard rails are now asked about a type's whole SUBTREE, so a fake that
+	// answered "no children" unconditionally would be MORE PERMISSIVE than
+	// the repository — which is exactly the shape of dead guard this plan
+	// keeps producing.
+	children map[uuid.UUID][]models.EORecordType
 }
 
 func (f *eoFakeTypeRepo) GetLinkTypeByKey(_ context.Context, key string) (*models.EOLinkType, error) {
@@ -133,6 +158,37 @@ func (f *eoFakeTypeRepo) GetByID(_ context.Context, _ uuid.UUID) (*models.EOReco
 
 func (f *eoFakeTypeRepo) FieldDefs(_ context.Context, _ []uuid.UUID) ([]models.EOFieldDef, error) {
 	return f.fieldDefs, nil
+}
+
+func (f *eoFakeTypeRepo) ChildTypes(_ context.Context, parentID uuid.UUID) ([]models.EORecordType, error) {
+	return f.children[parentID], nil
+}
+
+// DescendantIDs walks the same tree the repository walks: rootID, then
+// everything beneath it.
+func (f *eoFakeTypeRepo) DescendantIDs(_ context.Context, rootID uuid.UUID) ([]uuid.UUID, error) {
+	out := []uuid.UUID{rootID}
+	for i := 0; i < len(out); i++ {
+		for _, c := range f.children[out[i]] {
+			out = append(out, c.ID)
+		}
+	}
+	return out, nil
+}
+
+func (f *eoFakeTypeRepo) Delete(_ context.Context, _ uuid.UUID) error {
+	f.deleteCalls++
+	return nil
+}
+
+func (f *eoFakeTypeRepo) CreateFieldDef(_ context.Context, _ *models.EOFieldDef) error {
+	f.createFieldCalls++
+	return nil
+}
+
+func (f *eoFakeTypeRepo) DeleteFieldDef(_ context.Context, _ uuid.UUID) error {
+	f.deleteFieldCalls++
+	return nil
 }
 
 func (f *eoFakeTypeRepo) List(_ context.Context) ([]models.EORecordType, error) {

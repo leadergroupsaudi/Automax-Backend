@@ -43,6 +43,61 @@ const (
 	EOKindMultiUserAck    = "multi_user_ack"    // agreed | reservation (+ reservation text) per user
 )
 
+// EOFieldKinds is the allow-list of field kinds, built from the constants
+// above rather than from a second hand-written list of strings: renaming a
+// kind's value changes this list with it, because each entry IS the constant.
+//
+// The remaining drift — declaring a new EOKind* constant and forgetting to add
+// it here — is what TestEOFieldKindsCoversEveryKindConstant catches: it parses
+// this file and fails if any EOKind* constant is missing from the slice.
+//
+// The designer validates `kind` against this (handlers.eoValidateFieldShape).
+// It validates the NAME of the kind only. Per-kind validation of a stored
+// VALUE at save time — that a `yes_no` holds a boolean, that a `dropdown`
+// holds one of its configured options — is deliberately not here: that is Plan
+// 2's work, alongside the forms that render each kind.
+var EOFieldKinds = []string{
+	EOKindAutoNumber,
+	EOKindText,
+	EOKindLongText,
+	EOKindDropdown,
+	EOKindMultiSelect,
+	EOKindNumber,
+	EOKindPercent,
+	EOKindYesNo,
+	EOKindDate,
+	EOKindDateTime,
+	EOKindTime,
+	EOKindFile,
+	EOKindMultiFile,
+	EOKindUser,
+	EOKindMultiUser,
+	EOKindUserDate,
+	EOKindOrgUnit,
+	EOKindMultiOrgUnit,
+	EOKindExternalBody,
+	EOKindEmail,
+	EOKindPhone,
+	EOKindURL,
+	EOKindLink,
+	EOKindMultiLink,
+	EOKindWorkflowState,
+	EOKindMultiUserStatus,
+	EOKindMultiUserAck,
+}
+
+// eoFieldKindSet is EOFieldKinds as a set, built once.
+var eoFieldKindSet = func() map[string]bool {
+	out := make(map[string]bool, len(EOFieldKinds))
+	for _, k := range EOFieldKinds {
+		out[k] = true
+	}
+	return out
+}()
+
+// IsEOFieldKind reports whether kind is one of the configured field kinds.
+func IsEOFieldKind(kind string) bool { return eoFieldKindSet[kind] }
+
 // Provenance: who or what sets a field's value (spec §7.4).
 const (
 	EOProvenanceUser    = "user"
@@ -94,6 +149,22 @@ type EORecordType struct {
 	WorkflowID       *uuid.UUID     `gorm:"type:uuid;index" json:"workflow_id"`
 	Capabilities     datatypes.JSON `gorm:"type:jsonb;default:'[]'::jsonb" json:"capabilities"`
 	IsActive         bool           `gorm:"default:true" json:"is_active"`
+	// PartitionPending records that this type has no partition of its own and
+	// its records live in eo_records_default (spec §7.7). In Plan 1 NOTHING
+	// EVER CLEARS IT: no per-type partition is created, by the designer or by
+	// any command, so every record of every type is in the default partition
+	// and the platform is fully functional there.
+	//
+	// Promotion is a ONE-WAY DOOR and it closes at the type's first record.
+	// Creating a partition of a table that already has a DEFAULT partition
+	// makes Postgres scan that default and fail if any row would belong to the
+	// new partition — so promoting an EMPTY type is a plain CREATE TABLE …
+	// PARTITION OF, while promoting a POPULATED one needs a data move under an
+	// ACCESS EXCLUSIVE lock (create detached, copy, delete, attach): a
+	// maintenance window on the register, not a release step. Plan 2 must
+	// therefore create each type's partition BEFORE that type's first record,
+	// at type creation rather than at the next release. Nothing here enforces
+	// that ordering. Recorded in spec §7.7 during the Plan 1 fix wave.
 	PartitionPending bool           `gorm:"default:true" json:"partition_pending"`
 	CreatedAt        time.Time      `json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`
@@ -202,6 +273,14 @@ func (x *EOLinkType) BeforeCreate(tx *gorm.DB) error {
 //
 // On an update, the caller MUST exclude the type being edited from existing,
 // otherwise a type that keeps its own prefix is rejected against itself.
+// MESSAGES ARE ENGLISH-ONLY, against spec §5's bilingual requirement. The
+// error returned here is passed to the client verbatim by the handler, so a
+// refusal reaches an Arabic UI in English. Noted, not fixed, in the Plan 1 fix
+// wave (2026-11-22): the fix is to return an i18n KEY plus its arguments
+// instead of a sentence, and it belongs with Plan 2's forms, which is where
+// the client-signed Arabic labels for each field and kind arrive. Writing
+// Arabic wording the client has not approved now would only have to be
+// revised then. See spec §5.
 func ValidateReferencePrefix(t EORecordType, existing []EORecordType) error {
 	if t.IsAbstract || t.ReferenceMode == EOReferenceModeParent {
 		return nil
@@ -232,6 +311,14 @@ func ValidateReferencePrefix(t EORecordType, existing []EORecordType) error {
 //
 // Every rule here is conditional on hasRecords. None of them is "never": a
 // type nobody has used yet is still being designed and may be changed freely.
+// MESSAGES ARE ENGLISH-ONLY, against spec §5's bilingual requirement. The
+// error returned here is passed to the client verbatim by the handler, so a
+// refusal reaches an Arabic UI in English. Noted, not fixed, in the Plan 1 fix
+// wave (2026-11-22): the fix is to return an i18n KEY plus its arguments
+// instead of a sentence, and it belongs with Plan 2's forms, which is where
+// the client-signed Arabic labels for each field and kind arrive. Writing
+// Arabic wording the client has not approved now would only have to be
+// revised then. See spec §5.
 func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef, hasRecords bool) error {
 	if !hasRecords {
 		return nil

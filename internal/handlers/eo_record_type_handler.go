@@ -184,9 +184,31 @@ func (h *EORecordTypeHandler) eoGuardTypeEdit(
 // "does this type hold anything", not "does the caller see anything", and a
 // visibility-scoped count would let a restricted record be destroyed by an
 // administrator who cannot see it.
+//
+// It asks about the type AND EVERY TYPE BENEATH IT. Asking only about records
+// whose record_type_id IS this type makes every §7.14 rule void for exactly
+// the types the rules matter most on: an ABSTRACT base type holds no records
+// of its own by definition, so that count is always zero, and removing an
+// inherited field, changing its kind, making it required, re-keying,
+// re-parenting or repointing the workflow would all be waved through on
+// eo_base and on every intermediate ancestor — however many records their
+// descendants hold. The stored values such an edit orphans live on the
+// DESCENDANTS' records, so the descendants' records are the question.
+//
+// The subtree comes from the type repository and the count from the record
+// repository: no SQL is written here, so the register's partitioning and its
+// visibility clause stay in the one place that owns them.
 func (h *EORecordTypeHandler) eoTypeHasRecords(c *fiber.Ctx, typeID uuid.UUID) (bool, error) {
+	subtree, err := h.types.DescendantIDs(c.UserContext(), typeID)
+	if err != nil {
+		return false, err
+	}
+	ids := make([]string, 0, len(subtree))
+	for _, id := range subtree {
+		ids = append(ids, id.String())
+	}
 	_, total, err := h.records.List(c.UserContext(), &models.EORecordFilter{
-		RecordTypeID: []string{typeID.String()},
+		RecordTypeID: ids,
 		IsAdmin:      true,
 		Limit:        1,
 	})
@@ -343,6 +365,14 @@ func (h *EORecordTypeHandler) Update(c *fiber.Ctx) error {
 // type is the partition key of the register: deleting one whose records exist
 // would orphan a statutory audit trail behind a configuration row nobody can
 // read any more. Removing those records is not this endpoint's to decide.
+//
+// It also refuses while any other type names this one as its parent_type_id,
+// REGARDLESS of records. A soft-deleted parent is invisible to
+// EORecordTypeRepository.GetByID, so Ancestors answers "parent … not found"
+// for every descendant, and every create, update and transition of every
+// descendant type fails until someone un-deletes the row by hand in SQL. A
+// type with children is not deletable; the children are re-parented or
+// removed first.
 func (h *EORecordTypeHandler) Delete(c *fiber.Ctx) error {
 	id, ok, err := eoParamUUID(c, "id")
 	if !ok {
@@ -350,6 +380,18 @@ func (h *EORecordTypeHandler) Delete(c *fiber.Ctx) error {
 	}
 	if _, loaded, loadErr := h.eoLoadType(c, id); !loaded {
 		return loadErr
+	}
+	children, err := h.types.ChildTypes(c.UserContext(), id)
+	if err != nil {
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	if len(children) > 0 {
+		keys := make([]string, 0, len(children))
+		for _, child := range children {
+			keys = append(keys, child.Key)
+		}
+		return utils.ErrorResponse(c, fiber.StatusConflict,
+			i18n.Tf(c.UserContext(), "eo_record_type_has_children", strings.Join(keys, ", ")))
 	}
 	hasRecords, err := h.eoTypeHasRecords(c, id)
 	if err != nil {
@@ -556,8 +598,20 @@ func eoValidateFieldShape(c *fiber.Ctx, f *models.EOFieldDef) map[string]string 
 	if f.Label == "" {
 		errs["label"] = i18n.T(c.UserContext(), "eo_label_required")
 	}
-	if f.Kind == "" {
+	// The kind is checked against models.EOFieldKinds, which is built from the
+	// 27 EOKind* constants themselves rather than being a second list of
+	// strings here that could drift from them. Before this, the 27 constants
+	// were referenced only by the seed and the designer accepted any non-empty
+	// string: a typo like "drop_down" stored a field whose kind nothing can
+	// ever render or validate.
+	//
+	// This validates the NAME of the kind. Per-kind validation of a stored
+	// VALUE at save time is Plan 2 work and is deliberately not attempted here.
+	switch {
+	case f.Kind == "":
 		errs["kind"] = i18n.T(c.UserContext(), "eo_kind_required")
+	case !models.IsEOFieldKind(f.Kind):
+		errs["kind"] = i18n.Tf(c.UserContext(), "eo_kind_invalid", strings.Join(models.EOFieldKinds, ", "))
 	}
 	switch f.Provenance {
 	case "", models.EOProvenanceUser, models.EOProvenanceAuto, models.EOProvenanceDerived, models.EOProvenanceSystem:

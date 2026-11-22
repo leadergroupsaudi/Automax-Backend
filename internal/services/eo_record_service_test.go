@@ -35,6 +35,19 @@ type eoSvcRecordRepo struct {
 	// txTimers is the timer repository Transaction hands its closure; nil
 	// unless a test wires SLA clocks.
 	txTimers repository.EOTimerRepository
+	// txTypes is the record-type repository Transaction hands its closure.
+	// Update's derived step builds its dependency loader from it, as Execute
+	// does, so the fixture wires it to the same type repository the service
+	// holds.
+	txTypes repository.EORecordTypeRepository
+	// lockCalls counts LockForUpdate. Update must take the row lock, not
+	// merely open a transaction: a transaction alone does not serialise two
+	// concurrent edits under READ COMMITTED.
+	lockCalls int
+	// onLock runs just after LockForUpdate finds the row and just before it
+	// is handed back, standing in for another transaction's committed edit
+	// landing between the service's pre-read and the lock.
+	onLock func(stored *models.EORecord)
 	// historyErr fails CreateHistory, to test what a failed create leaves.
 	historyErr error
 }
@@ -65,6 +78,25 @@ func (f *eoSvcRecordRepo) GetByID(_ context.Context, id, recordTypeID uuid.UUID)
 
 func (f *eoSvcRecordRepo) GetAnyByID(_ context.Context, id uuid.UUID) (*models.EORecord, error) {
 	return f.stored[id], nil
+}
+
+// LockForUpdate stands in for SELECT … FOR UPDATE. It answers like GetByID and
+// counts the call: the fake cannot simulate a lock, but it CAN prove the
+// pipeline asks for one.
+func (f *eoSvcRecordRepo) LockForUpdate(_ context.Context, id, recordTypeID uuid.UUID) (*models.EORecord, error) {
+	f.lockCalls++
+	if f.onLock != nil {
+		if rec, ok := f.stored[id]; ok {
+			f.onLock(rec)
+		} else {
+			f.onLock(nil)
+		}
+	}
+	rec, ok := f.stored[id]
+	if !ok || rec.RecordTypeID != recordTypeID {
+		return nil, nil
+	}
+	return rec, nil
 }
 
 func (f *eoSvcRecordRepo) Children(_ context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error) {
@@ -101,7 +133,7 @@ func (f *eoSvcRecordRepo) EnteredStateIDs(_ context.Context, _, _ uuid.UUID) (ma
 }
 
 func (f *eoSvcRecordRepo) Transaction(ctx context.Context, fn func(repository.EORecordRepository, repository.EORecordTypeRepository, repository.EOTimerRepository) error) error {
-	return fn(f, nil, f.txTimers)
+	return fn(f, f.txTypes, f.txTimers)
 }
 
 type eoSvcTypeRepo struct {
@@ -222,6 +254,7 @@ func eoNewSvcFixture(t *testing.T, defs ...models.EOFieldDef) *eoSvcFixture {
 		}
 	}
 	f.types.defs = defs
+	f.records.txTypes = f.types
 	f.svc = NewEORecordService(f.records, f.types, f.sequences, f.workflows)
 	return f
 }
