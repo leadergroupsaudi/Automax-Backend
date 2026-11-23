@@ -661,46 +661,121 @@ func TestEOSignoffDischargeRefusesTheZeroUUID(t *testing.T) {
 	}
 }
 
-// TestEOSignoffDischargeIsAtomicAcrossBuckets is fix round 1's item 4. The
-// all-or-nothing claim rests on the whole request being one transaction, and
-// the only test of it put both ids in ONE bucket — where the partition fails
-// before any write, so the transaction was never exercised. Here the field
-// label is valid and updated first, and the unknown state id must roll it
-// back.
+// TestEOSignoffDischargeIsAtomicAcrossBuckets is fix round 1's item 4, made
+// order-independent in round 2. The all-or-nothing claim rests on the whole
+// request being one transaction, and the only test of it put both ids in ONE
+// bucket — where the partition fails before any write, so the transaction was
+// never exercised.
+//
+// IT RUNS BOTH DIRECTIONS, and that is what makes it a test rather than a
+// coincidence. A single direction proves a rollback only while `plan` happens
+// to visit the valid bucket first; reordering `plan` made the round-1 version
+// pass vacuously. Whatever order the buckets are visited in, one of these two
+// cases has its valid UPDATE executed before the other bucket refuses, so the
+// pair cannot all pass without a real rollback.
 func TestEOSignoffDischargeIsAtomicAcrossBuckets(t *testing.T) {
 	db := eoSignoffTestDB(t)
 	app := eoSignoffApp(db, eoSignoffActor(t, db), "eo:types:manage")
 
 	before := eoSignoffGet(t, app)
 	label := before.Data.UntranslatedLabels[0].ID
+	state := before.Data.UnconfirmedStates[0].ID
 
-	status, out := eoSignoffDischarge(t, app, fmt.Sprintf(
-		`{"field_def_ids":[%q],"state_ids":[%q]}`, label, uuid.New()))
-	if status != fiber.StatusBadRequest {
-		t.Fatalf("a valid field label with an unknown state id answered %d, want 400 (%s)", status, out.Error)
+	cases := []struct {
+		name, payload, valid string
+		retry                string
+	}{
+		{
+			"ValidLabelUnknownState",
+			fmt.Sprintf(`{"field_def_ids":[%q],"state_ids":[%q]}`, label, uuid.New()),
+			label, fmt.Sprintf(`{"field_def_ids":[%q]}`, label),
+		},
+		{
+			"ValidStateUnknownLabel",
+			fmt.Sprintf(`{"field_def_ids":[%q],"state_ids":[%q]}`, uuid.New(), state),
+			state, fmt.Sprintf(`{"state_ids":[%q]}`, state),
+		},
 	}
-	labels, states, transitions := eoSignoffMarked(t, db)
-	if labels != eoSignoffSeededLabels {
-		t.Errorf("%d labels still marked, want all %d: the field update in an earlier bucket was not rolled back",
-			labels, eoSignoffSeededLabels)
-	}
-	if states != eoSignoffSeededStates || transitions != eoSignoffSeededTransitions {
-		t.Errorf("states/transitions = %d/%d, want %d/%d", states, transitions, eoSignoffSeededStates, eoSignoffSeededTransitions)
-	}
-	var n int64
-	if err := db.Model(&models.ActionLog{}).Count(&n).Error; err != nil {
-		t.Fatalf("count action logs: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("%d audit entries after a rolled-back discharge, want none", n)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := eoSignoffDischarge(t, app, tc.payload)
+			if status != fiber.StatusBadRequest {
+				t.Fatalf("a valid id in one bucket with an unknown id in another answered %d, want 400 (%s)", status, out.Error)
+			}
+			labels, states, transitions := eoSignoffMarked(t, db)
+			if labels != eoSignoffSeededLabels || states != eoSignoffSeededStates || transitions != eoSignoffSeededTransitions {
+				t.Errorf("markers = %d/%d/%d, want %d/%d/%d: a write in another bucket was not rolled back",
+					labels, states, transitions,
+					eoSignoffSeededLabels, eoSignoffSeededStates, eoSignoffSeededTransitions)
+			}
+			var n int64
+			if err := db.Model(&models.ActionLog{}).Count(&n).Error; err != nil {
+				t.Fatalf("count action logs: %v", err)
+			}
+			if n != 0 {
+				t.Errorf("%d audit entries after a rolled-back discharge, want none", n)
+			}
 
-	// Non-vacuity: the field label WAS dischargeable, so the assertions above
-	// are about a write the field bucket really attempted before the state
-	// bucket refused — not about an id that would have been rejected anyway.
-	status, out = eoSignoffDischarge(t, app, fmt.Sprintf(`{"field_def_ids":[%q]}`, label))
-	if status != fiber.StatusOK || out.Data.Discharged.FieldDefs != 1 {
-		t.Fatalf("the same field label alone answered %d / %+v, so the rollback above proved nothing (%s)",
-			status, out.Data.Discharged, out.Error)
+			// Non-vacuity: the valid id WAS dischargeable, so the assertions
+			// above are about a write that bucket really attempted (when it
+			// ran first) rather than about an id that would have been
+			// rejected anyway. The row is put back afterwards so the next
+			// case starts from the seeded counts.
+			status, out = eoSignoffDischarge(t, app, tc.retry)
+			if status != fiber.StatusOK || out.Data.Discharged.FieldDefs+out.Data.Discharged.States != 1 {
+				t.Fatalf("the valid id alone answered %d / %+v, so the rollback above proved nothing (%s)",
+					status, out.Data.Discharged, out.Error)
+			}
+			if err := db.Model(&models.EOFieldDef{}).Where("id = ?", tc.valid).
+				Update("ar_untranslated", true).Error; err != nil {
+				t.Fatalf("restore the label marker: %v", err)
+			}
+			if err := db.Model(&models.WorkflowState{}).Where("id = ?", tc.valid).
+				Update("eo_client_unconfirmed", true).Error; err != nil {
+				t.Fatalf("restore the state marker: %v", err)
+			}
+			if err := db.Where("1 = 1").Delete(&models.ActionLog{}).Error; err != nil {
+				t.Fatalf("clear the action log: %v", err)
+			}
+		})
+	}
+}
+
+// TestEOSignoffDischargeRefusesAnIDSentInTheWrongBucket is fix round 2's
+// item 1. The three kinds live in three tables and an id says nothing about
+// which, so pasting the wrong spreadsheet column is a plausible operator
+// mistake. It used to answer 500: the outstanding set was one map shared by
+// all three buckets, so an OUTSTANDING state id looked outstanding to the
+// transition bucket, reached an UPDATE that matched nothing, and tripped the
+// short-count guard. Both directions are covered, and the ids are deliberately
+// OUTSTANDING ones — an unlisted id would have been refused either way and
+// would prove nothing.
+func TestEOSignoffDischargeRefusesAnIDSentInTheWrongBucket(t *testing.T) {
+	db := eoSignoffTestDB(t)
+	app := eoSignoffApp(db, eoSignoffActor(t, db), "eo:types:manage")
+
+	before := eoSignoffGet(t, app)
+	state := before.Data.UnconfirmedStates[0].ID
+	transition := before.Data.UnconfirmedTransitions[0].ID
+
+	cases := []struct{ name, payload string }{
+		{"StateIDInTransitionIDs", fmt.Sprintf(`{"transition_ids":[%q]}`, state)},
+		{"TransitionIDInStateIDs", fmt.Sprintf(`{"state_ids":[%q]}`, transition)},
+		{"LabelIDInStateIDs", fmt.Sprintf(`{"state_ids":[%q]}`, before.Data.UntranslatedLabels[0].ID)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := eoSignoffDischarge(t, app, tc.payload)
+			if status != fiber.StatusBadRequest {
+				t.Errorf("an id sent in the wrong bucket answered %d, want 400 — not a server error on an operator's paste (%s)",
+					status, out.Error)
+			}
+			labels, states, transitions := eoSignoffMarked(t, db)
+			if labels != eoSignoffSeededLabels || states != eoSignoffSeededStates || transitions != eoSignoffSeededTransitions {
+				t.Errorf("markers = %d/%d/%d, want the seeded %d/%d/%d",
+					labels, states, transitions,
+					eoSignoffSeededLabels, eoSignoffSeededStates, eoSignoffSeededTransitions)
+			}
+		})
 	}
 }

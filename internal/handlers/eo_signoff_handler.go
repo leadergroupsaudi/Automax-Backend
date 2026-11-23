@@ -264,12 +264,26 @@ func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
-		open := map[uuid.UUID]bool{}
+		// ONE OPEN SET PER BUCKET, NOT ONE SHARED SET. The three kinds live
+		// in three tables and the ids say nothing about which, so a shared
+		// set made an OUTSTANDING state id count as outstanding for the
+		// transition bucket: the partition handed it to the UPDATE, the
+		// UPDATE matched nothing, the short-count guard tripped, and a
+		// plausible operator mistake — pasting the wrong spreadsheet column
+		// — answered 500 instead of the 400 the refusal arm is there for.
+		// Per bucket, such an id is simply not outstanding for the bucket it
+		// was sent in and falls to that arm.
+		openLabels := map[uuid.UUID]bool{}
 		for _, l := range outstanding.UntranslatedLabels {
-			open[l.ID] = true
+			openLabels[l.ID] = true
 		}
-		for _, s := range append(append([]eoSignoffStep{}, outstanding.UnconfirmedStates...), outstanding.UnconfirmedTransitions...) {
-			open[s.ID] = true
+		openStates := map[uuid.UUID]bool{}
+		for _, s := range outstanding.UnconfirmedStates {
+			openStates[s.ID] = true
+		}
+		openTransitions := map[uuid.UUID]bool{}
+		for _, s := range outstanding.UnconfirmedTransitions {
+			openTransitions[s.ID] = true
 		}
 
 		var alreadyClear []string
@@ -278,14 +292,15 @@ func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 			model  any
 			marker string
 			what   string
+			open   map[uuid.UUID]bool
 			count  *int
 		}{
-			{fieldIDs, &models.EOFieldDef{}, "ar_untranslated", "field definition", &result.Discharged.FieldDefs},
-			{stateIDs, &models.WorkflowState{}, "eo_client_unconfirmed", "workflow state", &result.Discharged.States},
-			{transitionIDs, &models.WorkflowTransition{}, "eo_client_unconfirmed", "workflow transition", &result.Discharged.Transitions},
+			{fieldIDs, &models.EOFieldDef{}, "ar_untranslated", "field definition", openLabels, &result.Discharged.FieldDefs},
+			{stateIDs, &models.WorkflowState{}, "eo_client_unconfirmed", "workflow state", openStates, &result.Discharged.States},
+			{transitionIDs, &models.WorkflowTransition{}, "eo_client_unconfirmed", "workflow transition", openTransitions, &result.Discharged.Transitions},
 		}
 		for _, p := range plan {
-			clear, clearAlready, err := eoSignoffPartition(tx, p.model, p.marker, p.ids, open, p.what)
+			clear, clearAlready, err := eoSignoffPartition(tx, p.model, p.marker, p.ids, p.open, p.what)
 			if err != nil {
 				badRequest = err
 				return err
@@ -351,6 +366,12 @@ func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 //
 // The refusal arm covers an id of another kind (a state id pasted into
 // transition_ids), an id of nothing at all, and the hidden-parent row above.
+// The first of those three is only true because `open` is the calling
+// BUCKET's outstanding set and not a union of all three: under a shared set
+// an outstanding state id looked outstanding to the transition bucket, was
+// handed to an UPDATE that matched nothing, and came back 500. The caller
+// builds one set per bucket for that reason.
+//
 // It must refuse the whole batch rather than skip the id: a partial apply is
 // the failure mode that leaves a government deployment in a state nobody
 // asked for.
