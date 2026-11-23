@@ -760,6 +760,29 @@ var ErrEOCloseParentHasNoParent = errors.New("this transition closes the record'
 // A config this cannot read is also a refusal. The action would fail after
 // the commit for exactly the same reason, and a transition that cannot run
 // its closing action must not pretend it did.
+//
+// IT ASKS EXACTLY WHAT closeParent ASKS, IN THE SAME SPELLINGS, because a
+// check that is merely similar to the executor is worse than none: it vouches
+// for a transition that then fails after the commit, which is the one outcome
+// this exists to prevent. Two divergences were found and closed by Plan 3's
+// Task A3:
+//
+//   - WHITESPACE. closeParent emptiness-tests strings.TrimSpace(cfg.LinkType)
+//     but MATCHES on the untrimmed `l.LinkTypeKey == cfg.LinkType`. This used
+//     to look the TRIMMED key up among the record's links, so a config with a
+//     stray space passed here and found nothing there. The trim is kept for
+//     the emptiness test, where closeParent also trims, and dropped from the
+//     lookup, where closeParent does not.
+//   - THE TRANSITION. closeParent also refuses an empty `Transition`
+//     ("close_parent config names no transition"), and that refusal arrives
+//     after the commit. It is asked here too, with the same TrimSpace.
+//
+// WHAT IT STILL CANNOT SEE, so nobody reads more into it than it says: the
+// named transition may not be available out of the parent's current state,
+// and a requirement at the state it enters may be unsatisfiable from what is
+// already stored on the parent (closeParent passes no Values). Both are
+// post-commit failures still, and the history notes written on BOTH records
+// are what stands in for them.
 func eoCheckCloseParentHasAParent(ctx context.Context, r repository.EORecordRepository, rec *models.EORecord, transition *models.WorkflowTransition) error {
 	var wanted []string
 	for i := range transition.Actions {
@@ -772,12 +795,17 @@ func eoCheckCloseParentHasAParent(ctx context.Context, r repository.EORecordRepo
 			return fmt.Errorf("transition %q carries a close_parent action %q whose configuration cannot be read (%v), so it cannot close anything",
 				transition.Code, a.Name, err)
 		}
-		key := strings.TrimSpace(cfg.LinkType)
-		if key == "" {
+		if strings.TrimSpace(cfg.LinkType) == "" {
 			return fmt.Errorf("transition %q carries a close_parent action %q that names no link type, so it cannot say which parent to close",
 				transition.Code, a.Name)
 		}
-		wanted = append(wanted, key)
+		if strings.TrimSpace(cfg.Transition) == "" {
+			return fmt.Errorf("transition %q carries a close_parent action %q that names no transition to run on the parent, so the parent would be left open after this one commits",
+				transition.Code, a.Name)
+		}
+		// UNTRIMMED, which is the whole point: closeParent compares
+		// l.LinkTypeKey with cfg.LinkType as written.
+		wanted = append(wanted, cfg.LinkType)
 	}
 	if len(wanted) == 0 {
 		return nil

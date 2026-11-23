@@ -2180,3 +2180,97 @@ func TestTransitionConditionalRuleOverANilStoredValue(t *testing.T) {
 		t.Fatalf("a transition over a record holding a nil was refused: %v", err)
 	}
 }
+
+// ── Task A3 (Plan 3): the pre-commit check and the executor must agree ─────
+
+// eoCloseParentCheckTransition builds the one transition shape these two
+// tests need: a single active close_parent action carrying `config`.
+func eoCloseParentCheckTransition(config string) *models.WorkflowTransition {
+	return &models.WorkflowTransition{
+		Code: "issue",
+		Actions: []models.TransitionAction{{
+			Name:       "close the draft study",
+			ActionType: eoActionTypeCloseParent,
+			IsActive:   true,
+			Config:     config,
+		}},
+	}
+}
+
+// TestCloseParentCheckMatchesTheExecutorOnWhitespace.
+//
+// eoCheckCloseParentHasAParent is the PRE-COMMIT refusal that exists so a
+// close_parent action cannot fail after the child has committed, leaving the
+// parent open with nothing left to close it. It read
+// `strings.TrimSpace(cfg.LinkType)` and looked THAT up among the record's
+// links, while eoActionExecutor.closeParent compares `l.LinkTypeKey ==
+// cfg.LinkType` untrimmed. So a config with a stray space passed the check
+// and then failed after the commit — precisely the outcome the check exists
+// to prevent, and the one state in which it made things worse by vouching
+// for the transition.
+//
+// BOTH DIRECTIONS, because a check that simply refused everything whitespaced
+// would pass the first half while still disagreeing with the executor: the
+// executor finds a link whose stored key carries the same whitespace, and so
+// must the check.
+func TestCloseParentCheckMatchesTheExecutorOnWhitespace(t *testing.T) {
+	const key = "eo_decision_record_parent"
+	rec := &models.EORecord{ID: uuid.New(), Reference: "EO-DEC-2026-001"}
+
+	t.Run("a padded config against a clean link is refused", func(t *testing.T) {
+		repo := &eoAxRepo{links: []models.EORecordLink{{FromRecordID: rec.ID, LinkTypeKey: key}}}
+		err := eoCheckCloseParentHasAParent(context.Background(), repo,
+			rec, eoCloseParentCheckTransition(`{"link_type":" `+key+` ","transition":"close"}`))
+		if err == nil {
+			t.Fatalf("the check passed a config whose link type is %q while the record carries %q; closeParent compares the two untrimmed, so the transition commits and the parent is left open", " "+key+" ", key)
+		}
+		if !errors.Is(err, ErrEOCloseParentHasNoParent) {
+			t.Errorf("err = %v, want ErrEOCloseParentHasNoParent so a caller can tell it from a requirement refusal", err)
+		}
+	})
+
+	t.Run("a padded config against the link the executor would find is allowed", func(t *testing.T) {
+		padded := " " + key + " "
+		repo := &eoAxRepo{links: []models.EORecordLink{{FromRecordID: rec.ID, LinkTypeKey: padded}}}
+		if err := eoCheckCloseParentHasAParent(context.Background(), repo,
+			rec, eoCloseParentCheckTransition(`{"link_type":"`+padded+`","transition":"close"}`)); err != nil {
+			t.Errorf("the check refused a link closeParent would have found (%q == %q): err = %v", padded, padded, err)
+		}
+	})
+}
+
+// TestCloseParentCheckRefusesAnEmptyTransition.
+//
+// closeParent errors on an empty `Transition` ("close_parent config names no
+// transition"), and that error arrives AFTER the child has committed. The
+// pre-commit check validated `link_type` and never `transition`, so one
+// "parent left open after the commit" path survived a check whose own comment
+// says a transition that cannot run its closing action must not pretend it
+// did.
+//
+// Whitespace alone is the same case: closeParent tests
+// strings.TrimSpace(cfg.Transition), so the check does too.
+func TestCloseParentCheckRefusesAnEmptyTransition(t *testing.T) {
+	const key = "eo_decision_record_parent"
+	rec := &models.EORecord{ID: uuid.New(), Reference: "EO-DEC-2026-001"}
+
+	for _, tc := range []struct{ name, config string }{
+		{"no transition key at all", `{"link_type":"` + key + `"}`},
+		{"an empty transition", `{"link_type":"` + key + `","transition":""}`},
+		{"a transition of spaces", `{"link_type":"` + key + `","transition":"   "}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The record DOES carry the link, so the only thing that can
+			// refuse this is the transition check.
+			repo := &eoAxRepo{links: []models.EORecordLink{{FromRecordID: rec.ID, LinkTypeKey: key}}}
+			err := eoCheckCloseParentHasAParent(context.Background(), repo, rec,
+				eoCloseParentCheckTransition(tc.config))
+			if err == nil {
+				t.Fatal("the check passed a close_parent action that names no transition; closeParent refuses it after the commit and the parent stays open")
+			}
+			if !strings.Contains(err.Error(), "transition") || !strings.Contains(err.Error(), "close the draft study") {
+				t.Errorf("err = %v, and it names neither the missing transition nor the action, so an administrator cannot find the configuration to fix", err)
+			}
+		})
+	}
+}

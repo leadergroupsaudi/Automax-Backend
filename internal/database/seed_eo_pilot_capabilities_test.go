@@ -12,6 +12,7 @@ import (
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -1002,5 +1003,181 @@ func TestEoReportPilotObligationsLogsATypeWithNoLiveCodes(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("the boot log does not carry %q; an operator looking at a record type nobody can see has nothing to go on.\n--- output ---\n%s", want, got)
 		}
+	}
+}
+
+// ── Task A3 (Plan 3): the capability column is an administrator's to edit ──
+
+// eoAdminEditsCapabilities does what PUT /api/v1/admin/eo-record-types/:id
+// does to this column, and only that: handlers.eoRecordTypeRequest.applyTo
+// writes `capabilities` WHOLE when the request carries a non-empty value
+// (`if len(r.Capabilities) > 0 { t.Capabilities = r.Capabilities }`), so a
+// column replace is the exact state that route can leave behind.
+func eoAdminEditsCapabilities(t *testing.T, db *gorm.DB, id uuid.UUID, blob string) {
+	t.Helper()
+	if err := db.Model(&models.EORecordType{}).Where("id = ?", id).
+		Update("capabilities", datatypes.JSON([]byte(blob))).Error; err != nil {
+		t.Fatalf("apply the administrator's edit: %v", err)
+	}
+}
+
+// eoCapabilitiesOf reads the column back as the database holds it.
+func eoCapabilitiesOf(t *testing.T, db *gorm.DB, typeKey string) string {
+	t.Helper()
+	var ty models.EORecordType
+	if err := db.Where("key = ?", typeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read record type %q: %v", typeKey, err)
+	}
+	return string(ty.Capabilities)
+}
+
+// eoAdminEditedCapabilityBlob is a REAL edit an administrator might make: the
+// seeded decisions_base config with max_refs narrowed. It is valid JSON of
+// the shape the engine decodes, so nothing else in the pilot objects to it,
+// and it differs from the registry value in exactly one key.
+const eoAdminEditedCapabilityBlob = `[{"key":"decisions_base","config":{"base_type_key":"eo_decision_record","subject_key":"keywords","standing_key":"standing","standing_values":["in_force"],"max_refs":5}}]`
+
+// TestEoSeedDoesNotRevertAnAdministratorsCapabilityEdit is the behaviour this
+// task restores.
+//
+// Plan 2's fix wave made `enable_capabilities` convergent so a record type
+// appended later still gets its capability configuration — the right fix for
+// a real gap. But its gate asked "does the stored blob differ from the
+// registry's", and PUT /api/v1/admin/eo-record-types/:id writes exactly that
+// column, so from that wave onwards an administrator's edit was silently
+// reverted on the next restart. The wave's own author wrote the rule for the
+// sibling step and never applied it here: a deliberate administrative act is
+// not drift to be corrected.
+//
+// IT DRIVES THE REAL seedEOPilot, never eoEnableCapabilities. The GATE is
+// what shipped the regression; a test that called the writer would prove the
+// writer behaves while being structurally unable to see that the gate opens
+// on an edited column.
+//
+// Mutation that makes it fail: make eoCapabilitiesPending compare the stored
+// blob with the registry again, or drop the never-configured check from
+// eoEnableCapabilities.
+func TestEoSeedDoesNotRevertAnAdministratorsCapabilityEdit(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var ty models.EORecordType
+	if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+	}
+	seeded := string(ty.Capabilities)
+	if eoJSONEqual(t, seeded, eoAdminEditedCapabilityBlob) {
+		t.Fatal("fixture error: the edit is the seeded value, so nothing below could tell a revert from a no-op")
+	}
+
+	eoAdminEditsCapabilities(t, db, ty.ID, eoAdminEditedCapabilityBlob)
+
+	// The gate must be SHUT on an edited column. If it opens, the seed
+	// transaction runs on every boot and the assertion below is the only
+	// thing between the administrator and a rewrite.
+	open, err := eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if open {
+		t.Error("the convergent step reports work to do on a column an administrator edited; it would rewrite it on every boot")
+	}
+
+	seedEOPilot(db)
+
+	if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, got, eoAdminEditedCapabilityBlob) {
+		t.Errorf("CLOBBERED: capabilities = %s, want the administrator's %s", got, eoAdminEditedCapabilityBlob)
+	}
+}
+
+// TestEoSeedStillConvergesATypeNeverConfigured pins the Plan 2 behaviour this
+// task must NOT regress, and pins it in the SAME BOOT as an administrator's
+// edit — because a "fix" that simply stopped converging would satisfy the
+// test above on its own.
+//
+// The never-configured state is reached by clearing the column to the value
+// models.EORecordType declares as its default (`'[]'::jsonb`), which is
+// exactly what a record type appended by a later step arrives with. That is
+// the state `enable_capabilities` exists to fix, so it is the state the gate
+// must open on.
+//
+// Mutation that makes it fail: make eoCapabilitiesPending ignore an empty
+// column, or make eoEnableCapabilities skip every type that is not byte-equal
+// to the registry.
+func TestEoSeedStillConvergesATypeNeverConfigured(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var never, edited models.EORecordType
+	if err := db.Where("key = ?", eoIncomingTypeKey).First(&never).Error; err != nil {
+		t.Fatalf("read %q: %v", eoIncomingTypeKey, err)
+	}
+	if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&edited).Error; err != nil {
+		t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+	}
+	wantConverged := string(never.Capabilities)
+	if strings.TrimSpace(wantConverged) == "" || wantConverged == "[]" {
+		t.Fatalf("fixture error: %q carries no seeded capabilities (%q), so convergence cannot be observed", eoIncomingTypeKey, wantConverged)
+	}
+
+	// One type has never been configured; the other carries an
+	// administrator's edit. Both states, one boot.
+	eoAdminEditsCapabilities(t, db, never.ID, `[]`)
+	eoAdminEditsCapabilities(t, db, edited.ID, eoAdminEditedCapabilityBlob)
+
+	open, err := eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if !open {
+		t.Fatal("the convergent step is shut on a type with no capability configuration, so a record type added later would never get one")
+	}
+
+	seedEOPilot(db)
+
+	if got := eoCapabilitiesOf(t, db, eoIncomingTypeKey); !eoJSONEqual(t, got, wantConverged) {
+		t.Errorf("the never-configured type was not converged: capabilities = %s, want %s", got, wantConverged)
+	}
+	if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, got, eoAdminEditedCapabilityBlob) {
+		t.Errorf("CLOBBERED in the same boot that converged the other type: capabilities = %s, want %s", got, eoAdminEditedCapabilityBlob)
+	}
+
+	// And it terminates: with nothing left unconfigured the gate shuts, even
+	// though one column still differs from the registry.
+	open, err = eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate again: %v", err)
+	}
+	if open {
+		t.Error("the gate is still open after the convergence: the seed transaction would run on every boot for ever")
+	}
+}
+
+// TestEoReportPilotObligationsLogsAnAdministratorEditedCapability is how an
+// operator discovers the case this task DECIDES NOT TO HANDLE: a release that
+// changes a seeded capability config does not reach a type whose column has
+// been edited, and nothing else would say so.
+//
+// Mutation that makes it fail: drop
+// eoLogCapabilitiesAnAdministratorHasEdited from eoReportPilotObligations.
+func TestEoReportPilotObligationsLogsAnAdministratorEditedCapability(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var ty models.EORecordType
+	if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+	}
+	// A clean database says nothing: a line printed when nothing is wrong is
+	// a line nobody reads.
+	if out := eoCaptureSeed(t, db); strings.Contains(out, "differs from the configuration") {
+		t.Errorf("the report fires on an unedited database:\n%s", out)
+	}
+
+	eoAdminEditsCapabilities(t, db, ty.ID, eoAdminEditedCapabilityBlob)
+
+	out := eoCaptureSeed(t, db)
+	if !strings.Contains(out, eoDraftStudyTypeKey) || !strings.Contains(out, "differs from the configuration") {
+		t.Errorf("the boot report does not name the type whose capabilities diverge from the registry; a release that changes the seeded config would land nowhere and say nothing.\n--- output ---\n%s", out)
 	}
 }

@@ -1236,10 +1236,11 @@ func eoCreateForFolder(t *testing.T, f *eoSvcFixture, subjectEn string) (*models
 // eoFolderNotes returns the history rows that report a missing folder.
 //
 // The prefix is written out rather than taken from eoFolderFailureNote. The
-// constant's whole job is to be a STABLE string an operator and a backfill
-// grep for, so a test that matched on the constant would follow it anywhere
-// and pin nothing — the same defect as a clip test that derives its
-// expectation from the limit it is testing.
+// constant's whole job is to be a STABLE string an operator greps for —
+// THERE IS NO EO BACKFILL IN THIS REPOSITORY, so an operator with a SQL
+// prompt is the only consumer — and a test that matched on the constant
+// would follow it anywhere and pin nothing, the same defect as a clip test
+// that derives its expectation from the limit it is testing.
 const eoFolderNoteLiteral = "documenta folder not created"
 
 func eoFolderNotes(history []models.EORecordHistory) []models.EORecordHistory {
@@ -1407,7 +1408,10 @@ func TestFolderCreationFailureDoesNotLoseTheRecord(t *testing.T) {
 	// The decision this task had to make (Review Focus 4): a Documenta outage
 	// during a create does NOT block the record. The record is written with an
 	// empty documenta_folder_id — which C1 made a legible value rather than a
-	// null — and is backfillable. What makes that honest rather than silent is
+	// null. NOTHING IN THIS REPOSITORY REPAIRS IT: the column and the history
+	// note are the two handles a manual repair selects on, and
+	// POST /eo-records/:id/files refuses the record until one is applied by
+	// hand. What makes that honest rather than silent is
 	// the history row: it is written in the SAME transaction as the record, on
 	// the record it happened to, so it cannot be lost and cannot be filed
 	// against the wrong record the way A5's close_parent note was.

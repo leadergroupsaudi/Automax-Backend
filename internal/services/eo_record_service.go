@@ -1003,8 +1003,18 @@ func (s *eoRecordService) createRecordFolder(ctx context.Context, t *models.EORe
 // which named a tool that does not exist anywhere in this repository; a user
 // reading it would wait for a repair that is never coming. It says instead
 // what is true and what to do.
+//
+// AND IT NAMES THE REFUSAL THE READER WILL ACTUALLY MEET. Task B1 built
+// POST /eo-records/:id/files, and that route refuses a record with an empty
+// documenta_folder_id with 409 and the words "Its folder must be created
+// before files can be attached" (handlers.EOFileHandler.Upload). Saying
+// "until a folder is created for it by hand" and no more left the reader to
+// discover for themselves that the upload route is where it bites; naming
+// the route and the status is what makes the sentence actionable. It is true
+// whether or not that route exists: before B1 nothing could attach a file at
+// all, and after it the one route that can, refuses.
 func eoFolderFailureComment(rec *models.EORecord, err error) string {
-	return fmt.Sprintf("%s for %s: %v. The record was created without one (documenta_folder_id is empty); it is complete and usable, but files cannot be attached to it until a folder is created for it by hand.",
+	return fmt.Sprintf("%s for %s: %v. The record was created without one (documenta_folder_id is empty); it is complete and usable, but no file can be attached to it: POST /eo-records/:id/files refuses with 409 while the folder id is empty. Nothing in this system repairs it — the folder must be created in Documenta and its id written onto the record by hand.",
 		eoFolderFailureNote, rec.Reference, err)
 }
 

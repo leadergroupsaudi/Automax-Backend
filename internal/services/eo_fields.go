@@ -433,9 +433,11 @@ func eoValueList(v any) ([]any, bool) {
 // well-formed uuid without asking whether a file exists behind it, so
 // accepting the prefixed form widens nothing except the spelling. It is here
 // so that a deployment running the stub is not refused by shape alone, and it
-// is honest about its reach: it covers the id an UPLOAD returns, and no EO
-// code path calls UploadFile yet — there is no EO upload route in the server,
-// so today the prefix protects a flow that does not exist. The stub's
+// is honest about its reach: it covers the id an UPLOAD returns, which Task
+// B1's POST /eo-records/:id/files is the only EO path that mints. That route
+// refuses with 503 while EO_DOCUMENTA_ENABLED=false and never reaches the
+// stub, so the prefixed form is today accepted from a REQUEST BODY and from
+// no upload this server performs. The stub's
 // browsing and search methods hand out fixed sample ids (stub-file-readme,
 // stub-file-evidence, stub-file-search-1) that are not uuid-shaped and are
 // NOT accepted; they name files nobody uploaded.

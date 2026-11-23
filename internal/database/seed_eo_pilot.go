@@ -281,8 +281,9 @@ func seedEOPilot(db *gorm.DB) {
 // eoReportPilotObligations writes the boot-time lists the client sign-off
 // round reads: the field labels awaiting Arabic, the workflow states and
 // transitions awaiting confirmation, the capability inputs the configuration
-// does not yet provide, the types with no live permission codes, and the file
-// fields relaxed for want of Documenta.
+// does not yet provide, the record types whose capability configuration an
+// administrator has edited, the types with no live permission codes, and the
+// file fields relaxed for want of Documenta.
 //
 // It is SEPARATE FROM THE SEED because it is not part of it: it answers "what
 // does this database still owe the client", which is a question about the
@@ -296,6 +297,7 @@ func eoReportPilotObligations(db *gorm.DB) {
 	}
 	eoLogUnconfirmedStateMachines(db)
 	eoLogCapabilityInputGaps(db)
+	eoLogCapabilitiesAnAdministratorHasEdited(db)
 	eoLogTypesWithNoLiveCodes(db)
 	eoLogFileFieldsAwaitingDocumenta(db)
 }
@@ -687,8 +689,12 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // authorises it also says how it ends: an administrator restores these fields
 // once Documenta is connected — by whatever route is open to them, which is
 // the type designer only before the register is used (see HOW TO RE-TIGHTEN
-// above). A convergent step would read that edit as work to do and undo it on
-// the next boot — the precise defect this programme has already shipped twice. The
+// above). A convergent step gated on "the stored value differs from the
+// seeded one" would read that edit as work to do and undo it on the next
+// boot — the precise defect this programme has already shipped twice, on
+// seed_type_permissions and on enable_capabilities. (Both gates have since
+// been narrowed to a question an administrator's edit cannot answer yes to;
+// a one-shot step needs no such narrowing, which is why this stays one.) The
 // thing a one-shot step cannot do, reach a field definition created after it
 // ran, is covered instead by TestNoPilotFileFieldIsDemandedAtAll, which
 // fails CI if a later type seeds an `always` file field without registering
@@ -3156,9 +3162,25 @@ type eoCapabilityEnablement struct {
 
 // eoPilotCapabilities is every capability the pilot enables.
 //
-// ENABLING ONE ON A RECORD TYPE THAT DOES NOT EXIST YET. `enable_capabilities`
-// is convergent, so an entry added here reaches every existing database — but
-// it is also fail-closed, and a type key that resolves to nothing rolls the
+// HOW FAR AN ENTRY ADDED HERE REACHES, which is NOT "every existing
+// database" and must not be read as it. `enable_capabilities` is convergent,
+// but Plan 3's Task A3 narrowed its gate to types whose capability column has
+// NEVER BEEN CONFIGURED (eoCapabilitiesNeverConfigured), because an
+// administrator writes that column through
+// PUT /api/v1/admin/eo-record-types/:id. So:
+//
+//   - A NEW TYPE KEY here — one no entry named before, whose column is still
+//     the default `[]` — is written on every existing database at the next
+//     boot. That is the case this registry is normally extended for.
+//   - A CHANGE to an entry whose type is already configured, or a SECOND
+//     capability on such a type, reaches a fresh database and NO existing
+//     one. eoLogCapabilitiesAnAdministratorHasEdited prints the divergence on
+//     every boot, and the way to land it everywhere is an appended one-shot
+//     step with a new key, which is a deliberate overwrite rather than a side
+//     effect of a gate.
+//
+// ENABLING ONE ON A RECORD TYPE THAT DOES NOT EXIST YET. The step is
+// fail-closed, and a type key that resolves to nothing rolls the
 // whole pilot seed back with that type named. If the type is being added in
 // the same change, put the step that CREATES it before the
 // `enable_capabilities` entry in eoPilotSteps rather than appending it at the
@@ -3292,6 +3314,9 @@ var eoCapabilityReservedFieldRemovals = []eoCapabilityReservedFieldRemoval{
 // It is fail-closed throughout, like every other step: a type key that
 // resolves to nothing is an error that rolls the whole pilot seed back, not a
 // capability silently enabled on nothing.
+//
+// IT WRITES ONLY A TYPE THAT HAS NEVER BEEN CONFIGURED. See
+// eoCapabilitiesNeverConfigured for the rule and what it costs.
 func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 	for _, r := range eoCapabilityReservedFieldRemovals {
 		var ty models.EORecordType
@@ -3324,6 +3349,17 @@ func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 		}
 		if ty.ID == uuid.Nil {
 			return false, fmt.Errorf("capabilities are enabled on record type %q, which is not seeded", typeKey)
+		}
+		// THE GUARD AND THE GATE ARE THE SAME QUESTION, asked here as well
+		// because the step runs whenever eoCapabilitiesPending opens for ANY
+		// reason — a reappearing reserved field opens it too, and without
+		// this line that would rewrite every configured column on the way
+		// past. (eoReportPilotObligations is where a divergence is reported;
+		// this loop stays silent, because the writer runs only when there is
+		// something to write and a line per skipped type on that boot would
+		// say nothing an operator does not already get on every boot.)
+		if !eoCapabilitiesNeverConfigured(ty.Capabilities) {
+			continue
 		}
 		if err := tx.Model(&models.EORecordType{}).Where("id = ?", ty.ID).
 			Update("capabilities", datatypes.JSON(blob)).Error; err != nil {
@@ -3366,6 +3402,13 @@ func eoCapabilitiesByType() ([]string, map[string][]eoCapabilityEnablement) {
 // It is deliberately conservative: anything it cannot confirm is reported as
 // pending, and eoEnableCapabilities — which is fail-closed — then either does
 // the work or produces the error. It never swallows a problem to stay quiet.
+//
+// WHAT IT NO LONGER ASKS, and why that is the whole of Plan 3 Task A3. It
+// used to ask whether the stored blob EQUALS the registry's, which made every
+// difference work to do. PUT /api/v1/admin/eo-record-types/:id writes that
+// exact column, so from Plan 2's fix wave onwards an administrator's edit was
+// reverted on the next restart. The question is now "has this type ever been
+// configured" — see eoCapabilitiesNeverConfigured.
 func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 	for _, r := range eoCapabilityReservedFieldRemovals {
 		var ty models.EORecordType
@@ -3391,8 +3434,7 @@ func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 
 	order, byType := eoCapabilitiesByType()
 	for _, typeKey := range order {
-		want, err := eoCapabilityBlob(byType[typeKey])
-		if err != nil {
+		if _, err := eoCapabilityBlob(byType[typeKey]); err != nil {
 			// A malformed config is a seed failure with a precise message,
 			// and that message is the step's to write.
 			return true, nil
@@ -3404,15 +3446,134 @@ func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 		if ty.ID == uuid.Nil {
 			return true, nil
 		}
-		same, err := eoSameJSON(want, []byte(ty.Capabilities))
-		if err != nil {
-			return false, fmt.Errorf("compare the capabilities of %q with the configuration: %w", typeKey, err)
-		}
-		if !same {
+		if eoCapabilitiesNeverConfigured(ty.Capabilities) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// eoCapabilitiesNeverConfigured is the whole of `enable_capabilities`'
+// convergence rule, and the one judgement Plan 3 Task A3 had to make.
+//
+// THE RULE: converge a record type whose capability column has never been
+// configured; leave a type whose column has been written alone. It is the
+// rule the fix wave's own author wrote for the sibling step and did not apply
+// here — "a grant revoked by an administrator is a deliberate act and must
+// not be reinstated at boot" (eoTypePermissionsPending) — and
+// PUT /api/v1/admin/eo-record-types/:id writes `capabilities` WHOLE
+// (handlers.eoRecordTypeRequest.applyTo), so an edit through it is exactly
+// such an act.
+//
+// "NEVER CONFIGURED" IS THE COLUMN'S OWN DEFAULT. models.EORecordType
+// declares `default:'[]'::jsonb`, so a type created by a step, by a later
+// release's appended step, or by the type designer carries an empty list
+// until something enables a capability on it. That is the state the step
+// exists to fix, and it is the state this returns true for.
+//
+// THE QUESTION IT REFUSES TO ANSWER, stated rather than papered over. An
+// administrator's edit and a change to the SEEDED value between releases both
+// present as "the column differs from eoPilotCapabilities", and nothing in
+// this schema records who last wrote the column — there is no authored-by, no
+// seeded-value history, and the updated_at a seed write bumps is the one an
+// edit bumps. So the two cannot be told apart, and this treats EVERY written
+// column as an administrator's.
+//
+// WHAT THAT COSTS IN EACH DIRECTION:
+//
+//   - Wrong this way (it was really a release changing the seeded value): the
+//     new configuration does not reach that type, on that deployment, ever —
+//     the database keeps the old blob and the code says something else. The
+//     operator is told: eoLogCapabilitiesAnAdministratorHasEdited prints the
+//     stored blob beside the configured one on EVERY boot, naming the type.
+//     The supported way to land such a change is the mechanism's own, an
+//     APPENDED ONE-SHOT STEP with a new key, which runs exactly once on every
+//     existing database and is a deliberate decision to overwrite rather than
+//     a side effect of a gate.
+//   - Wrong the other way (treat a difference as drift, which is what shipped):
+//     the administrator's edit is reverted on the next restart, silently,
+//     because the seed believes it is correcting itself. Nothing could report
+//     it: the reverting write IS the seed's normal behaviour.
+//
+// THE CASE THIS DELIBERATELY DOES NOT HANDLE. An administrator who turns
+// every capability OFF writes `[]`, which is byte-identical to the column's
+// default, so the seed reads it as never-configured and re-enables the
+// registry's capabilities on the next boot. There is no way to tell those two
+// apart from the column alone, and inventing a marker column to do it is a
+// migration this task does not buy. The operator sees it as the
+// `record type %q enables [...]` line reappearing on every boot — the
+// capability they just removed, being enabled again, by name. Turning a
+// SEEDED capability off is therefore a change to eoPilotCapabilities, not an
+// edit through the route; that is an open item, not a closed one.
+func eoCapabilitiesNeverConfigured(raw datatypes.JSON) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		// UNREACHABLE ON A LIVE DATABASE and kept only so the helper is
+		// total: the column is jsonb, so Postgres refuses anything that is
+		// not JSON at write time. If it is ever reached, the step's own
+		// write is the only repair available, so "unconfigured" is the
+		// answer that leads somewhere.
+		return true
+	}
+	switch t := v.(type) {
+	case nil:
+		return true
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
+}
+
+// eoLogCapabilitiesAnAdministratorHasEdited is how an operator discovers the
+// case eoCapabilitiesNeverConfigured decides not to handle: a record type
+// whose capability column differs from what this build seeds, and which the
+// convergent step therefore left alone.
+//
+// IT IS CALLED FROM eoReportPilotObligations, WHICH RUNS ON EVERY BOOT, and
+// not from eoEnableCapabilities — for the reason eoLogTypesWithNoLiveCodes
+// records about itself. Inside the writer it could not fire in the state it
+// exists for: the writer runs only when the gate opens, and "every type is
+// configured, one of them differently" is precisely the state where the gate
+// is SHUT.
+//
+// It is a log and not a failure because a divergent column is a legitimate
+// state — it is what an administrator's edit looks like — and the seed does
+// not undo administrative acts.
+func eoLogCapabilitiesAnAdministratorHasEdited(db *gorm.DB) {
+	order, byType := eoCapabilitiesByType()
+	for _, typeKey := range order {
+		want, err := eoCapabilityBlob(byType[typeKey])
+		if err != nil {
+			// The step itself fails on this with a precise message; the
+			// report has nothing to add.
+			continue
+		}
+		var ty models.EORecordType
+		if err := db.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
+			log.Printf("EO pilot: could not read record type %q to compare its capabilities: %v", typeKey, err)
+			continue
+		}
+		if ty.ID == uuid.Nil || eoCapabilitiesNeverConfigured(ty.Capabilities) {
+			// A missing type is the seed's to report, loudly; an empty
+			// column is about to be converged.
+			continue
+		}
+		same, err := eoSameJSON(want, []byte(ty.Capabilities))
+		if err != nil {
+			log.Printf("EO pilot: could not compare the capabilities of %q with the configuration: %v", typeKey, err)
+			continue
+		}
+		if same {
+			continue
+		}
+		log.Printf("EO pilot: record type %q carries a capability configuration that differs from the configuration this build seeds, and was LEFT ALONE: stored %s, configured %s. The seed converges a type that has never been configured and never overwrites one that has, because PUT /api/v1/admin/eo-record-types/:id writes this column and an edit through it is a deliberate act. A release that changes the seeded value does NOT reach this type: apply it through that route, or clear the column to '[]' to let the next boot write it.",
+			typeKey, ty.Capabilities, want)
+	}
 }
 
 // eoSameJSON compares two JSON documents by VALUE. The column is jsonb, which

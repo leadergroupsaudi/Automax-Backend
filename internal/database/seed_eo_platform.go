@@ -698,11 +698,17 @@ func eoTypePermissionIsStale(p models.Permission) bool {
 // do not exist until the types they name have been seeded, which must happen
 // after the roles exist.
 //
-// IT IS CALLED TWICE: once from the platform seed and once from the pilot
-// seed's seed_type_permissions step, because the eleven pilot types are
-// created after the platform seed has already applied. The existence check
-// below keys on Code, so the second call adds exactly the types seeded since
-// the first. The ONE thing it changes about an existing row is a description
+// IT IS CALLED MORE THAN ONCE PER BOOT, and not a fixed number of times.
+// Once from the platform seed, because the eleven pilot types are created
+// after the platform seed has already applied; and then from the pilot seed's
+// seed_type_permissions step, which is CONVERGENT and is therefore asked
+// TWICE in one pilot seed — at its position in eoPilotSteps and again in the
+// second convergent pass after the whole list, so a type created by an
+// appended step gets its codes on the same boot. Three runs in one boot is
+// today's maximum; what the function guarantees is not a count but that any
+// number of runs is the same as one. The existence check
+// below keys on Code, so a later call adds exactly the types seeded since
+// the one before it. The ONE thing it changes about an existing row is a description
 // column still carrying the pre-A2 inert sentence (see
 // eoTypePermissionLegacyInertEN above): nothing else about a row that already
 // exists is touched, and a column an administrator has edited is not, because
@@ -712,7 +718,6 @@ func eoTypePermissionIsStale(p models.Permission) bool {
 // not reverting administrators' edits. The grant is re-applied on every call
 // and is safe: GORM's many-to-many Append writes the join rows ON CONFLICT DO
 // NOTHING.
-
 func eoSeedTypePermissions(db *gorm.DB) error {
 	var concrete []models.EORecordType
 	if err := db.Where("is_abstract = ?", false).Order("key").Find(&concrete).Error; err != nil {

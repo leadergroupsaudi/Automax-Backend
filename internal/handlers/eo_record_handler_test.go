@@ -567,8 +567,10 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		// client is not used for EO at all: the stub invents
 		// "stub-folder-<uuid>", and persisting that would file every record of
 		// a disabled deployment — the default — under an id that resolves to
-		// nothing, and hide it from the backfill that selects records whose
-		// documenta_folder_id is empty.
+		// nothing, and hide it from the only query that finds these records at
+		// all: documenta_folder_id = ''. There is no EO backfill in this
+		// repository; that query and services.eoFolderFailureNote are the two
+		// handles a manual repair has.
 		// (the call itself is pinned whitespace-insensitively below, so a
 		// reformat of this statement does not fail the test)
 		"var eoFolderOption services.EORecordOption",
@@ -651,8 +653,9 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 	// The stub must not reach the EO record path. StubDocumentaClient invents
 	// "stub-folder-<uuid>", and persisting that would file every record of a
 	// DISABLED deployment — the default, and what the pilot runs — under an
-	// id that resolves to nothing, and hide it from the backfill that selects
-	// records whose documenta_folder_id is empty.
+	// id that resolves to nothing, and hide it from the only query that finds
+	// these records at all: documenta_folder_id = ''. There is no EO backfill
+	// in this repository.
 	//
 	// Counting is what pins it. The positive pin above fixes what the ONE
 	// call is built from, but adding a SECOND call in the else branch —
