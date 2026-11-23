@@ -675,10 +675,11 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // whose job is "every X must have a Y" — a rule that must hold again whenever
 // the configuration grows. This is not such a rule. It is a one-time
 // remediation of a configuration the seed itself wrote, and the ruling that
-// authorises it also says how it ends: an administrator sets these fields back
-// to `always` through the type designer once Documenta is connected. A
-// convergent step would read that edit as work to do and undo it on the next
-// boot — the precise defect this programme has already shipped twice. The
+// authorises it also says how it ends: an administrator restores these fields
+// once Documenta is connected — by whatever route is open to them, which is
+// the type designer only before the register is used (see HOW TO RE-TIGHTEN
+// above). A convergent step would read that edit as work to do and undo it on
+// the next boot — the precise defect this programme has already shipped twice. The
 // thing a one-shot step cannot do, reach a field definition created after it
 // ran, is covered instead by TestNoPilotFileFieldIsDemandedAtAll, which
 // fails CI if a later type seeds an `always` file field without registering
@@ -689,8 +690,9 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // on an environment variable would mean a boot that happened to have the flag
 // set consumed the step for ever and left the register uncreatable with
 // nothing said. Relaxing on a Documenta-enabled deployment costs a field that
-// is optional instead of mandatory, which the type designer can correct and
-// the boot report asks it to.
+// is optional instead of mandatory — correctable through the type designer
+// while that type holds no records, and reported on every boot thereafter as
+// the blocker it becomes once it does.
 //
 // It is fail-closed, like every other step: a registered type or field that
 // does not exist is an error that rolls the pilot seed back, not a relaxation
@@ -791,8 +793,18 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 			Limit(1).
 			Pluck("COALESCE(f.required_mode, '')", &modes).Error
 		if err != nil {
-			// One unreadable field must not abandon the rest: this report
-			// is the only standing account of the relaxation.
+			// ON TODAY'S QUERY THIS ARM CANNOT FIRE, and it is kept
+			// deliberately rather than left to look like live protection.
+			// The scan error it was written for was a NULL required_mode
+			// landing in a string, and the COALESCE above removes it:
+			// reverting this `continue` to a `return` changes no test,
+			// which is exactly the shape this programme keeps finding and
+			// so is said out loud here. It stays because the next change to
+			// the query is what makes it reachable again — a column added
+			// to the Select, a Join that can fail — and the behaviour it
+			// pins is the one that matters: ONE unreadable field must not
+			// abandon the rest, because this report is the only standing
+			// account of the relaxation.
 			log.Printf("EO pilot seed: could not read the requiredness of %s.%s: %v", r.TypeKey, r.FieldKey, err)
 			continue
 		}

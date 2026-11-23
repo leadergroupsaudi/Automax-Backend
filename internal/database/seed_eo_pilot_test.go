@@ -1292,9 +1292,12 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	// TASK B2 RELAXED THE REQUIREDNESS AND NOTHING ELSE. The narrowing still
 	// exists — its own definition, at the base's slot — because `always` was
 	// a demand no clerk could meet while B1's upload route mints no file id
-	// (eoFileFieldsRelaxedUntilDocumenta). That is what makes re-tightening
-	// one column through the type designer rather than a re-seed, and it is
-	// why this subtest still checks the override's identity below.
+	// (eoFileFieldsRelaxedUntilDocumenta). Keeping the narrowing means
+	// restoring the field is one column rather than a re-seed — which is
+	// worth having even though it does NOT mean the type designer will
+	// accept it: models.ValidateTypeEdit refuses to make a field required
+	// once the type holds records. This subtest therefore still checks the
+	// override's identity below.
 	t.Run("attachments is declared on Incoming Correspondence and relaxed for want of Documenta", func(t *testing.T) {
 		got := eoEffectiveField(t, db, eoIncomingTypeKey, "attachments")
 		if got.RequiredMode != models.EORequiredNever {
@@ -4263,7 +4266,10 @@ func TestEoFileRelaxationReachesADatabaseSeededBeforeIt(t *testing.T) {
 // and nothing re-tightens a deployment that later connects Documenta. That is
 // accepted, and it is exactly why the boot report must say so: with Documenta
 // enabled the relaxed fields stop being a workaround and become a gap in the
-// client's matrix that only the type designer can close.
+// client's matrix that NOTHING CAN CLOSE once the registers hold records,
+// because models.ValidateTypeEdit refuses the edit and §7.14's
+// confirmed-destructive path is not built. The line is the only standing
+// notice of a blocker, which is why it must fire on every boot.
 //
 // The disabled wording is covered on every boot by
 // TestSeedEOPilotReportsOnEveryBoot, through eoObligationReportLines. This
