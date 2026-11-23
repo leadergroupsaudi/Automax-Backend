@@ -890,13 +890,22 @@ func main() {
 	// into the record's folder.
 	//
 	// GET /eo-records/:id/files/:file_id[/preview] read one back, and carry
-	// the guards of GET /eo-records/:id instead — a read is not an edit. They
-	// are the ONLY way an EO file can be opened: /documents/files/:id/* runs
-	// on the GOALS Documenta client (built from cfg.Documenta above, with its
-	// own token and workspace) behind goals:view, so it cannot reach a file
-	// uploaded here. Both stream the bytes through this gate rather than
-	// handing out a Documenta URL, which would answer without the record id
-	// and outlive the permission that produced it.
+	// the guards of GET /eo-records/:id instead — a read is not an edit. Both
+	// stream the bytes through this gate rather than redirecting to
+	// /api/v1/documents/files/<id>/..., which is what the EO client's
+	// GetDownloadURL/GetPreviewURL actually return: that path is the
+	// DOCUMENTS module, gated on goals:view and running on the GOALS
+	// Documenta client (cfg.Documenta above), so a redirect would answer
+	// under another module's permission or not at all.
+	//
+	// They are the only EO-GATED way to open an EO file. They are not
+	// necessarily the only way, and nothing here asserts otherwise: nothing
+	// prevents a deployment from pointing DOCUMENTA_* and EO_DOCUMENTA_* at
+	// ONE workspace, and in that configuration a holder of goals:view can
+	// enumerate and download EO documents through /documents/files/*
+	// outright, with no EO permission at all. Whether a shared workspace is a
+	// legitimate deployment is a product question this wiring does not
+	// settle.
 	eoFileHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission, eoTypePermission.RequireEOTypePermission)
 
 	// Admin routes

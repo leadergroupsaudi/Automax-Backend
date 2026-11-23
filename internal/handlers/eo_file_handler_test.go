@@ -56,9 +56,16 @@ type eoFakeDocumenta struct {
 	downloadCalls int
 	gotDownloadID string
 	// urlCalls counts GetDownloadURL/GetPreviewURL. It is asserted to be
-	// ZERO: a URL handed to the client carries Documenta's authorisation,
-	// not EO's, and outlives the permission check that produced it.
+	// ZERO: those return a path into the DOCUMENTS module, which runs on the
+	// Goals client behind goals:view — a redirect there answers under
+	// another module's permission, or 404s against another workspace.
 	urlCalls int
+
+	// fileInfo is what GetFileInfo answers: the file's REAL filing in
+	// Documenta, which the placement check compares with the record's folder.
+	fileInfo  *storage.DmsFile
+	infoErr   error
+	infoCalls int
 }
 
 func (f *eoFakeDocumenta) UploadFile(_ context.Context, folderID, fileName string, fileData io.Reader, fileSize int64, metadata map[string]string) (string, error) {
@@ -722,10 +729,14 @@ func TestEOSanitiseFileName(t *testing.T) {
 // The read path's half of the fake. GetDownloadURL and GetPreviewURL are
 // implemented and COUNTED rather than left to the embedded nil interface: the
 // tests below assert they are never called, which is what pins the decision to
-// stream the bytes through the EO gate instead of handing the caller a
-// Documenta URL that carries no EO authorisation and outlives the check that
-// produced it. Left unimplemented, that assertion would be satisfied by a nil
-// panic instead of by the handler's design.
+// stream the bytes through the EO gate. What those two return is NOT a signed
+// Documenta URL but a relative path into the DOCUMENTS module
+// (/api/v1/documents/files/<id>/...), which is gated on goals:view and runs on
+// the Goals client and workspace — so answering with one would 404 against a
+// separate workspace, or, where both configs point at one workspace, serve EO
+// documents to a caller who cleared none of EO's gates. Left unimplemented,
+// the zero-call assertion would be satisfied by a nil panic instead of by the
+// handler's design.
 func (f *eoFakeDocumenta) DownloadFile(_ context.Context, fileID string) (io.ReadCloser, *storage.DmsFile, error) {
 	f.downloadCalls++
 	f.gotDownloadID = fileID
@@ -733,6 +744,14 @@ func (f *eoFakeDocumenta) DownloadFile(_ context.Context, fileID string) (io.Rea
 		return nil, nil, f.downloadErr
 	}
 	return io.NopCloser(strings.NewReader(f.downloadBody)), f.downloadInfo, nil
+}
+
+func (f *eoFakeDocumenta) GetFileInfo(_ context.Context, fileID string) (*storage.DmsFile, error) {
+	f.infoCalls++
+	if f.infoErr != nil {
+		return nil, f.infoErr
+	}
+	return f.fileInfo, nil
 }
 
 func (f *eoFakeDocumenta) GetDownloadURL(_ context.Context, fileID string) (string, error) {
@@ -745,9 +764,18 @@ func (f *eoFakeDocumenta) GetPreviewURL(_ context.Context, fileID string) (strin
 	return "https://documenta.example/preview/" + fileID, nil
 }
 
-// eoReadFake is a Documenta that will hand back one file.
-func eoReadFake(body string, info *storage.DmsFile) *eoFakeDocumenta {
-	return &eoFakeDocumenta{downloadBody: body, downloadInfo: info}
+// eoReadFake is a Documenta that holds one file, FILED IN rec's own folder —
+// which is where Upload puts it. The placement check compares GetFileInfo's
+// ParentUUID with the record's documenta_folder_id, so a fake that left it
+// empty would make every read 404 and hide whatever else was broken.
+func eoReadFake(rec *models.EORecord, body string, info *storage.DmsFile) *eoFakeDocumenta {
+	f := &eoFakeDocumenta{downloadBody: body, downloadInfo: info}
+	uuidOf := ""
+	if info != nil {
+		uuidOf = info.UUID
+	}
+	f.fileInfo = &storage.DmsFile{UUID: uuidOf, Type: "file", ParentUUID: rec.DocumentaFolderID}
+	return f
 }
 
 // eoRecordHolding is a record whose stored values reference the given file
@@ -817,7 +845,7 @@ func eoRefusalEnvelope(t *testing.T, resp *http.Response) string {
 func TestEOFileDownloadStreamsTheFile(t *testing.T) {
 	fileID := uuid.New().String()
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
-	doc := eoReadFake("PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf", Size: 9})
+	doc := eoReadFake(rec, "PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf", Size: 9})
 	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
 	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
@@ -850,7 +878,11 @@ func TestEOFileDownloadStreamsTheFile(t *testing.T) {
 		t.Errorf("the response redirects to %q: that URL leaves EO's authorisation behind", loc)
 	}
 	if doc.urlCalls != 0 {
-		t.Errorf("a Documenta URL was minted %d times; the bytes must be served through this gate", doc.urlCalls)
+		t.Errorf("a Documents-module URL was produced %d times; the bytes must be served through this gate", doc.urlCalls)
+	}
+	// The placement check ran, against this record's own folder.
+	if doc.infoCalls != 1 {
+		t.Errorf("GetFileInfo calls = %d, want 1: the file's real parent folder must be confirmed before the bytes are served", doc.infoCalls)
 	}
 }
 
@@ -861,7 +893,7 @@ func TestEOFileDownloadStreamsTheFile(t *testing.T) {
 func TestEOFilePreviewServesTheFileInline(t *testing.T) {
 	fileID := uuid.New().String()
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
-	doc := eoReadFake("PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf"})
+	doc := eoReadFake(rec, "PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf"})
 	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
 	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
@@ -895,7 +927,7 @@ func TestEOFilePreviewServesTheFileInline(t *testing.T) {
 		t.Errorf("Content-Security-Policy = %q, want default-src 'none': an uploaded HTML file is previewed from this origin", csp)
 	}
 	if doc.urlCalls != 0 {
-		t.Errorf("a Documenta preview URL was minted %d times; it would be readable without any EO permission", doc.urlCalls)
+		t.Errorf("a Documents-module preview URL was produced %d times; it answers under goals:view, not EO's gates", doc.urlCalls)
 	}
 	if loc := resp.Header.Get("Location"); loc != "" {
 		t.Errorf("the preview redirects to %q", loc)
@@ -918,7 +950,7 @@ func TestEOFileDownloadAcceptsEveryStoredShape(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := eoRecordHolding(t, tc.values)
-			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+			doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
 			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
 			resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
@@ -964,7 +996,7 @@ func TestEOFileDownloadRefusesAFileNotOnThisRecord(t *testing.T) {
 		for routeName, path := range eoReadPaths("RECORD", tc.requested) {
 			t.Run(tc.name+"/"+routeName, func(t *testing.T) {
 				rec := eoRecordHolding(t, tc.values)
-				doc := eoReadFake("SECRET-BYTES", &storage.DmsFile{UUID: tc.requested, Name: "secret.pdf", MimeType: "application/pdf"})
+				doc := eoReadFake(rec, "SECRET-BYTES", &storage.DmsFile{UUID: tc.requested, Name: "secret.pdf", MimeType: "application/pdf"})
 				repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 				app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
 
@@ -981,7 +1013,13 @@ func TestEOFileDownloadRefusesAFileNotOnThisRecord(t *testing.T) {
 					t.Errorf("DownloadFile ran %d times for a file that is not on this record: the ownership check must run BEFORE the fetch", doc.downloadCalls)
 				}
 				if doc.urlCalls != 0 {
-					t.Errorf("a Documenta URL was minted %d times for a file that is not on this record", doc.urlCalls)
+					t.Errorf("a Documents-module URL was produced %d times for a file that is not on this record", doc.urlCalls)
+				}
+				// Not even the cheap metadata call: the REGISTER check is
+				// first, so an id that is not on the record reaches
+				// Documenta through no call at all.
+				if doc.infoCalls != 0 {
+					t.Errorf("GetFileInfo ran %d times for a file that is not on this record", doc.infoCalls)
 				}
 			})
 		}
@@ -998,7 +1036,7 @@ func TestEOFileDownloadHonoursRowLevelVisibility(t *testing.T) {
 			// The record really does hold the file, so the ONLY thing
 			// refusing here is visibility.
 			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
-			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
+			doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
 			repo := &eoFakeRecordRepo{
 				byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
 				visibleIDs: map[uuid.UUID]bool{}, // visible to nobody
@@ -1037,7 +1075,7 @@ func TestEOFileDownloadRefusesWithoutTypeViewPermission(t *testing.T) {
 	fileID := uuid.New().String()
 
 	newApp := func(user *models.User, rec *models.EORecord) (*fiber.App, *eoFakeDocumenta) {
-		doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+		doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
 		repo := &eoFakeRecordRepo{
 			byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
 			visibleIDs: map[uuid.UUID]bool{rec.ID: true},
@@ -1135,7 +1173,10 @@ func TestEOFileReadWhenDocumentaDisabled(t *testing.T) {
 func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
 	fileID := uuid.New().String()
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
-	doc := &eoFakeDocumenta{downloadErr: fmt.Errorf("documenta: gone: %w", storage.ErrFileNotFound)}
+	// Filed on the record, so the placement check PASSES and this test
+	// really does exercise the DownloadFile arm.
+	doc := eoReadFake(rec, "", nil)
+	doc.downloadErr = fmt.Errorf("documenta: gone: %w", storage.ErrFileNotFound)
 	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
 	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
@@ -1149,9 +1190,14 @@ func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
 	}
 	eoRefusalEnvelope(t, resp)
 
+	if doc.downloadCalls != 1 {
+		t.Errorf("DownloadFile ran %d times, want 1: this test must reach the download arm, not be refused earlier", doc.downloadCalls)
+	}
+
 	// And a genuine upstream failure is NOT a 404: it must not look like a
 	// deleted document.
-	doc2 := &eoFakeDocumenta{downloadErr: errors.New("documenta: 502 bad gateway")}
+	doc2 := eoReadFake(rec, "", nil)
+	doc2.downloadErr = errors.New("documenta: 502 bad gateway")
 	repo2 := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 	app2 := eoUploadApp(NewEOFileHandler(repo2, doc2), eoTestUser())
 	resp2, err := app2.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
@@ -1162,6 +1208,8 @@ func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
 		raw, _ := io.ReadAll(resp2.Body)
 		t.Fatalf("status = %d for an upstream outage, want a 5xx that is not 404: %s", resp2.StatusCode, string(raw))
 	}
+	// Same envelope as every other refusal — and a panic does not produce one.
+	eoRefusalEnvelope(t, resp2)
 }
 
 // TestEOFileDownloadServesTheIdTheRecordHolds: a uuid is case-insensitive, so
@@ -1171,7 +1219,7 @@ func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
 func TestEOFileDownloadServesTheIdTheRecordHolds(t *testing.T) {
 	stored := strings.ToLower(uuid.New().String())
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{stored}})
-	doc := eoReadFake("BYTES", &storage.DmsFile{UUID: stored, Name: "a.pdf", MimeType: "application/pdf"})
+	doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: stored, Name: "a.pdf", MimeType: "application/pdf"})
 	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
 	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
@@ -1201,7 +1249,7 @@ func TestEOFileDownloadDoesNotRequireAFolder(t *testing.T) {
 	fileID := uuid.New().String()
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
 	rec.DocumentaFolderID = ""
-	doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+	doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
 	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
 	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
@@ -1212,6 +1260,13 @@ func TestEOFileDownloadDoesNotRequireAFolder(t *testing.T) {
 	if resp.StatusCode != fiber.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 200: a read is answered from the id the record holds, not from its folder: %s", resp.StatusCode, string(raw))
+	}
+	// And the placement check is SKIPPED rather than failed: there is no
+	// folder to compare against, so asking Documenta would only produce a
+	// mismatch against "". This is the residual case the register check
+	// alone has to carry, and it is deliberate.
+	if doc.infoCalls != 0 {
+		t.Errorf("GetFileInfo ran %d times for a record with no folder: there is nothing to compare the file's parent with", doc.infoCalls)
 	}
 }
 
@@ -1229,7 +1284,7 @@ func TestEOFileReadRoutesCarryTheViewGates(t *testing.T) {
 			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
 			gates := &eoGateRecorder{}
 			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
-			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
+			doc := eoReadFake(rec, "BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
 
 			app := fiber.New()
 			app.Use(eoTestActor(eoTestUser()))
@@ -1246,6 +1301,126 @@ func TestEOFileReadRoutesCarryTheViewGates(t *testing.T) {
 			}
 			if want := []string{"module", "type"}; !reflect.DeepEqual(gates.order, want) {
 				t.Errorf("guard order = %v, want %v", gates.order, want)
+			}
+		})
+	}
+}
+
+// TestEOFileDownloadRefusesAFileFiledOutsideTheRecordsFolder closes the
+// escalation the register check alone cannot.
+//
+// The register check proves the record REFERENCES the id. It cannot prove the
+// id was ever filed against this record: a value reaches a record's values
+// through the save pipeline or a transition, and neither can tell a real file
+// id from one the caller read somewhere else. So a clerk holding
+// eo:<type>:update on ANY record they can see could paste a foreign file id
+// into one of its fields and read the document — turning "once knew an id"
+// into permanent, un-revocable read access, which is precisely the property
+// the redirect was rejected for.
+//
+// Documenta's own filing settles it, and the ORDER is still load-bearing: the
+// register check runs first, so this call is made only about a file the
+// record already claims, by a caller who has cleared every gate.
+func TestEOFileDownloadRefusesAFileFiledOutsideTheRecordsFolder(t *testing.T) {
+	fileID := uuid.New().String()
+	someoneElsesFolder := uuid.New().String()
+
+	for routeName, path := range eoReadPaths("RECORD", fileID) {
+		t.Run(routeName+"/filed in another record's folder", func(t *testing.T) {
+			// The record DOES reference the id: this is the self-reference
+			// attack, so only the placement check can refuse it.
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			doc := eoReadFake(rec, "SECRET-BYTES", &storage.DmsFile{UUID: fileID, Name: "secret.pdf", MimeType: "application/pdf"})
+			doc.fileInfo = &storage.DmsFile{UUID: fileID, Type: "file", ParentUUID: someoneElsesFolder}
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusNotFound {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 404: a file filed in another folder is not this record's: %s", resp.StatusCode, string(raw))
+			}
+			eoRefusalEnvelope(t, resp)
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times: the placement check must refuse BEFORE the bytes are fetched", doc.downloadCalls)
+			}
+			if doc.infoCalls != 1 {
+				t.Errorf("GetFileInfo calls = %d, want 1", doc.infoCalls)
+			}
+		})
+
+		t.Run(routeName+"/filed at the workspace root", func(t *testing.T) {
+			// No parent at all is not a pass. An empty ParentUUID must fail
+			// the comparison exactly as a wrong one does — the asymmetry
+			// "unknown means allowed" is how this kind of check dies.
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			doc := eoReadFake(rec, "SECRET-BYTES", &storage.DmsFile{UUID: fileID, Name: "secret.pdf"})
+			doc.fileInfo = &storage.DmsFile{UUID: fileID, Type: "file", ParentUUID: ""}
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusNotFound {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 404 for a file with no parent folder: %s", resp.StatusCode, string(raw))
+			}
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times for a file with no parent folder", doc.downloadCalls)
+			}
+		})
+
+		t.Run(routeName+"/a nil answer is not a pass", func(t *testing.T) {
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			doc := eoReadFake(rec, "SECRET-BYTES", &storage.DmsFile{UUID: fileID, Name: "secret.pdf"})
+			doc.fileInfo = nil
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusNotFound {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 404 when Documenta answers nothing about the file: %s", resp.StatusCode, string(raw))
+			}
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times on an unconfirmed placement", doc.downloadCalls)
+			}
+		})
+
+		t.Run(routeName+"/a check that could not run refuses", func(t *testing.T) {
+			// An outage is not a pass EITHER, and it is not a 404: a check
+			// that could not run has made no decision, and reporting it as
+			// "no such file" would tell an operator the document is gone.
+			//
+			// It is a 5xx and NOT a 404-by-ErrFileNotFound, deliberately:
+			// GetFileInfo never returns storage.ErrFileNotFound (parseResponse
+			// flattens every non-2xx into a generic error), so an errors.Is
+			// arm on this call would be code that can never run.
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			doc := eoReadFake(rec, "SECRET-BYTES", &storage.DmsFile{UUID: fileID, Name: "secret.pdf"})
+			doc.infoErr = errors.New("documenta: request failed (503)")
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode < 500 {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want a 5xx: an unverifiable placement must not serve the bytes: %s", resp.StatusCode, string(raw))
+			}
+			eoRefusalEnvelope(t, resp)
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times although the placement could not be confirmed: the check fails CLOSED", doc.downloadCalls)
 			}
 		})
 	}

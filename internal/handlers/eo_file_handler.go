@@ -265,15 +265,21 @@ func eoClampFileName(name string) string {
 //
 // WHY THE BYTES AND NOT A URL. storage.DocumentaClient offers GetDownloadURL
 // and GetPreviewURL, and answering with one of those would be a shorter
-// handler. It would also be a hole: that URL is minted against DOCUMENTA's
-// authorisation, not EO's. Once issued it is a bearer of access that this
-// handler cannot scope to the record, cannot scope to the caller, and cannot
-// withdraw — it keeps working after the per-type permission that produced it
-// is revoked, after the record's visibility narrows, and for anyone the URL is
-// forwarded to. Everything else in this task is about making the record id in
-// the path mean something; handing out a URL that answers without it would
-// give that away at the last step. Streaming keeps every read inside the gate,
-// at the cost of the bytes passing through Automax.
+// handler. Read what they actually return (documenta_http.go:434-441): not a
+// signed Documenta URL, but a RELATIVE AUTOMAX PATH,
+// /api/v1/documents/files/<id>/{preview,download}. That path lands on the
+// DOCUMENTS module — gated on goals:view and running on the GOALS Documenta
+// client and config (cmd/server/main.go:207-218), which is a different token
+// and a different workspace from EO's (:268-284). So a redirect would do one
+// of exactly two things, and both are wrong: against a separate workspace it
+// 404s, and against a deployment that happens to point both configs at ONE
+// workspace it hands EO documents to any holder of goals:view, who has
+// cleared neither eo:view, nor eo:<type_key>:view, nor §7.11, nor the
+// record-ownership check below. Everything else in this task is about making
+// the record id in the path mean something; redirecting to a route that
+// answers without it, under another module's permission, would give that away
+// at the last step. Streaming keeps every read inside THIS gate, at the cost
+// of the bytes passing through Automax.
 func (h *EOFileHandler) Download(c *fiber.Ctx) error {
 	return h.serveFile(c, "attachment")
 }
@@ -349,12 +355,78 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 	// system@automax.local.
 	ctx := storage.ContextWithOnBehalf(c.UserContext(), user.Email)
 
+	// ── THE SECOND OWNERSHIP CHECK: DOCUMENTA'S OWN FILING ──
+	//
+	// The register check above proves the record REFERENCES this id. It
+	// cannot prove the id was ever filed against this record, because a value
+	// gets into a record's values through the save pipeline or a transition,
+	// and neither can tell a real file id from one the caller read somewhere
+	// else. So a caller holding eo:<type>:update on any record they can see
+	// could write a foreign file id into one of its fields and read it here —
+	// which converts "once knew an id" into permanent, un-revocable read
+	// access. That is the very property the redirect was rejected for,
+	// reintroduced one layer down.
+	//
+	// GetFileInfo closes it: it maps MyDocs' parentUuid onto ParentUUID
+	// (documenta_http.go:629-665), so the file's REAL parent folder can be
+	// compared with the record's own. DownloadFile cannot be used for this —
+	// it fills DmsFile from the download response headers and leaves
+	// ParentUUID empty, which is why this is a separate call and not a check
+	// on the bytes already in hand.
+	//
+	// It runs AFTER the register check, never instead of it, so a file that
+	// is not on the record still reaches Documenta zero times. By the time
+	// this call is made the caller has cleared the module gate, the per-type
+	// gate, §7.11 and the register — asking Documenta about the file is no
+	// longer asking on behalf of someone who may not ask.
+	//
+	// LIMITS, stated rather than assumed:
+	//   - A record with an EMPTY documenta_folder_id cannot be checked: there
+	//     is nothing to compare against, and those records legitimately hold
+	//     files filed by a transition. They fall back to the register check
+	//     alone. Skipping is therefore deliberate, not an oversight.
+	//   - Direct-parent equality assumes a record's files sit directly in its
+	//     folder, which is what Upload does. If EO ever nests subfolders under
+	//     a record folder this must become a containment test over
+	//     GetFileBreadcrumb.
+	//   - It does not fix the SAVE path: a bogus id still lands in the
+	//     register and is only refused when someone tries to read it.
+	//
+	// An error here is NOT special-cased into a 404. GetFileInfo never
+	// returns storage.ErrFileNotFound — parseResponse flattens every non-2xx
+	// into a generic error (documenta_http.go:253-258) — so an errors.Is arm
+	// would be dead code. A check that could not run has not made a decision,
+	// so it refuses with a 5xx rather than serving.
+	if folder := strings.TrimSpace(rec.DocumentaFolderID); folder != "" {
+		placement, infoErr := h.documenta.GetFileInfo(ctx, fileID)
+		if infoErr != nil {
+			log.Printf("[EO] record %s: could not confirm that file %s is filed in folder %s: %v", rec.Reference, fileID, folder, infoErr)
+			return utils.InternalErrorResponse(c, infoErr, i18n.T(c.UserContext(), "failed_to_retrieve_file"))
+		}
+		// A nil answer and a parent that is not this record's folder get the
+		// same treatment: unproven is refused. An empty ParentUUID — a file at
+		// the workspace root — falls here too, by the same comparison.
+		if placement == nil || !strings.EqualFold(strings.TrimSpace(placement.ParentUUID), folder) {
+			parent := "<none>"
+			if placement != nil {
+				parent = placement.ParentUUID
+			}
+			log.Printf("[EO] record %s: refused a read of file %s — it is filed under %s, not under the record's folder %s", rec.Reference, fileID, parent, folder)
+			return utils.ErrorResponse(c, fiber.StatusNotFound, fmt.Sprintf(
+				"%s has no such file. A file can only be read through the record it is filed on.", rec.Reference))
+		}
+	}
+
 	reader, info, err := h.documenta.DownloadFile(ctx, fileID)
 	if err != nil {
 		// A file the register references and Documenta no longer holds is a
 		// 404, not a 500: nothing in Automax is broken and the operator needs
 		// to be told the document is gone. Any other upstream failure stays a
 		// 5xx, so an outage can never be read as a deleted document.
+		//
+		// Still reachable with the placement check above in place: a record
+		// with no folder skips that check entirely, and a file deleted
+		// between the two calls arrives here too.
 		if errors.Is(err, storage.ErrFileNotFound) {
 			log.Printf("[EO] record %s references file %s, which Documenta does not hold: %v", rec.Reference, fileID, err)
 			return utils.ErrorResponse(c, fiber.StatusNotFound, fmt.Sprintf(
@@ -385,11 +457,16 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 		log.Printf("[EO] closing file %s on record %s: %v", fileID, rec.Reference, closeErr)
 	}
 
+	// The file id is the fallback name: Documenta sets Content-Disposition on
+	// the download endpoint, but a client that does not is not a reason to
+	// answer with a nameless attachment. The test is on what Documenta SENT,
+	// not on what the sanitiser returned — eoSanitiseFileName never returns
+	// "", so a `!= ""` guard on its output would be an arm that cannot fire.
 	name := fileID
 	mime := ""
 	if info != nil {
-		if n := eoSanitiseFileName(info.Name); n != "" && n != "upload" {
-			name = n
+		if strings.TrimSpace(info.Name) != "" {
+			name = eoSanitiseFileName(info.Name)
 		}
 		mime = strings.TrimSpace(info.MimeType)
 	}
