@@ -671,6 +671,7 @@ var messages = map[string][2]string{
 	"unknown_bulk_action":                {"Unknown action: %s", "إجراء غير معروف: %s"},
 	"import_failed_detail":               {"Import failed: %s", "فشل الاستيراد: %s"},
 	"validation_failed_detail":           {"Validation failed: %s", "فشل التحقق: %s"},
+	"eo_and_n_more_fields":               {"and %d more field(s)", "و%d حقل (حقول) أخرى"},
 	"failed_to_list_value_changes":       {"Failed to list value changes", "فشل سرد تغييرات القيمة"},
 	"failed_to_create_check_in":          {"Failed to create check-in", "فشل إنشاء نقطة التتبع"},
 	"failed_to_delete_check_in":          {"Failed to delete check-in", "فشل حذف نقطة التتبع"},

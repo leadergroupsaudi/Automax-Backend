@@ -306,11 +306,15 @@ func TestCreateEORecordValidationErrorShape(t *testing.T) {
 	if out.Success {
 		t.Errorf("success = %v, want false", out.Success)
 	}
-	if out.Error != "" {
-		t.Errorf("error = %q, want the map shape and no error string", out.Error)
+	// BOTH KEYS. The map is what the form needs, and `error` is what any
+	// client that is not that form shows the user: the EO client renders
+	// `message || error` and had nothing to render, so a refusal naming the
+	// exact field read as a generic failure.
+	if !strings.Contains(out.Error, "subject_ar") {
+		t.Errorf("error = %q, want a human-readable line naming subject_ar: a client that reads `message || error` shows a generic failure without it", out.Error)
 	}
 	if got := out.Errors["subject_ar"]; got != "is required" {
-		t.Errorf("errors[subject_ar] = %q, want %q", got, "is required")
+		t.Errorf("errors[subject_ar] = %q, want %q: the field map must NOT be removed, it is what a form needs", got, "is required")
 	}
 }
 
@@ -1261,8 +1265,15 @@ func TestExecuteEOTransitionMapsRefusalsToStatuses(t *testing.T) {
 				if out.Errors[tc.wantErrKey] == "" {
 					t.Errorf("errors = %v, want a message under %q", out.Errors, tc.wantErrKey)
 				}
-				if out.Error != "" {
-					t.Errorf("error = %q, want the map shape", out.Error)
+				// A transition refused for a missing field value must be
+				// SHOWABLE. Every other refusal on this route answers
+				// through utils.ErrorResponse and carries `error`; this one
+				// carried only the map, and the EO client reads
+				// `message || error`, so the user saw a generic failure for
+				// the one refusal they could actually act on. The pilot
+				// seeds at-state-required non-file fields, so it is reached.
+				if !strings.Contains(out.Error, tc.wantErrKey) {
+					t.Errorf("error = %q, want a human-readable line naming %q alongside the field map", out.Error, tc.wantErrKey)
 				}
 			}
 		})

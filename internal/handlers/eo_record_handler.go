@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
@@ -156,13 +157,57 @@ func eoActor(c *fiber.Ctx) (*models.User, bool, error) {
 	return user, true, nil
 }
 
-// eoFieldErrors is the {"success":false,"errors":{field:message}} shape the EO
-// forms read, which is a MAP — not the {"error":"..."} string shape.
+// eoFieldErrors is the {"success":false,"errors":{field:message},"error":"…"}
+// shape the EO forms read. `errors` is a MAP, and it is the part a form
+// needs; `error` is the same refusal as one line.
+//
+// IT CARRIES BOTH. The map is what a form needs: it puts each message under
+// the input that caused it. But `errors` alone is unreadable to anything that
+// is not that form, and the EO client reads `message || error` for the text
+// it shows — so a transition refused because an at-state-required field is
+// empty (services.EOValidationError, raised on a route whose every OTHER
+// refusal answers through utils.ErrorResponse and therefore carries `error`)
+// showed the user a generic failure with the actual reason present in the
+// body and unread. The pilot seeds at-state-required non-file fields, so
+// that is reachable, not hypothetical.
+//
+// The summary is DERIVED from the same map rather than passed in, so the two
+// cannot disagree, and it is sorted because Go map order is random and a
+// message that changes between two identical requests is a bug report nobody
+// can reproduce. It is capped: the point is to name the problem, not to
+// re-render the form in a sentence.
 func eoFieldErrors(c *fiber.Ctx, fields map[string]string) error {
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 		"success": false,
 		"errors":  fields,
+		"error":   eoFieldErrorSummary(c, fields),
 	})
+}
+
+// eoFieldErrorSummary renders a field-error map as one human-readable line.
+const eoFieldErrorSummaryMax = 3
+
+func eoFieldErrorSummary(c *fiber.Ctx, fields map[string]string) string {
+	if len(fields) == 0 {
+		// Unreachable through the callers, which all raise at least one
+		// field, and kept so the helper is total: a bare "Validation failed"
+		// still tells the user what kind of refusal this was.
+		return i18n.T(c.UserContext(), "validation_failed")
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, eoFieldErrorSummaryMax)
+	for _, k := range keys {
+		if len(parts) == eoFieldErrorSummaryMax {
+			parts = append(parts, i18n.Tf(c.UserContext(), "eo_and_n_more_fields", len(keys)-eoFieldErrorSummaryMax))
+			break
+		}
+		parts = append(parts, k+": "+fields[k])
+	}
+	return i18n.Tf(c.UserContext(), "validation_failed_detail", strings.Join(parts, "; "))
 }
 
 // eoServiceError maps a service refusal to its status explicitly. A validation
