@@ -768,6 +768,55 @@ func TestExecuteEnforcesRequirements(t *testing.T) {
 		}
 	})
 
+	// eoAttachmentIDs is what makes this true, and nothing else tested it:
+	// the requirement counts the ids that survive the blank filter, not the
+	// entries of the list the request sent. Without it an empty string — what
+	// a web form posts for a file input nobody filled — satisfies a mandatory
+	// attachment, and the transition commits with its control unmet and
+	// nothing filed.
+	//
+	// Mutations that make it fail: in eoCheckRequirements, count
+	// len(input.Attachments) instead of len(ids) — the two single-blank cases
+	// then transition with the control unmet; or, in eoAttachmentIDs, drop
+	// the `strings.TrimSpace(id) == ""` skip — the last case then counts the
+	// blank as a second attachment and trips the single-attachment limit.
+	// (Under that second mutation the single-blank cases still refuse, but
+	// for another reason entirely: the blank reaches the file-shape check as
+	// a filed id. The last case is what pins the filter itself.)
+	t.Run("a blank entry is not an attachment", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			in   []string
+		}{
+			{"one empty string", []string{""}},
+			{"whitespace only", []string{"   "}},
+			{"several blanks", []string{"", "  ", "\t"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := eoNewTxFixture(t)
+				f.transition("raise").Requirements = []models.TransitionRequirement{
+					{RequirementType: "attachment", IsMandatory: eoTxMandatory(true)},
+				}
+				if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: tc.in}); err == nil {
+					t.Fatalf("%#v satisfied a mandatory attachment", tc.in)
+				}
+			})
+		}
+
+		// The other side of the same filter: a blank beside a real id is not
+		// a second attachment, so it must not trip the single-attachment
+		// limit either.
+		t.Run("a blank beside an id is not a second attachment", func(t *testing.T) {
+			f := eoNewTxFixture(t)
+			f.transition("raise").Requirements = []models.TransitionRequirement{
+				{RequirementType: "attachment", IsMandatory: eoTxMandatory(true)},
+			}
+			if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{"", uuid.NewString()}}); err != nil {
+				t.Fatalf("one id and one blank were refused as several attachments: %v", err)
+			}
+		})
+	})
+
 	t.Run("a single-attachment requirement refuses several", func(t *testing.T) {
 		f := eoNewTxFixture(t)
 		f.transition("raise").Requirements = []models.TransitionRequirement{
