@@ -576,12 +576,23 @@ func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 //
 // So the refresh is NARROW: eoTypePermissionsPending opens the convergent
 // step when a row still carries one of these, and eoSeedTypePermissions
-// rewrites ONLY rows that carry one. That is reachable (a stale row opens the
-// gate), idempotent (after the rewrite nothing carries it and the gate shuts)
-// and structurally incapable of touching an edited row, which by definition
-// no longer carries the sentence. The previous attempt rewrote on ANY
-// difference from the computed text, which is every edited row — and could
-// not run at all, because nothing opened the gate for a stale description.
+// rewrites ONLY the COLUMN that carries one.
+//
+// PER COLUMN, NOT PER ROW, and that distinction is the whole correctness of
+// this. PUT /api/v1/admin/permissions/:id writes `description` and NOTHING
+// ELSE — there is no description_ar in that request (handlers.UpdatePermission).
+// So the state an administrator's edit actually produces on a pre-A2 row is
+// an edited ENGLISH description beside the legacy ARABIC one. A row-level
+// predicate sees the stale Arabic, declares the row stale, and rewrites both
+// columns — destroying the edit. That was reproduced, and the first attempt's
+// tests missed it because both of them set description AND description_ar to
+// the edited text, which is a state the API cannot produce: a test built on
+// an unreachable input proves nothing about the reachable ones.
+//
+// The result is reachable (a stale column opens the gate), idempotent (after
+// the rewrite no column carries the sentence and the gate shuts), and it
+// cannot touch a column an administrator has edited, because an edited column
+// no longer carries the sentence that selects it.
 //
 // Pinned by TestEoStaleInertDescriptionsAreRefreshedByTheRealSeed and
 // TestEoSeedDoesNotRevertAnAdministratorsDescriptionEdit, both of which drive
@@ -592,31 +603,44 @@ const (
 	eoTypePermissionLegacyInertAR = "غير مُطبَّق بعد: لا شيء في المنصة يقرأ هذا الرمز، ومنحه يسجّل نيّة ولا يطبّق أي ضابط."
 )
 
-// eoTypePermissionIsStale reports whether a stored row still carries the
-// pre-A2 inert sentence in either language. It is the ONE predicate the gate
-// and the writer share, so the step cannot open on a row the writer then
-// declines to touch — which would make the seed transaction run on every boot
-// for ever.
+// eoTypePermissionENIsStale and eoTypePermissionARIsStale ask the question one
+// COLUMN at a time, because that is the granularity an administrator's edit
+// has: PUT /api/v1/admin/permissions/:id writes the English description only.
+func eoTypePermissionENIsStale(p models.Permission) bool {
+	return strings.Contains(p.Description, eoTypePermissionLegacyInertEN)
+}
+
+func eoTypePermissionARIsStale(p models.Permission) bool {
+	return strings.Contains(p.DescriptionAr, eoTypePermissionLegacyInertAR)
+}
+
+// eoTypePermissionIsStale is the gate's question: is there anything here to
+// rewrite? It is the OR of the two above and nothing else, so the step cannot
+// open on a row the writer then declines to touch — which would make the seed
+// transaction run on every boot for ever.
 func eoTypePermissionIsStale(p models.Permission) bool {
-	return strings.Contains(p.Description, eoTypePermissionLegacyInertEN) ||
-		strings.Contains(p.DescriptionAr, eoTypePermissionLegacyInertAR)
+	return eoTypePermissionENIsStale(p) || eoTypePermissionARIsStale(p)
 }
 
 // eoSeedTypePermissions writes eo:<type_key>:view|create|update for every
 // CONCRETE record type and grants the lot to admin and executive_office.
 //
-// NOT ENFORCED IN PLAN 1. Nothing consults these codes: every EO route is
-// gated by the MODULE-level codes (eo:view, eo:create, eo:update,
-// eo:transition, eo:types:manage) registered in
-// handlers.EORecordHandler.RegisterRoutes, and row-level visibility is the
-// repository's §7.11 clause. Granting or revoking eo:<type_key>:view today
-// changes nothing about what anyone can see or do. They are seeded anyway, and
-// deliberately: they are a seeded table (licensing/catalog_test.go asserts
-// every module a catalogued feature names is seeded), and the per-type gate
-// that will consult them is Plan 2 work, which should find the codes already
-// present and already granted rather than having to invent them against live
-// roles. An administrator reading the permission list should know that
-// checking one of these boxes is, for now, a statement of intent.
+// ENFORCED AS OF PLAN 3 TASK A2, where it was inert through Plans 1 and 2.
+// Two surfaces consult these codes now: middleware.EOTypePermission refuses a
+// record of a type the caller was not granted, and
+// repository.applyEORecordTypePermissions restricts the register to the types
+// whose view code the caller holds. The module-level codes (eo:view,
+// eo:create, eo:update, eo:transition, eo:types:manage) still gate the API
+// surface and row-level visibility is still the repository's other §7.11
+// clause; the per-type codes NARROW both. Granting or revoking
+// eo:<type_key>:view now changes what that role can see and do.
+//
+// They are seeded rather than created on demand because permissions are a
+// seeded table (licensing/catalog_test.go asserts every module a catalogued
+// feature names is seeded). A type an administrator creates at RUNTIME gets
+// its codes from repository.eoRecordTypeRepository.Create, which writes them
+// through the same models.EOTypePermissionsFor constructor — a type whose
+// codes waited for the next boot would be invisible to everyone until then.
 //
 // The module-level eo:* codes seeded in postgres.go gate the API surface;
 // these gate individual types. They are seeded rather than generated at
@@ -634,13 +658,16 @@ func eoTypePermissionIsStale(p models.Permission) bool {
 // seed's seed_type_permissions step, because the eleven pilot types are
 // created after the platform seed has already applied. The existence check
 // below keys on Code, so the second call adds exactly the types seeded since
-// the first — and, for the same reason, NEVER UPDATES AN EXISTING ROW. A
-// permission whose description was written before the sentences above existed
-// keeps the old text until somebody rewrites it; today that is nothing (the
-// only rows that predate them were the smoke types', which the pilot seed
-// deletes), but a future change to the wording will not reach rows already in
-// a customer's database. The grant is re-applied on every call and is safe:
-// GORM's many-to-many Append writes the join rows ON CONFLICT DO NOTHING.
+// the first. The ONE thing it changes about an existing row is a description
+// column still carrying the pre-A2 inert sentence (see
+// eoTypePermissionLegacyInertEN above): nothing else about a row that already
+// exists is touched, and a column an administrator has edited is not, because
+// the sentence is what selects it. A later rewording of the ENFORCED sentence
+// would again not reach rows already in a customer's database — that is a
+// known limit of keying the rewrite on the old text, and the honest price of
+// not reverting administrators' edits. The grant is re-applied on every call
+// and is safe: GORM's many-to-many Append writes the join rows ON CONFLICT DO
+// NOTHING.
 
 func eoSeedTypePermissions(db *gorm.DB) error {
 	var concrete []models.EORecordType
@@ -664,17 +691,26 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 				}
 			case err != nil:
 				return fmt.Errorf("check permission %q: %w", perm.Code, err)
-			case eoTypePermissionIsStale(stored):
-				// A row written before Task A2, still telling its
-				// administrator that the code applies no control. Only the
-				// two description columns move, and only for a row carrying
-				// the old sentence: an administrator's own edit does not, and
-				// is left exactly as they wrote it.
+			default:
+				// A row written before Task A2 is still telling its
+				// administrator that the code applies no control. Each
+				// description column is rewritten ONLY if that column itself
+				// carries the old sentence: an administrator who edited the
+				// English keeps their English, and the Arabic beside it —
+				// which their edit could not have touched — is brought up to
+				// date.
+				updates := map[string]any{}
+				if eoTypePermissionENIsStale(stored) {
+					updates["description"] = perm.Description
+				}
+				if eoTypePermissionARIsStale(stored) {
+					updates["description_ar"] = perm.DescriptionAr
+				}
+				if len(updates) == 0 {
+					break
+				}
 				if err := db.Model(&models.Permission{}).Where("id = ?", stored.ID).
-					Updates(map[string]any{
-						"description":    perm.Description,
-						"description_ar": perm.DescriptionAr,
-					}).Error; err != nil {
+					Updates(updates).Error; err != nil {
 					return fmt.Errorf("refresh the description of permission %q: %w", perm.Code, err)
 				}
 			}

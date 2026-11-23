@@ -3219,7 +3219,7 @@ func eoCapabilityBlob(entries []eoCapabilityEnablement) ([]byte, error) {
 // THE CODES ARE ENFORCED as of Task A2 — the route gate
 // (middleware.EOTypePermission) and the register's list filter
 // (repository.applyEORecordTypePermissions) both consult them — and the
-// wording an administrator reads says so; see eoTypePermissionEnforcedEN.
+// wording an administrator reads says so; see models.EOTypePermissionEnforcedEN.
 func eoSeedPilotTypePermissions(tx *gorm.DB) (bool, error) {
 	return true, eoSeedTypePermissions(tx)
 }
