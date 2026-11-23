@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
@@ -245,6 +246,17 @@ func (r *eoRecordTypeRepository) List(ctx context.Context) ([]models.EORecordTyp
 // retained records stay readable by whoever held its codes. Whether that is
 // right is a records-management question for the client, recorded as an open
 // product question in the task report.
+//
+// THREE OTHER STATES REACH THIS REFUSAL, and the message an operator reads
+// must be true of all four. Besides a retired type: a type made abstract and
+// then concrete again meets ITS OWN codes (permissions record no owning type,
+// so they cannot be told apart); a key renamed away leaves its codes behind,
+// so renaming back is refused; and a DELETED permission still occupies its
+// code, because permissions.code is uniquely indexed with no deleted_at
+// predicate. That last one also means the obvious remedy does not work —
+// DELETE /api/v1/admin/permissions/:id is a soft delete and frees nothing.
+// The only remedies are a different key or direct database access, and
+// i18n key eo_record_type_key_has_permissions says exactly that.
 var ErrEOTypePermissionCodesExist = errors.New("per-type permission codes already exist for this record type key")
 
 // ErrEOTypePermissionRoleMissing marks a write refused because a role in
@@ -308,6 +320,32 @@ func (r *eoRecordTypeRepository) Create(ctx context.Context, t *models.EORecordT
 		}
 		return eoWriteTypePermissions(tx, *t)
 	})
+}
+
+// eoLogTypeWithNoLiveCodes writes one line when a concrete type ends an edit
+// with no LIVE per-type code, which makes it invisible to everybody but a
+// super admin.
+//
+// It is reachable only by an administrator deleting the codes, and the
+// designer does not resurrect those — the same rule the seed applies to a
+// revoked grant. But nothing else would say so: the type is there, the
+// register is empty, and the reason is three deleted rows in another table.
+// One line in the log is the difference between a five-minute answer and an
+// afternoon.
+func eoLogTypeWithNoLiveCodes(tx *gorm.DB, t models.EORecordType) {
+	codes := make([]string, 0, len(models.EOTypePermissionActions))
+	for _, a := range models.EOTypePermissionActions {
+		codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
+	}
+	var live int64
+	if err := tx.Model(&models.Permission{}).Where("code IN ?", codes).Count(&live).Error; err != nil {
+		log.Printf("[EO] could not check the per-type permission codes of %q: %v", t.Key, err)
+		return
+	}
+	if live == 0 {
+		log.Printf("[EO] record type %q has NO live per-type permission code (%s): only a super admin can see its records. The codes exist but are deleted, and a deleted permission is not resurrected.",
+			t.Key, strings.Join(codes, ", "))
+	}
 }
 
 // eoExistingTypePermissionCodes returns which of the type's three codes are
@@ -378,6 +416,7 @@ func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType) error {
 		}
 		created = append(created, perm)
 	}
+	eoLogTypeWithNoLiveCodes(tx, t)
 	if len(created) == 0 {
 		return nil
 	}

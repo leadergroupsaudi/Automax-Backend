@@ -801,3 +801,86 @@ func TestEORecordTypeUpdateDoesNotResurrectADeletedPermission(t *testing.T) {
 		t.Errorf("%d live codes after an edit, want 0: the designer resurrected what an administrator deleted", n)
 	}
 }
+
+// TestEORecordTypeRenameStrandsTheOldCodes pins what a key rename actually
+// does to §7.11's codes, because all three consequences are invisible from
+// the designer and none of them was tested.
+//
+// Renaming eo_a → eo_b creates eo_b's codes and leaves eo_a's rows and grants
+// exactly where they were. So:
+//
+//  1. a custom role holding eo:eo_a:view silently loses the type — the new
+//     codes go to models.EOTypePermissionRoleCodes and nowhere else;
+//  2. eo_a's codes are stranded, held by whoever held them, naming a type key
+//     no live type uses;
+//  3. renaming back is permanently REFUSED, because those stranded codes are
+//     indistinguishable from a retired type's.
+//
+// This test does NOT assert that any of that is desirable. Migrating grants
+// across a rename is parked: permission rows record no owning type, so
+// nothing here can tell "this type's own codes" from "somebody else's", and
+// the fix is a schema change to a table every module shares. What the test
+// does is make the behaviour visible, so the next person meets it here rather
+// than in a deployment.
+func TestEORecordTypeRenameStrandsTheOldCodes(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	ctx := context.Background()
+
+	ty := &models.EORecordType{ID: uuid.New(), Key: "eo_a", Name: "A", IsActive: true}
+	if err := types.Create(ctx, ty); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A custom role an administrator granted the type to by hand.
+	counsel := models.Role{ID: uuid.New(), Name: "Legal Review", Code: "legal_review", IsActive: true}
+	if err := db.Create(&counsel).Error; err != nil {
+		t.Fatalf("create the custom role: %v", err)
+	}
+	oldView := models.EOTypePermissionCode("eo_a", models.EOTypePermissionView)
+	var viewPerm models.Permission
+	if err := db.Where("code = ?", oldView).First(&viewPerm).Error; err != nil {
+		t.Fatalf("read %q: %v", oldView, err)
+	}
+	if err := db.Model(&counsel).Association("Permissions").Append([]models.Permission{viewPerm}); err != nil {
+		t.Fatalf("grant it: %v", err)
+	}
+
+	renamed := *ty
+	renamed.Key = "eo_b"
+	if err := types.Update(ctx, &renamed); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	// 1. the new key's codes exist and are granted to the seeded roles only.
+	if n := eoCountTypeCodes(t, db, "eo_b"); n != 3 {
+		t.Errorf("%d codes for the new key, want 3", n)
+	}
+	newView := models.EOTypePermissionCode("eo_b", models.EOTypePermissionView)
+	if user := eoRoleUser(t, db, "executive_office"); !user.HasPermission(newView) {
+		t.Errorf("executive_office does not hold %q after the rename", newView)
+	}
+	// 2. the custom role was NOT carried across: it still holds the old code,
+	//    and the old code now names nothing live.
+	legal := eoRoleUser(t, db, "legal_review")
+	if legal.HasPermission(newView) {
+		t.Error("the custom role was granted the new code; this test's premise, and the parked design question, are stale")
+	}
+	if !legal.HasPermission(oldView) {
+		t.Errorf("the custom role lost %q as well, which is not what a rename does", oldView)
+	}
+	if n := eoCountTypeCodes(t, db, "eo_a"); n != 3 {
+		t.Errorf("%d stranded codes for the old key, want 3", n)
+	}
+
+	// 3. and renaming back is refused, with the message that says so.
+	back := renamed
+	back.Key = "eo_a"
+	err := types.Update(ctx, &back)
+	if !errors.Is(err, ErrEOTypePermissionCodesExist) {
+		t.Fatalf("renaming back = %v, want ErrEOTypePermissionCodesExist", err)
+	}
+	if !strings.Contains(err.Error(), oldView) {
+		t.Errorf("the refusal does not name the stranded codes: %v", err)
+	}
+}
