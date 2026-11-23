@@ -400,6 +400,7 @@ func EOSortKeys() []string {
 // is applied here, unconditionally: no filter field can switch it off.
 func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error) {
 	q = applyEORecordVisibility(q, f)
+	q = applyEORecordTypePermissions(q, f)
 
 	if f.RecordID != nil {
 		q = q.Where("eo_records.id = ?", *f.RecordID)
@@ -482,6 +483,47 @@ func applyEORecordVisibility(q *gorm.DB, f *models.EORecordFilter) *gorm.DB {
 		args = append(args, bodies)
 	}
 	return q.Where("("+strings.Join(clauses, " OR ")+")", args...)
+}
+
+// applyEORecordTypePermissions enforces §7.11's PER-TYPE permissions over the
+// register. It is the second half of the control middleware.EOTypePermission
+// starts: that gate answers 403 for one record reached by its id, and a route
+// check cannot narrow a result set — without this clause a caller who does not
+// hold eo:eo_decision_record:view is refused one Decision Record and shown
+// every Decision Record by GET /eo-records.
+//
+// IT LIVES HERE, beside applyEORecordVisibility and for that function's own
+// reason: a new endpoint that queries the register cannot bypass it. It
+// composes with visibility rather than replacing it — the two are ANDed, so a
+// caller who passes the type gate can still be refused by visible_to.
+//
+// IT FAILS CLOSED. The keys come from the caller's own permission codes; a
+// caller holding none matches no type and sees an EMPTY register. A filter
+// that treated "no codes supplied" as "no restriction" would be switched off
+// by every caller who forgot to supply them, which is exactly the inert guard
+// this mechanism has been for two plans.
+//
+// THE CODE FORMAT NEVER REACHES SQL. The keys are derived in Go by
+// models.EOTypeKeysFromPermissionCodes, the inverse of the function the seed
+// writes the codes with; a literal 'eo:' || key || ':view' in this WHERE
+// clause would be a second spelling that nothing could keep in step with the
+// seed — the shape of the Plan 1 Critical where visibility was seeded under
+// `visibility` and read as `visible_to`.
+//
+// The subquery names the TABLE rather than the model, deliberately: GORM would
+// add deleted_at IS NULL for the model, and soft-deleting a record type would
+// then drop its records out of the restricted set and unhide them for
+// everybody. Deleting a type is a configuration change, not a declassification.
+func applyEORecordTypePermissions(q *gorm.DB, f *models.EORecordFilter) *gorm.DB {
+	if f.IsAdmin {
+		return q
+	}
+	keys := models.EOTypeKeysFromPermissionCodes(f.PermissionCodes, models.EOTypePermissionView)
+	allowed := q.Session(&gorm.Session{NewDB: true}).
+		Table("eo_record_types").
+		Select("id").
+		Where("key IN ?", keys)
+	return q.Where("eo_records.record_type_id IN (?)", allowed)
 }
 
 // eoLikeEscaper makes a search term match literally inside ILIKE.

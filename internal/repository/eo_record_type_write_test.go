@@ -264,7 +264,10 @@ func TestEOLinkTypeWritesRoundTrip(t *testing.T) {
 func TestEORecordListFilterByRecordID(t *testing.T) {
 	db := eoRecordDB(t)
 	repo := NewEORecordRepository(db)
-	typeID := uuid.New()
+	// Catalogued and granted below: §7.11's per-type gate is its own clause,
+	// and an ungranted caller would see nothing here whatever RecordID said.
+	typeID := eoCatalogueType(t, db, "eo_directive")
+	held := []string{models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView)}
 	wanted := eoListRec(t, repo, typeID, "EO-DIR-2026-001", nil)
 	eoListRec(t, repo, typeID, "EO-DIR-2026-002", nil)
 
@@ -289,7 +292,7 @@ func TestEORecordListFilterByRecordID(t *testing.T) {
 			r.Values = []byte(`{"visible_to":"` + body.String() + `"}`)
 		})
 		// A caller who belongs to no body and did not create it.
-		f := models.EORecordFilter{RecordID: &restricted.ID, UserID: uuid.New()}
+		f := models.EORecordFilter{RecordID: &restricted.ID, UserID: uuid.New(), PermissionCodes: held}
 		got, total, err := repo.List(context.Background(), &f)
 		if err != nil {
 			t.Fatalf("List: %v", err)
@@ -330,7 +333,8 @@ func TestEORecordListFilterByParentID(t *testing.T) {
 	db := eoRecordDB(t)
 	repo := NewEORecordRepository(db)
 	ctx := context.Background()
-	typeID := uuid.New()
+	typeID := eoCatalogueType(t, db, "eo_directive")
+	held := []string{models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView)}
 	body := uuid.New()
 
 	parent := eoListRec(t, repo, typeID, "EO-DIR-2026-100", nil)
@@ -347,7 +351,7 @@ func TestEORecordListFilterByParentID(t *testing.T) {
 	parentID := parent.ID.String()
 
 	t.Run("a caller outside the restricted body sees one child", func(t *testing.T) {
-		f := models.EORecordFilter{ParentID: &parentID, UserID: uuid.New(), SortBy: "reference", SortDir: "asc"}
+		f := models.EORecordFilter{ParentID: &parentID, UserID: uuid.New(), PermissionCodes: held, SortBy: "reference", SortDir: "asc"}
 		got, total, err := repo.List(ctx, &f)
 		if err != nil {
 			t.Fatalf("List: %v", err)
@@ -364,6 +368,7 @@ func TestEORecordListFilterByParentID(t *testing.T) {
 		f := models.EORecordFilter{
 			ParentID:               &parentID,
 			UserID:                 uuid.New(),
+			PermissionCodes:        held,
 			VisibleToDepartmentIDs: []uuid.UUID{body},
 			SortBy:                 "reference",
 			SortDir:                "asc",

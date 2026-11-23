@@ -634,3 +634,166 @@ func TestEORecordRecordsOfTypeIsTheWholeTypeNotAPage(t *testing.T) {
 		}
 	})
 }
+
+// ── §7.11 per-type permissions: the register's half ─────────────────────────
+
+// eoCatalogueType inserts a record type into the catalogue and returns its id.
+// The per-type filter matches eo_record_types.key against the codes the caller
+// holds, so a test that creates records under an id with no catalogue row is
+// testing nothing the register can answer.
+func eoCatalogueType(t *testing.T, db *gorm.DB, key string) uuid.UUID {
+	t.Helper()
+	ty := models.EORecordType{ID: uuid.New(), Key: key, Name: key, IsActive: true}
+	if err := db.Create(&ty).Error; err != nil {
+		t.Fatalf("catalogue type %q: %v", key, err)
+	}
+	return ty.ID
+}
+
+// eoHolderOf is the filter a handler builds for a plain, non-super-admin
+// caller holding exactly these permission codes.
+func eoHolderOf(codes ...string) models.EORecordFilter {
+	return models.EORecordFilter{
+		UserID:          uuid.New(),
+		PermissionCodes: codes,
+		SortBy:          "reference",
+		SortDir:         "asc",
+	}
+}
+
+// TestEORecordListFiltersByTypePermission is the second surface of §7.11's
+// per-type gate, and the one that gets forgotten: the route check answers 403
+// for ONE record, but without this clause a caller who does not hold
+// eo:eo_decision_record:view is still shown every Decision Record in the
+// register.
+//
+// Every assertion states the returned set EXACTLY. "The result contains a
+// Directive" would pass whether or not the Decision Records were filtered out,
+// which is the shape of test this programme has shipped a dozen times.
+func TestEORecordListFiltersByTypePermission(t *testing.T) {
+	db := eoRecordDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	directiveT := eoCatalogueType(t, db, "eo_directive")
+	decisionT := eoCatalogueType(t, db, "eo_decision_record")
+	eoListRec(t, repo, directiveT, "DIR-1", nil)
+	eoListRec(t, repo, directiveT, "DIR-2", nil)
+	eoListRec(t, repo, decisionT, "DEC-1", nil)
+
+	view := func(key string) string {
+		return models.EOTypePermissionCode(key, models.EOTypePermissionView)
+	}
+	list := func(name string, f models.EORecordFilter, want ...string) {
+		t.Helper()
+		got, total, err := repo.List(ctx, &f)
+		if err != nil {
+			t.Fatalf("%s: list: %v", name, err)
+		}
+		if want == nil {
+			want = []string{}
+		}
+		if refs := eoRefs(got); !reflect.DeepEqual(refs, want) || total != int64(len(want)) {
+			t.Errorf("%s: refs %v total %d, want exactly %v", name, refs, total, want)
+		}
+	}
+
+	list("directives only", eoHolderOf("eo:view", view("eo_directive")), "DIR-1", "DIR-2")
+	list("decisions only", eoHolderOf("eo:view", view("eo_decision_record")), "DEC-1")
+	list("both types", eoHolderOf(view("eo_directive"), view("eo_decision_record")), "DEC-1", "DIR-1", "DIR-2")
+
+	// The module-level code is not a per-type grant. A caller holding eo:view
+	// and nothing else sees an EMPTY register, not the whole of it: "eo:view"
+	// ends with ":view", and reading it as a type key called "view" is the one
+	// way this filter silently matches everything.
+	list("module-level code alone", eoHolderOf("eo:view"), nil...)
+	list("no codes at all", eoHolderOf(), nil...)
+
+	// Holding update does not confer view.
+	list("update but not view", eoHolderOf(models.EOTypePermissionCode("eo_directive", models.EOTypePermissionUpdate)), nil...)
+
+	// Super admin bypasses, as everywhere else in this codebase.
+	admin := eoAdmin()
+	admin.SortBy, admin.SortDir = "reference", "asc"
+	list("super admin", admin, "DEC-1", "DIR-1", "DIR-2")
+}
+
+// TestEORecordListTypePermissionComposesWithVisibility: the two §7.11
+// mechanisms are ANDed. Passing the type gate does not defeat visible_to, and
+// being inside the restricted body does not defeat the type gate.
+func TestEORecordListTypePermissionComposesWithVisibility(t *testing.T) {
+	db := eoRecordDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	directiveT := eoCatalogueType(t, db, "eo_directive")
+	decisionT := eoCatalogueType(t, db, "eo_decision_record")
+	body := uuid.New()
+	eoListRec(t, repo, directiveT, "DIR-OPEN", nil)
+	eoListRec(t, repo, directiveT, "DIR-FOR-BODY", func(r *models.EORecord) {
+		r.Values = datatypes.JSON(`{"visible_to":"` + body.String() + `"}`)
+	})
+	eoListRec(t, repo, decisionT, "DEC-FOR-BODY", func(r *models.EORecord) {
+		r.Values = datatypes.JSON(`{"visible_to":"` + body.String() + `"}`)
+	})
+
+	refs := func(f models.EORecordFilter) []string {
+		t.Helper()
+		got, total, err := repo.List(ctx, &f)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if total != int64(len(got)) {
+			t.Fatalf("total %d but %d rows", total, len(got))
+		}
+		return eoRefs(got)
+	}
+
+	// Holds the Directive type, outside the body: the restricted Directive is
+	// still hidden by visible_to.
+	f := eoHolderOf(models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView))
+	if got, want := refs(f), []string{"DIR-OPEN"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("type gate passed, visible_to not applied: %v, want %v", got, want)
+	}
+
+	// Inside the body, holding the Directive type only: the Decision Record
+	// restricted to that same body is still hidden by the type gate.
+	f.VisibleToDepartmentIDs = []uuid.UUID{body}
+	if got, want := refs(f), []string{"DIR-FOR-BODY", "DIR-OPEN"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("visible_to passed, type gate not applied: %v, want %v", got, want)
+	}
+}
+
+// TestEORecordListTypePermissionSurvivesTypeDeletion: a soft-deleted record
+// type must not unhide its records. The clause matches on key rather than on a
+// live catalogue row for that reason — deleting a type is a configuration
+// change, not a declassification.
+func TestEORecordListTypePermissionSurvivesTypeDeletion(t *testing.T) {
+	db := eoRecordDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	directiveT := eoCatalogueType(t, db, "eo_directive")
+	eoListRec(t, repo, directiveT, "DIR-1", nil)
+	if err := db.Delete(&models.EORecordType{ID: directiveT}).Error; err != nil {
+		t.Fatalf("soft-delete the type: %v", err)
+	}
+
+	holder := eoHolderOf(models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView))
+	got, total, err := repo.List(ctx, &holder)
+	if err != nil {
+		t.Fatalf("list as holder: %v", err)
+	}
+	if refs := eoRefs(got); !reflect.DeepEqual(refs, []string{"DIR-1"}) || total != 1 {
+		t.Errorf("holder sees %v total %d, want [DIR-1]", refs, total)
+	}
+
+	stranger := eoHolderOf("eo:view")
+	got, total, err = repo.List(ctx, &stranger)
+	if err != nil {
+		t.Fatalf("list as stranger: %v", err)
+	}
+	if len(got) != 0 || total != 0 {
+		t.Errorf("a soft-deleted type unhid its records: %v total %d", eoRefs(got), total)
+	}
+}

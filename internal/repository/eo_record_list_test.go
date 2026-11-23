@@ -259,7 +259,13 @@ func TestListSortByIsAllowlisted(t *testing.T) {
 func TestListAppliesRowLevelVisibility(t *testing.T) {
 	db := eoRecordDB(t)
 	repo := NewEORecordRepository(db)
-	typeID := uuid.New()
+	// The type is CATALOGUED and its view code is held throughout: §7.11's
+	// per-type gate is a separate clause (TestEORecordListFiltersByTypePermission)
+	// and this test is about visible_to. A caller holding no per-type code
+	// sees an empty register whatever visible_to says, which would make every
+	// assertion below pass for the wrong reason.
+	typeID := eoCatalogueType(t, db, "eo_directive")
+	held := []string{models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView)}
 	bodyA, bodyB := uuid.New(), uuid.New()
 	// "Confidential" must not matter: there is no clearance policy (§7.11).
 	eoListRec(t, repo, typeID, "OPEN", func(r *models.EORecord) { r.Sensitivity = "Highly confidential" })
@@ -271,7 +277,7 @@ func TestListAppliesRowLevelVisibility(t *testing.T) {
 	})
 
 	as := func(admin bool, bodies ...uuid.UUID) ([]string, int64) {
-		f := models.EORecordFilter{IsAdmin: admin, VisibleToDepartmentIDs: bodies, SortBy: "reference", SortDir: "asc"}
+		f := models.EORecordFilter{IsAdmin: admin, VisibleToDepartmentIDs: bodies, PermissionCodes: held, SortBy: "reference", SortDir: "asc"}
 		got, total, err := repo.List(context.Background(), &f)
 		if err != nil {
 			t.Fatalf("list: %v", err)
@@ -298,7 +304,7 @@ func TestListAppliesRowLevelVisibility(t *testing.T) {
 	check("admin", g, n, "FOR-A", "FOR-B", "OPEN")
 
 	// A filter cannot be used to reach a restricted row.
-	f := models.EORecordFilter{VisibleToDepartmentIDs: []uuid.UUID{bodyA}, Values: map[string]any{"visible_to": bodyB.String()}}
+	f := models.EORecordFilter{VisibleToDepartmentIDs: []uuid.UUID{bodyA}, PermissionCodes: held, Values: map[string]any{"visible_to": bodyB.String()}}
 	if got, total, _ := repo.List(context.Background(), &f); len(got) != 0 || total != 0 {
 		t.Errorf("values filter on visible_to leaked %v", eoRefs(got))
 	}
@@ -307,7 +313,9 @@ func TestListAppliesRowLevelVisibility(t *testing.T) {
 func TestListCreatorAlwaysSeesTheirRestrictedRecord(t *testing.T) {
 	db := eoRecordDB(t)
 	repo := NewEORecordRepository(db)
-	typeID := uuid.New()
+	// Catalogued and granted for the same reason as the test above: this one
+	// is about the creator clause, not about §7.11's per-type gate.
+	typeID := eoCatalogueType(t, db, "eo_directive")
 	referred, office, stranger := uuid.New(), uuid.New(), uuid.New()
 	// The Office issues a referral restricted to another body.
 	eoListRec(t, repo, typeID, "REFERRAL", func(r *models.EORecord) {
@@ -318,6 +326,7 @@ func TestListCreatorAlwaysSeesTheirRestrictedRecord(t *testing.T) {
 
 	list := func(f models.EORecordFilter) []string {
 		f.SortBy, f.SortDir = "reference", "asc"
+		f.PermissionCodes = []string{models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView)}
 		got, total, err := repo.List(context.Background(), &f)
 		if err != nil || total != int64(len(got)) {
 			t.Fatalf("list: total %d len %d err %v", total, len(got), err)
