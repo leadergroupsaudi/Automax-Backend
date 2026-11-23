@@ -194,6 +194,45 @@ The dialog must state **what** will happen, not ask whether the administrator is
 
 An `eo_admin` can open the admin panel, create a record type, give it fields of any kind with the configuration each needs, link it to another type, see its lifecycle, and — with a stated reason — make a destructive change to a type that already holds records. The twelfth record type costs a configuration change rather than a release, and the six file fields Plan 3 relaxed can be restored through the product rather than by hand-written SQL.
 
+## Three defects found by seeding the demo data (2026-11-23), recorded here because nothing else holds them
+
+Seeding 48 records across all eleven registers through the API surfaced three
+real defects. None was found by any of the 45 reviewed tasks, because each
+needs a populated register to be visible at all.
+
+**1. Every register's extra columns are blank — fold into Task F1.**
+`frontend/src/pages/eo/EoRecordsPage.tsx:411` renders extra columns with
+`rec.values?.[f.key]`, but `sensitivity` and `source` are **real columns** on
+`EORecord` (`internal/models/eo_record.go:50-51`, `json:"sensitivity"` /
+`json:"source"`), not keys in the `values` bag. `ResolveEffectiveFields` sorts
+ancestor fields first, so those two are the first two extra columns on **every**
+type — meaning no register ever shows a meaningful extra column. The same
+values render correctly on the detail page. One line: read column-backed
+fields from the record, bag-backed fields from `values`.
+
+**2. A link type the numbering pattern cannot express.** `eo_assignment_parent`
+names Execution Plan among its targets, but creating an Assignment under one is
+refused: *"expects a parent reference of 4 segments, \"EO-DIR-2026-001-P2\" has
+5"* — `EO-DIR-YYYY-NNN-A#` cannot render under a 5-segment parent. The link
+type permits a relationship the reference pattern forbids. Decide which is
+right: narrow the link type's targets, or widen the pattern. The demo data ties
+assignments to stages through the `from_stage` link field instead.
+
+**3. Blocked transitions are offered and then refused.**
+`GET /eo-records/:id/transitions` lists `close` on a letter with an open
+sub-referral, and `raise_to_he` on a study with an open objection; executing
+either answers 409 *"An open child record blocks this transition"*. Blocking is
+enforced at execution but not reflected in the available-transitions list, so
+the UI shows a Move button that cannot work. Either filter the list or mark
+those transitions as blocked with the reason.
+
+**Also confirmed, and already a known client blocker:** `keywords` on Decision
+Record points at lookup category `eo_subject_taxonomy`, which does not exist in
+`lookup_categories`. The server does not validate option values, so the demo
+data holds plain slugs that render as raw chips, and the `decisions_base`
+capability matches nothing — exactly as the code documents until the client
+supplies the subject taxonomy.
+
 ## Out of scope, recorded so nobody goes looking
 
 - **Editing workflow states and transitions from the EO designer.** The existing workflow designer owns that; F4 links to it.
