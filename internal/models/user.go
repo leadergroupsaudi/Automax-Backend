@@ -94,6 +94,33 @@ func (u *User) HasPermission(permissionCode string) bool {
 	return false
 }
 
+// PermissionCodes is every distinct permission code the user actually holds,
+// in the order the roles carry them.
+//
+// It applies the SAME is_active test HasPermission does, because the two are
+// read as one fact by the EO per-type gate: the route check asks
+// HasPermission(eo:<type_key>:view) and the register's list filter is built
+// from this list (see EOTypeKeysFromPermissionCodes). If this returned a code
+// HasPermission would refuse, a caller would be answered 403 on one record and
+// shown that same record in the register.
+//
+// A super admin is not special-cased: this is what the user is GRANTED, and
+// both EO surfaces short-circuit on IsSuperAdmin before they consult it.
+func (u *User) PermissionCodes() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, role := range u.Roles {
+		for _, perm := range role.Permissions {
+			if !perm.IsActive || seen[perm.Code] {
+				continue
+			}
+			seen[perm.Code] = true
+			out = append(out, perm.Code)
+		}
+	}
+	return out
+}
+
 // HasRole checks if user has a specific role
 func (u *User) HasRole(roleCode string) bool {
 	if u.IsSuperAdmin {
