@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-11-20-eo-platform-metamodel-design.md`
 
 **Two repositories, both on `rnd/temporal-workflows`:**
-- Backend: `/home/ks/lig/automax3.1/backend` — Tasks A1–A3, B1–B2, C1
+- Backend: `/home/ks/lig/automax3.1/backend` — Tasks A1–A3, B1–B3, C1
 - Frontend: `/home/ks/lig/automax3.1/frontend` — Tasks D1–D3
 
 **Predecessors:** Plan 1 (engine, 21 tasks) and Plan 2 (pilot configuration, 14 tasks) are complete. The durable record is `docs/superpowers/eo-plan1-carry-forward.md` and the Plan 2 ledger. The EO UI prototype is frontend commit `526c1a0`; its own report is `frontend/EO_UI_REPORT.md` and the conventions brief it was built from is `frontend/EO_UI_BRIEF.md`.
@@ -194,6 +194,45 @@ Six accuracy fixes ride along, all found by the same re-review:
 - [ ] **Step 4: Fix the six accuracy items.** These are comments and test strings; no behaviour changes.
 - [ ] **Step 5: Run `go test ./internal/database/ ./internal/services/` and `TestEOCOMEndToEnd`.**
 - [ ] **Step 6: Commit** — `fix(eo): the seed converges new types without reverting administrators`
+
+---
+
+### Task B3: A file can be read back
+
+**Files:**
+- Modify: `internal/handlers/eo_file_handler.go`, `cmd/server/main.go`
+- Test: `internal/handlers/eo_file_handler_test.go`
+
+**Interfaces:**
+- Consumes: Task B1's `POST /eo-records/:id/files` and the EO Documenta client wired beside it; `storage.DocumentaClient`'s `GetPreviewURL`, `GetDownloadURL` and `DownloadFile`.
+- Produces: `GET /eo-records/:id/files/:file_id` (download) and `GET /eo-records/:id/files/:file_id/preview`, both gated like a record READ.
+
+B1 built upload. **Nothing can read the file back.** The existing Documents
+module is not the fallback it appears to be: `/documents/files/:id/{download,
+preview,info}` (`cmd/server/main.go:1546-1559`) are gated on `goals:view` and
+run on `documentService`, built at `:217` from the **Goals** client and
+`cfg.Documenta` — a different config, token and workspace from the EO client
+at `:273`. Unless a deployment points both at one workspace, an EO-uploaded
+file is write-only for the whole product.
+
+Four of eleven pilot registers have required-always `file`/`multi_file`
+fields. Without this task a clerk attaches the mandatory document to an
+Incoming Correspondence, the record saves, and nobody — clerk or reviewer —
+can ever open it. That is worse than having no upload.
+
+**Authorisation is a READ, not an edit.** Gate with the module `eo:view` and
+`middleware.RequireEOTypePermission("view")`, and apply §7.11 row-level
+visibility exactly as B1 does for upload, so a record the caller cannot see
+yields 404 and no bytes. A caller must not be able to read a file by knowing
+its id alone: **check the file id actually belongs to that record** before
+serving it, or the record id in the path is decoration and any file in the
+workspace is reachable by anyone holding `eo:view` on any type.
+
+- [ ] **Step 1: Write the failing tests** — `TestEOFileDownloadStreamsTheFile` (correct `Content-Type` and `Content-Disposition`); `TestEOFileDownloadRefusesAFileNotOnThisRecord` (**404**, and no call reaches Documenta — assert the fake's call count is zero, so a guard added after the fetch cannot pass); `TestEOFileDownloadHonoursRowLevelVisibility` (404 for a record the caller cannot see); `TestEOFileDownloadRefusesWithoutTypeViewPermission` (403); `TestEOFileDownloadWhenDocumentaDisabled` (503 naming the configuration, matching B1's wording).
+- [ ] **Step 2: Run them to verify they fail.**
+- [ ] **Step 3: Implement both routes.** Decide between streaming via `DownloadFile` and redirecting to `GetDownloadURL`, and say why in the report — a redirect hands the client a URL that may bypass EO's own authorisation, which is the deciding question, not convenience.
+- [ ] **Step 4: Run `go test ./internal/handlers/` and `TestEOCOMEndToEnd`.**
+- [ ] **Step 5: Commit** — `feat(eo): a record's files can be downloaded and previewed`
 
 ---
 
