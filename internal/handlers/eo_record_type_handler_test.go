@@ -110,7 +110,8 @@ func eoTypeTestApp(granted ...string) (*fiber.App, eoTypeIDs) {
 // TestEOTypeReadRoutesAcceptEoView: the UI cannot render a register list, a
 // type name or any form without the type catalogue — the forms are GENERATED
 // from each type's field definitions. A pilot user holding eo:view and not
-// eo:types:manage must therefore reach the three read routes.
+// eo:types:manage must therefore reach the four read routes — and must get a
+// 200 from them, not merely something that is not a 403.
 func TestEOTypeReadRoutesAcceptEoView(t *testing.T) {
 	app, ids := eoTypeTestApp("eo:view")
 
@@ -122,6 +123,11 @@ func TestEOTypeReadRoutesAcceptEoView(t *testing.T) {
 		{"List", "GET", "/eo-record-types"},
 		{"Get", "GET", "/eo-record-types/" + ids.typeID.String()},
 		{"ListLinkTypes", "GET", "/eo-record-types/link-types"},
+		// The ancestor-walk route: a create form is built from this type's
+		// field definitions AND every ancestor's, and List does not return
+		// fields. The other direction — the three field MUTATIONS stay on
+		// eo:types:manage — is pinned by the write table below.
+		{"ListFields", "GET", "/eo-record-types/" + ids.typeID.String() + "/fields"},
 	}
 
 	for _, tc := range cases {
@@ -143,13 +149,25 @@ func TestEOTypeReadRoutesAcceptEoView(t *testing.T) {
 	}
 }
 
-// TestEOTypeWriteRoutesStillRequireManage asserts ALL SIX mutating routes.
+// TestEOTypeWriteRoutesStillRequireManage asserts the mutating routes AND
+// the one read route that lives among them, in BOTH directions: refused to a
+// caller holding only eo:view, reachable for the designer.
+//
 // A single-route test would keep passing while a sibling silently widened —
 // and "every route in this file shares one constant" is exactly how the read
-// routes came to be locked behind eo:types:manage in the first place.
+// routes came to be locked behind eo:types:manage in the first place. The
+// opposite drift is just as silent, which is why GET /:id/fields is in this
+// table with wantViewer403 false rather than left untested: a line that
+// re-narrows it fails here.
 func TestEOTypeWriteRoutesStillRequireManage(t *testing.T) {
 	viewer, viewerIDs := eoTypeTestApp("eo:view")
-	manager, managerIDs := eoTypeTestApp("eo:types:manage")
+	// The designer app holds BOTH codes, because the role that uses these
+	// routes does: eo_admin is seeded with eo:view and eo:types:manage
+	// (database.Seed), and admin holds everything. A manage-only app would
+	// report GET /:id/fields as unreachable for a caller that cannot exist.
+	// The control half is unweakened by this: what proves a mutation demands
+	// eo:types:manage is the viewer half's 403, not this one.
+	manager, managerIDs := eoTypeTestApp("eo:types:manage", "eo:view")
 
 	// path is built from the ids of whichever app is being called, so the
 	// control request is the same ROUTE, not a request that 404s instead.
@@ -157,33 +175,35 @@ func TestEOTypeWriteRoutesStillRequireManage(t *testing.T) {
 		name   string
 		method string
 		path   func(eoTypeIDs) string
+		// wantViewer403 is the DIRECTION: true for a designer privilege, and
+		// false for a route an eo:view caller must reach.
+		wantViewer403 bool
 	}{
-		{"Create", "POST", func(eoTypeIDs) string { return "/eo-record-types" }},
-		{"Update", "PUT", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() }},
-		{"Delete", "DELETE", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() }},
-		{"CreateLinkType", "POST", func(eoTypeIDs) string { return "/eo-record-types/link-types" }},
-		{"UpdateLinkType", "PUT", func(i eoTypeIDs) string { return "/eo-record-types/link-types/" + i.linkID.String() }},
-		{"DeleteLinkType", "DELETE", func(i eoTypeIDs) string { return "/eo-record-types/link-types/" + i.linkID.String() }},
+		{"Create", "POST", func(eoTypeIDs) string { return "/eo-record-types" }, true},
+		{"Update", "PUT", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() }, true},
+		{"Delete", "DELETE", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() }, true},
+		{"CreateLinkType", "POST", func(eoTypeIDs) string { return "/eo-record-types/link-types" }, true},
+		{"UpdateLinkType", "PUT", func(i eoTypeIDs) string { return "/eo-record-types/link-types/" + i.linkID.String() }, true},
+		{"DeleteLinkType", "DELETE", func(i eoTypeIDs) string { return "/eo-record-types/link-types/" + i.linkID.String() }, true},
 		// The field-definition routes. A1 left these four with NO permission
 		// test at all, and its reviewer mutated GET /:id/fields from
-		// eo:types:manage to eo:view with the whole suite still passing. The
-		// three mutations are the dangerous half: an untested write route in
-		// a permission file is how A1's original bug arose.
+		// eo:types:manage to eo:view with the whole suite still passing.
 		//
-		// The READ is here rather than with the eo:view routes because that
-		// is where A1 left it, and deliberately: it is not a confidentiality
-		// boundary (GET /:id already returns every type's full field
-		// configuration through t.Fields), it is the designer's editing view
-		// of the same data. This test pins where it IS, so moving it becomes
-		// a decision somebody takes rather than a line that drifts.
-		{"ListFields", "GET", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() + "/fields" }},
-		{"CreateField", "POST", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() + "/fields" }},
+		// The READ is eo:view as of the Plan 3 fix wave. It is not a
+		// confidentiality boundary — GET /:id already returns every type's
+		// full field configuration through t.Fields to the same caller — and
+		// gating it on eo:types:manage left the pilot's own operator role
+		// (executive_office: eo:view, no eo:types:manage) unable to render a
+		// create form for a type or any of its ancestors. The three
+		// mutations are the designer privilege and stay where they were.
+		{"ListFields", "GET", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() + "/fields" }, false},
+		{"CreateField", "POST", func(i eoTypeIDs) string { return "/eo-record-types/" + i.typeID.String() + "/fields" }, true},
 		{"UpdateField", "PUT", func(i eoTypeIDs) string {
 			return "/eo-record-types/" + i.typeID.String() + "/fields/" + i.fieldID.String()
-		}},
+		}, true},
 		{"DeleteField", "DELETE", func(i eoTypeIDs) string {
 			return "/eo-record-types/" + i.typeID.String() + "/fields/" + i.fieldID.String()
-		}},
+		}, true},
 	}
 
 	for _, tc := range cases {
@@ -195,8 +215,13 @@ func TestEOTypeWriteRoutesStillRequireManage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("app.Test: %v", err)
 			}
-			if resp.StatusCode != fiber.StatusForbidden {
+			switch {
+			case tc.wantViewer403 && resp.StatusCode != fiber.StatusForbidden:
 				t.Fatalf("%s %s status = %d for a caller holding only eo:view, want 403: this mutating route no longer requires eo:types:manage", tc.method, denied, resp.StatusCode)
+			case !tc.wantViewer403 && resp.StatusCode == fiber.StatusForbidden:
+				t.Fatalf("%s %s status = 403 for a caller holding eo:view: the EO operator role holds eo:view and NOT eo:types:manage, so re-narrowing this route makes every create form unrenderable for the pilot's own staff", tc.method, denied)
+			case !tc.wantViewer403 && resp.StatusCode == fiber.StatusUnauthorized:
+				t.Fatalf("%s %s status = 401; permission denial must answer 403 (the frontend logs out on 401)", tc.method, denied)
 			}
 
 			// Control: the same route must EXIST and be reachable with

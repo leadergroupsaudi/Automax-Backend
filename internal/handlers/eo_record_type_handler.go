@@ -42,9 +42,21 @@ func (h *EORecordTypeHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMi
 	// may read records at all must be able to read the types, or the module
 	// renders empty. Defining the types remains eo:types:manage.
 	//
-	// ListFields is deliberately NOT here: the field definitions the UI
-	// renders a form from arrive inside Get, and /:id/fields is the
-	// designer's own editing view of them.
+	// THAT INCLUDES GET /:id/fields. An earlier wording claimed the route was
+	// "deliberately NOT here" because "the field definitions the UI renders a
+	// form from arrive inside Get" — an assertion about a client in another
+	// repository, which this file cannot see and must not make. What is
+	// verifiable here is the server side of it: Get returns t.Fields and List
+	// does not, so a form built for a type AND ITS ANCESTORS needs either one
+	// Get per type or this route, and nothing in this package can say which a
+	// client chose. Gating it on eo:types:manage made the choice for the
+	// client, and for the pilot operator role (executive_office, which holds
+	// eo:view and not eo:types:manage) it made the create form unrenderable.
+	//
+	// It is not a confidentiality boundary either way: GET /:id already
+	// returns the same field definitions to the same eo:view caller, so the
+	// widening tells nobody anything new. The three field MUTATIONS stay on
+	// eo:types:manage, which is where the designer privilege actually lives.
 	const (
 		read   = "eo:view"
 		manage = "eo:types:manage"
@@ -61,7 +73,7 @@ func (h *EORecordTypeHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMi
 	r.Put("/:id", perm(manage), h.Update)
 	r.Delete("/:id", perm(manage), h.Delete)
 
-	r.Get("/:id/fields", perm(manage), h.ListFields)
+	r.Get("/:id/fields", perm(read), h.ListFields)
 	r.Post("/:id/fields", perm(manage), h.CreateField)
 	r.Put("/:id/fields/:field_id", perm(manage), h.UpdateField)
 	r.Delete("/:id/fields/:field_id", perm(manage), h.DeleteField)
