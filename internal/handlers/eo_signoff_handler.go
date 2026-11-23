@@ -205,9 +205,11 @@ type eoSignoffDischargeCounts struct {
 
 type eoSignoffDischargeResult struct {
 	Discharged eoSignoffDischargeCounts `json:"discharged"`
-	// AlreadyClear are ids that exist and carried no marker. They are
-	// reported rather than refused so that retrying a batch that half
-	// succeeded is not an error.
+	// AlreadyClear are ids whose marker column is ALREADY false — read from
+	// that column, never inferred from the row's absence from the
+	// outstanding list. They are reported rather than refused so that
+	// retrying a batch that half succeeded is not an error. See
+	// eoSignoffPartition for why the distinction is load-bearing.
 	AlreadyClear []string `json:"already_clear"`
 	// Remaining is what is still outstanding after this discharge, read back
 	// from the database, so the caller does not have to ask again to know
@@ -217,11 +219,14 @@ type eoSignoffDischargeResult struct {
 
 // Discharge clears the markers on the rows it is given, and only those.
 //
-// IT IS ALL OR NOTHING. An id the database does not know is a mistake in the
-// list the operator is working from, and applying the rest of the batch would
-// discharge rows while the operator believed the whole request had failed. The
-// updates and the audit entry are written in ONE transaction, so a discharge
-// that was not recorded did not happen, and a recorded one did.
+// IT IS ALL OR NOTHING, ACROSS ALL THREE BUCKETS. An id that is neither
+// outstanding nor already discharged is a mistake in the list the operator is
+// working from, and applying the rest of the batch would discharge rows while
+// the operator believed the whole request had failed. The whole of it — the
+// field definitions, the states, the transitions and the audit entry — is ONE
+// transaction, so an unknown state id rolls back a field label that was
+// updated before it, a discharge that was not recorded did not happen, and a
+// recorded one did.
 func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 	var req eoSignoffDischargeRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -280,7 +285,7 @@ func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 			{transitionIDs, &models.WorkflowTransition{}, "eo_client_unconfirmed", "workflow transition", &result.Discharged.Transitions},
 		}
 		for _, p := range plan {
-			clear, clearAlready, err := eoSignoffPartition(tx, p.model, p.ids, open, p.what)
+			clear, clearAlready, err := eoSignoffPartition(tx, p.model, p.marker, p.ids, open, p.what)
 			if err != nil {
 				badRequest = err
 				return err
@@ -325,52 +330,78 @@ func (h *EOSignoffHandler) Discharge(c *fiber.Ctx) error {
 }
 
 // eoSignoffPartition splits ids into the ones that are outstanding and the
-// ones that exist but carry no marker, and fails on an id the table does not
-// hold at all.
+// ones that are already discharged, and refuses everything else.
 //
-// The existence probe is what separates "already signed off" — which is a
-// retry and is fine — from "this id is not a row of this kind", which is the
-// operator working from the wrong list or pasting a state id into
-// transition_ids. The second must refuse the WHOLE request: a partial apply
-// is the failure mode that leaves a government deployment in a state nobody
+// THE THREE ANSWERS, AND WHY ALREADY-CLEAR IS PROVED RATHER THAN INFERRED.
+// "Already clear" is a claim the response makes and the audit entry records,
+// so it is read from THE MARKER COLUMN — `<marker> = false` — and never
+// inferred from absence from the outstanding list. The two are not the same
+// set: the list joins the row's parent (`eo_record_types` for a field
+// definition, `workflows` for a state or a transition) with
+// `deleted_at IS NULL`, so a row that is alive and STILL MARKED under a
+// soft-deleted parent is missing from the list while its marker stands.
+// Inferring from the list told the operator, and the action log, that such a
+// row needed no action — a durable, timestamped claim that the opposite of
+// the truth had been checked. It is now the third answer: refused, naming
+// the row, with nothing applied.
+//
+//	open, i.e. listed and marked   -> discharge it
+//	marker already false           -> already clear; a retry, and fine
+//	anything else                  -> refuse the WHOLE request
+//
+// The refusal arm covers an id of another kind (a state id pasted into
+// transition_ids), an id of nothing at all, and the hidden-parent row above.
+// It must refuse the whole batch rather than skip the id: a partial apply is
+// the failure mode that leaves a government deployment in a state nobody
 // asked for.
-func eoSignoffPartition(tx *gorm.DB, model any, ids []uuid.UUID, open map[uuid.UUID]bool, what string) (clear []uuid.UUID, alreadyClear []string, err error) {
+func eoSignoffPartition(tx *gorm.DB, model any, marker string, ids []uuid.UUID, open map[uuid.UUID]bool, what string) (clear []uuid.UUID, alreadyClear []string, err error) {
 	if len(ids) == 0 {
 		return nil, nil, nil
 	}
-	var present []uuid.UUID
-	if err := tx.Model(model).Where("id IN ?", ids).Pluck("id", &present).Error; err != nil {
+	var discharged []uuid.UUID
+	if err := tx.Model(model).Where("id IN ? AND "+marker+" = ?", ids, false).
+		Pluck("id", &discharged).Error; err != nil {
 		return nil, nil, fmt.Errorf("read the %ss named: %w", what, err)
 	}
-	exists := make(map[uuid.UUID]bool, len(present))
-	for _, id := range present {
-		exists[id] = true
+	cleared := make(map[uuid.UUID]bool, len(discharged))
+	for _, id := range discharged {
+		cleared[id] = true
 	}
-	var unknown []string
+	var refused []string
 	for _, id := range ids {
 		switch {
-		case open[id] && exists[id]:
+		case open[id]:
 			clear = append(clear, id)
-		case exists[id]:
+		case cleared[id]:
 			alreadyClear = append(alreadyClear, id.String())
 		default:
-			unknown = append(unknown, id.String())
+			refused = append(refused, id.String())
 		}
 	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		return nil, nil, fmt.Errorf("no %s has id %s, so nothing was discharged", what, strings.Join(unknown, ", "))
+	if len(refused) > 0 {
+		sort.Strings(refused)
+		return nil, nil, fmt.Errorf(
+			"%s %s is not outstanding and is not already discharged — it is not a %s, or its record type or workflow has been deleted so it is not listed. Nothing was discharged",
+			what, strings.Join(refused, ", "), what)
 	}
 	return clear, alreadyClear, nil
 }
 
-// eoSignoffDistinct drops duplicates and the zero uuid, preserving order. A
-// repeated id would otherwise be counted twice in the audit entry.
+// eoSignoffDistinct drops duplicates, preserving order. A repeated id would
+// otherwise be counted twice in the audit entry.
+//
+// THE ZERO UUID IS NOT DROPPED. It is passed on to the partition, which
+// refuses it like any other id that names no row, because a request of forty
+// ids one of which is empty — a script that emitted a blank cell — must not
+// answer "39 discharged" against the forty lines the operator pasted, with an
+// audit entry naming 39 and nothing anywhere saying one was discarded. The
+// all-or-nothing contract above has no exception for an id that happens to be
+// zero.
 func eoSignoffDistinct(ids []uuid.UUID) []uuid.UUID {
 	seen := make(map[uuid.UUID]bool, len(ids))
 	out := make([]uuid.UUID, 0, len(ids))
 	for _, id := range ids {
-		if id == uuid.Nil || seen[id] {
+		if seen[id] {
 			continue
 		}
 		seen[id] = true

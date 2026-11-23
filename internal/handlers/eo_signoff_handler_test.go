@@ -391,8 +391,16 @@ func TestEOSignoffDischargeIsAudited(t *testing.T) {
 	if err := db.Find(&logs).Error; err != nil {
 		t.Fatalf("read action logs: %v", err)
 	}
+	// EXACTLY ONE HERE, TWO IN THE DEPLOYED SYSTEM, and the difference is not
+	// a defect. This app registers the handler alone; cmd/server/main.go also
+	// puts middleware.ActionLogger on the group, which writes its own row for
+	// the CALL (module from the path, action "create", no request body). So
+	// an operator reading the action-log screen sees two rows per discharge —
+	// the middleware's, saying somebody posted to the route, and this one,
+	// naming the rows. Nobody reconciling this count against that screen
+	// should conclude one of them is missing.
 	if len(logs) != 1 {
-		t.Fatalf("%d action log entries after one discharge, want exactly 1", len(logs))
+		t.Fatalf("%d action log entries after one discharge, want exactly 1 (this app has no ActionLogger middleware)", len(logs))
 	}
 	entry := logs[0]
 	if entry.UserID != actor.ID {
@@ -558,5 +566,141 @@ func TestEOSignoffDischargeRefusesWhatItCannotIdentify(t *testing.T) {
 	if out.Data.Discharged.FieldDefs != 0 || len(out.Data.AlreadyClear) != 1 {
 		t.Errorf("the retry reported %+v / already clear %v, want nothing discharged and one already clear",
 			out.Data.Discharged, out.Data.AlreadyClear)
+	}
+}
+
+// TestEOSignoffDischargeNeverCallsAMarkedRowClear is fix round 1's F1.
+//
+// The outstanding list joins each row's parent with deleted_at IS NULL, so a
+// row that is ALIVE and STILL MARKED under a soft-deleted record type or
+// workflow is missing from the list while its marker stands. Partitioning on
+// absence from that list put such a row in `already_clear`: the route answered
+// 200 and the audit entry durably recorded that the id had needed no action,
+// which is the opposite of the truth. The scenario is ordinary — an
+// administrator retires a pilot type between the client producing a signed-off
+// list and somebody running the discharge.
+//
+// Both halves are covered: a field definition under a deleted record type, and
+// a workflow state under a deleted workflow.
+func TestEOSignoffDischargeNeverCallsAMarkedRowClear(t *testing.T) {
+	db := eoSignoffTestDB(t)
+	app := eoSignoffApp(db, eoSignoffActor(t, db), "eo:types:manage")
+
+	before := eoSignoffGet(t, app)
+	label := before.Data.UntranslatedLabels[0]
+	state := before.Data.UnconfirmedStates[0]
+
+	// Soft-delete the parents, leaving both rows alive and still marked.
+	var def models.EOFieldDef
+	if err := db.Where("id = ?", label.ID).First(&def).Error; err != nil {
+		t.Fatalf("read the field def: %v", err)
+	}
+	if err := db.Delete(&models.EORecordType{}, "id = ?", def.RecordTypeID).Error; err != nil {
+		t.Fatalf("soft-delete the record type: %v", err)
+	}
+	var st models.WorkflowState
+	if err := db.Where("id = ?", state.ID).First(&st).Error; err != nil {
+		t.Fatalf("read the state: %v", err)
+	}
+	if err := db.Delete(&models.Workflow{}, "id = ?", st.WorkflowID).Error; err != nil {
+		t.Fatalf("soft-delete the workflow: %v", err)
+	}
+
+	cases := []struct {
+		name, payload, id string
+		model             any
+		marker            string
+	}{
+		{"FieldDef", fmt.Sprintf(`{"field_def_ids":[%q]}`, label.ID), label.ID, &models.EOFieldDef{}, "ar_untranslated"},
+		{"State", fmt.Sprintf(`{"state_ids":[%q]}`, state.ID), state.ID, &models.WorkflowState{}, "eo_client_unconfirmed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, out := eoSignoffDischarge(t, app, tc.payload)
+			for _, id := range out.Data.AlreadyClear {
+				if id == tc.id {
+					t.Errorf("%s is reported as ALREADY CLEAR while its marker is still set; the audit entry would record that it needed no action", id)
+				}
+			}
+			if status != fiber.StatusBadRequest {
+				t.Errorf("discharging a still-marked row hidden by a deleted parent answered %d, want 400 (%s)", status, out.Error)
+			}
+			var still bool
+			if err := db.Model(tc.model).Where("id = ?", tc.id).Pluck(tc.marker, &still).Error; err != nil {
+				t.Fatalf("read the marker back: %v", err)
+			}
+			if !still {
+				t.Errorf("the marker on %s was cleared by a request that answered %d", tc.id, status)
+			}
+		})
+	}
+}
+
+// TestEOSignoffDischargeRefusesTheZeroUUID is fix round 1's M2. The zero uuid
+// used to be dropped before the partition saw it, so a script that emitted an
+// empty cell among forty ids got "39 discharged" against forty pasted lines,
+// with an audit entry naming 39 and nothing saying one had been discarded. The
+// all-or-nothing contract has no exception for an id that happens to be zero.
+func TestEOSignoffDischargeRefusesTheZeroUUID(t *testing.T) {
+	db := eoSignoffTestDB(t)
+	app := eoSignoffApp(db, eoSignoffActor(t, db), "eo:types:manage")
+
+	before := eoSignoffGet(t, app)
+	real := before.Data.UntranslatedLabels[0].ID
+
+	status, out := eoSignoffDischarge(t, app, fmt.Sprintf(`{"field_def_ids":[%q,%q]}`, uuid.Nil, real))
+	if status != fiber.StatusBadRequest {
+		t.Errorf("a discharge naming the zero uuid answered %d, want 400 (%s)", status, out.Error)
+	}
+	if out.Data.Discharged.FieldDefs != 0 {
+		t.Errorf("the zero uuid was dropped and the rest applied: discharged %+v", out.Data.Discharged)
+	}
+	labels, _, _ := eoSignoffMarked(t, db)
+	if labels != eoSignoffSeededLabels {
+		t.Errorf("%d labels still marked after a request carrying the zero uuid, want all %d", labels, eoSignoffSeededLabels)
+	}
+}
+
+// TestEOSignoffDischargeIsAtomicAcrossBuckets is fix round 1's item 4. The
+// all-or-nothing claim rests on the whole request being one transaction, and
+// the only test of it put both ids in ONE bucket — where the partition fails
+// before any write, so the transaction was never exercised. Here the field
+// label is valid and updated first, and the unknown state id must roll it
+// back.
+func TestEOSignoffDischargeIsAtomicAcrossBuckets(t *testing.T) {
+	db := eoSignoffTestDB(t)
+	app := eoSignoffApp(db, eoSignoffActor(t, db), "eo:types:manage")
+
+	before := eoSignoffGet(t, app)
+	label := before.Data.UntranslatedLabels[0].ID
+
+	status, out := eoSignoffDischarge(t, app, fmt.Sprintf(
+		`{"field_def_ids":[%q],"state_ids":[%q]}`, label, uuid.New()))
+	if status != fiber.StatusBadRequest {
+		t.Fatalf("a valid field label with an unknown state id answered %d, want 400 (%s)", status, out.Error)
+	}
+	labels, states, transitions := eoSignoffMarked(t, db)
+	if labels != eoSignoffSeededLabels {
+		t.Errorf("%d labels still marked, want all %d: the field update in an earlier bucket was not rolled back",
+			labels, eoSignoffSeededLabels)
+	}
+	if states != eoSignoffSeededStates || transitions != eoSignoffSeededTransitions {
+		t.Errorf("states/transitions = %d/%d, want %d/%d", states, transitions, eoSignoffSeededStates, eoSignoffSeededTransitions)
+	}
+	var n int64
+	if err := db.Model(&models.ActionLog{}).Count(&n).Error; err != nil {
+		t.Fatalf("count action logs: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d audit entries after a rolled-back discharge, want none", n)
+	}
+
+	// Non-vacuity: the field label WAS dischargeable, so the assertions above
+	// are about a write the field bucket really attempted before the state
+	// bucket refused — not about an id that would have been rejected anyway.
+	status, out = eoSignoffDischarge(t, app, fmt.Sprintf(`{"field_def_ids":[%q]}`, label))
+	if status != fiber.StatusOK || out.Data.Discharged.FieldDefs != 1 {
+		t.Fatalf("the same field label alone answered %d / %+v, so the rollback above proved nothing (%s)",
+			status, out.Data.Discharged, out.Error)
 	}
 }
