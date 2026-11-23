@@ -362,14 +362,23 @@ func eoValueList(v any) ([]any, bool) {
 // attachment. Whether an id still resolves is a question for the moment the
 // file is opened, not for the moment it is referenced.
 //
-// Two shapes are accepted, and they are the only two a storage.DocumentaClient
-// in this repository hands out:
+// Two shapes are accepted:
 //
 //   - a canonical 36-character uuid, which is what the HTTP client reports as
-//     DmsFile.UUID and what UploadFile returns;
+//     DmsFile.UUID and what its UploadFile returns;
 //   - storage.StubFileIDPrefix followed by one, which is what
-//     StubDocumentaClient returns when Documenta is disabled, and therefore
-//     what such a deployment genuinely holds.
+//     StubDocumentaClient.UploadFile returns when Documenta is disabled.
+//
+// The second grants NO authority the first does not: the check accepts any
+// well-formed uuid without asking whether a file exists behind it, so
+// accepting the prefixed form widens nothing except the spelling. It is here
+// so that a deployment running the stub is not refused by shape alone, and it
+// is honest about its reach: it covers the id an UPLOAD returns, and no EO
+// code path calls UploadFile yet — there is no EO upload route in the server,
+// so today the prefix protects a flow that does not exist. The stub's
+// browsing and search methods hand out fixed sample ids (stub-file-readme,
+// stub-file-evidence, stub-file-search-1) that are not uuid-shaped and are
+// NOT accepted; they name files nobody uploaded.
 //
 // The 36-character check is deliberate: uuid.Parse also accepts the
 // unhyphenated, braced and urn: spellings, and none of those is the string

@@ -347,7 +347,15 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// the value the transition just wrote would look unchanged and pass
 		// the lock, while the record's genuine assignee would look like an
 		// edit and be refused.
-		if err := s.applyFieldChanges(ctx, r, fields, before, fresh, transition, input); err != nil {
+		// Every state the record has ever entered, read ONCE: the locked-field
+		// rule is asked twice from here — of the values the actor submitted,
+		// and of the attachments the engine files — and the two must be
+		// answered from the same history.
+		entered, err := r.EnteredStateIDs(ctx, fresh.ID, fresh.RecordTypeID)
+		if err != nil {
+			return err
+		}
+		if err := s.applyFieldChanges(fields, before, fresh, transition, input, entered); err != nil {
 			return err
 		}
 
@@ -356,7 +364,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 		// `attachments` as a field change of its own has already written
 		// what it writes and these are added to it; before the capabilities
 		// and the derived step, so both see the record's whole file.
-		if err := eoFileAttachments(fields, fresh, input.Attachments); err != nil {
+		if err := eoFileAttachments(fields, fresh, entered, transition.Code, input.Attachments); err != nil {
 			return err
 		}
 
@@ -751,18 +759,38 @@ func eoAttachmentIDs(ids []string) []string {
 // transition adds to it and an id already filed is not filed twice. Order is
 // preserved, oldest first, because that is the order the files arrived in.
 //
-// Three refusals, none of them silent:
+// The field's own rules apply to this write. Filing is an ENGINE write, and
+// an engine write does not outrank the configuration: `attachments` is an
+// ordinary field, and the two guards ValidateRecordValues applies to it on
+// the create and update paths — provenance, and IsLockedAfterStateID — apply
+// here too. A transition that demands an attachment into a field the client
+// has locked, or has configured as one the system fills, is contradictory
+// configuration, and it fails loudly at the point of use naming the conflict
+// rather than resolving itself in the engine's favour. A guard that cannot
+// fire in the case that matters is not a guard.
+//
+// Five refusals, none of them silent:
 //
 //   - a record type with no attachments field has nowhere to put them. That
 //     is configuration, not input, so it returns a plain error (a 500 and a
 //     log) rather than a field map a client could act on: no form the client
 //     can fill would fix it.
+//   - a field whose provenance is `derived` or `auto` is filled by the
+//     system, and ValidateRecordValues refuses a submitted value for one
+//     outright. Same answer here, for the same reason.
+//   - a field LOCKED by a state the record has already entered refuses a
+//     change. Ids the record already holds are not a change, so an actor
+//     re-sending what is filed is let through, exactly as an unchanged echo
+//     is on the update path.
 //   - a `file` field holds ONE id, so a second one is refused rather than
 //     overwriting the first.
 //   - an id that is not shaped like a Documenta file id is refused as a
 //     field error, the same shape check ValidateRecordValues applies to the
 //     same field on the create and update paths.
-func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, attachments []string) error {
+//
+// Both configuration refusals are plain errors rather than field errors: no
+// value the actor could send would satisfy them.
+func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, entered map[uuid.UUID]bool, transitionCode string, attachments []string) error {
 	ids := eoAttachmentIDs(attachments)
 	if len(ids) == 0 {
 		return nil
@@ -783,6 +811,10 @@ func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, attachm
 		return fmt.Errorf("record %s: field %q is of kind %q, which does not hold Documenta file ids; attachments can only be filed in a %q or %q field",
 			rec.Reference, eoAttachmentsFieldKey, def.Kind, models.EOKindFile, models.EOKindMultiFile)
 	}
+	if def.Provenance == models.EOProvenanceDerived || def.Provenance == models.EOProvenanceAuto {
+		return fmt.Errorf("transition %q on record %s carries %d attachment(s), but field %q has provenance %q: the system fills that field and ValidateRecordValues refuses a submitted value for it, so filing these would write past a rule the same key obeys on every other path; configure the field as a user field, or the transition without attachments",
+			transitionCode, rec.Reference, len(ids), eoAttachmentsFieldKey, def.Provenance)
+	}
 
 	name := def.Label
 	if name == "" {
@@ -799,6 +831,7 @@ func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, attachm
 	// id at all, and filing a new attachment is not the moment to delete it:
 	// the merge adds, and nothing here removes.
 	merged := eoStoredAttachmentValues(rec)
+	held := len(merged)
 	seen := make(map[string]bool, len(merged)+len(ids))
 	for _, v := range merged {
 		if s, ok := v.(string); ok {
@@ -811,6 +844,16 @@ func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, attachm
 		}
 		seen[id] = true
 		merged = append(merged, id)
+	}
+
+	// Every id was already filed: there is nothing to write, so there is
+	// nothing for the lock to refuse and no history entry to make.
+	if len(merged) == held {
+		return nil
+	}
+	if def.IsLockedAfterStateID != nil && entered[*def.IsLockedAfterStateID] {
+		return fmt.Errorf("transition %q on record %s carries %d attachment(s), but field %q is locked after a state this record has already entered: the record's files can no longer be changed, so filing them would write past the lock; configure the transition without attachments, or the field without the lock",
+			transitionCode, rec.Reference, len(ids), eoAttachmentsFieldKey)
 	}
 
 	var value any = merged
@@ -952,13 +995,12 @@ func eoBlockedError(code string, blocked []models.EORecord) error {
 // time this runs the static assignment has already been applied and rec is no
 // longer the baseline the field rules must compare against.
 func (s *eoTransitionService) applyFieldChanges(
-	ctx context.Context,
-	r repository.EORecordRepository,
 	fields []models.EOFieldDef,
 	stored map[string]any,
 	rec *models.EORecord,
 	transition *models.WorkflowTransition,
 	input models.EOTransitionInput,
+	entered map[uuid.UUID]bool,
 ) error {
 	declared := make(map[string]models.TransitionFieldChange, len(transition.FieldChanges))
 	for _, fc := range transition.FieldChanges {
@@ -987,11 +1029,25 @@ func (s *eoTransitionService) applyFieldChanges(
 		return err
 	}
 
-	entered, err := r.EnteredStateIDs(ctx, rec.ID, rec.RecordTypeID)
-	if err != nil {
-		return err
-	}
 	baseline := eoValidationBaseline(stored, eoFlattenStored(rec), input.Values)
+
+	// The attachments the actor supplied are filed immediately after this
+	// (step 5a), so requiredness must be asked of the record the transition
+	// WILL leave behind. They arrive on input.Attachments rather than in
+	// input.Values, so without this a field required at the target state is
+	// reported missing to an actor who has just supplied it.
+	//
+	// The baseline is the right channel and the only safe one: it answers
+	// "the effective value of a key that was NOT submitted", which is read
+	// in exactly the branch the locked-field comparison is not, so the
+	// overlay cannot reach that comparison. When the key IS submitted the
+	// value is already before the validator and nothing is overlaid.
+	if ids := eoAttachmentIDs(input.Attachments); len(ids) > 0 {
+		if _, submitted := input.Values[eoAttachmentsFieldKey]; !submitted {
+			baseline[eoAttachmentsFieldKey] = ids
+		}
+	}
+
 	fieldErrs, err := ValidateRecordValues(fields, baseline, input.Values, &transition.ToStateID, entered, s.eval)
 	if err != nil {
 		return err

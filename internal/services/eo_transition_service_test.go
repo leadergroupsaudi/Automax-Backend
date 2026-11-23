@@ -1998,3 +1998,116 @@ func TestTransitionAttachmentsArePersisted(t *testing.T) {
 		}
 	})
 }
+
+// eoTxAttachmentsDef returns the fixture's attachments field definition for a
+// test to narrow, the way a record type's configuration narrows it.
+func eoTxAttachmentsDef(f *eoTxFixture) *models.EOFieldDef {
+	for i := range f.types.defs {
+		if f.types.defs[i].Key == "attachments" {
+			return &f.types.defs[i]
+		}
+	}
+	panic("the fixture has no attachments field")
+}
+
+// The transition path files attachments into an ordinary field, so the rules
+// that field carries apply to it. An engine write does not outrank the
+// configuration: a guard that cannot fire in the case that matters is no
+// guard, so contradictory configuration fails loudly at the point of use.
+func TestTransitionAttachmentsObeyTheFieldRules(t *testing.T) {
+	a, b := uuid.NewString(), uuid.NewString()
+
+	t.Run("a locked field refuses a new attachment", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		eoTxAttachmentsDef(f).IsLockedAfterStateID = &f.review.ID
+		f.records.entered = map[uuid.UUID]bool{f.review.ID: true}
+		f.setValues(t, map[string]any{"attachments": []any{a}})
+
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{b}})
+		if err == nil {
+			t.Fatal("a transition filed an attachment into a field that is locked")
+		}
+		if !strings.Contains(err.Error(), "attachments") {
+			t.Errorf("err = %v, want the conflicting field named", err)
+		}
+		if len(f.records.updated) != 0 {
+			t.Fatalf("the record was written anyway: %v", f.records.updated)
+		}
+	})
+
+	t.Run("a locked field accepts ids it already holds", func(t *testing.T) {
+		// Nothing changes, so the lock has nothing to refuse — the same
+		// allowance ValidateRecordValues makes for an unchanged echo.
+		f := eoNewTxFixture(t)
+		eoTxAttachmentsDef(f).IsLockedAfterStateID = &f.review.ID
+		f.records.entered = map[uuid.UUID]bool{f.review.ID: true}
+		f.setValues(t, map[string]any{"attachments": []any{a}})
+
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("an unchanged attachment tripped the lock: %v", err)
+		}
+		if got := eoTxAttachments(t, f.records.updated[len(f.records.updated)-1]); strings.Join(got, ",") != a {
+			t.Fatalf("attachments = %v, want the stored id untouched", got)
+		}
+	})
+
+	t.Run("a field the system fills refuses attachments", func(t *testing.T) {
+		for _, prov := range []string{models.EOProvenanceDerived, models.EOProvenanceAuto} {
+			t.Run(prov, func(t *testing.T) {
+				f := eoNewTxFixture(t)
+				eoTxAttachmentsDef(f).Provenance = prov
+				_, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}})
+				if err == nil {
+					t.Fatalf("a transition wrote attachments into a %q field", prov)
+				}
+				if !strings.Contains(err.Error(), "attachments") || !strings.Contains(err.Error(), prov) {
+					t.Errorf("err = %v, want the field and its provenance named", err)
+				}
+				if len(f.records.updated) != 0 {
+					t.Fatalf("the record was written anyway: %v", f.records.updated)
+				}
+			})
+		}
+	})
+}
+
+// Requiredness is judged over the record the transition will leave behind, so
+// attachments supplied on the transition satisfy a field required at the
+// target state. They arrive on input.Attachments, not in input.Values, and a
+// refusal here would tell the actor they had not supplied what they just did.
+func TestTransitionAttachmentsSatisfyRequiredness(t *testing.T) {
+	a := uuid.NewString()
+
+	build := func(t *testing.T) *eoTxFixture {
+		f := eoNewTxFixture(t)
+		d := eoTxAttachmentsDef(f)
+		d.RequiredMode = models.EORequiredAtState
+		d.RequiredAtStateIDs = datatypes.JSON(`["` + f.escalated.ID.String() + `"]`)
+		return f
+	}
+
+	t.Run("supplied on the transition", func(t *testing.T) {
+		f := build(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("the attachments were supplied and the transition still refused them: %v", err)
+		}
+		if got := eoTxAttachments(t, f.records.updated[len(f.records.updated)-1]); strings.Join(got, ",") != a {
+			t.Fatalf("attachments = %v, want %s filed", got, a)
+		}
+	})
+
+	t.Run("not supplied at all is still refused", func(t *testing.T) {
+		f := build(t)
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{})
+		if err == nil {
+			t.Fatal("the record entered a state that requires attachments with none")
+		}
+		var invalid *EOValidationError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("err = %v, want a field validation error", err)
+		}
+		if _, named := invalid.Fields["attachments"]; !named {
+			t.Fatalf("fields = %v, want attachments named", invalid.Fields)
+		}
+	})
+}

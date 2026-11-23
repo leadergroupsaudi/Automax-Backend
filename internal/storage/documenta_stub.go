@@ -13,11 +13,14 @@ import (
 // StubFileIDPrefix is what StubDocumentaClient.UploadFile puts in front of the
 // uuid it invents, so a stub file id is recognisable as one.
 //
-// It is exported because the id the stub produces is what a deployment running
-// it (DOCUMENTA_ENABLED=false) genuinely holds and submits, so a consumer that
-// checks the SHAPE of a Documenta file id — ValidateRecordValues for the EO
-// file kinds, spec §7.12 — has to accept it, and must not do so by repeating
-// the literal.
+// It is exported so that services.eoIsDocumentaFileID — the SHAPE check EO
+// file fields apply, spec §7.12 — can accept an uploaded stub id without
+// repeating the literal, and so that a change to the format reaches that
+// check. It covers UploadFile ALONE. The browsing and search methods below
+// hand out fixed sample ids of their own (stub-file-readme,
+// stub-file-evidence, stub-file-search-1) which are NOT uuid-shaped and are
+// NOT accepted: they stand for files in a workspace nobody uploaded, so no
+// shape rule written here would make them real.
 const StubFileIDPrefix = "stub-file-"
 
 // StubDocumentaClient is a placeholder implementation that logs all calls
