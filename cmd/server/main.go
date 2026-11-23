@@ -256,20 +256,29 @@ func main() {
 	// select on, and a fabricated id would make the affected records LOOK
 	// filed and leave them unfindable by either. Goals has no such contract
 	// to break; this register does.
+	//
+	// The client is held in a variable because TWO things need it: the record
+	// service's folders (Task C2) and the file upload route (Task B1), which
+	// uploads into the folder the service created. One handle means one set
+	// of credentials and one token — a deployment cannot end up creating
+	// folders as one principal and filing documents as another — and it
+	// means the upload route is wired exactly when folders are, so there is
+	// no configuration in which a record has a folder nothing can write to.
+	var eoDocumentaClient storage.DocumentaClient
 	var eoFolderOption services.EORecordOption
 	if cfg.EODocumenta.Enabled {
 		if err := services.EOCheckDocumentaBaseURL(cfg.EODocumenta.BaseURL); err != nil {
 			log.Fatalf("EO_DOCUMENTA_ENABLED=true but %v: set the URL or disable EO Documenta", err)
 		}
+		eoDocumentaClient = storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)
 		// The workspace name is passed per call because NewHTTPDocumentaClient
 		// ignores cfg.WorkspaceName; it is the only route
 		// EO_DOCUMENTA_WORKSPACE_NAME has to Documenta, and even then the OAuth
 		// token's workspace_uuid claim takes precedence over it.
-		eoFolderOption = services.EOWithDocumentaFolders(
-			storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil), cfg.EODocumenta.WorkspaceName)
+		eoFolderOption = services.EOWithDocumentaFolders(eoDocumentaClient, cfg.EODocumenta.WorkspaceName)
 		log.Println("EO Documenta HTTP client enabled: every EO record gets a folder")
 	} else {
-		log.Println("EO Documenta disabled (EO_DOCUMENTA_ENABLED=false): EO records are created with no Documenta folder")
+		log.Println("EO Documenta disabled (EO_DOCUMENTA_ENABLED=false): EO records are created with no Documenta folder, and POST /eo-records/:id/files refuses with 503")
 	}
 
 	// Ready-to-Close service
@@ -554,6 +563,11 @@ func main() {
 	eoActionExecutor.SetTransitions(eoTransitionService)
 
 	eoRecordHandler := handlers.NewEORecordHandler(eoRecordService, eoTransitionService, eoRecordRepo, eoTypeRepo)
+	// Task B1's upload route. eoDocumentaClient is NIL when EO Documenta is
+	// disabled — the pilot default — and the handler then refuses with 503
+	// naming the setting, rather than minting a stub file id for a document
+	// nobody could ever open.
+	eoFileHandler := handlers.NewEOFileHandler(eoRecordRepo, eoDocumentaClient)
 	eoRecordTypeHandler := handlers.NewEORecordTypeHandler(eoTypeRepo, eoRecordRepo)
 
 	// The timer worker's handler is the ROUTER, not the escalation handler.
@@ -870,6 +884,11 @@ func main() {
 	eoRecords := v1.Group("/eo-records", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)))
 	eoTypePermission := middleware.NewEOTypePermission(eoRecordRepo, eoTypeRepo)
 	eoRecordHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission, eoTypePermission.RequireEOTypePermission)
+	// POST /eo-records/:id/files — the only supply path for the Documenta
+	// file ids every `file`/`multi_file` EO field stores (§7.12). It carries
+	// the same two guards as PUT /eo-records/:id, because an upload writes
+	// into the record's folder.
+	eoFileHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission, eoTypePermission.RequireEOTypePermission)
 
 	// Admin routes
 	admin := v1.Group("/admin", authMiddleware.Authenticate(), licenseMiddleware.LicenseGate())

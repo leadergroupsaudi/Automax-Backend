@@ -633,7 +633,14 @@ func TestEOWiringUsesSLAConstructors(t *testing.T) {
 		// part of the pin because the client constructor ignores
 		// cfg.WorkspaceName — the per-call argument is the only way
 		// EO_DOCUMENTA_WORKSPACE_NAME reaches Documenta.
-		"services.EOWithDocumentaFolders(storage.NewHTTPDocumentaClient(cfg.EODocumenta,nil),cfg.EODocumenta.WorkspaceName)",
+		// The client itself is pinned above ("storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)");
+		// here it is pinned that the folder option is built FROM IT. Task B1
+		// gave the same handle to the upload route, so the expression holds
+		// the variable rather than the constructor call — one client, one
+		// token, one workspace for both filing a folder and filling it.
+		// handlers.TestEOFileRoutesAreWiredInMain pins the assignment and
+		// that the disabled branch leaves it nil.
+		"services.EOWithDocumentaFolders(eoDocumentaClient,cfg.EODocumenta.WorkspaceName)",
 		"escalationPolicyRepo,eoFolderOption)",
 	} {
 		if !strings.Contains(flat, want) {

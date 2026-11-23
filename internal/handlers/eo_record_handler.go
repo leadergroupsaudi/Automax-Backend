@@ -206,7 +206,7 @@ func eoServiceError(c *fiber.Ctx, err error) error {
 // three server-filled fields are overwritten and the fourth is not" is the
 // kind of asymmetry that becomes a hole when a field is added.
 //
-// Callers that legitimately set RecordID — eoVisible's single-record probe —
+// Callers that legitimately set RecordID — eoVisibleScoped's single-record probe —
 // must therefore set it AFTER calling this.
 func eoScopeFilter(filter *models.EORecordFilter, user *models.User) {
 	filter.UserID = user.ID
@@ -274,14 +274,23 @@ func eoParamUUID(c *fiber.Ctx, name string) (uuid.UUID, bool, error) {
 // Absence and invisibility deliberately give the same answer, so the endpoint
 // cannot be used to probe for references.
 func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.User) (*models.EORecord, bool, error) {
-	rec, err := h.records.GetAnyByID(c.UserContext(), id)
+	return eoLoadRecordScoped(c, h.records, id, user)
+}
+
+// eoLoadRecordScoped is eoLoadRecord with the repository passed in, so a
+// handler that is NOT the record handler — the file upload route, which
+// writes into a record's own Documenta folder — reaches a record by exactly
+// the same rule instead of growing a second, kinder one. The method above is
+// kept so this handler's own call sites read unchanged.
+func eoLoadRecordScoped(c *fiber.Ctx, records repository.EORecordRepository, id uuid.UUID, user *models.User) (*models.EORecord, bool, error) {
+	rec, err := records.GetAnyByID(c.UserContext(), id)
 	if err != nil {
 		return nil, false, utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 	if rec == nil {
 		return nil, false, utils.ErrorResponse(c, fiber.StatusNotFound, i18n.T(c.UserContext(), "eo_record_not_found"))
 	}
-	visible, err := h.eoVisible(c, rec, user)
+	visible, err := eoVisibleScoped(c, records, rec, user)
 	if err != nil {
 		// A failed visibility probe is an OUTAGE, not an answer. Reporting it
 		// as 404 would be safe in direction and badly wrong in meaning: it
@@ -295,7 +304,8 @@ func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.
 	return rec, true, nil
 }
 
-// eoVisible re-asks the register for this one record under the caller's scope.
+// eoVisibleScoped re-asks the register for this one record under the caller's
+// scope.
 // The visibility rule lives in the repository's WHERE clause and exists in one
 // place (applyEORecordVisibility); re-implementing it here against the values
 // bag would be a second copy that drifts.
@@ -303,7 +313,7 @@ func (h *EORecordHandler) eoLoadRecord(c *fiber.Ctx, id uuid.UUID, user *models.
 // It returns the repository's error rather than folding it into false: "the
 // caller may not see this" and "the database did not answer" are different
 // facts and must not share a status code.
-func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *models.User) (bool, error) {
+func eoVisibleScoped(c *fiber.Ctx, records repository.EORecordRepository, rec *models.EORecord, user *models.User) (bool, error) {
 	filter := &models.EORecordFilter{
 		RecordTypeID: []string{rec.RecordTypeID.String()},
 		Limit:        1,
@@ -318,7 +328,7 @@ func (h *EORecordHandler) eoVisible(c *fiber.Ctx, rec *models.EORecord, user *mo
 		return true, nil
 	}
 	filter.RecordID = &rec.ID
-	rows, _, err := h.records.List(c.UserContext(), filter)
+	rows, _, err := records.List(c.UserContext(), filter)
 	if err != nil {
 		return false, err
 	}
