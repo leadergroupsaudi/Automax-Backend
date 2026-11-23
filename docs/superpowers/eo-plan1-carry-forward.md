@@ -901,23 +901,22 @@ out of it, and none of them lives anywhere else.
   `ValidateAgainstTypes`, or extending `eoCapabilityOwnTypeInputKeys` to config
   keys that name a type as well as a key.
 
-- **The per-type permission codes are seeded, granted and still INERT, and the
-  wording that says so must be deleted when enforcement arrives.** Nothing
-  consults `eo:<type_key>:view|create|update`; the API surface is gated by the
-  module-level `eo:*` codes and row-level visibility is the repository's §7.11
-  clause. Every per-type permission's `Description` and `DescriptionAr` now
-  ends with `database.eoTypePermissionInertEN` / `…AR`, so an administrator
-  ticking the box is told they are recording an intention, not applying a
-  control. **When the per-type gate is wired, those two sentences must go in
-  the SAME change** — a control that says it enforces nothing while enforcing
-  something is the same defect pointing the other way. Note also that
-  `eoSeedTypePermissions` never updates an existing row (its check keys on
-  Code), so a later rewording will not reach rows already in a customer's
-  database.
+- **CLOSED by Plan 3 Task A2: the per-type permission codes are enforced.**
+  `middleware.EOTypePermission` gates the record routes that carry a record id
+  or a `record_type_id`, and `repository.applyEORecordTypePermissions` filters
+  the register — the route check answers 403 for one record and a route check
+  cannot narrow a result set. The module-level `eo:*` codes stay; the per-type
+  codes narrow them. The two inert sentences went in the same change, replaced
+  by `database.eoTypePermissionEnforcedEN` / `…AR`, and
+  `eoSeedTypePermissions` now REFRESHES the description of a row it finds
+  (and only the description), so a database seeded before A2 stops telling its
+  administrator that the box applies no control.
 
-- **The inert-permission sentences are implementer-written ARABIC, and this is
-  the only place the sign-off round can find them.** The string is
-  `database.eoTypePermissionInertAR` in `internal/database/seed_eo_platform.go`.
+- **The per-type permission sentences are implementer-written ARABIC, and this
+  is the only place the sign-off round can find them.** The string is
+  `database.eoTypePermissionEnforcedAR` in
+  `internal/database/seed_eo_platform.go` (Task A2 replaced the inert sentence
+  it was opened for; the obligation is unchanged).
   Tasks A4 and A5 met the same situation — no `ar_untranslated` marker on the
   table — and left the ENGLISH standing rather than invent Arabic. A6 could not
   do that: the `DescriptionAr` the sentence is appended to is ALREADY Plan 1

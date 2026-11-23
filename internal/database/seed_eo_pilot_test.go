@@ -3246,6 +3246,11 @@ func TestEoReferralVisibilityIsEnforcedByTheLiveClause(t *testing.T) {
 	list := func(f models.EORecordFilter) []string {
 		t.Helper()
 		f.RecordTypeID = []string{ty.ID.String()}
+		// §7.11's per-type gate is a SEPARATE clause and this test is about
+		// the row-level one: the caller holds the type's view code
+		// throughout, or the register would answer empty for every row below
+		// and each assertion would pass for the wrong reason.
+		f.PermissionCodes = []string{models.EOTypePermissionCode(ty.Key, models.EOTypePermissionView)}
 		f.SortBy, f.SortDir = "reference", "asc"
 		recs, _, err := repo.List(context.Background(), &f)
 		if err != nil {

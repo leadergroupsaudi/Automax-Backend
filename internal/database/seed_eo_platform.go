@@ -1,6 +1,7 @@
 package database
 
 import (
+	"errors"
 	"fmt"
 	"log"
 
@@ -557,43 +558,44 @@ func eoSeedEscalationPolicy(db *gorm.DB) (*uuid.UUID, error) {
 
 // ── the per-type permission codes (spec §7.11) ──────────────────────────────
 
-// eoTypePermissionInertEN and eoTypePermissionInertAR are appended to every
-// per-type permission's description, in both languages.
+// eoTypePermissionEnforcedEN and eoTypePermissionEnforcedAR are appended to
+// every per-type permission's description, in both languages.
 //
-// WHY THE WORDING IS PART OF THE SEED. Spec §7.11 names per-type permissions
-// as one of three required mechanisms and the branch ships two: nothing
-// consults eo:<type_key>:view|create|update. Every EO route is gated by the
-// MODULE-level codes and row-level visibility is the repository's §7.11
-// clause, so granting or revoking one of these changes nothing about what
-// anyone can see or do. The permissions UI shows the administrator this
-// Description and nothing else; without these sentences the box reads exactly
-// like a control, and the person ticking it believes they have applied one.
-// Spec §7.11's own words for what they have actually done are an expression
-// of intent.
+// WHY THE WORDING IS PART OF THE SEED. Through Plan 1 and Plan 2 these codes
+// were seeded and granted with NOTHING consulting them, and the sentence that
+// stood here said so: "NOT YET ENFORCED… granting it records an intention and
+// applies no control." The permissions UI shows the administrator this
+// Description and nothing else, so without that sentence the box read exactly
+// like a control to the person ticking it.
 //
-// It is appended rather than replacing the text so the administrator still
+// Task A2 wired the control, and the sentence had to go in the SAME change —
+// a box that says it enforces nothing while enforcing something is the same
+// defect pointing the other way. What replaces it says what the code now does,
+// and names BOTH surfaces: the route gate
+// (middleware.EOTypePermission) refuses a record of a type the caller was not
+// granted, and the register (repository.applyEORecordTypePermissions) lists
+// only the types whose view code they hold. An administrator who revokes a
+// view code needs to know the second part, because it is the one that changes
+// what a whole screen shows rather than what one request answers.
+//
+// IT IS APPENDED rather than replacing the text so the administrator still
 // learns WHICH type and WHICH action the code names.
 //
-// WHEN THE PER-TYPE GATE ARRIVES these two sentences must go, in the same
-// change that wires enforcement — a control that says it enforces nothing
-// while enforcing something is the same defect pointing the other way.
-// Pinned by TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem.
+// ROWS ALREADY IN A DATABASE ARE REWRITTEN. eoSeedTypePermissions never
+// updated an existing row — its check keys on Code — so a database seeded
+// before this change would keep telling its administrator that the code is
+// inert while the gate refused their users. The description is therefore
+// refreshed in place on every run; nothing else about an existing row is
+// touched. Pinned by TestEoPerTypePermissionDescriptionsAreRefreshed.
 //
 // THE ARABIC WAS WRITTEN BY AN IMPLEMENTER, NOT SUPPLIED BY THE CLIENT, and
 // it awaits the spec §9 sign-off round like every other Arabic string in this
-// seed. Tasks A4 and A5 met the same situation with link-type and workflow
-// labels and left the ENGLISH standing rather than invent Arabic, because an
-// invented translation is indistinguishable from a signed-off one once it is
-// in the database. That is not available here: `permissions` has no
-// ar_untranslated marker column, and the DescriptionAr this sentence is
-// appended to is ALREADY Plan 1 implementer Arabic, so an English tail would
-// have been a visible inconsistency inside one string rather than a visible
-// obligation. The obligation is carried instead by this comment and by
-// docs/superpowers/eo-plan1-carry-forward.md ("Opened by Task A6"), which
-// names the string so the sign-off round can find it.
+// seed — as the sentence it replaces did. The obligation is carried by this
+// comment and by docs/superpowers/eo-plan1-carry-forward.md, which names the
+// string so the sign-off round can find it.
 const (
-	eoTypePermissionInertEN = "NOT YET ENFORCED: nothing in the platform consults this code, so granting it records an intention and applies no control."
-	eoTypePermissionInertAR = "غير مُطبَّق بعد: لا شيء في المنصة يقرأ هذا الرمز، ومنحه يسجّل نيّة ولا يطبّق أي ضابط."
+	eoTypePermissionEnforcedEN = "ENFORCED: a caller who does not hold this code is refused records of this type, and the register lists only the types whose view code they hold."
+	eoTypePermissionEnforcedAR = "مُطبَّق: يُرفض وصول من لا يملك هذا الرمز إلى سجلات هذا النوع، ولا يعرض السجل إلا الأنواع التي يملك رمز عرضها."
 )
 
 // eoSeedTypePermissions writes eo:<type_key>:view|create|update for every
@@ -666,22 +668,39 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 			// harmless. The existence check keys on Code, which is derived
 			// from the same key, so the two agree.
 			perm := models.Permission{
-				ID:            uuid.New(),
-				Name:          fmt.Sprintf("EO %s %s", a.verb, t.Key),
-				Code:          fmt.Sprintf("eo:%s:%s", t.Key, a.action),
+				ID:   uuid.New(),
+				Name: fmt.Sprintf("EO %s %s", a.verb, t.Key),
+				// The CODE is built by models.EOTypePermissionCode, which is
+				// also what the route gate asks HasPermission for and what
+				// the register's list filter reads back. One function, so a
+				// change to the format cannot move the gate away from the
+				// rows an administrator has already granted.
+				Code:          models.EOTypePermissionCode(t.Key, a.action),
 				Module:        "eo",
 				Action:        fmt.Sprintf("%s:%s", t.Key, a.action),
 				ActionAr:      a.verbAr,
-				Description:   fmt.Sprintf("%s executive-office records of type %s (%s). %s", a.verb, t.Name, t.Key, eoTypePermissionInertEN),
-				DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s. %s", a.verbAr, t.NameAr, eoTypePermissionInertAR),
+				Description:   fmt.Sprintf("%s executive-office records of type %s (%s). %s", a.verb, t.Name, t.Key, eoTypePermissionEnforcedEN),
+				DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s. %s", a.verbAr, t.NameAr, eoTypePermissionEnforcedAR),
 			}
-			var existing int64
-			if err := db.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
-				return fmt.Errorf("check permission %q: %w", perm.Code, err)
-			}
-			if existing == 0 {
+			var stored models.Permission
+			err := db.Where("code = ?", perm.Code).First(&stored).Error
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
 				if err := db.Create(&perm).Error; err != nil {
 					return fmt.Errorf("create permission %q: %w", perm.Code, err)
+				}
+			case err != nil:
+				return fmt.Errorf("check permission %q: %w", perm.Code, err)
+			case stored.Description != perm.Description || stored.DescriptionAr != perm.DescriptionAr:
+				// Only the two description columns, and only when they differ:
+				// the row's id, name, module and grants are whatever the
+				// database already made of them.
+				if err := db.Model(&models.Permission{}).Where("id = ?", stored.ID).
+					Updates(map[string]any{
+						"description":    perm.Description,
+						"description_ar": perm.DescriptionAr,
+					}).Error; err != nil {
+					return fmt.Errorf("refresh the description of permission %q: %w", perm.Code, err)
 				}
 			}
 			codes = append(codes, perm.Code)

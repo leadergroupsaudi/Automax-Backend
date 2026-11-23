@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -96,16 +98,86 @@ func TestEoEveryConcreteTypeHasItsThreePermissions(t *testing.T) {
 	}
 }
 
-// TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem is the addendum's
-// item 3. Nothing consults eo:<type_key>:view|create|update — every EO route
-// is gated by the MODULE-level codes and row-level visibility is the
-// repository's §7.11 clause — so an administrator ticking one of these boxes
-// is expressing an intention, not applying a control. The text they read must
-// say so; it is the only place the person meeting the code is told.
+// TestEoPerTypePermissionCodesAreTheCodesTheGateBuilds is the cross-check
+// Task A2 rests on. The route gate asks HasPermission for
+// models.EOTypePermissionCode(key, action); the register's list filter reads
+// the caller's codes back through EOTypeKeysFromPermissionCodes. Both are
+// answered by the rows THIS seed writes, and neither can see them.
 //
-// Mutation that makes it fail: restore the old wording, "%s executive-office
-// records of type %s (%s)", in eoSeedTypePermissions.
-func TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem(t *testing.T) {
+// Plan 1 shipped a Critical of exactly this shape: Referral visibility was
+// seeded under `visibility` while the engine read `visible_to`, so every
+// Referral was unrestricted while the code looked enforced. A gate that builds
+// a code nobody holds refuses everyone; a filter that builds one everybody
+// holds filters nothing.
+//
+// Mutation that makes it fail: spell the Code in eoSeedTypePermissions by
+// hand again (fmt.Sprintf("eo:%s:%s", …)) and change one character of it.
+func TestEoPerTypePermissionCodesAreTheCodesTheGateBuilds(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var types []models.EORecordType
+	if err := db.Where("is_abstract = ?", false).Order("key").Find(&types).Error; err != nil {
+		t.Fatalf("read concrete record types: %v", err)
+	}
+	if len(types) == 0 {
+		t.Fatal("no concrete record types, so every assertion below is checked against nothing")
+	}
+
+	var perms []models.Permission
+	if err := db.Where("module = ?", "eo").Order("code").Find(&perms).Error; err != nil {
+		t.Fatalf("read the eo permissions: %v", err)
+	}
+	seeded := map[string]models.Permission{}
+	for _, p := range perms {
+		seeded[p.Code] = p
+	}
+
+	held := []string{}
+	for _, ty := range types {
+		for _, action := range eoCapTypePermissionActions {
+			code := models.EOTypePermissionCode(ty.Key, action)
+			if _, ok := seeded[code]; !ok {
+				t.Errorf("the gate would ask for %q and the seed wrote no such row", code)
+				continue
+			}
+			if action == models.EOTypePermissionView {
+				held = append(held, code)
+			}
+		}
+	}
+
+	// The whole eo module's codes, read back as the register reads a caller's
+	// permissions: every concrete type, and nothing that is not one. A
+	// module-level code such as eo:view must not be read as a type key.
+	all := make([]string, 0, len(perms))
+	for _, p := range perms {
+		all = append(all, p.Code)
+	}
+	gotKeys := models.EOTypeKeysFromPermissionCodes(all, models.EOTypePermissionView)
+	wantKeys := make([]string, 0, len(types))
+	for _, ty := range types {
+		wantKeys = append(wantKeys, ty.Key)
+	}
+	sort.Strings(gotKeys)
+	sort.Strings(wantKeys)
+	if !reflect.DeepEqual(gotKeys, wantKeys) {
+		t.Errorf("the register would restrict to %v, want exactly the concrete types %v", gotKeys, wantKeys)
+	}
+	if len(held) != len(types) {
+		t.Errorf("%d view codes for %d types", len(held), len(types))
+	}
+}
+
+// TestEoPerTypePermissionDescriptionsSayTheyAreEnforced is the other half of
+// what used to be asserted here. Until Task A2 nothing consulted these codes
+// and the seeded wording said so, in both languages; the gate is now wired, so
+// the wording must say THAT instead. A box that tells an administrator it
+// applies no control while refusing their users is the same defect the inert
+// sentence existed to prevent, pointing the other way.
+//
+// Mutation that makes it fail: restore eoTypePermissionInertEN's text.
+func TestEoPerTypePermissionDescriptionsSayTheyAreEnforced(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
@@ -119,22 +191,63 @@ func TestEoPerTypePermissionDescriptionsSayNothingEnforcesThem(t *testing.T) {
 	// strings.Contains(x, "") is true for every x, so an emptied constant
 	// would make every assertion below pass while the administrator read a
 	// description that says nothing. Checked first, and loudly.
-	if len(eoTypePermissionInertEN) < 20 || len(eoTypePermissionInertAR) < 20 {
-		t.Fatalf("the inert-code sentences are %d and %d characters; substring assertions against a near-empty needle prove nothing",
-			len(eoTypePermissionInertEN), len(eoTypePermissionInertAR))
+	if len(eoTypePermissionEnforcedEN) < 20 || len(eoTypePermissionEnforcedAR) < 20 {
+		t.Fatalf("the enforcement sentences are %d and %d characters; substring assertions against a near-empty needle prove nothing",
+			len(eoTypePermissionEnforcedEN), len(eoTypePermissionEnforcedAR))
 	}
-	if !strings.Contains(strings.ToLower(eoTypePermissionInertEN), "not yet enforced") {
-		t.Errorf("the English sentence %q does not tell the administrator the code is unenforced", eoTypePermissionInertEN)
+	if !strings.Contains(strings.ToLower(eoTypePermissionEnforcedEN), "enforced") {
+		t.Errorf("the English sentence %q does not tell the administrator the code is enforced", eoTypePermissionEnforcedEN)
+	}
+	if strings.Contains(strings.ToLower(eoTypePermissionEnforcedEN), "not yet enforced") {
+		t.Errorf("the English sentence %q still says the code is inert", eoTypePermissionEnforcedEN)
 	}
 	for _, p := range perms {
 		t.Run(p.Code, func(t *testing.T) {
-			if !strings.Contains(p.Description, eoTypePermissionInertEN) {
-				t.Errorf("Description %q does not carry %q", p.Description, eoTypePermissionInertEN)
+			if !strings.Contains(p.Description, eoTypePermissionEnforcedEN) {
+				t.Errorf("Description %q does not carry %q", p.Description, eoTypePermissionEnforcedEN)
 			}
-			if !strings.Contains(p.DescriptionAr, eoTypePermissionInertAR) {
-				t.Errorf("DescriptionAr %q does not carry %q", p.DescriptionAr, eoTypePermissionInertAR)
+			if !strings.Contains(p.DescriptionAr, eoTypePermissionEnforcedAR) {
+				t.Errorf("DescriptionAr %q does not carry %q", p.DescriptionAr, eoTypePermissionEnforcedAR)
 			}
 		})
+	}
+}
+
+// TestEoPerTypePermissionDescriptionsAreRefreshed covers the database that
+// already exists. eoSeedTypePermissions keys its existence check on Code and
+// never used to touch a row it found, so every database seeded before Task A2
+// would keep telling its administrator that the code applies no control while
+// the gate refused their users. The description is refreshed in place.
+//
+// Mutation that makes it fail: drop the Updates branch and create only.
+func TestEoPerTypePermissionDescriptionsAreRefreshed(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var before models.Permission
+	if err := db.Where("code LIKE ?", "eo:eo\\_%").Order("code").First(&before).Error; err != nil {
+		t.Fatalf("read a per-type permission: %v", err)
+	}
+	stale := "Stale. NOT YET ENFORCED: nothing in the platform consults this code."
+	if err := db.Model(&models.Permission{}).Where("id = ?", before.ID).
+		Updates(map[string]any{"description": stale, "description_ar": stale}).Error; err != nil {
+		t.Fatalf("write the stale description: %v", err)
+	}
+
+	if err := eoSeedTypePermissions(db); err != nil {
+		t.Fatalf("re-run the per-type permission seed: %v", err)
+	}
+
+	var after models.Permission
+	if err := db.First(&after, "id = ?", before.ID).Error; err != nil {
+		t.Fatalf("read it back: %v", err)
+	}
+	if after.Description != before.Description || after.DescriptionAr != before.DescriptionAr {
+		t.Errorf("description = %q / %q, want it refreshed to %q / %q", after.Description, after.DescriptionAr, before.Description, before.DescriptionAr)
+	}
+	// Nothing else about the row may move: the grants hang off its id.
+	if after.ID != before.ID || after.Code != before.Code || after.Name != before.Name {
+		t.Errorf("the refresh rewrote more than the description: %+v, want id/code/name of %+v", after, before)
 	}
 }
 
