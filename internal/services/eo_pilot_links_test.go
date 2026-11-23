@@ -294,20 +294,25 @@ func (f *eoPilotFixture) eoPilotValues(t *testing.T, typeKey string) map[string]
 // eoPilotFieldValue is a placeholder submission value of the right SHAPE for
 // one field definition, read from the seeded configuration.
 //
-// "x" satisfies a text field and nothing else. A `file` or `multi_file` field
-// holds a Documenta file id (spec §7.12) and a filename is not one, so these
-// stand in for the id an upload would have returned — which is the whole of
-// what the engine can check without calling Documenta.
+// "x" satisfies a text field and nothing else.
+//
+// IT NO LONGER MINTS DOCUMENTA FILE IDS. It used to carry a `file` and a
+// `multi_file` arm standing in for the id an upload would have returned.
+// All three callers select `Provenance == user && RequiredMode == always`,
+// and after Task B2 no file field of the pilot is `always`
+// (database.TestNoPilotFileFieldIsDemandedAtAll pins that), so both arms
+// were unreachable — replacing them with a panic left the suite green.
+// They are removed rather than kept "for the day the fields are
+// re-tightened": if a file field ever becomes `always` again, falling
+// through to "x" fails the shape check loudly and names the field, which is
+// what should happen. A fixture that silently fabricates a document
+// reference is the thing B2 refused to let the UPLOAD ROUTE do.
 func eoPilotFieldValue(d models.EOFieldDef, bodyID uuid.UUID) any {
 	switch {
 	case d.Key == "owning_body_id":
 		return bodyID.String()
 	case d.Key == "due_date":
 		return time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339)
-	case d.Kind == models.EOKindFile:
-		return uuid.NewString()
-	case d.Kind == models.EOKindMultiFile:
-		return []any{uuid.NewString()}
 	default:
 		return "x"
 	}

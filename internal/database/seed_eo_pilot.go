@@ -398,9 +398,10 @@ var eoPilotSteps = []eoPilotStep{
 	// cannot supply an id for while EO Documenta is disabled, four demanded
 	// at creation and two at a closing transition; see
 	// eoFileFieldsRelaxedUntilDocumenta for the ruling and for how to
-	// re-tighten. It is deliberately NOT convergent: re-tightening is an
-	// administrator's edit through the type designer, and a convergent step
-	// would undo it on the next boot.
+	// re-tighten and for the narrow window in which that is possible at all.
+	// It is deliberately NOT convergent: restoring one of these fields is an
+	// administrator's edit, and a convergent step would undo it on the next
+	// boot.
 	{key: eoRelaxFileRequirednessStepKey, run: eoRelaxFileRequirednessUntilDocumenta},
 }
 
@@ -566,9 +567,6 @@ const eoRelaxFileRequirednessStepKey = "relax_file_requiredness_until_documenta"
 type eoFileRequirednessRelaxation struct {
 	TypeKey  string
 	FieldKey string
-	// Register is the client's name for the record this field blocks, for
-	// the operator-facing line.
-	Register string
 	// From is the required_mode the SEED wrote and this step is entitled to
 	// change. It is the step's WHERE clause and the mode the boot report
 	// tells an administrator to RESTORE, which are the same fact and must
@@ -597,13 +595,34 @@ type eoFileRequirednessRelaxation struct {
 // The reference would be indistinguishable from a real filing and nothing
 // would ever reconcile it.
 //
-// HOW TO RE-TIGHTEN, once the client's Documenta is connected. It is a
-// CONFIGURATION change and needs no release: set required_mode back to
-// `always` on each field through the type designer. Nothing in this seed will
-// undo that — the step is one-shot and its applied row already exists — and
-// nothing will do it for you either, which is why
-// eoLogFileFieldsAwaitingDocumenta reports these fields as an OBLIGATION on
-// every boot of a deployment that has EO_DOCUMENTA_ENABLED=true.
+// HOW TO RE-TIGHTEN, AND THE WINDOW IN WHICH IT IS POSSIBLE AT ALL. The task
+// that authorised this relaxation said re-tightening was "a configuration
+// change through the type designer that does not need a release". THAT IS
+// NOT TRUE ONCE THE REGISTER IS IN USE, and the correction is recorded here
+// rather than left to be discovered by the operator who tries it:
+//
+//	models.ValidateTypeEdit refuses `never -> always` AND `never -> at_state`
+//	outright while records exist ("making field %q required is destructive
+//	while records exist"). Its one caller is the type designer's own
+//	handlers.eoGuardTypeEdit, which asks eoTypeHasRecords — a count over the
+//	type AND EVERY TYPE BENEATH IT — so the designer answers 400 from the
+//	moment the register holds its first record. Which is precisely what this
+//	step enables.
+//
+// So the designer route is open ONLY while the type and its descendants hold
+// no records: on a fresh deployment, before go-live. After the first record
+// there is NO SUPPORTED ROUTE. Spec §7.14 contemplates a confirmed-destructive
+// edit with a stated backfill rule and IT IS NOT BUILT; building it is a
+// feature with its own risk, not a line in this seed. Until it exists, a
+// deployment that has filed records and then connects Documenta cannot
+// restore these controls through any supported path, which is a recorded
+// BLOCKER ON ENABLING EO_DOCUMENTA_ENABLED=true and not a chore for the
+// operator.
+//
+// Nothing in this seed will re-tighten them either: the step is one-shot and
+// its applied row already exists. eoLogFileFieldsAwaitingDocumenta therefore
+// says on every boot what is true, including that the designer refuses once
+// records exist.
 //
 // IT COVERS `at_state` TOO, and the addendum that extended it says why. The
 // ruling was first written against the CREATE path because that was the
@@ -624,17 +643,17 @@ type eoFileRequirednessRelaxation struct {
 // reads it only when the mode is `at_state`, so it is inert meanwhile, and
 // it means re-tightening does not have to rediscover the terminal state.
 var eoFileFieldsRelaxedUntilDocumenta = []eoFileRequirednessRelaxation{
-	{eoIncomingTypeKey, "attachments", "Incoming Correspondence", models.EORequiredAlways},
-	{eoDraftStudyTypeKey, "draft_file", "Draft Decision Study", models.EORequiredAlways},
-	{eoDraftStudyTypeKey, "study_report", "Draft Decision Study", models.EORequiredAlways},
-	{eoObjectionTypeKey, "proof", "Objection", models.EORequiredAlways},
+	{eoIncomingTypeKey, "attachments", models.EORequiredAlways},
+	{eoDraftStudyTypeKey, "draft_file", models.EORequiredAlways},
+	{eoDraftStudyTypeKey, "study_report", models.EORequiredAlways},
+	{eoObjectionTypeKey, "proof", models.EORequiredAlways},
 	// THE TWO CLOSING-TRANSITION FIELDS. The matrix marks both "Yes at
 	// closure"; eoAtClosureFields names them and eoRequireAtClosureState has
 	// already pointed them at their type's terminal state by the time this
 	// step runs, which is why it runs last and why it leaves those state ids
 	// alone.
-	{eoAssignmentTypeKey, "evidence", "Assignment", models.EORequiredAtState},
-	{eoTaskTypeKey, "evidence", "Task", models.EORequiredAtState},
+	{eoAssignmentTypeKey, "evidence", models.EORequiredAtState},
+	{eoTaskTypeKey, "evidence", models.EORequiredAtState},
 }
 
 // eoIsRelaxedUntilDocumenta reports whether (typeKey, fieldKey) is recorded as
@@ -718,8 +737,8 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 			log.Printf("EO pilot: %s.%s is %q, not the %q this step relaxes; left as it is", r.TypeKey, r.FieldKey, def.RequiredMode, r.From)
 			continue
 		}
-		log.Printf("EO pilot: %s.%s (%s) was %q and is now %q: EO Documenta mints no file id while it is disabled, so nothing could satisfy it. Restore it to %q through the type designer once Documenta is connected.",
-			r.TypeKey, r.FieldKey, def.Kind, r.From, models.EORequiredNever, r.From)
+		log.Printf("EO pilot: %s.%s (%s) was %q and is now %q: EO Documenta mints no file id while it is disabled, so nothing could satisfy it. Restoring it to %q is possible through the type designer only while %q holds no records; after the first one models.ValidateTypeEdit refuses the edit and no supported route remains.",
+			r.TypeKey, r.FieldKey, def.Kind, r.From, models.EORequiredNever, r.From, r.TypeKey)
 	}
 	return true, nil
 }
@@ -729,43 +748,99 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 //
 // The relaxation is permanent until somebody undoes it, and nothing undoes it
 // automatically — least of all connecting Documenta, which this seed never
-// hears about. The only thing standing between a Documenta-enabled deployment
-// and a statutory register whose mandatory attachment is quietly optional is
-// this line, so it reads the flag on every boot and says which of the two
-// states the deployment is in. It reports the DATABASE's current modes, not
-// the registry's intent, so a field an administrator has already re-tightened
-// drops out of the list by itself.
+// hears about. It reports the DATABASE's current modes, not the registry's
+// intent, and it reports BOTH halves of what it finds:
+//
+//	RELAXED — the field is `never`, so the register works and the client's
+//	matrix is not being honoured. Which mode would restore it differs by
+//	field (`always` at creation, `at_state` at closure), so each is named
+//	with its own.
+//
+//	STILL DEMANDED — the field is some other mode, so NOTHING CAN SATISFY IT
+//	while Documenta is off and the register is shut. This arm exists because
+//	eoRelaxFileRequirednessUntilDocumenta deliberately SKIPS a field that has
+//	been moved off the mode the seed wrote: the skip is logged once, on the
+//	boot it happened, and the step is one-shot, so without this the field
+//	would be stranded in silence for ever.
+//
+//	MISSING — no definition at all. Reported as its own case rather than
+//	counted as relaxed, which an empty mode string would otherwise do.
+//
+// WHAT IT MUST NOT SAY. It used to tell the operator to "set required_mode
+// back through the type designer", which 400s: models.ValidateTypeEdit
+// refuses to make a field required while the type or any type beneath it
+// holds records, and filing a record is exactly what the relaxation enables.
+// The line now says what is actually available, and names the missing
+// capability (§7.14's confirmed-destructive edit) instead of implying a route
+// that exists.
 func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
-	// Each entry is printed as "type.field (restore: <mode>)". The mode is
-	// the whole value of the line for the two at-closure fields: an
+	// Each entry prints as "type.field (restore: <mode>)". The mode is the
+	// whole value of the line for the two at-closure fields: an
 	// administrator who restored them to `always` instead would demand
 	// closing evidence at creation.
-	var relaxed []string
+	var relaxed, demanded, missing []string
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
-		var mode string
+		// COALESCE: required_mode is nullable, and a NULL scanned into a
+		// string errors. A row written before the column existed carries
+		// NULL and means `never`, which is not the same as NO ROW — hence
+		// the slice, which distinguishes them.
+		var modes []string
 		err := db.Table("eo_field_defs AS f").
 			Joins("JOIN eo_record_types t ON t.id = f.record_type_id AND t.deleted_at IS NULL").
 			Where("t.key = ? AND f.key = ? AND f.deleted_at IS NULL", r.TypeKey, r.FieldKey).
-			Limit(1).Pluck("f.required_mode", &mode).Error
+			Limit(1).
+			Pluck("COALESCE(f.required_mode, '')", &modes).Error
 		if err != nil {
+			// One unreadable field must not abandon the rest: this report
+			// is the only standing account of the relaxation.
 			log.Printf("EO pilot seed: could not read the requiredness of %s.%s: %v", r.TypeKey, r.FieldKey, err)
-			return
+			continue
 		}
-		// An empty mode is `never`: the column defaults to it and a row
-		// written before it existed carries no value.
-		if mode == "" || mode == models.EORequiredNever {
+		if len(modes) == 0 {
+			missing = append(missing, r.TypeKey+"."+r.FieldKey)
+			continue
+		}
+		switch modes[0] {
+		case "", models.EORequiredNever:
 			relaxed = append(relaxed, fmt.Sprintf("%s.%s (restore: %s)", r.TypeKey, r.FieldKey, r.From))
+		default:
+			demanded = append(demanded, fmt.Sprintf("%s.%s (%s)", r.TypeKey, r.FieldKey, modes[0]))
 		}
 	}
+
+	if len(missing) > 0 {
+		log.Printf("EO pilot: %d file field(s) this seed relaxed have NO definition at all: %s. Something removed them after the seed ran; the registry eoFileFieldsRelaxedUntilDocumenta still names them.",
+			len(missing), strings.Join(missing, ", "))
+	}
+
+	// THE STRANDED ARM, and it is reported whether Documenta is on or off.
+	// With Documenta disabled nothing can satisfy these fields and the
+	// register is shut; with it enabled they are simply the controls the
+	// client asked for, so only the first case is a fault.
+	if len(demanded) > 0 {
+		if config.EODocumentaEnabled() {
+			log.Printf("EO pilot: %d file field(s) are demanded and EO Documenta is enabled, so they can be satisfied: %s.",
+				len(demanded), strings.Join(demanded, ", "))
+		} else {
+			log.Printf("EO pilot: %d file field(s) are STILL DEMANDED while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. No upload route can mint a file id, so nothing can satisfy them and those registers cannot be used. The pilot seed relaxes only a field left at the mode it seeded, so a field moved off it by anything else stays demanded until somebody changes it back by hand.",
+				len(demanded), strings.Join(demanded, ", "))
+		}
+	}
+
 	if len(relaxed) == 0 {
 		return
 	}
+	// THE RE-TIGHTENING SENTENCE IS THE SAME IN BOTH ARMS because the
+	// constraint is the same: the type designer refuses to make a field
+	// required once the type or anything beneath it holds a record. Only
+	// the urgency differs.
+	const howToRestore = "Restoring a field is possible through the type designer ONLY while its record type and every type beneath it hold no records; after the first record models.ValidateTypeEdit refuses the edit (\"making field ... required is destructive while records exist\") and NO SUPPORTED ROUTE REMAINS — §7.14's confirmed-destructive edit with a backfill rule is not built."
 	if config.EODocumentaEnabled() {
-		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY — set each field's required_mode back to the mode shown in its own brackets through the type designer. The mode differs by field: an at-closure field restored to \"always\" would demand closing evidence at creation.",
+		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY. "+howToRestore+" Treat this as a BLOCKER on running enabled with these controls missing, not as a chore.",
 			len(relaxed), strings.Join(relaxed, ", "))
 		return
 	}
-	log.Printf("EO pilot: %d file field(s) are optional while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. The client's matrix marks them Required; restore each to the mode shown in its own brackets through the type designer once Documenta is connected.",
+	log.Printf("EO pilot: %d file field(s) are optional while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. The client's matrix marks them Required. "+howToRestore,
 		len(relaxed), strings.Join(relaxed, ", "))
 }
 

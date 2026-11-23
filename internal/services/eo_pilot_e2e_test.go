@@ -57,8 +57,9 @@ import (
 // (database.eoFileFieldsRelaxedUntilDocumenta), so `values` below — which
 // fills every user field the SEEDED configuration requires — no longer
 // selects a file field at all, and the scenario now runs on submissions a
-// clerk could type. eoPilotFieldValue keeps its file arms for the older pilot
-// fixtures and for the day the fields are re-tightened.
+// clerk could type. eoPilotFieldValue's file arms were removed with it: all
+// three callers select the same `user && always` pair, so nothing reached
+// them any more.
 
 // eoComFixture is the seeded pilot plus the whole service stack. documenta
 // says which of the two deployments is under test; see eoComNewFixture.
@@ -233,8 +234,8 @@ func eoComNewFixture(t *testing.T, withDocumenta bool) *eoComFixture {
 // values is a submission satisfying everything the SEEDED configuration
 // requires at creation of typeKey, read back from the database so a field
 // added to the pilot cannot leave this fixture behind. It is eoWfValues'
-// shape, and eoPilotFieldValue — the helper Task C3 changed — is what mints
-// the Documenta file ids the file kinds need.
+// shape, built by eoPilotFieldValue. It mints no Documenta file id: no file
+// field of the pilot is `always` any more, so none is ever selected here.
 func (f *eoComFixture) values(t *testing.T, typeKey string) map[string]any {
 	t.Helper()
 	var defs []models.EOFieldDef

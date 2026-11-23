@@ -4082,25 +4082,129 @@ func TestEoFileRelaxationDoesNotRevertAnAdministratorsRetightening(t *testing.T)
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	r := eoFileFieldsRelaxedUntilDocumenta[0]
-	def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
-	if def.RequiredMode != models.EORequiredNever {
-		t.Fatalf("fixture error: %s.%s is %q after the seed, so there is nothing for an administrator to re-tighten", r.TypeKey, r.FieldKey, def.RequiredMode)
-	}
-	// What the type designer does once Documenta is connected.
-	if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
-		Update("required_mode", models.EORequiredAlways).Error; err != nil {
-		t.Fatalf("re-tighten %s.%s: %v", r.TypeKey, r.FieldKey, err)
+	// EVERY ENTRY, EACH RESTORED TO ITS OWN MODE. Asking only about entry
+	// [0] was not enough and that is measured, not assumed: with the step
+	// made convergent and its pending check recognising `at_state` alone,
+	// the single-field version PASSED while this one fails on both evidence
+	// fields. A guard that covers one mode of a two-mode registry is a
+	// guard with a hole exactly where the newer half lives.
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+		if def.RequiredMode != models.EORequiredNever {
+			t.Fatalf("fixture error: %s.%s is %q after the seed, so there is nothing for an administrator to restore", r.TypeKey, r.FieldKey, def.RequiredMode)
+		}
+		// What an administrator does, by whatever route is open to them.
+		if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
+			Update("required_mode", r.From).Error; err != nil {
+			t.Fatalf("restore %s.%s to %q: %v", r.TypeKey, r.FieldKey, r.From, err)
+		}
 	}
 
 	for i := 0; i < 3; i++ {
 		seedEOPilot(db)
 	}
 
-	again := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
-	if again.RequiredMode != models.EORequiredAlways {
-		t.Errorf("after three more boots %s.%s is %q; an administrator set it to %q through the type designer and the seed reverted it",
-			r.TypeKey, r.FieldKey, again.RequiredMode, models.EORequiredAlways)
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		again := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+		if again.RequiredMode != r.From {
+			t.Errorf("after three more boots %s.%s is %q; an administrator set it to %q and the seed reverted it",
+				r.TypeKey, r.FieldKey, again.RequiredMode, r.From)
+		}
+	}
+}
+
+// TestEoAStrandedFileFieldIsReportedOnEveryBoot is the complement of the
+// step's WHERE clause.
+//
+// eoRelaxFileRequirednessUntilDocumenta deliberately SKIPS a field that has
+// been moved off the mode the seed wrote — that is how an administrator's
+// edit stays theirs. But the step is one-shot and logs the skip once, on the
+// boot it happened, so a field left at some third mode (`conditional`, say)
+// was stranded in total silence: still demanded, still unsatisfiable while
+// Documenta is off, and absent from every report for ever because the report
+// listed only fields that were already `never`.
+//
+// Mutation: drop the `demanded` arm of eoLogFileFieldsAwaitingDocumenta, or
+// make it report only when Documenta is enabled.
+func TestEoAStrandedFileFieldIsReportedOnEveryBoot(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	r := eoFileFieldsRelaxedUntilDocumenta[0]
+	def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+	// A mode that is neither `never` nor the one the step relaxes, which is
+	// exactly the case the step walks past.
+	if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
+		Update("required_mode", models.EORequiredConditional).Error; err != nil {
+		t.Fatalf("strand %s.%s: %v", r.TypeKey, r.FieldKey, err)
+	}
+
+	out := eoCaptureSeed(t, db)
+	if strings.Contains(out, "Applying the EO pilot configuration") {
+		t.Fatalf("fixture error: this boot applied seed steps, so it is not the every-boot report under test.\n--- output ---\n%s", out)
+	}
+	if !strings.Contains(out, "STILL DEMANDED") {
+		t.Errorf("a field stranded at %q is not reported; the step skipped it once and nothing mentions it again, so the register stays unusable in silence.\n--- output ---\n%s", models.EORequiredConditional, out)
+	}
+	if !strings.Contains(out, r.TypeKey+"."+r.FieldKey) {
+		t.Errorf("the report does not name %s.%s.\n--- output ---\n%s", r.TypeKey, r.FieldKey, out)
+	}
+}
+
+// TestEoFileFieldReportSurvivesANullRequiredMode: required_mode is NULLABLE,
+// and the report read it into a string. One NULL row made the whole handler
+// error and return, so EVERY remaining field went unreported and the
+// obligation line vanished entirely — a report that goes silent in the one
+// state it exists to describe.
+//
+// Mutation: drop the COALESCE, or turn the per-field `continue` back into a
+// `return`.
+func TestEoFileFieldReportSurvivesANullRequiredMode(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	r := eoFileFieldsRelaxedUntilDocumenta[0]
+	def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+	if err := db.Exec("UPDATE eo_field_defs SET required_mode = NULL WHERE id = ?", def.ID).Error; err != nil {
+		t.Fatalf("null the required_mode of %s.%s: %v", r.TypeKey, r.FieldKey, err)
+	}
+
+	out := eoCaptureSeed(t, db)
+	if !strings.Contains(out, "file field(s) are optional while EO Documenta is disabled") {
+		t.Errorf("one NULL required_mode silenced the whole obligation report.\n--- output ---\n%s", out)
+	}
+	// A NULL mode IS `never`, so the field is reported as relaxed like the
+	// rest rather than dropped or counted as demanded.
+	if !strings.Contains(out, r.TypeKey+"."+r.FieldKey+" (restore: "+r.From+")") {
+		t.Errorf("the field whose mode is NULL is not listed as relaxed; NULL and `never` are the same state.\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, "STILL DEMANDED") {
+		t.Errorf("a NULL required_mode is reported as demanded.\n--- output ---\n%s", out)
+	}
+}
+
+// TestEoAMissingFileFieldIsReportedAsMissing: no row at all is NOT the same
+// as a row whose mode is empty, and the first draft could not tell them
+// apart — a deleted definition read back as "" and was reported as relaxed
+// for ever, which is a field that does not exist described as working.
+//
+// Mutation: fold the `missing` arm into the `relaxed` one.
+func TestEoAMissingFileFieldIsReportedAsMissing(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	r := eoFileFieldsRelaxedUntilDocumenta[0]
+	def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+	if err := db.Unscoped().Where("id = ?", def.ID).Delete(&models.EOFieldDef{}).Error; err != nil {
+		t.Fatalf("remove %s.%s: %v", r.TypeKey, r.FieldKey, err)
+	}
+
+	out := eoCaptureSeed(t, db)
+	if !strings.Contains(out, "have NO definition at all") {
+		t.Errorf("a removed field definition is not reported as missing.\n--- output ---\n%s", out)
+	}
+	if strings.Contains(out, r.TypeKey+"."+r.FieldKey+" (restore: ") {
+		t.Errorf("a removed field definition is listed among the relaxed ones, so a field that does not exist is described as working.\n--- output ---\n%s", out)
 	}
 }
 
