@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // These cover the metamodel writes the designer API needs. They are DB-backed
@@ -397,4 +399,135 @@ func TestEORecordListFilterByParentID(t *testing.T) {
 			t.Errorf("Children returned %d, want 2 (it applies no visibility)", len(kids))
 		}
 	})
+}
+
+// ── §7.11: a type created through the designer is usable immediately ────────
+
+// eoRoleUser is the user a role's holder is, loaded the way the auth
+// middleware loads one: the role WITH its permissions.
+func eoRoleUser(t *testing.T, db *gorm.DB, roleCode string) *models.User {
+	t.Helper()
+	var role models.Role
+	if err := db.Preload("Permissions").Where("code = ?", roleCode).First(&role).Error; err != nil {
+		t.Fatalf("read role %q with its permissions: %v", roleCode, err)
+	}
+	return &models.User{ID: uuid.New(), Roles: []models.Role{role}}
+}
+
+// TestEORecordTypeCreateGrantsItsPerTypePermissions is the fix for the
+// Critical the A2 review found: with the per-type gate enforcing, a record
+// type created through the designer had NO permission row, so every
+// non-super-admin — admin and executive_office included — was refused create
+// and shown an empty register for it until the next server restart.
+//
+// Spec §7.13 says a new process is a configuration change rather than a
+// release. This asserts the whole chain the designer depends on: the codes
+// exist, they are granted, and a holder of the seeded role can immediately see
+// a record of the new type through the register's §7.11 clause.
+func TestEORecordTypeCreateGrantsItsPerTypePermissions(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	records := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	created := &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsActive: true}
+	if err := types.Create(ctx, created); err != nil {
+		t.Fatalf("create the record type: %v", err)
+	}
+
+	// 1. the three codes exist, spelled the way the gate and the filter read
+	//    them.
+	for _, action := range []string{models.EOTypePermissionView, models.EOTypePermissionCreate, models.EOTypePermissionUpdate} {
+		code := models.EOTypePermissionCode(created.Key, action)
+		var n int64
+		if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&n).Error; err != nil {
+			t.Fatalf("count %q: %v", code, err)
+		}
+		if n != 1 {
+			t.Errorf("%d rows for %q, want 1: the designer wrote a type nobody holds a code for", n, code)
+		}
+	}
+
+	// 2. both seeded roles hold all three — the designer may not grant a
+	//    different population than the seed.
+	for _, roleCode := range models.EOTypePermissionRoleCodes {
+		held := map[string]bool{}
+		for _, code := range eoRoleUser(t, db, roleCode).Roles[0].Permissions {
+			held[code.Code] = true
+		}
+		for _, action := range []string{models.EOTypePermissionView, models.EOTypePermissionCreate, models.EOTypePermissionUpdate} {
+			if code := models.EOTypePermissionCode(created.Key, action); !held[code] {
+				t.Errorf("role %q does not hold %q", roleCode, code)
+			}
+		}
+	}
+
+	// 3. the register shows a record of the new type to a holder of the
+	//    seeded role, with no restart. This is the assertion that fails if
+	//    anything above is cosmetic.
+	rec := eoListRec(t, records, created.ID, "EO-BR-2026-001", nil)
+	user := eoRoleUser(t, db, "executive_office")
+	if !user.HasPermission(models.EOTypePermissionCode(created.Key, models.EOTypePermissionView)) {
+		t.Fatal("the role does not hold the view code, so the register below proves nothing")
+	}
+	f := models.EORecordFilter{UserID: user.ID, PermissionCodes: user.PermissionCodes()}
+	got, total, err := records.List(ctx, &f)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if refs := eoRefs(got); !reflect.DeepEqual(refs, []string{rec.Reference}) || total != 1 {
+		t.Errorf("an executive_office user sees %v total %d, want [%s]: the designer-created type is invisible", refs, total, rec.Reference)
+	}
+}
+
+// TestEORecordTypeCreateWritesNoCodesForAnAbstractType matches the seed, which
+// writes codes for CONCRETE types only. An abstract type holds no records of
+// its own, so a code naming it would grant access to an empty set and widen
+// silently the moment a child type was added.
+func TestEORecordTypeCreateWritesNoCodesForAnAbstractType(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+
+	abstract := &models.EORecordType{ID: uuid.New(), Key: "eo_abstract_base", Name: "Base", IsAbstract: true, IsActive: true}
+	if err := types.Create(context.Background(), abstract); err != nil {
+		t.Fatalf("create the abstract type: %v", err)
+	}
+	var n int64
+	if err := db.Model(&models.Permission{}).Where("code LIKE ?", "eo:eo\\_abstract\\_base:%").Count(&n).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d per-type codes for an abstract type, want 0", n)
+	}
+}
+
+// TestEORecordTypeCreateRollsBackWhenARoleIsMissing: the grant and the type
+// are one transaction. A deployment missing a seeded role is a
+// misconfiguration, and a loud failure is better than the type this whole fix
+// exists to prevent — one that exists and that nobody but a super admin can
+// see.
+func TestEORecordTypeCreateRollsBackWhenARoleIsMissing(t *testing.T) {
+	db := eoRecordDB(t)
+	if err := db.Where("code = ?", "executive_office").Delete(&models.Role{}).Error; err != nil {
+		t.Fatalf("remove the role: %v", err)
+	}
+	types := NewEORecordTypeRepository(db)
+
+	err := types.Create(context.Background(), &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsActive: true})
+	if err == nil {
+		t.Fatal("Create succeeded with a seeded role missing, so the type's codes were granted to nobody")
+	}
+	var n int64
+	if err := db.Model(&models.EORecordType{}).Where("key = ?", "eo_board_resolution").Count(&n).Error; err != nil {
+		t.Fatalf("count types: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d type rows after a failed grant, want 0: the transaction did not roll back", n)
+	}
+	if err := db.Model(&models.Permission{}).Where("code LIKE ?", "eo:eo\\_board\\_resolution:%").Count(&n).Error; err != nil {
+		t.Fatalf("count permissions: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d permission rows after a failed grant, want 0", n)
+	}
 }

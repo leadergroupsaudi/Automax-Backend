@@ -24,6 +24,20 @@ func eoRecordDB(t *testing.T) *gorm.DB {
 	if err := migrationDB.Migrator().CreateTable(&models.EORecordType{}, &models.EOFieldDef{}, &models.EOLinkType{}); err != nil {
 		t.Fatalf("create metamodel tables: %v", err)
 	}
+	// The roles and permissions the DESIGNER writes to. Creating a record
+	// type now writes §7.11's three per-type codes and grants them, in the
+	// type's own transaction, so a test schema without these tables is not a
+	// test schema the designer can run against — which is the point: a type
+	// created without its codes is one nobody but a super admin can see.
+	if err := migrationDB.AutoMigrate(&models.Role{}, &models.Permission{}); err != nil {
+		t.Fatalf("create the role and permission tables: %v", err)
+	}
+	for _, code := range models.EOTypePermissionRoleCodes {
+		r := models.Role{ID: uuid.New(), Name: code, Code: code, IsActive: true}
+		if err := db.Create(&r).Error; err != nil {
+			t.Fatalf("create role %q: %v", code, err)
+		}
+	}
 	return db
 }
 

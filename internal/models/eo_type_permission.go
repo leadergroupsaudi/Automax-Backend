@@ -1,6 +1,11 @@
 package models
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+)
 
 // Spec §7.11 names three visibility mechanisms: the sensitivity label,
 // row-level visible_to, and PER-TYPE PERMISSIONS. This file is the third one's
@@ -80,6 +85,98 @@ func EOTypeKeysFromPermissionCodes(codes []string, action string) []string {
 		}
 		seen[key] = true
 		out = append(out, key)
+	}
+	return out
+}
+
+// ── the rows themselves ─────────────────────────────────────────────────────
+//
+// TWO WRITERS, ONE CONSTRUCTOR. The boot seed
+// (database.eoSeedTypePermissions) writes these rows for every type it seeds,
+// and the type designer writes them for a type an administrator creates at
+// runtime (repository.eoRecordTypeRepository.Create). Until Plan 3's A2 fix
+// round the designer wrote NOTHING, and with the per-type gate enforcing, a
+// type created through the designer was invisible to every non-super-admin —
+// admin and executive_office included — until the next server restart. Spec
+// §7.13's headline is "a new process is a configuration change rather than a
+// release"; a configuration change that needs a restart to take effect is a
+// release.
+//
+// So the two writers share this constructor and the role list below, rather
+// than the designer growing a second copy that is right on the day it is
+// written. What a designer-created type gets is, by construction, what a
+// seeded type gets.
+
+// EOTypePermissionAction is one of spec §7.11's three actions together with
+// the words the administrator reads in the permissions UI.
+type EOTypePermissionAction struct{ Action, Verb, VerbAr string }
+
+// EOTypePermissionActions is §7.11's three actions, in the order the codes are
+// written.
+var EOTypePermissionActions = []EOTypePermissionAction{
+	{EOTypePermissionView, "View", "عرض"},
+	{EOTypePermissionCreate, "Create", "إنشاء"},
+	{EOTypePermissionUpdate, "Update", "تحديث"},
+}
+
+// EOTypePermissionRoleCodes are the roles a new record type's codes are
+// granted to. It is ONE list because the seed and the designer must grant the
+// same set: a designer that invented its own would make a runtime-created type
+// reachable by a different population than a seeded one, which is a
+// configuration difference nobody could see in the UI.
+//
+// Which roles belong here is a question for whoever changes the seed, not for
+// a caller: this is read, never parameterised.
+var EOTypePermissionRoleCodes = []string{"admin", "executive_office"}
+
+// EOTypePermissionEnforcedEN and EOTypePermissionEnforcedAR are appended to
+// every per-type permission's description, in both languages.
+//
+// WHY THE WORDING IS PART OF THE ROW. The permissions UI shows the
+// administrator this Description and nothing else. Through Plan 1 and Plan 2
+// the sentence here said the opposite — "NOT YET ENFORCED… granting it
+// records an intention and applies no control" — because nothing consulted
+// these codes. Task A2 wired the control and the sentence had to go in the
+// same change: a box that says it enforces nothing while enforcing something
+// is the same defect pointing the other way.
+//
+// It names BOTH surfaces. An administrator revoking a view code needs to know
+// the register narrows, not only that one request is refused.
+//
+// THE ARABIC WAS WRITTEN BY AN IMPLEMENTER, NOT SUPPLIED BY THE CLIENT, and it
+// awaits the spec §9 sign-off round like every other Arabic string in the EO
+// seed. docs/superpowers/eo-plan1-carry-forward.md names it so the sign-off
+// round can find it.
+const (
+	EOTypePermissionEnforcedEN = "ENFORCED: a caller who does not hold this code is refused records of this type, and the register lists only the types whose view code they hold."
+	EOTypePermissionEnforcedAR = "مُطبَّق: يُرفض وصول من لا يملك هذا الرمز إلى سجلات هذا النوع، ولا يعرض السجل إلا الأنواع التي يملك رمز عرضها."
+)
+
+// EOTypePermissionsFor builds the three permission rows a concrete record type
+// needs, in the order EOTypePermissionActions lists them.
+//
+// Permission.Name is uniquely indexed, so it is built from the type KEY —
+// which eo_record_types.key already makes unique — and not from the display
+// Name, which two types may share. The display name goes in the description,
+// where a collision is harmless. The Code is derived from the same key, so the
+// uniqueness of the two agrees.
+//
+// IsActive is deliberately left zero: the column defaults to true, and the
+// seed has always relied on that. Setting it here would make a designer-written
+// row differ from a seeded one in a column HasPermission reads.
+func EOTypePermissionsFor(t EORecordType) []Permission {
+	out := make([]Permission, 0, len(EOTypePermissionActions))
+	for _, a := range EOTypePermissionActions {
+		out = append(out, Permission{
+			ID:            uuid.New(),
+			Name:          fmt.Sprintf("EO %s %s", a.Verb, t.Key),
+			Code:          EOTypePermissionCode(t.Key, a.Action),
+			Module:        "eo",
+			Action:        fmt.Sprintf("%s:%s", t.Key, a.Action),
+			ActionAr:      a.VerbAr,
+			Description:   fmt.Sprintf("%s executive-office records of type %s (%s). %s", a.Verb, t.Name, t.Key, EOTypePermissionEnforcedEN),
+			DescriptionAr: fmt.Sprintf("%s سجلات المكتب التنفيذي من نوع %s. %s", a.VerbAr, t.NameAr, EOTypePermissionEnforcedAR),
+		})
 	}
 	return out
 }
