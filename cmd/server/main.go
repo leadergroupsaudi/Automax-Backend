@@ -888,6 +888,15 @@ func main() {
 	// file ids every `file`/`multi_file` EO field stores (§7.12). It carries
 	// the same two guards as PUT /eo-records/:id, because an upload writes
 	// into the record's folder.
+	//
+	// GET /eo-records/:id/files/:file_id[/preview] read one back, and carry
+	// the guards of GET /eo-records/:id instead — a read is not an edit. They
+	// are the ONLY way an EO file can be opened: /documents/files/:id/* runs
+	// on the GOALS Documenta client (built from cfg.Documenta above, with its
+	// own token and workspace) behind goals:view, so it cannot reach a file
+	// uploaded here. Both stream the bytes through this gate rather than
+	// handing out a Documenta URL, which would answer without the record id
+	// and outlive the permission that produced it.
 	eoFileHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission, eoTypePermission.RequireEOTypePermission)
 
 	// Admin routes

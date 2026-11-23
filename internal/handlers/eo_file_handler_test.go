@@ -23,6 +23,7 @@ import (
 	"github.com/automax/backend/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 // ── fake Documenta client ───────────────────────────────────────────────────
@@ -47,6 +48,17 @@ type eoFakeDocumenta struct {
 	tagCalls  int
 	gotTagID  string
 	gotTagMap map[string]string
+
+	// ── the read path (Task B3) ──
+	downloadBody  string
+	downloadInfo  *storage.DmsFile
+	downloadErr   error
+	downloadCalls int
+	gotDownloadID string
+	// urlCalls counts GetDownloadURL/GetPreviewURL. It is asserted to be
+	// ZERO: a URL handed to the client carries Documenta's authorisation,
+	// not EO's, and outlives the permission check that produced it.
+	urlCalls int
 }
 
 func (f *eoFakeDocumenta) UploadFile(_ context.Context, folderID, fileName string, fileData io.Reader, fileSize int64, metadata map[string]string) (string, error) {
@@ -700,5 +712,541 @@ func TestEOSanitiseFileName(t *testing.T) {
 	}
 	if got := eoSanitiseFileName(long); len([]rune(got)) > eoMaxFileNameRunes || !strings.HasSuffix(got, ".pdf") {
 		t.Errorf("eoSanitiseFileName(<400 chars>) = %q (%d runes): it must be clamped and keep its extension", got, len([]rune(got)))
+	}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Task B3 — reading a record's file back
+// ════════════════════════════════════════════════════════════════════════════
+
+// The read path's half of the fake. GetDownloadURL and GetPreviewURL are
+// implemented and COUNTED rather than left to the embedded nil interface: the
+// tests below assert they are never called, which is what pins the decision to
+// stream the bytes through the EO gate instead of handing the caller a
+// Documenta URL that carries no EO authorisation and outlives the check that
+// produced it. Left unimplemented, that assertion would be satisfied by a nil
+// panic instead of by the handler's design.
+func (f *eoFakeDocumenta) DownloadFile(_ context.Context, fileID string) (io.ReadCloser, *storage.DmsFile, error) {
+	f.downloadCalls++
+	f.gotDownloadID = fileID
+	if f.downloadErr != nil {
+		return nil, nil, f.downloadErr
+	}
+	return io.NopCloser(strings.NewReader(f.downloadBody)), f.downloadInfo, nil
+}
+
+func (f *eoFakeDocumenta) GetDownloadURL(_ context.Context, fileID string) (string, error) {
+	f.urlCalls++
+	return "https://documenta.example/signed/" + fileID, nil
+}
+
+func (f *eoFakeDocumenta) GetPreviewURL(_ context.Context, fileID string) (string, error) {
+	f.urlCalls++
+	return "https://documenta.example/preview/" + fileID, nil
+}
+
+// eoReadFake is a Documenta that will hand back one file.
+func eoReadFake(body string, info *storage.DmsFile) *eoFakeDocumenta {
+	return &eoFakeDocumenta{downloadBody: body, downloadInfo: info}
+}
+
+// eoRecordHolding is a record whose stored values reference the given file
+// ids in an `attachments` multi_file field — what the register holds once the
+// clerk has saved the form B1's upload fed.
+func eoRecordHolding(t *testing.T, values map[string]any) *models.EORecord {
+	t.Helper()
+	rec := eoUploadRecord()
+	raw, err := json.Marshal(values)
+	if err != nil {
+		t.Fatalf("marshal values: %v", err)
+	}
+	rec.Values = datatypes.JSON(raw)
+	return rec
+}
+
+// eoReadPaths is the download route and the preview route. Every refusal below
+// is driven through BOTH: a guard present on one and missing on the other is
+// exactly this programme's signature defect, and the preview route is the one
+// that would be written second and checked least.
+func eoReadPaths(recID, fileID string) map[string]string {
+	return map[string]string{
+		"download": "/eo-records/" + recID + "/files/" + fileID,
+		"preview":  "/eo-records/" + recID + "/files/" + fileID + "/preview",
+	}
+}
+
+// eoRefusalEnvelope asserts the response is this API's JSON refusal and
+// returns its message.
+//
+// It exists because of a specific trap: before these routes were registered,
+// Fiber answered every one of these requests with its OWN 404 ("Cannot GET
+// /eo-records/..." as text/plain). A test that checked only the status code
+// would therefore have PASSED against no implementation at all — and would
+// equally pass against a nil-pointer panic once the status it asserts is 500.
+// Requiring the envelope, with success=false and a message, is what makes the
+// refusal tests mean something.
+func eoRefusalEnvelope(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("the refusal is not this API's JSON envelope (a route that does not exist, or a panic, answers like this): %q", string(raw))
+	}
+	if success, _ := env["success"].(bool); success {
+		t.Errorf("success = true on a refusal: %s", string(raw))
+	}
+	msg := fmt.Sprintf("%v%v", env["error"], env["message"])
+	if strings.TrimSpace(strings.ReplaceAll(msg, "<nil>", "")) == "" {
+		t.Errorf("the refusal carries no message: %s", string(raw))
+	}
+	return msg
+}
+
+// TestEOFileDownloadStreamsTheFile is the whole point of B3: until these
+// routes existed a clerk could attach the mandatory document to an Incoming
+// Correspondence and nobody — not even the clerk — could ever open it.
+//
+// It asserts the BYTES, not a URL. A 3xx to a Documenta download URL would
+// also "work" in a browser, and is asserted against explicitly: that URL
+// carries Documenta's own authorisation, not EO's, so it is readable by
+// anyone it reaches and keeps working after the permission that produced it
+// is revoked.
+func TestEOFileDownloadStreamsTheFile(t *testing.T) {
+	fileID := uuid.New().String()
+	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+	doc := eoReadFake("PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf", Size: 9})
+	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+	if string(body) != "PDF-BYTES" {
+		t.Errorf("body = %q, want the file's bytes", string(body))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/pdf") {
+		t.Errorf("Content-Type = %q, want the file's own type", ct)
+	}
+	cd := resp.Header.Get("Content-Disposition")
+	if !strings.HasPrefix(cd, "attachment") || !strings.Contains(cd, "minute.pdf") {
+		t.Errorf("Content-Disposition = %q, want an attachment named minute.pdf", cd)
+	}
+	if doc.downloadCalls != 1 || doc.gotDownloadID != fileID {
+		t.Errorf("DownloadFile calls = %d for id %q, want 1 for %q", doc.downloadCalls, doc.gotDownloadID, fileID)
+	}
+	// Not a redirect, and no Documenta URL minted anywhere.
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("the response redirects to %q: that URL leaves EO's authorisation behind", loc)
+	}
+	if doc.urlCalls != 0 {
+		t.Errorf("a Documenta URL was minted %d times; the bytes must be served through this gate", doc.urlCalls)
+	}
+}
+
+// TestEOFilePreviewServesTheFileInline pins the one thing that distinguishes
+// the preview route from the download route. A preview that answered
+// `attachment` would be a download under another name — the route would exist,
+// be registered, be tested, and do nothing of its own.
+func TestEOFilePreviewServesTheFileInline(t *testing.T) {
+	fileID := uuid.New().String()
+	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+	doc := eoReadFake("PDF-BYTES", &storage.DmsFile{UUID: fileID, Name: "minute.pdf", MimeType: "application/pdf"})
+	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["preview"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(body))
+	}
+	if string(body) != "PDF-BYTES" {
+		t.Errorf("body = %q, want the file's bytes", string(body))
+	}
+	cd := resp.Header.Get("Content-Disposition")
+	if !strings.HasPrefix(cd, "inline") {
+		t.Errorf("Content-Disposition = %q, want inline: a preview that answers `attachment` is the download route with a second name", cd)
+	}
+	if !strings.Contains(cd, "minute.pdf") {
+		t.Errorf("Content-Disposition = %q, want the file's name", cd)
+	}
+	// An uploaded .html or .svg is served from the API's own origin here.
+	// Without these two headers it would run as a document of that origin.
+	if nosniff := resp.Header.Get("X-Content-Type-Options"); nosniff != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", nosniff)
+	}
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("Content-Security-Policy = %q, want default-src 'none': an uploaded HTML file is previewed from this origin", csp)
+	}
+	if doc.urlCalls != 0 {
+		t.Errorf("a Documenta preview URL was minted %d times; it would be readable without any EO permission", doc.urlCalls)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("the preview redirects to %q", loc)
+	}
+}
+
+// TestEOFileDownloadAcceptsEveryStoredShape: a `file` field holds one id, a
+// `multi_file` field holds a list, and the transition path may have filed a
+// list beside other values. All three are the register's own storage, so all
+// three must read back.
+func TestEOFileDownloadAcceptsEveryStoredShape(t *testing.T) {
+	fileID := uuid.New().String()
+	for _, tc := range []struct {
+		name   string
+		values map[string]any
+	}{
+		{"a file field", map[string]any{"cover_letter": fileID}},
+		{"a multi_file field", map[string]any{"attachments": []any{uuid.New().String(), fileID}}},
+		{"beside other values", map[string]any{"note": "see attached", "attachments": []any{fileID}, "count": 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := eoRecordHolding(t, tc.values)
+			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusOK {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(raw))
+			}
+		})
+	}
+}
+
+// TestEOFileDownloadRefusesAFileNotOnThisRecord is the security property this
+// task turns on. Without it the record id in the path is decoration: anyone
+// holding eo:view on any one record type could read EVERY file in the EO
+// workspace by quoting its id against a record they can see.
+//
+// The assertion that makes it real is doc.downloadCalls == 0. An ownership
+// check placed after the fetch would serve nothing, but it would still have
+// FETCHED — and the next refactor that logs or caches the body turns that into
+// a leak. The call count is what forbids that shape.
+func TestEOFileDownloadRefusesAFileNotOnThisRecord(t *testing.T) {
+	// The file that is really on another record — the actual attack.
+	othersFile := uuid.New().String()
+	mine := uuid.New().String()
+
+	for _, tc := range []struct {
+		name      string
+		values    map[string]any
+		requested string
+	}{
+		{"a file filed on another record", map[string]any{"attachments": []any{mine}}, othersFile},
+		{"a file nothing references", map[string]any{"attachments": []any{mine}}, uuid.New().String()},
+		{"a record holding no files at all", map[string]any{"note": "nothing attached"}, othersFile},
+		{"a record with empty values", map[string]any{}, othersFile},
+		{"an id that is not a file id", map[string]any{"attachments": []any{mine}}, "not-a-uuid"},
+		// The record holds this exact STRING, but not as a Documenta file id:
+		// a text field is not a filing cabinet.
+		{"a non-id string the record happens to hold", map[string]any{"note": "letter.pdf"}, "letter.pdf"},
+	} {
+		for routeName, path := range eoReadPaths("RECORD", tc.requested) {
+			t.Run(tc.name+"/"+routeName, func(t *testing.T) {
+				rec := eoRecordHolding(t, tc.values)
+				doc := eoReadFake("SECRET-BYTES", &storage.DmsFile{UUID: tc.requested, Name: "secret.pdf", MimeType: "application/pdf"})
+				repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+				app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+
+				resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+				if err != nil {
+					t.Fatalf("app.Test: %v", err)
+				}
+				if resp.StatusCode != fiber.StatusNotFound {
+					raw, _ := io.ReadAll(resp.Body)
+					t.Fatalf("status = %d, want 404: %s", resp.StatusCode, string(raw))
+				}
+				eoRefusalEnvelope(t, resp)
+				if doc.downloadCalls != 0 {
+					t.Errorf("DownloadFile ran %d times for a file that is not on this record: the ownership check must run BEFORE the fetch", doc.downloadCalls)
+				}
+				if doc.urlCalls != 0 {
+					t.Errorf("a Documenta URL was minted %d times for a file that is not on this record", doc.urlCalls)
+				}
+			})
+		}
+	}
+}
+
+// TestEOFileDownloadHonoursRowLevelVisibility: §7.11 decides this before any
+// question about the file is asked. A record the caller may not see answers
+// 404 exactly as GET /eo-records/:id does, and nothing is fetched.
+func TestEOFileDownloadHonoursRowLevelVisibility(t *testing.T) {
+	fileID := uuid.New().String()
+	for routeName, path := range eoReadPaths("RECORD", fileID) {
+		t.Run(routeName, func(t *testing.T) {
+			// The record really does hold the file, so the ONLY thing
+			// refusing here is visibility.
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
+			repo := &eoFakeRecordRepo{
+				byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
+				visibleIDs: map[uuid.UUID]bool{}, // visible to nobody
+			}
+			user := &models.User{ID: uuid.New(), Email: "outsider@eo.gov"} // not a super admin
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), user)
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusNotFound {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 404: %s", resp.StatusCode, string(raw))
+			}
+			eoRefusalEnvelope(t, resp)
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times for a record the caller cannot see", doc.downloadCalls)
+			}
+		})
+	}
+}
+
+// TestEOFileDownloadRefusesWithoutTypeViewPermission drives the REAL per-type
+// middleware on the REAL routes.
+//
+// Reading a file is a READ: it asks for eo:<type_key>:VIEW, not update. The
+// near miss is deliberate — a caller holding UPDATE on this type but not view
+// must still be refused, because a gate wired to the wrong action would wave
+// the common case through and look correct.
+//
+// 403 and never 401: the frontend's axios interceptor logs the user out on a
+// 401, so a permission refusal that answered 401 would end the session.
+func TestEOFileDownloadRefusesWithoutTypeViewPermission(t *testing.T) {
+	const typeKey = "eo_incoming_correspondence"
+	fileID := uuid.New().String()
+
+	newApp := func(user *models.User, rec *models.EORecord) (*fiber.App, *eoFakeDocumenta) {
+		doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+		repo := &eoFakeRecordRepo{
+			byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
+			visibleIDs: map[uuid.UUID]bool{rec.ID: true},
+		}
+		types := &eoFakeTypeRepo{byID: &models.EORecordType{ID: rec.RecordTypeID, Key: typeKey}}
+		gate := middleware.NewEOTypePermission(repo, types)
+		app := fiber.New()
+		app.Use(eoTestActor(user))
+		NewEOFileHandler(repo, doc).RegisterRoutes(app.Group("/eo-records"), eoNoPerm, gate.RequireEOTypePermission)
+		return app, doc
+	}
+	withCodes := func(codes ...string) *models.User {
+		perms := make([]models.Permission, 0, len(codes))
+		for _, code := range codes {
+			perms = append(perms, models.Permission{Code: code, IsActive: true})
+		}
+		return &models.User{ID: uuid.New(), Email: "clerk@eo.gov", Roles: []models.Role{{Permissions: perms}}}
+	}
+
+	for routeName, path := range eoReadPaths("RECORD", fileID) {
+		t.Run(routeName+"/refused without the type's view code", func(t *testing.T) {
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			user := withCodes(
+				models.EOTypePermissionCode(typeKey, models.EOTypePermissionUpdate),
+				models.EOTypePermissionCode("eo_directive", models.EOTypePermissionView),
+			)
+			app, doc := newApp(user, rec)
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusForbidden {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 403: %s", resp.StatusCode, string(raw))
+			}
+			if doc.downloadCalls != 0 {
+				t.Errorf("DownloadFile ran %d times for a refused caller", doc.downloadCalls)
+			}
+		})
+		t.Run(routeName+"/allowed with it", func(t *testing.T) {
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			user := withCodes(models.EOTypePermissionCode(typeKey, models.EOTypePermissionView))
+			app, doc := newApp(user, rec)
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusOK {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 200 for a caller who holds the view code: %s", resp.StatusCode, string(raw))
+			}
+			if doc.downloadCalls != 1 {
+				t.Errorf("DownloadFile ran %d times, want 1", doc.downloadCalls)
+			}
+		})
+	}
+}
+
+// TestEOFileReadWhenDocumentaDisabled is the pilot's own deployment:
+// EO_DOCUMENTA_ENABLED=false, so main.go wires NO client.
+//
+// Pinned by status AND wording, matching B1's upload refusal exactly, so the
+// two read as one feature: 503 because nothing is broken, naming the setting
+// because "failed to retrieve file" sends an operator looking for an outage
+// that is not there.
+func TestEOFileReadWhenDocumentaDisabled(t *testing.T) {
+	fileID := uuid.New().String()
+	for routeName, path := range eoReadPaths("RECORD", fileID) {
+		t.Run(routeName, func(t *testing.T) {
+			// The record holds the file, so nothing EARLIER can refuse: this
+			// test can only pass on the 503 arm itself.
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, nil), eoTestUser())
+			resp, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != fiber.StatusServiceUnavailable {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 503 (Service Unavailable): %s", resp.StatusCode, string(raw))
+			}
+			if msg := eoRefusalEnvelope(t, resp); !strings.Contains(msg, "EO_DOCUMENTA_ENABLED") {
+				t.Errorf("the refusal does not name the configuration that causes it: %s", msg)
+			}
+		})
+	}
+}
+
+// TestEOFileDownloadWhenDocumentaHasLostTheFile: the record references a file
+// that Documenta no longer holds. That is a 404, not a 500 — nothing in
+// Automax is broken and the operator needs to be told the document is gone,
+// not that the server failed.
+func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
+	fileID := uuid.New().String()
+	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+	doc := &eoFakeDocumenta{downloadErr: fmt.Errorf("documenta: gone: %w", storage.ErrFileNotFound)}
+	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusNotFound {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 404: %s", resp.StatusCode, string(raw))
+	}
+	eoRefusalEnvelope(t, resp)
+
+	// And a genuine upstream failure is NOT a 404: it must not look like a
+	// deleted document.
+	doc2 := &eoFakeDocumenta{downloadErr: errors.New("documenta: 502 bad gateway")}
+	repo2 := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+	app2 := eoUploadApp(NewEOFileHandler(repo2, doc2), eoTestUser())
+	resp2, err := app2.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp2.StatusCode == fiber.StatusNotFound || resp2.StatusCode < 500 {
+		raw, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("status = %d for an upstream outage, want a 5xx that is not 404: %s", resp2.StatusCode, string(raw))
+	}
+}
+
+// TestEOFileDownloadServesTheIdTheRecordHolds: a uuid is case-insensitive, so
+// a caller quoting the id in upper case names the same file. What goes
+// UPSTREAM is the spelling the register holds, not the caller's — the record
+// is the authority on what it is filed with.
+func TestEOFileDownloadServesTheIdTheRecordHolds(t *testing.T) {
+	stored := strings.ToLower(uuid.New().String())
+	rec := eoRecordHolding(t, map[string]any{"attachments": []any{stored}})
+	doc := eoReadFake("BYTES", &storage.DmsFile{UUID: stored, Name: "a.pdf", MimeType: "application/pdf"})
+	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), strings.ToUpper(stored))["download"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(raw))
+	}
+	if doc.gotDownloadID != stored {
+		t.Errorf("Documenta was asked for %q, want the stored spelling %q", doc.gotDownloadID, stored)
+	}
+}
+
+// TestEOFileDownloadDoesNotRequireAFolder pins a decision B1's 409 does NOT
+// carry over to.
+//
+// Upload refuses a record with an empty documenta_folder_id because it has
+// nowhere to WRITE. A read needs no folder: it is answered from the file id
+// the record already holds, and the transition path (eoFileAttachments) can
+// file ids on a record whose folder creation failed. A 409 here would refuse a
+// file that is perfectly readable, and would fire only in the one case where
+// the read would otherwise have worked.
+func TestEOFileDownloadDoesNotRequireAFolder(t *testing.T) {
+	fileID := uuid.New().String()
+	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+	rec.DocumentaFolderID = ""
+	doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf", MimeType: "application/pdf"})
+	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: a read is answered from the id the record holds, not from its folder: %s", resp.StatusCode, string(raw))
+	}
+}
+
+// TestEOFileReadRoutesCarryTheViewGates pins the gating of the two new routes
+// the way TestEOFileRouteCarriesTheUpdateGates pins the upload's.
+//
+// Reading is eo:view and the per-type VIEW action. Conflating it with update
+// — which the upload route correctly uses — would mean a reviewer who may see
+// a register but not edit it could not open its documents, which is the
+// commonest role in the pilot.
+func TestEOFileReadRoutesCarryTheViewGates(t *testing.T) {
+	fileID := uuid.New().String()
+	for routeName, path := range eoReadPaths("RECORD", fileID) {
+		t.Run(routeName, func(t *testing.T) {
+			rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+			gates := &eoGateRecorder{}
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+			doc := eoReadFake("BYTES", &storage.DmsFile{UUID: fileID, Name: "a.pdf"})
+
+			app := fiber.New()
+			app.Use(eoTestActor(eoTestUser()))
+			NewEOFileHandler(repo, doc).RegisterRoutes(app.Group("/eo-records"), gates.perm, gates.typePerm)
+
+			if _, err := app.Test(httptest.NewRequest("GET", strings.Replace(path, "RECORD", rec.ID.String(), 1), nil)); err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if want := []string{"eo:view"}; !reflect.DeepEqual(gates.module, want) {
+				t.Errorf("module-level codes = %v, want %v: reading a record's file is a read of the record", gates.module, want)
+			}
+			if gates.action != models.EOTypePermissionView {
+				t.Errorf("per-type action = %q, want %q", gates.action, models.EOTypePermissionView)
+			}
+			if want := []string{"module", "type"}; !reflect.DeepEqual(gates.order, want) {
+				t.Errorf("guard order = %v, want %v", gates.order, want)
+			}
+		})
 	}
 }
