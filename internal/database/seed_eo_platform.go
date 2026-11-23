@@ -603,6 +603,34 @@ const (
 	eoTypePermissionLegacyInertAR = "غير مُطبَّق بعد: لا شيء في المنصة يقرأ هذا الرمز، ومنحه يسجّل نيّة ولا يطبّق أي ضابط."
 )
 
+// eoLogTypesWithNoLiveCodes writes one line per concrete record type that has
+// no LIVE per-type permission code, which makes it invisible to everybody but
+// a super admin.
+//
+// It is a log and not a failure because the only way to reach it is an
+// administrator deleting the codes, and the seed does not undo administrative
+// acts — it does not resurrect a deleted permission any more than it
+// reinstates a revoked grant. But an operator looking at a record type nobody
+// can see has nothing else to go on: the type is there, the register is
+// empty, and the reason is three deleted rows in another table.
+func eoLogTypesWithNoLiveCodes(db *gorm.DB, concrete []models.EORecordType) {
+	for _, t := range concrete {
+		codes := make([]string, 0, len(models.EOTypePermissionActions))
+		for _, a := range models.EOTypePermissionActions {
+			codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
+		}
+		var live int64
+		if err := db.Model(&models.Permission{}).Where("code IN ?", codes).Count(&live).Error; err != nil {
+			log.Printf("EO seed: could not check the per-type permission codes of %q: %v", t.Key, err)
+			continue
+		}
+		if live == 0 {
+			log.Printf("EO seed: record type %q has NO live per-type permission code (%s): only a super admin can see its records. The codes exist but are deleted; the seed does not resurrect a deleted permission.",
+				t.Key, strings.Join(codes, ", "))
+		}
+	}
+}
+
 // eoTypePermissionENIsStale and eoTypePermissionARIsStale ask the question one
 // COLUMN at a time, because that is the granularity an administrator's edit
 // has: PUT /api/v1/admin/permissions/:id writes the English description only.
@@ -682,8 +710,18 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 		// so a type created at runtime carries exactly what a seeded type
 		// carries — including the code the gate asks for.
 		for _, perm := range models.EOTypePermissionsFor(t) {
+			// UNSCOPED, like the designer's checks in
+			// repository.eoWriteTypePermissions and for the same reason:
+			// permissions.code is uniquely indexed with NO deleted_at
+			// predicate, so a SOFT-DELETED row still occupies its code. A
+			// scoped read reports that code absent, the Create below violates
+			// the unique index, and the WHOLE pilot seed transaction rolls
+			// back — on every boot, taking every other pending convergent
+			// step with it, because the gate below never shuts either. One
+			// DELETE /api/v1/admin/permissions/:id is enough to put a
+			// deployment into that state permanently.
 			var stored models.Permission
-			err := db.Where("code = ?", perm.Code).First(&stored).Error
+			err := db.Unscoped().Where("code = ?", perm.Code).First(&stored).Error
 			switch {
 			case errors.Is(err, gorm.ErrRecordNotFound):
 				if err := db.Create(&perm).Error; err != nil {
@@ -721,10 +759,16 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 		return nil
 	}
 
+	// The GRANT read is deliberately scoped, unlike the existence check
+	// above: a deleted permission is not one to hand anybody. A type whose
+	// codes an administrator deleted is left with no live code, which is
+	// their act and fails closed — eoLogTypesWithNoLiveCodes says so in the
+	// boot log, because nothing else would.
 	var perms []models.Permission
 	if err := db.Where("code IN ?", codes).Find(&perms).Error; err != nil {
 		return fmt.Errorf("read back the per-type permissions: %w", err)
 	}
+	eoLogTypesWithNoLiveCodes(db, concrete)
 	// A missing role aborts for the same reason the transition's does: a
 	// permission code nobody holds is a type nobody can use, and the marker
 	// would commit alongside it.

@@ -832,3 +832,68 @@ func TestEoSeedEOPilotLogsTheUnprovidedCapabilityInput(t *testing.T) {
 		}
 	}
 }
+
+// TestEoSeedSurvivesADeletedPerTypePermission is the MUST FIX of fix round 3.
+//
+// permissions.code is uniquely indexed with NO deleted_at predicate, so a row
+// deleted through DELETE /api/v1/admin/permissions/:id — an ordinary admin
+// action — still occupies its code. While the seed's reads were scoped, that
+// code read as MISSING: the convergent step opened, the Create violated the
+// unique index, and the WHOLE pilot seed transaction rolled back. On every
+// boot, for ever, taking every other pending convergent step with it.
+//
+// Mutation that makes it fail: drop Unscoped() from eoSeedTypePermissions's
+// existence read, or from either query in eoTypePermissionsPending.
+func TestEoSeedSurvivesADeletedPerTypePermission(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	code := models.EOTypePermissionCode("eo_objection", models.EOTypePermissionView)
+	if err := db.Where("code = ?", code).Delete(&models.Permission{}).Error; err != nil {
+		t.Fatalf("delete %q: %v", code, err)
+	}
+	var live int64
+	if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&live).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("%q is still live, so the premise of this test is gone", code)
+	}
+
+	// The writer must not blow up on the row that still occupies the code …
+	if err := eoSeedTypePermissions(db); err != nil {
+		t.Fatalf("the seed failed over a deleted permission: %v", err)
+	}
+	// … and the whole pilot seed must complete.
+	seedEOPilot(db)
+
+	// A second boot must find nothing to do, or the seed transaction runs for
+	// ever and its log says so on every start.
+	open, err := eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if open {
+		t.Error("the gate is open after the seed ran: every boot would re-run the whole pilot seed transaction")
+	}
+
+	// The deleted code is NOT resurrected: deleting a permission is an
+	// administrative act, like revoking a grant.
+	if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&live).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if live != 0 {
+		t.Errorf("the seed resurrected %q, which an administrator deleted", code)
+	}
+	// Its two siblings are untouched and the rest of the pilot is intact.
+	for _, a := range []string{models.EOTypePermissionCreate, models.EOTypePermissionUpdate} {
+		sibling := models.EOTypePermissionCode("eo_objection", a)
+		var n int64
+		if err := db.Model(&models.Permission{}).Where("code = ?", sibling).Count(&n).Error; err != nil {
+			t.Fatalf("count %q: %v", sibling, err)
+		}
+		if n != 1 {
+			t.Errorf("%d live rows for %q, want 1", n, sibling)
+		}
+	}
+}

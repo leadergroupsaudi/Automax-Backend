@@ -3148,8 +3148,15 @@ func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 			codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
 		}
 	}
+	// BOTH READS ARE UNSCOPED, matching the writer. permissions.code is
+	// uniquely indexed with no deleted_at predicate, so a soft-deleted row
+	// still occupies its code and the writer (which is unscoped) will not
+	// create it. A scoped count here would report that code missing for ever:
+	// the step would open on every boot, the writer would decline, and the
+	// gate's contract — it opens only when the writer has work — would be
+	// broken in the direction that never terminates.
 	var have int64
-	if err := db.Model(&models.Permission{}).Where("code IN ?", codes).Count(&have).Error; err != nil {
+	if err := db.Unscoped().Model(&models.Permission{}).Where("code IN ?", codes).Count(&have).Error; err != nil {
 		return false, fmt.Errorf("count the per-type permission codes: %w", err)
 	}
 	if have < int64(len(codes)) {
@@ -3161,7 +3168,7 @@ func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 	// which the writer also applies, so the step cannot open on a row the
 	// writer would then decline to rewrite.
 	var rows []models.Permission
-	if err := db.Where("code IN ?", codes).Find(&rows).Error; err != nil {
+	if err := db.Unscoped().Where("code IN ?", codes).Find(&rows).Error; err != nil {
 		return false, fmt.Errorf("read the per-type permission descriptions: %w", err)
 	}
 	for _, p := range rows {
