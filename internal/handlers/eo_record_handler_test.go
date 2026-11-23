@@ -1423,3 +1423,65 @@ func TestListEORecordsRejectsAnUnknownSortKey(t *testing.T) {
 		t.Errorf("errors[sort_by] = %q, want it to name the allow-listed keys", msg)
 	}
 }
+
+// TestEOChildrenReportTheFullCountWhenTruncated is the Plan 3 fix wave's
+// IMPORTANT 4.
+//
+// Children goes through the paginated List, so a Directive with 30 Tasks
+// answers with the default page of 20. What makes that acceptable rather
+// than a silent truncation is the ENVELOPE: total_items says 30 and
+// total_pages says 2, so the client knows there is more and how to ask for
+// it. Returning a bare array — which is what this route would become under
+// an "it only has children, just send them" simplification — would drop
+// exactly that, and the caller could not tell 20 children from 20 of 30.
+//
+// Mutation that makes it fail: answer with utils.SuccessResponse and the
+// rows, or stop passing the repository's total through.
+func TestEOChildrenReportTheFullCountWhenTruncated(t *testing.T) {
+	eoInitValidator(t)
+	parent := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-DIR-2026-001"}
+
+	// One page's worth of rows out of a far larger set: what the repository
+	// returns when the register clamps to the default limit.
+	page := make([]models.EORecord, eoDefaultPageLimit)
+	for i := range page {
+		page[i] = models.EORecord{ID: uuid.New(), RecordTypeID: parent.RecordTypeID}
+	}
+	const children = 30
+	repo := &eoFakeRecordRepo{anyByID: parent, visibleRows: page, visibleTotal: children}
+	h := NewEORecordHandler(&eoFakeRecordService{}, nil, repo, &eoFakeTypeRepo{})
+
+	app := fiber.New()
+	app.Use(eoTestActor(eoTestUser()))
+	app.Get("/eo-records/:id/children", h.Children)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+parent.ID.String()+"/children", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Data       []models.EORecord `json:"data"`
+		Page       int               `json:"page"`
+		Limit      int               `json:"limit"`
+		TotalItems int64             `json:"total_items"`
+		TotalPages int               `json:"total_pages"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Data) != eoDefaultPageLimit {
+		t.Errorf("len(data) = %d, want the default page of %d", len(out.Data), eoDefaultPageLimit)
+	}
+	if out.TotalItems != children {
+		t.Errorf("total_items = %d, want %d: without it a client cannot tell %d children from %d of %d", out.TotalItems, children, eoDefaultPageLimit, eoDefaultPageLimit, children)
+	}
+	if out.TotalPages != 2 {
+		t.Errorf("total_pages = %d, want 2", out.TotalPages)
+	}
+	if out.Page != 1 || out.Limit != eoDefaultPageLimit {
+		t.Errorf("page/limit = %d/%d, want 1/%d: the client needs both to ask for the rest", out.Page, out.Limit, eoDefaultPageLimit)
+	}
+}

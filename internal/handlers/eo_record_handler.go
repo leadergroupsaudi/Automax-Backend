@@ -634,7 +634,19 @@ func (h *EORecordHandler) Transition(c *fiber.Ctx) error {
 // the tree, the children are precisely the rows the rule is protecting.
 //
 // Both queries select on parent_record_id, so this is the same set of records,
-// minus the ones the caller may not see. It is paginated, because List is.
+// minus the ones the caller may not see.
+//
+// IT IS PAGINATED, because List is, AND IT SAYS SO. The default page is
+// eoDefaultPageLimit (20) and the maximum is eoMaxPageLimit (100), the same
+// clamp every other register route carries — so a Directive with 30 Tasks
+// answers with 20 of them. That is not a silent truncation: the answer is
+// utils.PaginatedSuccessResponse's envelope, which states page, limit,
+// total_items and total_pages, so a client is told there are 30 and can ask
+// for ?page=2 (or ?limit=100). A bare array here would be the silent one,
+// and the cheap-looking "return them all" is worse: the tree is the pilot's
+// own fan-out — one Directive spawns a Task per department — and an
+// unbounded child list is an unbounded response on a route any register row
+// can reach. Pinned by TestEOChildrenReportTheFullCountWhenTruncated.
 func (h *EORecordHandler) Children(c *fiber.Ctx) error {
 	user, ok, err := eoActor(c)
 	if !ok {
