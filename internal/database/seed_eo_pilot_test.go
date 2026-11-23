@@ -539,10 +539,16 @@ func eoCaptureSeed(t *testing.T, db *gorm.DB) string {
 	return buf.String()
 }
 
-// eoObligationReportLines is one marker per boot-time obligation report, in
-// the order seedEOPilot writes them: the untranslated labels, the unconfirmed
-// state machines, and the capability inputs the configuration does not
-// provide.
+// eoObligationReportLines is one marker per boot-time obligation report that
+// fires in the DEFAULT environment, in the order seedEOPilot writes them: the
+// untranslated labels, the unconfirmed state machines, the capability inputs
+// the configuration does not provide, and the relaxed file fields.
+//
+// IT IS NOT ONE LINE PER CALL. eoReportPilotObligations makes SIX calls; the
+// two missing here are conditional on a state a clean database is not in —
+// eoLogCapabilitiesAnAdministratorHasEdited (a capability column edited away
+// from the registry) and eoLogTypesWithNoLiveCodes (a deleted permission) —
+// and each has a test of its own that puts the database into that state.
 var eoObligationReportLines = []string{
 	"field labels await Arabic sign-off",
 	"await client sign-off (workflow_states/workflow_transitions.eo_client_unconfirmed)",
@@ -553,22 +559,24 @@ var eoObligationReportLines = []string{
 	"file field(s) are optional while EO Documenta is disabled",
 }
 
-// TestSeedEOPilotReportsOnEveryBoot is the guard against the three reports
-// drifting back under a short-circuit return.
+// TestSeedEOPilotReportsOnEveryBoot is the guard against the obligation
+// reports drifting back under a short-circuit return.
 //
-// All three used to sit at the BOTTOM of seedEOPilot, below the `!needed`
-// return, so they printed only on the boot that applied the seed — on every
-// database in the world, the lists the client sign-off round depends on
-// existed only in the log of the day the database was created. Each of the
-// three reports arrived in a different task, and each inherited the same gate
-// without anybody noticing it was shared.
+// They used to sit at the BOTTOM of seedEOPilot, below the `!needed` return,
+// so they printed only on the boot that applied the seed — on every database
+// in the world, the lists the client sign-off round depends on existed only
+// in the log of the day the database was created. Each report arrived in a
+// different task, and each inherited the same gate without anybody noticing
+// it was shared. There were three then and there are six now; this asserts
+// the four that fire in the default environment (eoObligationReportLines),
+// and the other two are covered where their state is set up.
 //
 // IT SEEDS TWICE ON PURPOSE. Every existing test of these lines calls
 // seedEOPilot once, on a fresh database, where the gate is open and the bug
 // is invisible; no such test can catch this, however many of them there are.
 // The SECOND call is the whole test.
 //
-// Mutation that makes it fail: move any of the three report calls from
+// Mutation that makes it fail: move any report call from
 // eoReportPilotObligations back below the `!needed` return in seedEOPilot, or
 // drop the `defer`.
 func TestSeedEOPilotReportsOnEveryBoot(t *testing.T) {

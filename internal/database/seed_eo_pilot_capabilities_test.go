@@ -1122,7 +1122,15 @@ func TestEoSeedStillConvergesATypeNeverConfigured(t *testing.T) {
 
 	// One type has never been configured; the other carries an
 	// administrator's edit. Both states, one boot.
+	//
+	// "NEVER CONFIGURED" IS TWO FACTS AND THE FIXTURE MUST PRODUCE BOTH: the
+	// column at its default AND no marker row. That is exactly what a record
+	// type appended by a later step arrives with, and an empty column ALONE
+	// is not it — an administrator who empties the column of a type the seed
+	// has already configured is the case the marker exists to honour
+	// (TestEoSeedDoesNotReEnableACapabilityAnAdministratorDisabled).
 	eoAdminEditsCapabilities(t, db, never.ID, `[]`)
+	eoForgetCapabilityMarker(t, db, eoIncomingTypeKey)
 	eoAdminEditsCapabilities(t, db, edited.ID, eoAdminEditedCapabilityBlob)
 
 	open, err := eoCapabilitiesPending(db)
@@ -1179,5 +1187,278 @@ func TestEoReportPilotObligationsLogsAnAdministratorEditedCapability(t *testing.
 	out := eoCaptureSeed(t, db)
 	if !strings.Contains(out, eoDraftStudyTypeKey) || !strings.Contains(out, "differs from the configuration") {
 		t.Errorf("the boot report does not name the type whose capabilities diverge from the registry; a release that changes the seeded config would land nowhere and say nothing.\n--- output ---\n%s", out)
+	}
+}
+
+// ── Task A3 round 1: the marker row, and what it closes ───────────────────
+
+// eoForgetCapabilityMarker deletes a type's "this column has been
+// configured" row, which is half of what a record type appended by a later
+// step looks like. The other half is the column's default, which the caller
+// writes.
+func eoForgetCapabilityMarker(t *testing.T, db *gorm.DB, typeKey string) {
+	t.Helper()
+	if err := db.Where("key = ?", eoCapabilitiesConfiguredMarker(typeKey)).
+		Delete(&models.EOSeedStep{}).Error; err != nil {
+		t.Fatalf("delete the capability marker of %q: %v", typeKey, err)
+	}
+}
+
+// eoFieldDefCount counts a type's own definitions for one key, UNSCOPED,
+// because a soft-deleted row still holds the unique index and the removal
+// under test is a hard delete.
+func eoFieldDefCount(t *testing.T, db *gorm.DB, typeKey, fieldKey string) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Unscoped().Table("eo_field_defs AS f").
+		Joins("JOIN eo_record_types t ON t.id = f.record_type_id").
+		Where("t.key = ? AND f.key = ?", typeKey, fieldKey).Count(&n).Error; err != nil {
+		t.Fatalf("count %s.%s: %v", typeKey, fieldKey, err)
+	}
+	return n
+}
+
+// eoDeclareField re-declares a field definition on a type, the way the type
+// designer's POST /admin/eo-record-types/:id/fields does.
+func eoDeclareField(t *testing.T, db *gorm.DB, typeKey, fieldKey string) {
+	t.Helper()
+	var ty models.EORecordType
+	if err := db.Where("key = ?", typeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read record type %q: %v", typeKey, err)
+	}
+	if err := db.Create(&models.EOFieldDef{
+		ID: uuid.New(), RecordTypeID: ty.ID, Key: fieldKey,
+		Label: "Related references", LabelAr: "المراجع ذات الصلة",
+		Kind: "multi_link", RequiredMode: "never", Provenance: "auto",
+	}).Error; err != nil {
+		t.Fatalf("declare %s.%s: %v", typeKey, fieldKey, err)
+	}
+}
+
+// TestEoCapabilityMarkerKeysCannotCollideWithAStepKey. The marker shares
+// eo_seed_steps with the pilot's own steps, whose keys are permanent
+// identifiers; a collision would make a step look applied, or a marker look
+// absent, and either is silent.
+func TestEoCapabilityMarkerKeysCannotCollideWithAStepKey(t *testing.T) {
+	steps := map[string]bool{}
+	for _, st := range eoPilotSteps {
+		steps[st.key] = true
+	}
+	for _, e := range eoPilotCapabilities {
+		key := eoCapabilitiesConfiguredMarker(e.TypeKey)
+		if steps[key] {
+			t.Errorf("the capability marker %q is also an eoPilotSteps key", key)
+		}
+		if !strings.Contains(key, ":") {
+			t.Errorf("the capability marker %q carries no namespace separator, so a future step key could collide with it", key)
+		}
+		if len(key) > 100 {
+			t.Errorf("the capability marker %q is %d characters; eo_seed_steps.key is size:100 and the insert would fail at boot", key, len(key))
+		}
+	}
+	// And the fast path must not count them: eoPilotSeedNeeded compares
+	// applied rows with the number of ONE-SHOT steps, so a marker row landing
+	// in that count would shut the gate on a database missing a real step.
+	for _, st := range eoPilotSteps {
+		if strings.HasPrefix(st.key, "capabilities_configured:") {
+			t.Errorf("step %q uses the marker namespace", st.key)
+		}
+	}
+}
+
+// TestEoSeedDoesNotReEnableACapabilityAnAdministratorDisabled is the residual
+// round 1 closed.
+//
+// `handlers.eoRecordTypeRequest.applyTo` writes the column only when the
+// request carries a non-empty value, so OMITTING the key means "leave
+// alone": sending `[]` is the only way an administrator can express "this
+// type enables no capabilities". Read from the column alone that is
+// byte-identical to the default, so the first version of this fix re-enabled
+// it on every boot — and because the gate then stayed open, the writer's
+// reserved-field half ran with it.
+//
+// Mutation that makes it fail: drop the eoMarkCapabilitiesConfigured call
+// from eoEnableCapabilities, or make eoCapabilitiesNeverConfigured ask the
+// column alone.
+func TestEoSeedDoesNotReEnableACapabilityAnAdministratorDisabled(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var ty models.EORecordType
+	if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+	}
+	// The marker must be there after the seed wrote the column, or nothing
+	// below is about the mechanism under test.
+	var markers int64
+	if err := db.Model(&models.EOSeedStep{}).
+		Where("key = ?", eoCapabilitiesConfiguredMarker(eoDraftStudyTypeKey)).Count(&markers).Error; err != nil {
+		t.Fatal(err)
+	}
+	if markers != 1 {
+		t.Fatalf("the seed wrote the capability column of %q and %d marker rows, want 1", eoDraftStudyTypeKey, markers)
+	}
+
+	eoAdminEditsCapabilities(t, db, ty.ID, `[]`)
+
+	open, err := eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if open {
+		t.Error("the gate opens on a column an administrator emptied; the capability would be re-enabled on every boot")
+	}
+
+	seedEOPilot(db)
+
+	if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, got, `[]`) {
+		t.Errorf("the seed re-enabled a capability the administrator disabled: capabilities = %s, want []", got)
+	}
+}
+
+// TestEoReservedFieldSurvivesWhenItsCapabilityIsDisabled is the data-loss
+// path the round-1 review named, closed at its other end.
+//
+// The reserved-field removal is a HARD, UNSCOPED delete. Once an
+// administrator has disabled `decisions_base` on the Draft Decision Study,
+// nothing writes `related_refs` and services.eoCapabilitiesCheckConfig does
+// not refuse the declaration, so re-declaring it is a legitimate act — and
+// deleting it would orphan its values with nothing in the UI to say so.
+//
+// TWO MECHANISMS HOLD THIS, AND THEY ARE TESTED AS TWO. The gate does not
+// open on a reserved key whose capability is off, so on a quiet boot nothing
+// runs at all; and the WRITER refuses the removal as well, for the boot that
+// is running anyway because something else is pending. The subtests are
+// those two boots, and the second one would pass vacuously without a second
+// pending reason — the first version of it did.
+//
+// Mutations that make it fail: remove the eoTypeWillEnableCapability guard
+// from eoEnableCapabilities' removal loop (subtest 2), or from
+// eoCapabilitiesPending's reserved-field half (subtest 1).
+func TestEoReservedFieldSurvivesWhenItsCapabilityIsDisabled(t *testing.T) {
+	// disable turns decisions_base off on the Draft Decision Study and
+	// re-declares the key it used to reserve, which is what an
+	// administrator does once nothing writes that key.
+	disable := func(t *testing.T, db *gorm.DB) {
+		t.Helper()
+		var ty models.EORecordType
+		if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&ty).Error; err != nil {
+			t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+		}
+		if n := eoFieldDefCount(t, db, eoDraftStudyTypeKey, "related_refs"); n != 0 {
+			t.Fatalf("fixture error: the seed left %d related_refs rows, want 0", n)
+		}
+		eoAdminEditsCapabilities(t, db, ty.ID, `[]`)
+		eoDeclareField(t, db, eoDraftStudyTypeKey, "related_refs")
+	}
+
+	t.Run("the gate does not open on it, so a quiet boot does nothing", func(t *testing.T) {
+		db := eoPilotDB(t)
+		seedEOPilot(db)
+		disable(t, db)
+
+		open, err := eoCapabilitiesPending(db)
+		if err != nil {
+			t.Fatalf("ask the gate: %v", err)
+		}
+		if open {
+			t.Error("the gate opens on a reserved key whose capability is off: the seed transaction would run on every boot, and the removal with it")
+		}
+
+		seedEOPilot(db)
+		seedEOPilot(db)
+
+		if n := eoFieldDefCount(t, db, eoDraftStudyTypeKey, "related_refs"); n != 1 {
+			t.Errorf("%d related_refs rows survive, want 1", n)
+		}
+		if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, got, `[]`) {
+			t.Errorf("capabilities = %s, want []", got)
+		}
+	})
+
+	t.Run("a boot that is running anyway does not take it with it", func(t *testing.T) {
+		db := eoPilotDB(t)
+		seedEOPilot(db)
+		disable(t, db)
+
+		// THE SECOND PENDING REASON, without which the writer never runs and
+		// this subtest proves nothing about its guard: another registry type
+		// in the state a record type appended by a later step arrives in.
+		var never models.EORecordType
+		if err := db.Where("key = ?", eoIncomingTypeKey).First(&never).Error; err != nil {
+			t.Fatalf("read %q: %v", eoIncomingTypeKey, err)
+		}
+		wantConverged := string(never.Capabilities)
+		eoAdminEditsCapabilities(t, db, never.ID, `[]`)
+		eoForgetCapabilityMarker(t, db, eoIncomingTypeKey)
+
+		open, err := eoCapabilitiesPending(db)
+		if err != nil {
+			t.Fatalf("ask the gate: %v", err)
+		}
+		if !open {
+			t.Fatal("nothing is pending, so the writer will not run and this subtest cannot see its guard")
+		}
+
+		seedEOPilot(db)
+
+		// The writer really ran: the never-configured type was converged.
+		if got := eoCapabilitiesOf(t, db, eoIncomingTypeKey); !eoJSONEqual(t, got, wantConverged) {
+			t.Fatalf("the writer did not run (%q was not converged), so the assertion below would pass vacuously", eoIncomingTypeKey)
+		}
+		if n := eoFieldDefCount(t, db, eoDraftStudyTypeKey, "related_refs"); n != 1 {
+			t.Errorf("%d related_refs rows survive, want 1: the writer hard-deleted a field definition on a type that does not enable the capability reserving it, on the way past a boot it was running for another reason", n)
+		}
+		if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, got, `[]`) {
+			t.Errorf("capabilities = %s, want []: the seed re-enabled a capability the administrator disabled", got)
+		}
+	})
+}
+
+// TestEoSeedLeavesEditedColumnsAloneWhenAReservedFieldReappears reaches the
+// writer's per-type guard by the OTHER path — the one the guard's comment
+// names and no test used to drive.
+//
+// The gate opens on the reserved-field half with NO type pending, so the
+// writer runs over every type in the registry while every column is already
+// configured. Without the guard, that boot rewrites each of them — including
+// the one an administrator edited — as a side effect of removing a field.
+//
+// Mutation that makes it fail: delete the eoCapabilitiesNeverConfigured
+// guard from eoEnableCapabilities' type loop.
+func TestEoSeedLeavesEditedColumnsAloneWhenAReservedFieldReappears(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var edited models.EORecordType
+	if err := db.Where("key = ?", eoIncomingTypeKey).First(&edited).Error; err != nil {
+		t.Fatalf("read %q: %v", eoIncomingTypeKey, err)
+	}
+	const editedBlob = `[{"key":"referral_tree","config":{"branch_type_key":"eo_referral","parent_key":"parent_referral"}}]`
+	if eoJSONEqual(t, string(edited.Capabilities), editedBlob) {
+		t.Fatal("fixture error: the edit is the seeded value")
+	}
+	eoAdminEditsCapabilities(t, db, edited.ID, editedBlob)
+
+	// The reserved key is re-declared on the type that DOES enable the
+	// capability reserving it, so the removal is legitimate and the gate
+	// opens on it alone.
+	eoDeclareField(t, db, eoDraftStudyTypeKey, "related_refs")
+
+	open, err := eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if !open {
+		t.Fatal("a re-declared reserved key did not open the step, so the rest of this test proves nothing about the writer's guard")
+	}
+
+	seedEOPilot(db)
+
+	if n := eoFieldDefCount(t, db, eoDraftStudyTypeKey, "related_refs"); n != 0 {
+		t.Errorf("%d related_refs rows survive on a type that enables decisions_base, want 0: that type is dead on arrival at the first request", n)
+	}
+	if got := eoCapabilitiesOf(t, db, eoIncomingTypeKey); !eoJSONEqual(t, got, editedBlob) {
+		t.Errorf("CLOBBERED on the way past a field removal: capabilities = %s, want the administrator's %s", got, editedBlob)
 	}
 }

@@ -75,6 +75,14 @@ func (h *EORecordTypeHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMi
 // would most plausibly drop — reference_prefix and reference_pattern — are the
 // two ValidateTypeEdit refuses to see change while records exist, so a
 // dropped key is refused rather than silently applied.
+//
+// `capabilities` IS THE ONE EXCEPTION, and applyTo below is where it is made:
+// an omitted or empty `capabilities` leaves the stored column alone. THAT IS
+// LOAD-BEARING, not a convenience. It means the only way to express "this
+// type enables no capabilities" is to send `[]` explicitly, and the pilot
+// seed reads an empty column plus the absence of a marker row as "never
+// configured" and converges it — see database.eoCapabilitiesNeverConfigured,
+// which records what the marker closes and the one upgrade boot it does not.
 type eoRecordTypeRequest struct {
 	Key              string         `json:"key"`
 	Name             string         `json:"name"`

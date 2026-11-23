@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ── the matrix-to-engine key map ────────────────────────────────────────────
@@ -3315,8 +3316,10 @@ var eoCapabilityReservedFieldRemovals = []eoCapabilityReservedFieldRemoval{
 // resolves to nothing is an error that rolls the whole pilot seed back, not a
 // capability silently enabled on nothing.
 //
-// IT WRITES ONLY A TYPE THAT HAS NEVER BEEN CONFIGURED. See
-// eoCapabilitiesNeverConfigured for the rule and what it costs.
+// IT WRITES ONLY A TYPE THAT HAS NEVER BEEN CONFIGURED, and it removes a
+// reserved field definition only from a type that WILL CARRY the capability
+// reserving it. See eoCapabilitiesNeverConfigured for the rule and what it
+// costs, and eoTypeWillEnableCapability for why the removal is conditional.
 func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 	for _, r := range eoCapabilityReservedFieldRemovals {
 		var ty models.EORecordType
@@ -3325,6 +3328,24 @@ func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 		}
 		if ty.ID == uuid.Nil {
 			return false, fmt.Errorf("capability %q reserves %q on record type %q, which is not seeded", r.CapabilityKey, r.FieldKey, r.TypeKey)
+		}
+		// THE REMOVAL IS A HARD, UNSCOPED DELETE, so it must not fire on a
+		// type that does not carry the capability doing the reserving. An
+		// administrator who disables `decisions_base` on the Draft Decision
+		// Study is entitled to declare `related_refs` again — nothing writes
+		// that key any more, and services.eoCapabilitiesCheckConfig only
+		// refuses a reserved key for a capability the type ENABLES. Deleting
+		// it anyway would orphan its values on every boot after the
+		// declaration, which is the same class of act this task exists to
+		// stop.
+		will, err := eoTypeWillEnableCapability(tx, ty, r.CapabilityKey)
+		if err != nil {
+			return false, err
+		}
+		if !will {
+			log.Printf("EO pilot: record type %q does not enable capability %q, so its reserved field %q is left in place; nothing writes that key while the capability is off",
+				r.TypeKey, r.CapabilityKey, r.FieldKey)
+			continue
 		}
 		// Unscoped: a soft-deleted definition still occupies the
 		// (record_type_id, key) unique index, and the point is that the key
@@ -3352,18 +3373,41 @@ func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 		}
 		// THE GUARD AND THE GATE ARE THE SAME QUESTION, asked here as well
 		// because the step runs whenever eoCapabilitiesPending opens for ANY
-		// reason — a reappearing reserved field opens it too, and without
-		// this line that would rewrite every configured column on the way
-		// past. (eoReportPilotObligations is where a divergence is reported;
-		// this loop stays silent, because the writer runs only when there is
-		// something to write and a line per skipped type on that boot would
-		// say nothing an operator does not already get on every boot.)
-		if !eoCapabilitiesNeverConfigured(ty.Capabilities) {
+		// reason — one never-configured type opens it for all of them, and a
+		// reappearing reserved field opens it with none of them pending —
+		// and without this line either would rewrite every configured column
+		// on the way past. BOTH PATHS ARE TESTED:
+		// TestEoSeedStillConvergesATypeNeverConfigured drives the first and
+		// TestEoSeedLeavesEditedColumnsAloneWhenAReservedFieldReappears the
+		// second. (eoReportPilotObligations is where a divergence is
+		// reported; this loop stays silent, because an operator already gets
+		// that line on every boot.)
+		never, err := eoCapabilitiesNeverConfigured(tx, typeKey, ty.Capabilities)
+		if err != nil {
+			return false, err
+		}
+		if !never {
+			// THE MARKER IS BACKFILLED HERE, on a type whose column is
+			// already configured but carries no row: a database seeded by a
+			// release before this marker existed gets one the first time the
+			// writer runs, and is protected from then on. It costs one row
+			// and closes most of the upgrade window described on
+			// eoCapabilitiesNeverConfigured.
+			if err := eoMarkCapabilitiesConfigured(tx, typeKey); err != nil {
+				return false, err
+			}
 			continue
 		}
 		if err := tx.Model(&models.EORecordType{}).Where("id = ?", ty.ID).
 			Update("capabilities", datatypes.JSON(blob)).Error; err != nil {
 			return false, fmt.Errorf("enable capabilities on %q: %w", typeKey, err)
+		}
+		// IN THE SAME TRANSACTION AS THE COLUMN WRITE, so "this column has
+		// been configured" is a durable fact and never an inference from the
+		// column's content — the same contract models.EOSeedStep already
+		// carries for a step, applied to a type.
+		if err := eoMarkCapabilitiesConfigured(tx, typeKey); err != nil {
+			return false, err
 		}
 		keys := make([]string, 0, len(byType[typeKey]))
 		for _, e := range byType[typeKey] {
@@ -3427,7 +3471,17 @@ func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 			Where("record_type_id = ? AND key = ?", ty.ID, r.FieldKey).Count(&n).Error; err != nil {
 			return false, fmt.Errorf("look for the reserved field %q on %q: %w", r.FieldKey, r.TypeKey, err)
 		}
-		if n > 0 {
+		if n == 0 {
+			continue
+		}
+		// THE SAME CONDITION THE WRITER APPLIES, so the gate cannot open on
+		// a removal the writer would then decline — the never-terminating
+		// gate, which this file has closed twice already.
+		will, err := eoTypeWillEnableCapability(db, ty, r.CapabilityKey)
+		if err != nil {
+			return false, err
+		}
+		if will {
 			return true, nil
 		}
 	}
@@ -3446,7 +3500,11 @@ func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 		if ty.ID == uuid.Nil {
 			return true, nil
 		}
-		if eoCapabilitiesNeverConfigured(ty.Capabilities) {
+		never, err := eoCapabilitiesNeverConfigured(db, typeKey, ty.Capabilities)
+		if err != nil {
+			return false, err
+		}
+		if never {
 			return true, nil
 		}
 	}
@@ -3495,17 +3553,77 @@ func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
 //     because the seed believes it is correcting itself. Nothing could report
 //     it: the reverting write IS the seed's normal behaviour.
 //
-// THE CASE THIS DELIBERATELY DOES NOT HANDLE. An administrator who turns
-// every capability OFF writes `[]`, which is byte-identical to the column's
-// default, so the seed reads it as never-configured and re-enables the
-// registry's capabilities on the next boot. There is no way to tell those two
-// apart from the column alone, and inventing a marker column to do it is a
-// migration this task does not buy. The operator sees it as the
-// `record type %q enables [...]` line reappearing on every boot — the
-// capability they just removed, being enabled again, by name. Turning a
-// SEEDED capability off is therefore a change to eoPilotCapabilities, not an
-// edit through the route; that is an open item, not a closed one.
-func eoCapabilitiesNeverConfigured(raw datatypes.JSON) bool {
+// DISABLING EVERY CAPABILITY, which the column alone cannot express and a
+// MARKER ROW CAN. `handlers.eoRecordTypeRequest.applyTo` writes this column
+// only when the request carries a non-empty value, so omitting the key means
+// "leave alone" and an administrator who wants NO capabilities must send
+// `[]` — exactly the byte pattern the column's default has. Read from the
+// column alone, that deliberate act is indistinguishable from a type the
+// seed has not reached, and re-enabling it is not merely noisy: the gate is
+// then open on every boot, the writer's reserved-field half runs with it,
+// and a `related_refs` the administrator re-declared once the capability was
+// off is HARD-DELETED UNSCOPED, orphaning its values, with nothing in the UI
+// to say so.
+//
+// So "never configured" is two facts, not one: the column is still its
+// default AND there is no eoCapabilitiesConfiguredMarker row for the type.
+// The marker is written in the same transaction as the column
+// (eoMarkCapabilitiesConfigured), which is the contract models.EOSeedStep
+// already carries for a step — "applied" is durable, never inferred from
+// content. IT NEEDS NO MIGRATION: eo_seed_steps already exists, and
+// eoPilotSeedNeeded counts only the rows whose key is a ONE-SHOT STEP's, so
+// rows under any other key are invisible to the fast path.
+//
+// WHAT IS STILL NOT CLOSED, bounded and stated rather than implied away. A
+// database configured by a release that predates the marker has no row for
+// its types. For a type whose column is non-empty this costs nothing — the
+// column test alone answers, and the writer backfills the marker the next
+// time it runs. For a type whose column is ALREADY `[]` when this change
+// first boots, there is no evidence anywhere that the `[]` was deliberate,
+// so that FIRST boot converges it once and writes the marker; every `[]`
+// after that is honoured. The residual is therefore one boot per type, on
+// upgrade only, and not a standing condition.
+func eoCapabilitiesNeverConfigured(db *gorm.DB, typeKey string, raw datatypes.JSON) (bool, error) {
+	if !eoCapabilityColumnIsDefault(raw) {
+		return false, nil
+	}
+	var n int64
+	if err := db.Model(&models.EOSeedStep{}).
+		Where("key = ?", eoCapabilitiesConfiguredMarker(typeKey)).Count(&n).Error; err != nil {
+		return false, fmt.Errorf("look for the capability marker of %q: %w", typeKey, err)
+	}
+	return n == 0, nil
+}
+
+// eoCapabilitiesConfiguredMarker is the eo_seed_steps key that records that
+// this seed has written one record type's capability column at least once.
+//
+// IT IS A PERMANENT IDENTIFIER, like every other key in that table, and must
+// never be renamed: a renamed key is a type that has never been configured,
+// and the next boot would overwrite the column the row was protecting. It is
+// namespaced with a colon so it can never collide with an eoPilotSteps key,
+// which TestEoCapabilityMarkerKeysCannotCollideWithAStepKey pins.
+func eoCapabilitiesConfiguredMarker(typeKey string) string {
+	return "capabilities_configured:" + typeKey
+}
+
+// eoMarkCapabilitiesConfigured writes that marker, idempotently: the writer
+// may be reached twice in one boot (the position pass and the second
+// convergent pass), and the key is the table's primary key.
+func eoMarkCapabilitiesConfigured(tx *gorm.DB, typeKey string) error {
+	key := eoCapabilitiesConfiguredMarker(typeKey)
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&models.EOSeedStep{Key: key}).Error; err != nil {
+		return fmt.Errorf("record that the capabilities of %q have been configured: %w", typeKey, err)
+	}
+	return nil
+}
+
+// eoCapabilityColumnIsDefault is the COLUMN half of the question: is this the
+// value models.EORecordType declares as its default (`'[]'::jsonb`) and that
+// all three arrival routes write — the root and child type steps, and a type
+// created through the designer?
+func eoCapabilityColumnIsDefault(raw datatypes.JSON) bool {
 	if len(raw) == 0 {
 		return true
 	}
@@ -3514,8 +3632,8 @@ func eoCapabilitiesNeverConfigured(raw datatypes.JSON) bool {
 		// UNREACHABLE ON A LIVE DATABASE and kept only so the helper is
 		// total: the column is jsonb, so Postgres refuses anything that is
 		// not JSON at write time. If it is ever reached, the step's own
-		// write is the only repair available, so "unconfigured" is the
-		// answer that leads somewhere.
+		// write is the only repair available, so "default" is the answer
+		// that leads somewhere.
 		return true
 	}
 	switch t := v.(type) {
@@ -3529,10 +3647,63 @@ func eoCapabilitiesNeverConfigured(raw datatypes.JSON) bool {
 	return false
 }
 
+// eoTypeWillEnableCapability answers, for the removal of a reserved field
+// definition: will this record type carry that capability once this step has
+// finished?
+//
+// IT ASKS ABOUT THE END OF THE STEP, not the start, and that is the whole
+// reason it exists in this shape. On a fresh database the column is still
+// its default when the removal loop runs — the blob is written later in the
+// same function — so "does the stored blob name this capability" would be NO
+// for every type, the removal would be skipped, and the type would be seeded
+// with a reserved key declared and the capability enabled beside it: dead on
+// arrival at the first request, which is precisely what THE TWO HALVES MUST
+// NOT BE SEPARATED means. So a never-configured type is asked of the
+// REGISTRY (what the step is about to write) and a configured one is asked
+// of its own column (what an administrator has left there).
+func eoTypeWillEnableCapability(db *gorm.DB, ty models.EORecordType, capabilityKey string) (bool, error) {
+	never, err := eoCapabilitiesNeverConfigured(db, ty.Key, ty.Capabilities)
+	if err != nil {
+		return false, err
+	}
+	if never {
+		_, byType := eoCapabilitiesByType()
+		for _, e := range byType[ty.Key] {
+			if e.CapabilityKey == capabilityKey {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	var entries []struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal([]byte(ty.Capabilities), &entries); err != nil {
+		// A blob the engine cannot decode enables nothing it can name, but
+		// it is also not something an administrator produced through a route
+		// that validates. The CONSERVATIVE answer is the one that keeps the
+		// reservation: a reserved key left standing beside a capability that
+		// turns out to be enabled makes the type unusable at the first
+		// request, which is worse than a field definition removed from a
+		// type nobody can use until the blob is repaired.
+		log.Printf("EO pilot: the capability blob of %q does not decode (%v), so the reserved key of %q is treated as still reserved", ty.Key, err, capabilityKey)
+		return true, nil
+	}
+	for _, e := range entries {
+		if e.Key == capabilityKey {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // eoLogCapabilitiesAnAdministratorHasEdited is how an operator discovers the
-// case eoCapabilitiesNeverConfigured decides not to handle: a record type
-// whose capability column differs from what this build seeds, and which the
-// convergent step therefore left alone.
+// case eoCapabilitiesNeverConfigured decides not to handle — a release that
+// changes a seeded capability config: a record type whose capability column
+// differs from what this build seeds, and which the convergent step
+// therefore left alone. A column an administrator emptied to `[]` is
+// reported too, because that also differs from the configuration and is also
+// now honoured.
 //
 // IT IS CALLED FROM eoReportPilotObligations, WHICH RUNS ON EVERY BOOT, and
 // not from eoEnableCapabilities — for the reason eoLogTypesWithNoLiveCodes
@@ -3558,9 +3729,17 @@ func eoLogCapabilitiesAnAdministratorHasEdited(db *gorm.DB) {
 			log.Printf("EO pilot: could not read record type %q to compare its capabilities: %v", typeKey, err)
 			continue
 		}
-		if ty.ID == uuid.Nil || eoCapabilitiesNeverConfigured(ty.Capabilities) {
-			// A missing type is the seed's to report, loudly; an empty
-			// column is about to be converged.
+		if ty.ID == uuid.Nil {
+			// A missing type is the seed's to report, loudly.
+			continue
+		}
+		never, err := eoCapabilitiesNeverConfigured(db, typeKey, ty.Capabilities)
+		if err != nil {
+			log.Printf("EO pilot: could not tell whether %q has ever been configured: %v", typeKey, err)
+			continue
+		}
+		if never {
+			// About to be converged; there is nothing to leave alone.
 			continue
 		}
 		same, err := eoSameJSON(want, []byte(ty.Capabilities))
@@ -3579,7 +3758,19 @@ func eoLogCapabilitiesAnAdministratorHasEdited(db *gorm.DB) {
 // eoSameJSON compares two JSON documents by VALUE. The column is jsonb, which
 // normalises whitespace and reorders object keys, so comparing the bytes we
 // wrote with the bytes Postgres returns would report a difference on every
-// boot and rewrite every blob for ever.
+// boot.
+//
+// WHAT THAT COSTS TODAY, stated exactly, because the older wording ("and
+// rewrite every blob for ever") stopped being true the moment Plan 3's Task
+// A3 narrowed the gate. NOTHING ON A WRITE PATH COMPARES VALUES ANY MORE:
+// this function has exactly ONE caller,
+// eoLogCapabilitiesAnAdministratorHasEdited, and that caller only logs. A
+// byte comparison here would produce a spurious boot line, not a rewrite.
+//
+// DO NOT READ THAT AS PERMISSION TO PUT A VALUE COMPARISON BACK IN A GATE.
+// "The stored blob differs from the seeded one" is the question that
+// reverted administrators' edits, and removing it is what A3 was for; see
+// eoCapabilitiesNeverConfigured for what replaced it.
 func eoSameJSON(a, b []byte) (bool, error) {
 	var av, bv any
 	if len(a) == 0 {

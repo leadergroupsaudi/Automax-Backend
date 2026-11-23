@@ -803,6 +803,17 @@ func eoCheckCloseParentHasAParent(ctx context.Context, r repository.EORecordRepo
 			return fmt.Errorf("transition %q carries a close_parent action %q that names no transition to run on the parent, so the parent would be left open after this one commits",
 				transition.Code, a.Name)
 		}
+		// PADDING IS ALSO A REFUSAL, and here it can be exact. closeParent
+		// matches the parent's available transitions on `available[i].Code
+		// != cfg.Transition`, untrimmed, so " close " matches no workflow
+		// code — unlike a link type key, no stored transition code could
+		// legitimately carry the padding, and there is nothing to look it up
+		// against before the commit. Refusing the SHAPE is therefore exactly
+		// as strict as the executor and no stricter.
+		if cfg.Transition != strings.TrimSpace(cfg.Transition) {
+			return fmt.Errorf("transition %q carries a close_parent action %q whose transition %q is padded with whitespace; closeParent compares it with the parent's transition codes untrimmed, so it would match none of them after this one commits",
+				transition.Code, a.Name, cfg.Transition)
+		}
 		// UNTRIMMED, which is the whole point: closeParent compares
 		// l.LinkTypeKey with cfg.LinkType as written.
 		wanted = append(wanted, cfg.LinkType)

@@ -2248,8 +2248,14 @@ func TestCloseParentCheckMatchesTheExecutorOnWhitespace(t *testing.T) {
 // says a transition that cannot run its closing action must not pretend it
 // did.
 //
-// Whitespace alone is the same case: closeParent tests
-// strings.TrimSpace(cfg.Transition), so the check does too.
+// TWO SHAPES, because closeParent treats them differently and so must this.
+// It EMPTINESS-TESTS strings.TrimSpace(cfg.Transition) and then MATCHES the
+// untrimmed value against the parent's transition codes — so an empty or
+// all-whitespace transition is refused there by the first test, and a PADDED
+// one (" close ") survives it and then matches no code at all. Both are
+// refused here, the padded one on its shape: no stored transition code could
+// legitimately carry the padding, so refusing it is exactly as strict as the
+// executor and no stricter.
 func TestCloseParentCheckRefusesAnEmptyTransition(t *testing.T) {
 	const key = "eo_decision_record_parent"
 	rec := &models.EORecord{ID: uuid.New(), Reference: "EO-DEC-2026-001"}
@@ -2258,6 +2264,13 @@ func TestCloseParentCheckRefusesAnEmptyTransition(t *testing.T) {
 		{"no transition key at all", `{"link_type":"` + key + `"}`},
 		{"an empty transition", `{"link_type":"` + key + `","transition":""}`},
 		{"a transition of spaces", `{"link_type":"` + key + `","transition":"   "}`},
+		// PADDED, not empty: closeParent compares cfg.Transition with the
+		// parent's transition CODES untrimmed, so " close " matches none of
+		// them and fails after the commit. Unlike a link type there is
+		// nothing to look it up against here, and no stored code could
+		// legitimately carry the padding, so the shape itself is the
+		// refusal.
+		{"a padded transition", `{"link_type":"` + key + `","transition":" close "}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The record DOES carry the link, so the only thing that can
@@ -2269,7 +2282,7 @@ func TestCloseParentCheckRefusesAnEmptyTransition(t *testing.T) {
 				t.Fatal("the check passed a close_parent action that names no transition; closeParent refuses it after the commit and the parent stays open")
 			}
 			if !strings.Contains(err.Error(), "transition") || !strings.Contains(err.Error(), "close the draft study") {
-				t.Errorf("err = %v, and it names neither the missing transition nor the action, so an administrator cannot find the configuration to fix", err)
+				t.Errorf("err = %v, and it names neither the transition nor the action, so an administrator cannot find the configuration to fix", err)
 			}
 		})
 	}
