@@ -4084,7 +4084,14 @@ func TestNoPilotFileFieldIsDemandedAtAll(t *testing.T) {
 // ADMINISTRATOR'S EDIT guard, and the reason this step is NOT convergent.
 //
 // The ruling says re-tightening is a configuration change through the type
-// designer once the client's Documenta is connected — no release needed. A
+// designer once the client's Documenta is connected — and ONLY WHILE THE
+// TYPE AND EVERY TYPE BENEATH IT HOLD NO RECORDS. That qualifier is not
+// decoration: models.ValidateTypeEdit refuses `never -> always` and
+// `never -> at_state` outright once records exist, so after the first
+// filing there is no supported route at all (eoFileFieldsRelaxedUntilDocumenta
+// has the whole of it, and it is the version to copy if this needs restating
+// anywhere else). What matters HERE is only that whatever an administrator
+// managed to re-tighten inside that window must survive the next boot. A
 // convergent step gated on "any registered field is not `never`" would see
 // that change as work to do and undo it on the very next boot, silently, which
 // is a defect this programme has shipped twice. A one-shot step cannot: its

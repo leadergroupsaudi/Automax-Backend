@@ -1535,3 +1535,97 @@ func TestEoDivergentCapabilityLineNamesARemedyThatWorks(t *testing.T) {
 		t.Errorf("after deleting the marker the next boot left capabilities = %s, want the configured %s", converged, seeded)
 	}
 }
+
+// TestEoTypeWillEnableCapabilityAsksTheEndState pins the DIRECTION of
+// eoTypeWillEnableCapability's question, which nothing pinned before: the
+// whole package passes with the start-state variant, because eoSeedPilotTx's
+// second convergent pass re-asks the gate once the column is written and the
+// removal lands anyway, inside the same transaction.
+//
+// What the start-state variant really costs is intra-boot ordering.
+// `seed_spawn_actions` runs between `enable_capabilities` and that second
+// pass and reads the field definitions the removal leaves behind
+// (eoCheckSpawnFieldMap validates each spawn's field map against the target
+// type's definitions as Task A6 left them), so deferring every removal to
+// the second pass means that check runs against definitions the step is
+// about to delete. Today's one removal is on a type no seeded spawn targets,
+// so the hazard is latent — which is why it must be pinned here rather than
+// left to the package's luck.
+//
+// Mutation that makes it fail: change eoTypeWillEnableCapability to ask the
+// stored column for a never-configured type — "does the blob name this
+// capability" — instead of asking the registry.
+func TestEoTypeWillEnableCapabilityAsksTheEndState(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	removal := eoCapabilityReservedFieldRemovals[0]
+	var ty models.EORecordType
+	if err := db.Where("key = ?", removal.TypeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read %q: %v", removal.TypeKey, err)
+	}
+
+	// DIRECTION 1, the one the start-state variant gets wrong: a type that
+	// has NEVER been configured — the default column and no marker, which is
+	// what every type looks like when the removal loop runs on a fresh
+	// database and what a type appended by a later step arrives with. The
+	// answer must come from the REGISTRY, which is what the step is about to
+	// write, so it is YES even though the column names nothing.
+	eoAdminEditsCapabilities(t, db, ty.ID, `[]`)
+	eoForgetCapabilityMarker(t, db, removal.TypeKey)
+	var never models.EORecordType
+	if err := db.Where("key = ?", removal.TypeKey).First(&never).Error; err != nil {
+		t.Fatalf("re-read %q: %v", removal.TypeKey, err)
+	}
+	if !eoCapabilityColumnIsDefault(never.Capabilities) {
+		t.Fatalf("fixture error: the column is %s, not its default", never.Capabilities)
+	}
+	will, err := eoTypeWillEnableCapability(db, never, removal.CapabilityKey)
+	if err != nil {
+		t.Fatalf("ask the question: %v", err)
+	}
+	if !will {
+		t.Errorf("a never-configured type answers NO for %q while its column is still '[]': the question is being asked of the START of the step, so every removal is deferred to the second convergent pass — after seed_spawn_actions has read the definitions the removal deletes", removal.CapabilityKey)
+	}
+
+	// DIRECTION 2, which the end-state question must NOT swallow: a type an
+	// administrator has CONFIGURED without this capability is asked of its
+	// own column, and the answer is NO — the removal is a hard unscoped
+	// delete and must not fire on a type that does not carry the capability
+	// reserving the key.
+	eoAdminEditsCapabilities(t, db, ty.ID, `[{"key":"some_other_capability","config":{}}]`)
+	var configured models.EORecordType
+	if err := db.Where("key = ?", removal.TypeKey).First(&configured).Error; err != nil {
+		t.Fatalf("re-read %q: %v", removal.TypeKey, err)
+	}
+	will, err = eoTypeWillEnableCapability(db, configured, removal.CapabilityKey)
+	if err != nil {
+		t.Fatalf("ask the question: %v", err)
+	}
+	if will {
+		t.Errorf("a configured type that does NOT enable %q answers YES: the registry is overriding an administrator's edit, and the removal would hard-delete a field definition they are entitled to re-declare", removal.CapabilityKey)
+	}
+}
+
+// TestEoCapabilitiesPrecedeTheSpawnActions pins the ordering the comment on
+// eoTypeWillEnableCapability now rests on: `enable_capabilities` must run
+// BEFORE `seed_spawn_actions`, because the spawn step validates its field
+// maps against the field definitions the capability step removes. Reordering
+// eoPilotSteps would make that reason false without failing anything else.
+func TestEoCapabilitiesPrecedeTheSpawnActions(t *testing.T) {
+	capabilities, spawn := -1, -1
+	for i, st := range eoPilotSteps {
+		switch st.key {
+		case eoEnableCapabilitiesStepKey:
+			capabilities = i
+		case eoSeedSpawnActionsStepKey:
+			spawn = i
+		}
+	}
+	if capabilities < 0 || spawn < 0 {
+		t.Fatalf("fixture error: steps not found (enable_capabilities=%d, seed_spawn_actions=%d)", capabilities, spawn)
+	}
+	if capabilities >= spawn {
+		t.Errorf("enable_capabilities is at %d and seed_spawn_actions at %d: the spawn step reads the field definitions the capability step removes, so it must come after it", capabilities, spawn)
+	}
+}

@@ -3654,16 +3654,37 @@ func eoCapabilityColumnIsDefault(raw datatypes.JSON) bool {
 // definition: will this record type carry that capability once this step has
 // finished?
 //
-// IT ASKS ABOUT THE END OF THE STEP, not the start, and that is the whole
-// reason it exists in this shape. On a fresh database the column is still
-// its default when the removal loop runs — the blob is written later in the
-// same function — so "does the stored blob name this capability" would be NO
-// for every type, the removal would be skipped, and the type would be seeded
-// with a reserved key declared and the capability enabled beside it: dead on
-// arrival at the first request, which is precisely what THE TWO HALVES MUST
-// NOT BE SEPARATED means. So a never-configured type is asked of the
-// REGISTRY (what the step is about to write) and a configured one is asked
-// of its own column (what an administrator has left there).
+// IT ASKS ABOUT THE END OF THE STEP, not the start. On a fresh database the
+// column is still its default when the removal loop runs — the blob is
+// written later in the same function — so the start-state variant ("does the
+// stored blob name this capability") answers NO for every type and skips
+// every removal in that first pass.
+//
+// WHY THAT IS A BUG, STATED CORRECTLY. An earlier wording here said the
+// start-state variant would leave the type "seeded with a reserved key
+// declared and the capability enabled beside it: dead on arrival". THAT IS
+// NOT WHAT HAPPENS, and the claim was disproved by mutation: the whole
+// package passes with the start-state variant, because eoSeedPilotTx runs a
+// SECOND CONVERGENT PASS after the list, by which time the column is written
+// and the start-state question answers YES — so the removal still lands
+// inside the same transaction and the committed database is identical.
+//
+// The real cost is an INTRA-BOOT ORDERING HAZARD, and it is the reason the
+// step sits where it does. `seed_spawn_actions` runs BETWEEN
+// `enable_capabilities` and that second pass, and it reads the field
+// definitions the removal leaves behind: eoCheckSpawnFieldMap validates each
+// spawn's field map against the target type's definitions AS TASK A6 LEFT
+// THEM. Deferring every removal to the second pass means that check runs
+// against definitions this step is about to delete. Today's single removal
+// (`related_refs` on the Draft Decision Study) is on a type no seeded spawn
+// targets, so the hazard is latent rather than live — which is exactly why
+// nothing failed, and exactly why the direction must be pinned by a test
+// rather than by the package happening to pass.
+//
+// So a never-configured type is asked of the REGISTRY (what the step is
+// about to write) and a configured one is asked of its own column (what an
+// administrator has left there).
+// TestEoTypeWillEnableCapabilityAsksTheEndState pins both directions.
 func eoTypeWillEnableCapability(db *gorm.DB, ty models.EORecordType, capabilityKey string) (bool, error) {
 	never, err := eoCapabilitiesNeverConfigured(db, ty.Key, ty.Capabilities)
 	if err != nil {
@@ -3836,13 +3857,19 @@ func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 			codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
 		}
 	}
-	// BOTH READS ARE UNSCOPED, matching the writer. permissions.code is
-	// uniquely indexed with no deleted_at predicate, so a soft-deleted row
+	// THE COUNT IS UNSCOPED, matching the writer's create. permissions.code
+	// is uniquely indexed with no deleted_at predicate, so a soft-deleted row
 	// still occupies its code and the writer (which is unscoped) will not
 	// create it. A scoped count here would report that code missing for ever:
 	// the step would open on every boot, the writer would decline, and the
 	// gate's contract — it opens only when the writer has work — would be
 	// broken in the direction that never terminates.
+	//
+	// THE STALE-DESCRIPTION READ BELOW IS SCOPED, and the asymmetry is
+	// deliberate; the comment there has the whole of it. An earlier wording
+	// here said "BOTH READS ARE UNSCOPED", which stopped being true in Task
+	// A2's fourth fix round and was contradicted twenty lines down. Acting
+	// on it reintroduces the never-terminating gate from the other side.
 	var have int64
 	if err := db.Unscoped().Model(&models.Permission{}).Where("code IN ?", codes).Count(&have).Error; err != nil {
 		return false, fmt.Errorf("count the per-type permission codes: %w", err)
