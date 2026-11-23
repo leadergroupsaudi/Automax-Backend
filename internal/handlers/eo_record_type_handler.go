@@ -13,8 +13,9 @@ import (
 )
 
 // EORecordTypeHandler is the designer: record types, their field definitions
-// and the link types between them (spec §7.2, §7.3, §7.6). Everything it
-// exposes sits behind eo:types:manage.
+// and the link types between them (spec §7.2, §7.3, §7.6). Defining a type is
+// behind eo:types:manage; READING the catalogue is behind eo:view, because
+// every EO screen is generated from it (see RegisterRoutes).
 //
 // It holds the RECORD repository as well as the type repository because the
 // guard rails of spec §7.14 are conditional on one fact only the register
@@ -33,16 +34,28 @@ func NewEORecordTypeHandler(types repository.EORecordTypeRepository, records rep
 // matches in registration order and /eo-record-types/link-types would
 // otherwise resolve to the by-id handler.
 func (h *EORecordTypeHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMiddleware) {
-	const manage = "eo:types:manage"
+	// The catalogue READS are not a designer privilege. Every EO screen is
+	// generated FROM the catalogue — a register list needs its type's name,
+	// and a form is built from that type's field definitions — so a user who
+	// may read records at all must be able to read the types, or the module
+	// renders empty. Defining the types remains eo:types:manage.
+	//
+	// ListFields is deliberately NOT here: the field definitions the UI
+	// renders a form from arrive inside Get, and /:id/fields is the
+	// designer's own editing view of them.
+	const (
+		read   = "eo:view"
+		manage = "eo:types:manage"
+	)
 
-	r.Get("/link-types", perm(manage), h.ListLinkTypes)
+	r.Get("/link-types", perm(read), h.ListLinkTypes)
 	r.Post("/link-types", perm(manage), h.CreateLinkType)
 	r.Put("/link-types/:link_type_id", perm(manage), h.UpdateLinkType)
 	r.Delete("/link-types/:link_type_id", perm(manage), h.DeleteLinkType)
 
-	r.Get("/", perm(manage), h.List)
+	r.Get("/", perm(read), h.List)
 	r.Post("/", perm(manage), h.Create)
-	r.Get("/:id", perm(manage), h.Get)
+	r.Get("/:id", perm(read), h.Get)
 	r.Put("/:id", perm(manage), h.Update)
 	r.Delete("/:id", perm(manage), h.Delete)
 

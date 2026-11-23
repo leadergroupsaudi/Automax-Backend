@@ -868,7 +868,11 @@ func main() {
 	admin := v1.Group("/admin", authMiddleware.Authenticate(), licenseMiddleware.LicenseGate())
 
 	// Executive Office record-type designer: types, their field definitions
-	// and the link types between them, all behind eo:types:manage.
+	// and the link types between them. Defining them is behind
+	// eo:types:manage; reading the catalogue is behind eo:view — the EO UI
+	// generates its registers and forms from it. The split lives in
+	// handlers.EORecordTypeHandler.RegisterRoutes, where
+	// handlers.TestEOTypeWriteRoutesStillRequireManage pins it.
 	eoRecordTypes := admin.Group("/eo-record-types", licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)), middleware.ActionLogger(middleware.ActionLoggerConfig{
 		Enabled:     true,
 		LogService:  actionLogService,
