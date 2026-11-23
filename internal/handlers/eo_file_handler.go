@@ -9,6 +9,7 @@ import (
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
+	"github.com/automax/backend/internal/services"
 	"github.com/automax/backend/internal/storage"
 	"github.com/automax/backend/pkg/i18n"
 	"github.com/automax/backend/pkg/utils"
@@ -159,6 +160,26 @@ func (h *EOFileHandler) Upload(c *fiber.Ctx) error {
 	// would upload it again.
 	if tagErr := h.documenta.SetTags(ctx, fileID, metadata); tagErr != nil {
 		log.Printf("[EO] SetTags failed for file %s on record %s: %v", fileID, rec.Reference, tagErr)
+	}
+
+	// THE ID MUST BE STORABLE. services.EOIsDocumentaFileID is the exact rule
+	// the save pipeline applies to a `file`/`multi_file` value, and the HTTP
+	// client forwards whatever Documenta's upload response contained
+	// (file.uuid / version.nodeUuid / uuid) verbatim. A braced or
+	// unhyphenated spelling would otherwise come back as a 201 carrying an id
+	// the next request refuses — and the caller cannot retry, because the
+	// bytes are already filed. Nothing in this repository proves the client's
+	// Documenta returns canonical uuids; until a sample response settles it,
+	// this turns a silent dead end into a loud one.
+	//
+	// 502 and not 500: Automax did its part and the upstream answer is the
+	// problem. The tagging call above has already run, so the file carries
+	// the record's reference and an operator can find it.
+	if !services.EOIsDocumentaFileID(fileID) {
+		log.Printf("[EO] record %s: Documenta accepted the upload into folder %s but returned an unusable file id %q", rec.Reference, rec.DocumentaFolderID, fileID)
+		return utils.ErrorResponse(c, fiber.StatusBadGateway, fmt.Sprintf(
+			"Documenta stored the file but returned the id %q, which is not a canonical Documenta file id and cannot be saved into a record field. The file is in %s's folder and is tagged with its reference; it must be re-linked by hand once the id format is corrected.",
+			fileID, rec.Reference))
 	}
 
 	return utils.SuccessResponse(c, fiber.StatusCreated, "", fiber.Map{

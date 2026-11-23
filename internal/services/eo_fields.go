@@ -445,6 +445,20 @@ func eoValueList(v any) ([]any, bool) {
 // Documenta gave out. Accepting them would mean the register stores an id in a
 // spelling Documenta never used, and a later equality check against the
 // upstream one would fail.
+// EOIsDocumentaFileID is eoIsDocumentaFileID's exported face, for the ONE
+// caller outside this package that must ask the same question: the EO upload
+// route (handlers.EOFileHandler), which checks the id Documenta hands back
+// BEFORE answering 201. Without it the route can return an id this very
+// function then refuses at save time, and the caller cannot retry — the bytes
+// are already in Documenta.
+//
+// It is a delegation and not a copy on purpose: a second spelling of the rule
+// in another package is a rule that drifts, and the drift would show up as
+// uploads that succeed and fields that will not save.
+func EOIsDocumentaFileID(s string) bool {
+	return eoIsDocumentaFileID(s)
+}
+
 func eoIsDocumentaFileID(s string) bool {
 	id := strings.TrimPrefix(s, storage.StubFileIDPrefix)
 	if len(id) != 36 {

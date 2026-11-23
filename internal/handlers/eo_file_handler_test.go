@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -256,6 +257,56 @@ func TestEOFileUploadSurvivesASetTagsFailure(t *testing.T) {
 	data, _ := env["data"].(map[string]any)
 	if id, _ := data["documenta_file_id"].(string); id != fileID {
 		t.Errorf("documenta_file_id = %q, want %q: the file is in Documenta, so its id must reach the caller", id, fileID)
+	}
+}
+
+// TestEOFileUploadRefusesANonCanonicalDocumentaID: the HTTP client forwards
+// whatever the upload response carried (file.uuid / version.nodeUuid / uuid)
+// verbatim, and nothing in this repository proves the client's Documenta
+// returns canonical uuids. A braced (38) or unhyphenated (32) spelling is
+// refused by services.EOIsDocumentaFileID at save time, so answering 201 with
+// one would hand the caller an id their next request rejects — with no way to
+// retry, because the bytes are already filed.
+//
+// The answer is 502, with the id in the message and the file left tagged, so
+// the document can be found and re-linked rather than lost.
+func TestEOFileUploadRefusesANonCanonicalDocumentaID(t *testing.T) {
+	canonical := uuid.New()
+	for _, tc := range []struct{ name, fileID string }{
+		{"braced", "{" + canonical.String() + "}"},
+		{"unhyphenated", strings.ReplaceAll(canonical.String(), "-", "")},
+		{"urn", "urn:uuid:" + canonical.String()},
+		{"a stub browsing id", "stub-file-readme"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The premise: the save pipeline really does refuse this id.
+			if services.EOIsDocumentaFileID(tc.fileID) {
+				t.Fatalf("premise broken: %q is storable after all", tc.fileID)
+			}
+			rec := eoUploadRecord()
+			doc := &eoFakeDocumenta{uploadID: tc.fileID}
+			repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+			app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+			resp, err := app.Test(eoUploadRequest(t, "/eo-records/"+rec.ID.String()+"/files", "file", "letter.pdf", []byte("bytes")))
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			raw, env := eoUploadBody(t, resp)
+			if resp.StatusCode != fiber.StatusBadGateway {
+				t.Errorf("status = %d, want 502 (Bad Gateway): %s", resp.StatusCode, raw)
+			}
+			if strings.Contains(raw, "documenta_file_id") {
+				t.Errorf("an unstorable id was handed to the caller as a file id: %s", raw)
+			}
+			if msg := fmt.Sprintf("%v%v", env["error"], env["message"]); !strings.Contains(msg, rec.Reference) {
+				t.Errorf("the refusal does not name the record, so the orphaned file cannot be traced: %s", raw)
+			}
+			if doc.tagCalls != 1 {
+				t.Errorf("SetTags calls = %d, want 1: the file IS in Documenta, and its tags are what makes it findable", doc.tagCalls)
+			}
+		})
 	}
 }
 
@@ -589,8 +640,26 @@ func TestEOFileRoutesAreWiredInMain(t *testing.T) {
 	// no Documenta would answer 201 with a stub-file-<uuid> that resolves to
 	// nothing, and the register would fill with references to files nobody
 	// can open. That is the one outcome this task must not produce.
-	if n := strings.Count(src, "eoDocumentaClient = storage.NewHTTPDocumentaClient"); n != 1 {
-		t.Errorf("cmd/server/main.go assigns eoDocumentaClient %d times, want exactly 1 (inside the cfg.EODocumenta.Enabled branch)", n)
+	//
+	// Counted on the VARIABLE, not on a constructor spelling. Pinning
+	// "eoDocumentaClient = storage.NewHTTPDocumentaClient" alone let a second
+	// assignment through — `if eoDocumentaClient == nil { eoDocumentaClient =
+	// storage.NewStubDocumentaClient() }` below the branch compiles, passes
+	// every other pin here and in TestEOWiringUsesSLAConstructors (the folder
+	// option is built before it, so it keeps the real client), and turns the
+	// pilot's 503 into a 201 carrying a stub-file-<uuid> that
+	// eoIsDocumentaFileID ACCEPTS. One assignment, in one branch, is the
+	// whole guarantee.
+	assignments := regexp.MustCompile(`eoDocumentaClient\s*=[^=]`).FindAllString(src, -1)
+	if len(assignments) != 1 {
+		t.Errorf("cmd/server/main.go assigns eoDocumentaClient %d times %v, want exactly 1 (inside the cfg.EODocumenta.Enabled branch): a second assignment is how the no-stub guarantee gets undone silently", len(assignments), assignments)
+	}
+	if !strings.Contains(src, "eoDocumentaClient = storage.NewHTTPDocumentaClient(cfg.EODocumenta, nil)") {
+		t.Errorf("cmd/server/main.go's one assignment is not the EO HTTP client built from cfg.EODocumenta with nil Redis")
+	}
+	// And no stub is substituted anywhere between the branch and the handler.
+	if region := src[strings.Index(src, "var eoDocumentaClient storage.DocumentaClient"):strings.Index(src, "handlers.NewEOFileHandler(")]; strings.Contains(region, "NewStubDocumentaClient") {
+		t.Errorf("a stub Documenta client is wired between the EO branch and the upload handler: on a deployment with EO Documenta off, every upload would answer 201 with a stub-file-<uuid> the field validator accepts and nobody can open")
 	}
 	_, afterDecl, found := strings.Cut(src, "var eoDocumentaClient storage.DocumentaClient")
 	if !found {
