@@ -663,3 +663,141 @@ func eoCountTypeCodes(t *testing.T, db *gorm.DB, key string) int64 {
 	}
 	return n
 }
+
+// TestEORecordTypeUpdateRefusesAdoptingAnotherTypesCodes is Create's refusal
+// read through PUT. models.ValidateTypeEdit returns nil for EVERY edit when
+// the type holds no records (models/eo_record_type.go:352), so both of these
+// are reachable from the designer — and Create's refusal is worth nothing if
+// PUT can walk around it.
+func TestEORecordTypeUpdateRefusesAdoptingAnotherTypesCodes(t *testing.T) {
+	// retire sets up a key whose per-type codes exist with no live type.
+	retire := func(t *testing.T, db *gorm.DB, types EORecordTypeRepository, key string) {
+		t.Helper()
+		old := &models.EORecordType{ID: uuid.New(), Key: key, Name: key, IsActive: true}
+		if err := types.Create(context.Background(), old); err != nil {
+			t.Fatalf("create %q: %v", key, err)
+		}
+		if err := types.Delete(context.Background(), old.ID); err != nil {
+			t.Fatalf("retire %q: %v", key, err)
+		}
+		if n := eoCountTypeCodes(t, db, key); n != 3 {
+			t.Fatalf("%d codes survive the retirement of %q, want 3: the premise is gone", n, key)
+		}
+	}
+
+	t.Run("renaming onto a retired type's key", func(t *testing.T) {
+		db := eoRecordDB(t)
+		types := NewEORecordTypeRepository(db)
+		ctx := context.Background()
+		retire(t, db, types, "eo_objection")
+
+		mine := &models.EORecordType{ID: uuid.New(), Key: "eo_supplier_note", Name: "Supplier Note", IsActive: true}
+		if err := types.Create(ctx, mine); err != nil {
+			t.Fatalf("create my type: %v", err)
+		}
+		renamed := *mine
+		renamed.Key = "eo_objection"
+		err := types.Update(ctx, &renamed)
+		if !errors.Is(err, ErrEOTypePermissionCodesExist) {
+			t.Fatalf("Update = %v, want ErrEOTypePermissionCodesExist: the rename would inherit the retired type's grants", err)
+		}
+		if !strings.Contains(err.Error(), models.EOTypePermissionCode("eo_objection", models.EOTypePermissionView)) {
+			t.Errorf("the refusal does not name the codes in the way: %v", err)
+		}
+		// The check runs BEFORE the save, so no renamed row is committed.
+		var stored models.EORecordType
+		if err := db.First(&stored, "id = ?", mine.ID).Error; err != nil {
+			t.Fatalf("read it back: %v", err)
+		}
+		if stored.Key != "eo_supplier_note" {
+			t.Errorf("key = %q after a refused update, want %q: the rename committed", stored.Key, "eo_supplier_note")
+		}
+	})
+
+	t.Run("abstract to concrete onto an occupied key", func(t *testing.T) {
+		db := eoRecordDB(t)
+		types := NewEORecordTypeRepository(db)
+		ctx := context.Background()
+		retire(t, db, types, "eo_objection")
+
+		// An abstract type may be created on that key: Create writes no codes
+		// for an abstract type, so its guard does not fire.
+		shell := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Supplier Objection", IsAbstract: true, IsActive: true}
+		if err := types.Create(ctx, shell); err != nil {
+			t.Fatalf("create the abstract shell: %v", err)
+		}
+		concrete := *shell
+		concrete.IsAbstract = false
+		err := types.Update(ctx, &concrete)
+		if !errors.Is(err, ErrEOTypePermissionCodesExist) {
+			t.Fatalf("Update = %v, want ErrEOTypePermissionCodesExist: the transition would inherit the retired type's grants", err)
+		}
+		var stored models.EORecordType
+		if err := db.First(&stored, "id = ?", shell.ID).Error; err != nil {
+			t.Fatalf("read it back: %v", err)
+		}
+		if !stored.IsAbstract {
+			t.Error("the type is concrete after a refused update: the save ran before the check")
+		}
+	})
+
+	t.Run("an ordinary edit still converges the codes", func(t *testing.T) {
+		db := eoRecordDB(t)
+		types := NewEORecordTypeRepository(db)
+		ctx := context.Background()
+
+		// A concrete type whose codes were somehow never written — the state
+		// NEW-2's fix converges. The guard must not turn this into a refusal.
+		ty := &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsActive: true}
+		if err := types.Create(ctx, ty); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		// HARD delete: permissions.code is uniquely indexed with no deleted_at
+		// predicate, so a soft-deleted row still occupies the code. This
+		// models a type whose codes were never written, which is the state
+		// NEW-2's fix converges.
+		if err := db.Unscoped().Where("code LIKE ?", "eo:eo\\_board\\_resolution:%").Delete(&models.Permission{}).Error; err != nil {
+			t.Fatalf("remove the codes: %v", err)
+		}
+		if n := eoCountTypeCodes(t, db, ty.Key); n != 0 {
+			t.Fatalf("%d codes left, want 0", n)
+		}
+
+		ty.Name = "Board Resolution (revised)"
+		if err := types.Update(ctx, ty); err != nil {
+			t.Fatalf("an ordinary edit was refused: %v", err)
+		}
+		if n := eoCountTypeCodes(t, db, ty.Key); n != 3 {
+			t.Errorf("%d codes after an ordinary edit, want 3: the guard swallowed the convergence", n)
+		}
+	})
+}
+
+// TestEORecordTypeUpdateDoesNotResurrectADeletedPermission: deleting a
+// permission is an administrative act, like revoking a grant, and the next
+// edit of the type must not undo it. It must also not CRASH on it:
+// permissions.code is uniquely indexed with no deleted_at predicate, so a
+// scoped existence check would report the code absent and the insert would
+// then violate the index, turning an ordinary edit into a 500.
+func TestEORecordTypeUpdateDoesNotResurrectADeletedPermission(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	ctx := context.Background()
+
+	ty := &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsActive: true}
+	if err := types.Create(ctx, ty); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// A soft delete, which is what DELETE /admin/permissions/:id performs.
+	if err := db.Where("code LIKE ?", "eo:eo\\_board\\_resolution:%").Delete(&models.Permission{}).Error; err != nil {
+		t.Fatalf("delete the codes: %v", err)
+	}
+
+	ty.Name = "Board Resolution (revised)"
+	if err := types.Update(ctx, ty); err != nil {
+		t.Fatalf("an ordinary edit failed over deleted permissions: %v", err)
+	}
+	if n := eoCountTypeCodes(t, db, ty.Key); n != 0 {
+		t.Errorf("%d live codes after an edit, want 0: the designer resurrected what an administrator deleted", n)
+	}
+}

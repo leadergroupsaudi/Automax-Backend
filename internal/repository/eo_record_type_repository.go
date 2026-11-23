@@ -312,8 +312,15 @@ func (r *eoRecordTypeRepository) Create(ctx context.Context, t *models.EORecordT
 
 // eoExistingTypePermissionCodes returns which of the type's three codes are
 // already in the database, in the order models.EOTypePermissionsFor writes
-// them. Soft-deleted permission rows are excluded by GORM, as everywhere else:
-// a code somebody deleted is not one anybody holds.
+// them.
+//
+// IT IS UNSCOPED, and that is not a detail. permissions.code is uniquely
+// indexed with no deleted_at predicate, so a SOFT-DELETED row still occupies
+// its code: a scoped check reports the code absent, the insert that follows
+// hits the unique constraint, and the designer answers 500 for a state the
+// operator can neither see nor act on. A deleted row is also still in the way
+// in the sense this check exists for — the code cannot be written afresh for
+// the new type — so it belongs in the refusal, where the message names it.
 func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string, error) {
 	want := models.EOTypePermissionsFor(t)
 	codes := make([]string, 0, len(want))
@@ -321,7 +328,7 @@ func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string
 		codes = append(codes, p.Code)
 	}
 	var found []models.Permission
-	if err := tx.Where("code IN ?", codes).Find(&found).Error; err != nil {
+	if err := tx.Unscoped().Where("code IN ?", codes).Find(&found).Error; err != nil {
 		return nil, fmt.Errorf("check the per-type permission codes of %q: %w", t.Key, err)
 	}
 	present := map[string]bool{}
@@ -347,13 +354,20 @@ func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string
 //
 // A missing role fails, wrapping ErrEOTypePermissionRoleMissing: a code
 // nobody holds is a type nobody can use.
+//
+// ITS EXISTENCE CHECK IS UNSCOPED, for the reason eoExistingTypePermissionCodes
+// gives and for one more: a permission an administrator DELETED must not be
+// resurrected by the next edit of the type. That is the same rule the seed
+// states about a revoked grant — a deliberate administrative act is not drift
+// to be corrected — and the alternative here is worse than inaction, because
+// the insert would fail on the unique index and take the whole edit with it.
 func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType) error {
 	want := models.EOTypePermissionsFor(t)
 	created := make([]models.Permission, 0, len(want))
 	for i := range want {
 		perm := want[i]
 		var existing int64
-		if err := tx.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
+		if err := tx.Unscoped().Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
 			return fmt.Errorf("check permission %q: %w", perm.Code, err)
 		}
 		if existing > 0 {
@@ -382,23 +396,54 @@ func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType) error {
 // Update writes every column with Save rather than a field map: the caller has
 // already built the full after-state and had models.ValidateTypeEdit pass on
 // it, so a partial write would store something nothing validated.
-// It also writes any of spec §7.11's three codes that the type does not have.
+// It also writes any of spec §7.11's three codes that the type does not have,
+// and refuses the two edits that would make it ADOPT codes written for
+// something else.
 //
-// THE EDIT THAT NEEDS THIS is abstract → concrete, which
+// THE EDIT THAT NEEDS THE WRITE is abstract → concrete, which
 // models.ValidateTypeEdit explicitly allows: a type created abstract has no
 // codes by design, and the moment it becomes concrete it can hold records that
-// nobody but a super admin could see. A key change is the same hazard by
-// another route — the codes name the KEY — and is covered by the same check.
-// A Critical fixed on the create path alone is not fixed.
+// nobody but a super admin could see. A Critical fixed on the create path
+// alone is not fixed.
 //
-// Nothing is granted when all three codes already exist, so an ordinary edit
-// of an ordinary type touches no permission row and cannot reinstate a grant
-// an administrator revoked.
+// THE EDITS THAT NEED THE REFUSAL are the same two, read the other way round.
+// ValidateTypeEdit returns nil for EVERY edit when the type holds no records
+// (models/eo_record_type.go:352), so a record-less type can be renamed onto a
+// retired type's key, and an abstract type can be made concrete on a key whose
+// codes survive an earlier incarnation. Either way eoWriteTypePermissions
+// would find the codes present, skip them, and hand the type to every role the
+// retired type's codes were granted to — the privilege carryover Create
+// refuses. Create's refusal would be worth nothing if PUT could walk around
+// it, so the same check, the same sentinel and the same wording are applied
+// here.
+//
+// IT RUNS BEFORE THE SAVE, as Create's does, so a refused update leaves no
+// renamed row behind.
+//
+// AN ORDINARY EDIT IS UNTOUCHED. The guard asks only about a key change and
+// about abstract → concrete; anything else converges the codes as before. And
+// nothing is granted when all three codes already exist, so an ordinary edit
+// touches no permission row and cannot reinstate a grant an administrator
+// revoked.
 func (r *eoRecordTypeRepository) Update(ctx context.Context, t *models.EORecordType) error {
 	if t == nil {
 		return fmt.Errorf("update eo record type: nil record type")
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var before models.EORecordType
+		if err := tx.Where("id = ?", t.ID).First(&before).Error; err != nil {
+			return fmt.Errorf("read eo record type %s before update: %w", t.ID, err)
+		}
+		adopting := before.Key != t.Key || (before.IsAbstract && !t.IsAbstract)
+		if adopting && !t.IsAbstract {
+			existing, err := eoExistingTypePermissionCodes(tx, *t)
+			if err != nil {
+				return err
+			}
+			if len(existing) > 0 {
+				return fmt.Errorf("update eo record type %q: %w: %s", t.Key, ErrEOTypePermissionCodesExist, strings.Join(existing, ", "))
+			}
+		}
 		if err := tx.Save(t).Error; err != nil {
 			return fmt.Errorf("update eo record type %q: %w", t.Key, err)
 		}
