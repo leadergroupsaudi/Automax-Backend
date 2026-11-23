@@ -871,6 +871,20 @@ func (e *eoActionExecutor) recordActionFailure(ctx context.Context, action *mode
 
 // eoCloseParentConfig is the action's configuration. It must stay in step with
 // database.eoCloseParentConfig, which writes it.
+//
+// THE RULE THAT GOVERNS WHAT MAY BE REQUIRED AT THE OTHER END, recorded here
+// because this is one of the three places someone edits when adding a
+// requirement at an action-closed state:
+//
+//	closeParent passes NO `Values`. A requirement at a state an action closes
+//	into must therefore be satisfiable from what is ALREADY STORED on the
+//	parent, and anything else makes the closure fail after the child has
+//	committed.
+//
+// closeParent's doc comment argues why no Values are passed. The
+// consequence of missing this used to be a parent left open for ever; the
+// pre-commit refusal (eoCheckCloseParentHasAParent) removes only the
+// parentless case, not this one.
 type eoCloseParentConfig struct {
 	// LinkType names WHICH parent: a record may carry several links, and the
 	// client's rule is about the one it hangs off.

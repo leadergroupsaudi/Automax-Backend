@@ -153,6 +153,13 @@ type eoTransitionSpec struct {
 	// "Closes the parent": when this transition runs, the record's parent
 	// through that LINK TYPE is moved through the transition of that CODE on
 	// its own workflow. Empty means no such action.
+	//
+	// BEFORE ADDING A REQUIREMENT AT THE STATE THAT CODE ENTERS: the action
+	// passes NO `Values` (services.closeParent explains why), so anything
+	// required there must be satisfiable from what is ALREADY STORED on the
+	// parent. A requirement that is not fails the closure AFTER the child has
+	// committed, and nothing retries it — see eoClosureArtefacts, which is
+	// where the pilot's instance of this lives.
 	closesParentLinkType   string
 	closesParentTransition string
 }
@@ -496,6 +503,16 @@ const (
 
 // eoClosureArtefacts is what A5 resolved. eoRequireAtClosureState points these
 // AND eoAtClosureFields at the type's closing state.
+//
+// A FIELD HERE ON A TYPE THAT ANOTHER TYPE CLOSES IS A FIELD THE CLOSING
+// ACTION CANNOT SUPPLY. services.closeParent passes no `Values`, so a
+// requirement at a state an action closes into must be satisfiable from what
+// is ALREADY STORED on that record. The pilot's live instance is the Draft
+// Decision Study's three rows below: a clerk records H.E.'s decision while
+// the study is `with_he`, and if they do not, the Decision Record's `issue`
+// still succeeds and the study stays open with a note on both records.
+// Adding a row here for a type whose closure is run by a child's action is
+// adding another one of those, so check that the value can be there first.
 //
 // TWO OF THE SEVEN REST ON AN EXPLICIT PHRASE AND FIVE ON A STEP NUMBER. That
 // is the honest split and it is in the data, not only in the report: only
@@ -989,6 +1006,13 @@ type eoCloseParentConfig struct {
 	Transition string `json:"transition"`
 }
 
+// eoSeedCloseParentAction writes one transition's close_parent action.
+//
+// SEEDING ONE HERE MAKES THE TRANSITION REFUSE A RECORD WITH NO SUCH PARENT:
+// services.eoCheckCloseParentHasAParent reads these actions before the
+// transition commits, because the action itself runs after it and nothing
+// retries it. And see eoTransitionSpec.closesParentLinkType for the rule
+// about what may be required at the state the parent is moved into.
 func eoSeedCloseParentAction(tx *gorm.DB, transition models.WorkflowTransition, tr eoTransitionSpec) error {
 	// Fail closed on a link type that is not seeded: an action naming a link
 	// type nothing wrote would find no parent, log one line and leave the
