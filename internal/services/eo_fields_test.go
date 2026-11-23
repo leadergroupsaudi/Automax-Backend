@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -504,12 +505,27 @@ func TestFileFieldsRejectANonDocumentaValue(t *testing.T) {
 		}
 	})
 
-	t.Run("no Documenta call is made either way", func(t *testing.T) {
-		// The shape check takes no client and cannot reach one: EO Documenta
-		// is disabled in the pilot's default deployment, and a check that
-		// asked Documenta would pass there and fail here, or the reverse.
-		if errs := eoValidate(t, fields, nil, map[string]any{"letter": eoDocID()}, nil, nil, nil); len(errs) != 0 {
-			t.Fatalf("errs = %v: a well-formed id that no Documenta holds must still pass", errs)
+	t.Run("the shape check has no Documenta client to reach", func(t *testing.T) {
+		// WHY THIS IS A SIGNATURE CHECK AND NOT A CALL. The shape check must
+		// stay syntactic: EO Documenta is disabled in the pilot's default
+		// deployment, so a check that asked Documenta whether an id exists
+		// would pass there and fail where it is enabled, or the reverse.
+		//
+		// Nothing in the table above can pin that. Every id in it is a fresh
+		// uuid no Documenta holds, so each row passes or fails identically
+		// whether or not a call is made — asserting one of them again under
+		// this name proved nothing. What does pin it is the signature: a
+		// client can only arrive through a parameter, and there is none.
+		//
+		// Mutation that makes it fail: add a storage.DocumentaClient
+		// parameter to ValidateRecordValues.
+		docClient := reflect.TypeOf((*storage.DocumentaClient)(nil)).Elem()
+		ft := reflect.TypeOf(ValidateRecordValues)
+		for i := 0; i < ft.NumIn(); i++ {
+			in := ft.In(i)
+			if in == docClient || in.Implements(docClient) {
+				t.Errorf("ValidateRecordValues parameter %d is %s, which satisfies storage.DocumentaClient: the file-kind check can now ask Documenta whether an id exists, and the same value would validate differently in a deployment that has Documenta enabled", i, in)
+			}
 		}
 	})
 }
