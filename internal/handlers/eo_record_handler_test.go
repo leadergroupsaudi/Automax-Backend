@@ -218,6 +218,14 @@ func eoNoPerm(_ ...string) fiber.Handler {
 	return func(c *fiber.Ctx) error { return c.Next() }
 }
 
+// eoNoTypePerm is the same stand-in for §7.11's per-type gate. Tests that are
+// about the route SET or about a handler's body use it; the gate itself is
+// tested in internal/middleware, and the routes that must CARRY it are pinned
+// by TestEORecordRoutesCarryThePerTypeGate.
+func eoNoTypePerm(_ string) fiber.Handler {
+	return func(c *fiber.Ctx) error { return c.Next() }
+}
+
 func eoTestUser() *models.User {
 	return &models.User{ID: uuid.New(), IsSuperAdmin: true}
 }
@@ -393,7 +401,7 @@ func TestEORecordRoutesOrderStaticBeforeParam(t *testing.T) {
 	app := fiber.New()
 	app.Use(eoTestActor(eoTestUser()))
 	// The REAL route set, in the order main.go registers it.
-	h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm)
+	h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm, eoNoTypePerm)
 
 	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/my-assigned", nil))
 	if err != nil {

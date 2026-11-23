@@ -32,6 +32,19 @@ const (
 // spelled out a second time in main.go where nothing checks it.
 type EOPermissionMiddleware func(permissions ...string) fiber.Handler
 
+// EOTypePermissionMiddleware builds §7.11's PER-TYPE guard for one action —
+// in the server it is (*middleware.EOTypePermission).RequireEOTypePermission,
+// which resolves the record type this request names and demands
+// eo:<type_key>:<action>.
+//
+// It is a SECOND parameter rather than a wider EOPermissionMiddleware because
+// the two compose and neither replaces the other: the module-level code says
+// the caller may use the EO module at all, and this says which of its eleven
+// record types they may use it on. It is declared here, as a function type,
+// so this package does not import internal/middleware — which imports the
+// repositories this handler also holds.
+type EOTypePermissionMiddleware func(action string) fiber.Handler
+
 // EORecordHandler is the HTTP surface of the EO record engine.
 //
 // It holds the two services AND the two repositories: the register query
@@ -73,19 +86,44 @@ func NewEORecordHandler(
 // question this plan does not settle. The same goes for a stats aggregate:
 // nothing computes one, and a count query invented at the HTTP boundary would
 // not respect §7.11 row-level visibility the way List does.
-func (h *EORecordHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMiddleware) {
-	r.Post("/", perm("eo:create"), h.Create)
+func (h *EORecordHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMiddleware, typePerm EOTypePermissionMiddleware) {
+	// THE MODULE-LEVEL CODE STAYS on every route. typePerm NARROWS it: it
+	// runs second, reads the user the module-level guard has just loaded into
+	// Locals, resolves the record type from the path id or the create body,
+	// and refuses a caller who does not hold eo:<type_key>:<action>.
+	//
+	// The three list routes carry no per-type middleware because a 403 is the
+	// wrong answer for a register: they are filtered instead, in the
+	// repository (applyEORecordTypePermissions), so a caller sees the types
+	// they hold and no others rather than being refused the page.
+	//
+	// AvailableTransitions is gated too, although it is a read of the same
+	// record Get serves. Leaving the one id-carrying read ungated is how a
+	// gate ends up with a hole: it would still be covered by the register's
+	// filter (it loads the record through eoLoadRecord, which asks List), but
+	// that is a 404 where its siblings answer 403, for no reason a reader
+	// could reconstruct.
+	const (
+		view   = models.EOTypePermissionView
+		create = models.EOTypePermissionCreate
+		update = models.EOTypePermissionUpdate
+	)
+	r.Post("/", perm("eo:create"), typePerm(create), h.Create)
 	r.Get("/", perm("eo:view"), h.List)
 	r.Get("/my-assigned", perm("eo:view"), h.MyAssigned)
 	// Search is the only list route that binds a BODY. It is a literal path
 	// and registers before /:id for the same reason my-assigned does.
 	r.Post("/search", perm("eo:view"), h.Search)
-	r.Get("/:id", perm("eo:view"), h.Get)
-	r.Put("/:id", perm("eo:update"), h.Update)
-	r.Get("/:id/transitions", perm("eo:view"), h.AvailableTransitions)
-	r.Post("/:id/transition", perm("eo:transition"), h.Transition)
-	r.Get("/:id/children", perm("eo:view"), h.Children)
-	r.Post("/:id/links", perm("eo:update"), h.CreateLink)
+	r.Get("/:id", perm("eo:view"), typePerm(view), h.Get)
+	r.Put("/:id", perm("eo:update"), typePerm(update), h.Update)
+	r.Get("/:id/transitions", perm("eo:view"), typePerm(view), h.AvailableTransitions)
+	// A transition is a WRITE to the record, so it asks for the type's update
+	// code: §7.11 names three per-type actions (view, create, update) and the
+	// seed writes exactly those three, so there is no eo:<type_key>:transition
+	// to demand and inventing one would name a code no role has ever held.
+	r.Post("/:id/transition", perm("eo:transition"), typePerm(update), h.Transition)
+	r.Get("/:id/children", perm("eo:view"), typePerm(view), h.Children)
+	r.Post("/:id/links", perm("eo:update"), typePerm(update), h.CreateLink)
 }
 
 // ── shared plumbing ─────────────────────────────────────────────────────────
@@ -174,6 +212,14 @@ func eoScopeFilter(filter *models.EORecordFilter, user *models.User) {
 	filter.UserID = user.ID
 	filter.IsAdmin = user.IsSuperAdmin
 	filter.VisibleToDepartmentIDs = eoUserBodies(user)
+	// §7.11's per-type gate, register side. The repository restricts the
+	// query to the types these codes grant eo:<type_key>:view on; the route
+	// gate (middleware.EOTypePermission) answers 403 for a single record and
+	// cannot narrow a result set. The codes are set HERE, with the other
+	// server-filled fields, so every route that lists — List, Search,
+	// MyAssigned, Children and the single-record visibility probe — carries
+	// them without each remembering to.
+	filter.PermissionCodes = user.PermissionCodes()
 	filter.RecordID = nil
 }
 

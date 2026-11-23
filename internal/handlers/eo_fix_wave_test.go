@@ -414,7 +414,7 @@ func TestSearchEORecordsReachesTheBodyOnlyFilters(t *testing.T) {
 		app.Use(eoTestActor(actor))
 		// Registered through RegisterRoutes, not hand-mounted: the route's
 		// EXISTENCE and its position before /:id are part of what is covered.
-		h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm)
+		h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm, eoNoTypePerm)
 
 		raw, _ := json.Marshal(body)
 		req := httptest.NewRequest("POST", "/eo-records/search", bytes.NewReader(raw))
@@ -550,7 +550,7 @@ func TestSearchEORecordsCannotSetRecordIDFromAFormBody(t *testing.T) {
 
 	app := fiber.New()
 	app.Use(eoTestActor(user))
-	h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm)
+	h.RegisterRoutes(app.Group("/eo-records"), eoNoPerm, eoNoTypePerm)
 
 	// The server-filled fields a form body CAN carry, by their Go field name,
 	// which is what BodyParser falls back to when there is no `form` tag.

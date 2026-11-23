@@ -250,6 +250,19 @@ type EORecordFilter struct {
 	// WHERE clause and a second copy would drift. Handler-set only.
 	RecordID *uuid.UUID `query:"-" json:"-"`
 
+	// PermissionCodes is every permission code the caller holds, set by the
+	// handler from models.User.PermissionCodes. The register restricts itself
+	// to the record types those codes grant eo:<type_key>:view on — spec
+	// §7.11's per-type mechanism, applied here so that a new endpoint cannot
+	// serve the register without it.
+	//
+	// IT FAILS CLOSED. An empty list is a caller who holds no per-type code,
+	// and the register answers EMPTY for them rather than whole: a filter
+	// whose absent input means "no restriction" is a filter that every caller
+	// who forgets to set it switches off. IsAdmin still bypasses it, as it
+	// bypasses row-level visibility.
+	PermissionCodes []string `query:"-" json:"-"`
+
 	// Set by the handler. VisibleToDepartmentIDs are the bodies the caller
 	// belongs to; UserID is the caller, who always sees records they created;
 	// IsAdmin bypasses row-level visibility.

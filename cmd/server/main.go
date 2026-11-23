@@ -861,8 +861,15 @@ func main() {
 	// registration order, so /eo-records/my-assigned must be registered
 	// before /eo-records/:id, and handlers.TestEORecordRoutesOrderStaticBeforeParam
 	// registers that same function on a bare app to prove it still is.
+	//
+	// eoTypePermission is spec §7.11's per-type gate. It is passed as a
+	// SECOND guard rather than replacing RequirePermission: the module-level
+	// codes still say who may use the EO module, and this says which of its
+	// record types they may use it on. Its other half is the register's list
+	// filter, which lives in the repository and needs no wiring here.
 	eoRecords := v1.Group("/eo-records", authMiddleware.Authenticate(), licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)))
-	eoRecordHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission)
+	eoTypePermission := middleware.NewEOTypePermission(eoRecordRepo, eoTypeRepo)
+	eoRecordHandler.RegisterRoutes(eoRecords, authMiddleware.RequirePermission, eoTypePermission.RequireEOTypePermission)
 
 	// Admin routes
 	admin := v1.Group("/admin", authMiddleware.Authenticate(), licenseMiddleware.LicenseGate())
