@@ -158,7 +158,9 @@ Six fields hold files and are demanded: four at `required_mode = always` (`eo_in
 - Consumes: `EOFieldDef.ArUntranslated` (`internal/models/eo_record_type.go:235`), `WorkflowState.EOClientUnconfirmed` and `WorkflowTransition.EOClientUnconfirmed` (`internal/models/workflow.go:166`, `:274`).
 - Produces: `GET /admin/eo-signoff` returning the two lists, and `POST /admin/eo-signoff/discharge` clearing named rows. Both on `eo:types:manage`.
 
-Two separate gaps compose into one problem. The markers are **write-only**: nothing anywhere can clear them, so a client sign-off can only be recorded by hand-written SQL on a government deployment. And the boot-time reports that listed them were reachable only on the boot that applied the seed (fixed in Plan 2's fix wave) — so there was no live way to ask what is outstanding either.
+Two separate gaps composed into one problem. The markers **were** write-only: nothing anywhere could clear them, so a client sign-off could only be recorded by hand-written SQL on a government deployment. And the boot-time reports that listed them were reachable only on the boot that applied the seed (fixed in Plan 2's fix wave) — so there was no live way to ask what was outstanding either.
+
+> **Both are closed by this task** (`POST /api/v1/admin/eo-signoff/discharge` and `GET /api/v1/admin/eo-signoff`). Write-only on the **designer** path is deliberate and stays — a designer save must never silently clear a sign-off, and `internal/handlers/eo_field_def_request_test.go` pins that. Read the paragraph above as the problem statement, not as current behaviour.
 
 Write-only on the **designer** path is correct and stays: a designer save must not silently clear a sign-off. This adds a deliberate, audited discharge path instead, which is a different thing.
 
