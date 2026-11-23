@@ -2111,3 +2111,23 @@ func TestTransitionAttachmentsSatisfyRequiredness(t *testing.T) {
 		}
 	})
 }
+
+// The env is built from stored AND submitted values, so a record that already
+// holds a nil reaches the same rule on the transition path. This is the
+// service's real evaluator, not a stub, so a regression here is a 500 on an
+// ordinary transition.
+func TestTransitionConditionalRuleOverANilStoredValue(t *testing.T) {
+	f := eoNewTxFixture(t)
+	f.types.defs = append(f.types.defs, models.EOFieldDef{
+		ID: uuid.New(), RecordTypeID: f.recordType.ID, Key: "corrective_action", Label: "Corrective action",
+		Kind: models.EOKindLongText, Provenance: models.EOProvenanceUser,
+		RequiredMode: models.EORequiredConditional, RequiredRule: `he_reason matches "\\S"`,
+	})
+	// A BAG key, not a column: delay_reason is an eo_records column and
+	// flattens to "" rather than nil, so it could not carry this case.
+	f.setValues(t, map[string]any{"he_reason": nil})
+
+	if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+		t.Fatalf("a transition over a record holding a nil was refused: %v", err)
+	}
+}

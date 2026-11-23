@@ -629,3 +629,68 @@ func TestValidateConditionalMalformedRuleIsMachineryError(t *testing.T) {
 		}
 	})
 }
+
+// A key PRESENT with a nil value must behave exactly as an absent one.
+//
+// eoformula treats a present-but-nil key as RESOLVED (formula.go:225), so it
+// raises no unresolved reference and the classification added for the absent
+// case never fires. The pilot's `delay_reason matches "\S"` rule then fails to
+// compile against an unknown type and the create answers 500 — reproduced live
+// on eo_directive: values {} -> 400, {"delay_reason": null} -> 500,
+// {"delay_reason": ""} -> 400. A UI that submits every writable field sends
+// null for an untouched optional one, so this is ordinary input.
+func TestValidateConditionalNilReferenceIsNotRequired(t *testing.T) {
+	ev := eoformula.New(0)
+	// One rule per operator the pilot uses, so the fix is not one operator's.
+	rules := []struct{ name, rule string }{
+		{"matches", `delay_reason matches "\\S"`},
+		{"equality", `delay_reason == "late"`},
+		{"membership", `delay_reason in ["late", "very late"]`},
+		{"comparison", `delay_reason > 3`},
+	}
+	var typedNil *string
+
+	for _, r := range rules {
+		t.Run(r.name, func(t *testing.T) {
+			f := []models.EOFieldDef{{Key: "corrective_action", Label: "Corrective action",
+				RequiredMode: models.EORequiredConditional, RequiredRule: r.rule}}
+
+			for _, tc := range []struct {
+				name   string
+				stored map[string]any
+				values map[string]any
+			}{
+				{"submitted nil", nil, map[string]any{"delay_reason": nil}},
+				{"stored nil", map[string]any{"delay_reason": nil}, map[string]any{}},
+				{"stored typed nil", map[string]any{"delay_reason": typedNil}, map[string]any{}},
+				{"submitted nil clears a stored value", map[string]any{"delay_reason": "late"}, map[string]any{"delay_reason": nil}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					errs, err := ValidateRecordValues(f, tc.stored, tc.values, nil, nil, ev)
+					if err != nil {
+						t.Fatalf("err = %v, want none: a nil value is a value nobody supplied, not a broken rule", err)
+					}
+					if len(errs) != 0 {
+						t.Fatalf("errs = %v, want none", errs)
+					}
+				})
+			}
+		})
+	}
+
+	t.Run("a value that is there still decides", func(t *testing.T) {
+		f := []models.EOFieldDef{{Key: "corrective_action", Label: "Corrective action",
+			RequiredMode: models.EORequiredConditional, RequiredRule: `delay_reason matches "\\S"`}}
+		if errs := eoValidate(t, f, nil, map[string]any{"delay_reason": "late"}, nil, nil, ev); len(errs) != 1 {
+			t.Fatalf("errs = %v, want corrective_action required", errs)
+		}
+		if errs := eoValidate(t, f, map[string]any{"delay_reason": "late"}, map[string]any{}, nil, nil, ev); len(errs) != 1 {
+			t.Fatalf("errs = %v, want corrective_action required from the stored value", errs)
+		}
+		// Spaces are no delay: eoIsEmpty trims, and seed_eo_pilot.go:907
+		// chose `matches "\S"` so the rule agrees with it.
+		if errs := eoValidate(t, f, nil, map[string]any{"delay_reason": "   "}, nil, nil, ev); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+	})
+}

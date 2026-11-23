@@ -228,13 +228,7 @@ func ValidateRecordValues(
 				return nil, fmt.Errorf("validate record values: field %q needs a formula evaluator", f.Key)
 			}
 			if env == nil {
-				env = make(map[string]any, len(stored)+len(values))
-				for k, v := range stored {
-					env[k] = v
-				}
-				for k, v := range values {
-					env[k] = v
-				}
+				env = eoRuleEnv(stored, values)
 			}
 			ok, err := eval.EvalBool(f.RequiredRule, env)
 			if err != nil {
@@ -262,6 +256,72 @@ func ValidateRecordValues(
 		}
 	}
 	return errs, nil
+}
+
+// eoRuleEnv builds the environment a required_rule is evaluated in, from the
+// record's stored values overlaid with the submitted ones.
+//
+// A NIL value is OMITTED rather than carried, so the rule sees the key as
+// absent. eoformula treats a key present with a nil value as RESOLVED
+// (formula.go:225, so that "x == nil" works on a null field), which means a
+// rule over it compiles against an unknown type and fails:
+// `delay_reason matches "\S"` — the pilot's own rule, seeded at
+// seed_eo_pilot.go:914 — answered 500 to an ordinary create carrying
+// {"delay_reason": null}, while the same create with the key ABSENT answered
+// 400. A client that submits every writable field sends null for an untouched
+// optional one, so that is ordinary input, and the two spellings of "nothing
+// was supplied" must not answer differently.
+//
+// Omitting is also what the DERIVED env already does: eoValuesOf "omits empty
+// values rather than setting them to nil, so a formula over missing data
+// yields eoformula.ErrUnresolvedReference" (eo_derive.go:264). The unresolved
+// reference then flows into the unmet-condition path, which is the answer a
+// rule about a value nobody supplied deserves.
+//
+// A SUBMITTED nil REMOVES a stored value from the env rather than being
+// skipped: an explicit nil clears the field (eoIsEmpty reads it that way, and
+// requiredness treats it as emptying the record), so a rule must not go on
+// testing the value the submission is in the act of deleting.
+//
+// The consequence, stated plainly: a required_rule cannot make a field
+// required on the grounds that something is ABSENT — `x == nil` is unmet
+// rather than true. That was already so for an absent key; this makes a nil
+// one behave the same, rather than being a third case that errors.
+func eoRuleEnv(stored, values map[string]any) map[string]any {
+	env := make(map[string]any, len(stored)+len(values))
+	for k, v := range stored {
+		if eoIsNil(v) {
+			continue
+		}
+		env[k] = v
+	}
+	for k, v := range values {
+		if eoIsNil(v) {
+			delete(env, k)
+			continue
+		}
+		env[k] = v
+	}
+	return env
+}
+
+// eoIsNil reports whether v carries no value at all. It is NOT eoIsEmpty: a
+// blank string and an empty list are values a rule can legitimately test, and
+// only the absence of one is indistinguishable from an absent key.
+//
+// Typed nils are included for the reason eoIsEmpty handles them — a NULL
+// column flattened into stored arrives as a non-nil interface holding a nil
+// pointer, slice or map.
+func eoIsNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Slice, reflect.Map, reflect.Interface, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // eoRequiredRuleUnmet reports whether an EvalBool failure is ONLY an
