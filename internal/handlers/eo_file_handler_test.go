@@ -66,6 +66,7 @@ type eoFakeDocumenta struct {
 	fileInfo  *storage.DmsFile
 	infoErr   error
 	infoCalls int
+	gotInfoID string
 }
 
 func (f *eoFakeDocumenta) UploadFile(_ context.Context, folderID, fileName string, fileData io.Reader, fileSize int64, metadata map[string]string) (string, error) {
@@ -748,20 +749,30 @@ func (f *eoFakeDocumenta) DownloadFile(_ context.Context, fileID string) (io.Rea
 
 func (f *eoFakeDocumenta) GetFileInfo(_ context.Context, fileID string) (*storage.DmsFile, error) {
 	f.infoCalls++
+	// RECORDED, not ignored. A fake that drops its argument cannot tell the
+	// placement check apart from one asking about the CALLER's spelling of
+	// the id instead of the register's — and the two differ exactly when it
+	// matters.
+	f.gotInfoID = fileID
 	if f.infoErr != nil {
 		return nil, f.infoErr
 	}
 	return f.fileInfo, nil
 }
 
+// These two return exactly what the real client returns (documenta_http.go:
+// 434-441): a RELATIVE AUTOMAX PATH into the Documents module, not a signed
+// Documenta URL. A fake that invented a signed URL here would model the
+// fiction this fix retracted, and would make a redirect look like a sharing
+// problem rather than what it is — an answer under another module's gate.
 func (f *eoFakeDocumenta) GetDownloadURL(_ context.Context, fileID string) (string, error) {
 	f.urlCalls++
-	return "https://documenta.example/signed/" + fileID, nil
+	return "/api/v1/documents/files/" + fileID + "/download", nil
 }
 
 func (f *eoFakeDocumenta) GetPreviewURL(_ context.Context, fileID string) (string, error) {
 	f.urlCalls++
-	return "https://documenta.example/preview/" + fileID, nil
+	return "/api/v1/documents/files/" + fileID + "/preview", nil
 }
 
 // eoReadFake is a Documenta that holds one file, FILED IN rec's own folder —
@@ -837,11 +848,13 @@ func eoRefusalEnvelope(t *testing.T, resp *http.Response) string {
 // routes existed a clerk could attach the mandatory document to an Incoming
 // Correspondence and nobody — not even the clerk — could ever open it.
 //
-// It asserts the BYTES, not a URL. A 3xx to a Documenta download URL would
-// also "work" in a browser, and is asserted against explicitly: that URL
-// carries Documenta's own authorisation, not EO's, so it is readable by
-// anyone it reaches and keeps working after the permission that produced it
-// is revoked.
+// It asserts the BYTES, not a URL, and asserts against a 3xx explicitly.
+// GetDownloadURL does not mint a signed Documenta URL — it returns the
+// relative path /api/v1/documents/files/<id>/download, which is the DOCUMENTS
+// module, gated on goals:view and running on the Goals client and workspace.
+// A redirect there would 404 against a separate workspace, or, where one
+// deployment points both configs at the same workspace, serve EO documents to
+// a caller who cleared none of EO's gates.
 func TestEOFileDownloadStreamsTheFile(t *testing.T) {
 	fileID := uuid.New().String()
 	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
@@ -873,9 +886,9 @@ func TestEOFileDownloadStreamsTheFile(t *testing.T) {
 	if doc.downloadCalls != 1 || doc.gotDownloadID != fileID {
 		t.Errorf("DownloadFile calls = %d for id %q, want 1 for %q", doc.downloadCalls, doc.gotDownloadID, fileID)
 	}
-	// Not a redirect, and no Documenta URL minted anywhere.
+	// Not a redirect, and no Documents-module URL produced anywhere.
 	if loc := resp.Header.Get("Location"); loc != "" {
-		t.Errorf("the response redirects to %q: that URL leaves EO's authorisation behind", loc)
+		t.Errorf("the response redirects to %q: that path answers under the Documents module's goals:view, not EO's gates", loc)
 	}
 	if doc.urlCalls != 0 {
 		t.Errorf("a Documents-module URL was produced %d times; the bytes must be served through this gate", doc.urlCalls)
@@ -1166,50 +1179,98 @@ func TestEOFileReadWhenDocumentaDisabled(t *testing.T) {
 	}
 }
 
-// TestEOFileDownloadWhenDocumentaHasLostTheFile: the record references a file
-// that Documenta no longer holds. That is a 404, not a 500 — nothing in
-// Automax is broken and the operator needs to be told the document is gone,
-// not that the server failed.
+// TestEOFileDownloadWhenDocumentaHasLostTheFile drives the states the REAL
+// client produces for a record whose file is gone — which are not the same
+// state for a foldered and a folderless record, and the difference is a known
+// defect rather than a design.
+//
+// MyDocs answers /files/info/<id> with a 404 and parseResponse
+// (documenta_http.go:253-258) flattens every non-2xx into a generic error, so
+// GetFileInfo cannot say "not found". A foldered record therefore fails the
+// placement check and reports 500 for a document that is merely deleted. The
+// 404 mapping that the download arm applies is reached only when the
+// placement check did not run.
+//
+// Both are pinned, so the defect is visible in the suite instead of being
+// described in a comment nobody re-reads, and so the fix (teaching
+// GetFileInfo to wrap ErrFileNotFound) lands on a test that changes colour.
 func TestEOFileDownloadWhenDocumentaHasLostTheFile(t *testing.T) {
 	fileID := uuid.New().String()
-	rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
-	// Filed on the record, so the placement check PASSES and this test
-	// really does exercise the DownloadFile arm.
-	doc := eoReadFake(rec, "", nil)
-	doc.downloadErr = fmt.Errorf("documenta: gone: %w", storage.ErrFileNotFound)
-	repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
-	app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
-	resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
-	if err != nil {
-		t.Fatalf("app.Test: %v", err)
-	}
-	if resp.StatusCode != fiber.StatusNotFound {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 404: %s", resp.StatusCode, string(raw))
-	}
-	eoRefusalEnvelope(t, resp)
+	t.Run("a folderless record reaches the download arm and gets 404", func(t *testing.T) {
+		// Folderless records are real: createRecordFolder logs and lets the
+		// record through when Documenta is failing, nothing backfills, and a
+		// transition can still file ids on them. The placement check is
+		// skipped, so DownloadFile's ErrFileNotFound is what answers.
+		rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+		rec.DocumentaFolderID = ""
+		doc := eoReadFake(rec, "", nil)
+		doc.downloadErr = fmt.Errorf("documenta: file %s not found: %w", fileID, storage.ErrFileNotFound)
+		repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
 
-	if doc.downloadCalls != 1 {
-		t.Errorf("DownloadFile ran %d times, want 1: this test must reach the download arm, not be refused earlier", doc.downloadCalls)
-	}
+		app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+		resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusNotFound {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 404: %s", resp.StatusCode, string(raw))
+		}
+		eoRefusalEnvelope(t, resp)
+		if doc.downloadCalls != 1 {
+			t.Errorf("DownloadFile ran %d times, want 1: this case must REACH the download arm, not be refused earlier", doc.downloadCalls)
+		}
+		if doc.infoCalls != 0 {
+			t.Errorf("GetFileInfo ran %d times for a record with no folder", doc.infoCalls)
+		}
+	})
 
-	// And a genuine upstream failure is NOT a 404: it must not look like a
-	// deleted document.
-	doc2 := eoReadFake(rec, "", nil)
-	doc2.downloadErr = errors.New("documenta: 502 bad gateway")
-	repo2 := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
-	app2 := eoUploadApp(NewEOFileHandler(repo2, doc2), eoTestUser())
-	resp2, err := app2.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
-	if err != nil {
-		t.Fatalf("app.Test: %v", err)
-	}
-	if resp2.StatusCode == fiber.StatusNotFound || resp2.StatusCode < 500 {
-		raw, _ := io.ReadAll(resp2.Body)
-		t.Fatalf("status = %d for an upstream outage, want a 5xx that is not 404: %s", resp2.StatusCode, string(raw))
-	}
-	// Same envelope as every other refusal — and a panic does not produce one.
-	eoRefusalEnvelope(t, resp2)
+	t.Run("a foldered record gets 500 today, which is the known defect", func(t *testing.T) {
+		// EXACTLY what the real client returns for a deleted file: a generic
+		// error carrying the upstream 404, with no ErrFileNotFound to match.
+		rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+		doc := eoReadFake(rec, "", nil)
+		doc.infoErr = errors.New("documenta: request failed (404): {\"error\":\"node not found\"}")
+		repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+		app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+		resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		// Asserted as it IS, with the reason recorded: refusing is right,
+		// the status is not. When GetFileInfo learns to wrap
+		// ErrFileNotFound this assertion is what must change to 404.
+		if resp.StatusCode < 500 {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want a 5xx: an unconfirmed placement must never serve the bytes: %s", resp.StatusCode, string(raw))
+		}
+		eoRefusalEnvelope(t, resp)
+		if doc.downloadCalls != 0 {
+			t.Errorf("DownloadFile ran %d times although the placement could not be confirmed", doc.downloadCalls)
+		}
+	})
+
+	t.Run("a genuine outage is not a 404", func(t *testing.T) {
+		// It must not look like a deleted document.
+		rec := eoRecordHolding(t, map[string]any{"attachments": []any{fileID}})
+		doc := eoReadFake(rec, "", nil)
+		doc.downloadErr = errors.New("documenta: 502 bad gateway")
+		repo := &eoFakeRecordRepo{byID: map[uuid.UUID]*models.EORecord{rec.ID: rec}}
+
+		app := eoUploadApp(NewEOFileHandler(repo, doc), eoTestUser())
+		resp, err := app.Test(httptest.NewRequest("GET", eoReadPaths(rec.ID.String(), fileID)["download"], nil))
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		if resp.StatusCode == fiber.StatusNotFound || resp.StatusCode < 500 {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d for an upstream outage, want a 5xx that is not 404: %s", resp.StatusCode, string(raw))
+		}
+		// Same envelope as every other refusal — and a panic does not produce one.
+		eoRefusalEnvelope(t, resp)
+	})
 }
 
 // TestEOFileDownloadServesTheIdTheRecordHolds: a uuid is case-insensitive, so
@@ -1232,7 +1293,13 @@ func TestEOFileDownloadServesTheIdTheRecordHolds(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(raw))
 	}
 	if doc.gotDownloadID != stored {
-		t.Errorf("Documenta was asked for %q, want the stored spelling %q", doc.gotDownloadID, stored)
+		t.Errorf("DownloadFile was asked for %q, want the stored spelling %q", doc.gotDownloadID, stored)
+	}
+	// The placement check must ask about the SAME id, in the same spelling.
+	// Asking about the caller's string instead would confirm the placement of
+	// whatever they typed, which is the one thing this check exists to stop.
+	if doc.gotInfoID != stored {
+		t.Errorf("GetFileInfo was asked about %q, want the stored spelling %q: the placement check must be made about the id the register holds, not the one the caller sent", doc.gotInfoID, stored)
 	}
 }
 
@@ -1347,8 +1414,8 @@ func TestEOFileDownloadRefusesAFileFiledOutsideTheRecordsFolder(t *testing.T) {
 			if doc.downloadCalls != 0 {
 				t.Errorf("DownloadFile ran %d times: the placement check must refuse BEFORE the bytes are fetched", doc.downloadCalls)
 			}
-			if doc.infoCalls != 1 {
-				t.Errorf("GetFileInfo calls = %d, want 1", doc.infoCalls)
+			if doc.infoCalls != 1 || doc.gotInfoID != fileID {
+				t.Errorf("GetFileInfo calls = %d about %q, want 1 about %q", doc.infoCalls, doc.gotInfoID, fileID)
 			}
 		})
 

@@ -322,20 +322,23 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 			"Documenta is not configured for the Executive Office (EO_DOCUMENTA_ENABLED=false), so files cannot be read from EO records. No file was returned.")
 	}
 
-	// ── THE OWNERSHIP CHECK ──
+	// ── OWNERSHIP CHECK 1 OF 2: THE REGISTER ──
 	//
 	// Without this the record id in the path is decoration: any caller
 	// holding eo:view on any one record type could read EVERY file in the EO
 	// workspace by quoting its id against a record they can see.
 	//
 	// It is answered from the REGISTER — the ids the record itself stores in
-	// its `file`/`multi_file` values — and therefore costs no upstream call
-	// and cannot be satisfied by a file that merely sits in the same folder.
-	// Documenta's own metadata is not usable for this: DownloadFile fills
-	// DmsFile from the download response headers and leaves ParentUUID
-	// empty, so a parent-folder comparison there would be a guard that can
-	// never fire, and GetFileInfo would mean asking Documenta about a file
-	// before deciding whether the caller may ask about it.
+	// its `file`/`multi_file` values — and therefore costs NO upstream call,
+	// which is why it is first: a file this record does not claim reaches
+	// Documenta through no request at all, not even for metadata.
+	//
+	// It is necessary and NOT sufficient, because a record's values can be
+	// made to claim any id (see check 2 below, which settles whether the
+	// claim is true). DownloadFile's own metadata cannot help either way: it
+	// fills DmsFile from the download response headers and leaves ParentUUID
+	// empty, so a parent comparison on the bytes already in hand would be a
+	// guard that can never fire.
 	//
 	// Unparseable ids, ids on other records and strings the record happens to
 	// hold that are not Documenta file ids all land here, in ONE arm with one
@@ -355,7 +358,7 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 	// system@automax.local.
 	ctx := storage.ContextWithOnBehalf(c.UserContext(), user.Email)
 
-	// ── THE SECOND OWNERSHIP CHECK: DOCUMENTA'S OWN FILING ──
+	// ── OWNERSHIP CHECK 2 OF 2: DOCUMENTA'S OWN FILING ──
 	//
 	// The register check above proves the record REFERENCES this id. It
 	// cannot prove the id was ever filed against this record, because a value
@@ -382,9 +385,13 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 	//
 	// LIMITS, stated rather than assumed:
 	//   - A record with an EMPTY documenta_folder_id cannot be checked: there
-	//     is nothing to compare against, and those records legitimately hold
-	//     files filed by a transition. They fall back to the register check
-	//     alone. Skipping is therefore deliberate, not an oversight.
+	//     is nothing to compare against. Those are the records whose folder
+	//     creation FAILED during a Documenta outage (createRecordFolder logs
+	//     and lets the record through, and nothing backfills) plus any record
+	//     whose files a transition filed. They fall back to the register
+	//     check alone, which means the escalation above is intact in full for
+	//     them. Skipping is deliberate — comparing against "" would refuse
+	//     every one of their files — but it is a residual, not a closure.
 	//   - Direct-parent equality assumes a record's files sit directly in its
 	//     folder, which is what Upload does. If EO ever nests subfolders under
 	//     a record folder this must become a containment test over
@@ -392,11 +399,22 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 	//   - It does not fix the SAVE path: a bogus id still lands in the
 	//     register and is only refused when someone tries to read it.
 	//
-	// An error here is NOT special-cased into a 404. GetFileInfo never
-	// returns storage.ErrFileNotFound — parseResponse flattens every non-2xx
-	// into a generic error (documenta_http.go:253-258) — so an errors.Is arm
-	// would be dead code. A check that could not run has not made a decision,
-	// so it refuses with a 5xx rather than serving.
+	// AN ERROR HERE IS A 5xx, AND THAT IS A KNOWN DEFECT, not a design
+	// choice. A check that could not run has made no decision, so refusing
+	// rather than serving is right. What is wrong is the STATUS a deleted
+	// document gets: MyDocs answers /files/info/<id> with a 404, parseResponse
+	// flattens every non-2xx into a generic error (documenta_http.go:253-258),
+	// and so a file that is simply gone arrives here indistinguishable from an
+	// outage and is reported 500. For a foldered record — the normal case —
+	// that is what happens, and the 404 arm below is reached only for
+	// folderless records and for a file deleted between the two calls.
+	//
+	// It is NOT fixed by an errors.Is arm here: GetFileInfo never returns
+	// storage.ErrFileNotFound, so such an arm would be code that can never
+	// run. Fixing it properly means teaching GetFileInfo to wrap
+	// ErrFileNotFound on a 404 — shared storage code that Goals and KPI also
+	// call — which is deliberately out of scope for this task and is carried
+	// as a follow-up rather than done quietly here.
 	if folder := strings.TrimSpace(rec.DocumentaFolderID); folder != "" {
 		placement, infoErr := h.documenta.GetFileInfo(ctx, fileID)
 		if infoErr != nil {
@@ -424,9 +442,13 @@ func (h *EOFileHandler) serveFile(c *fiber.Ctx, disposition string) error {
 		// to be told the document is gone. Any other upstream failure stays a
 		// 5xx, so an outage can never be read as a deleted document.
 		//
-		// Still reachable with the placement check above in place: a record
-		// with no folder skips that check entirely, and a file deleted
-		// between the two calls arrives here too.
+		// HONEST ABOUT ITS REACH. This arm is reached only when the placement
+		// check above did not run or did not fail first: a record with no
+		// folder skips that check entirely, and a file deleted between the
+		// two calls arrives here too. For a FOLDERED record a deleted file is
+		// caught by GetFileInfo instead and reported 500 — the known defect
+		// named there. So this is the right mapping applied to a shrinking
+		// set of cases, not a claim about every deleted document.
 		if errors.Is(err, storage.ErrFileNotFound) {
 			log.Printf("[EO] record %s references file %s, which Documenta does not hold: %v", rec.Reference, fileID, err)
 			return utils.ErrorResponse(c, fiber.StatusNotFound, fmt.Sprintf(
