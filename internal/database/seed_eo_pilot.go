@@ -285,6 +285,7 @@ func eoReportPilotObligations(db *gorm.DB) {
 	}
 	eoLogUnconfirmedStateMachines(db)
 	eoLogCapabilityInputGaps(db)
+	eoLogTypesWithNoLiveCodes(db)
 }
 
 // eoPilotStep is one unit of the pilot seed.
@@ -3167,8 +3168,20 @@ func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 	// are matched literally; the predicate itself is eoTypePermissionIsStale,
 	// which the writer also applies, so the step cannot open on a row the
 	// writer would then decline to rewrite.
+	//
+	// THIS READ IS SCOPED while the count above is not, and the asymmetry is
+	// the whole of it: the three reads here have three different jobs. The
+	// count asks "is this code occupied", and a deleted row occupies its code
+	// — that is the unique index with no deleted_at predicate, and the bug
+	// the Unscoped() count fixes. This one asks "is there a description to
+	// correct", and a DELETED row's description is read by nobody and cannot
+	// be corrected anyway: eoSeedTypePermissions's refresh is a scoped
+	// Updates, so it would match zero rows. Unscoped here opens the step on a
+	// row the writer cannot converge, and the next boot is identical — the
+	// never-terminating gate, reintroduced one line away from where it was
+	// closed. Pinned by TestEoGateShutsOnADeletedStaleDescription.
 	var rows []models.Permission
-	if err := db.Unscoped().Where("code IN ?", codes).Find(&rows).Error; err != nil {
+	if err := db.Where("code IN ?", codes).Find(&rows).Error; err != nil {
 		return false, fmt.Errorf("read the per-type permission descriptions: %w", err)
 	}
 	for _, p := range rows {

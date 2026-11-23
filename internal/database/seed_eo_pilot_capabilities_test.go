@@ -897,3 +897,110 @@ func TestEoSeedSurvivesADeletedPerTypePermission(t *testing.T) {
 		}
 	}
 }
+
+// TestEoGateShutsOnADeletedStaleDescription is fix round 4's NEW-1: the
+// never-terminating gate, reintroduced one line from where round 3 closed it.
+//
+// The three reads around the per-type codes have three different jobs. The
+// COUNT must be unscoped, because a deleted row occupies its unique code. The
+// STALE read must be SCOPED, because eoSeedTypePermissions's refresh is a
+// scoped Updates: for a deleted row it matches nothing. Unscoped there, a
+// pre-A2 row that an administrator later deleted opens the step on every
+// boot, the writer converges nothing, and the whole pilot seed transaction
+// re-runs for ever.
+//
+// Mutation that makes it fail: put Unscoped() back on the stale read in
+// eoTypePermissionsPending.
+func TestEoGateShutsOnADeletedStaleDescription(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	code := models.EOTypePermissionCode("eo_objection", models.EOTypePermissionView)
+	var row models.Permission
+	if err := db.Where("code = ?", code).First(&row).Error; err != nil {
+		t.Fatalf("read %q: %v", code, err)
+	}
+	// A row as a pre-A2 database holds it …
+	if err := db.Model(&models.Permission{}).Where("id = ?", row.ID).
+		Updates(map[string]any{
+			"description":    "View executive-office records of type Objection (eo_objection). " + eoTypePermissionLegacyInertEN,
+			"description_ar": "عرض سجلات المكتب التنفيذي من نوع اعتراض. " + eoTypePermissionLegacyInertAR,
+		}).Error; err != nil {
+		t.Fatalf("write the stale description: %v", err)
+	}
+	// … which an administrator then deletes.
+	if err := db.Where("id = ?", row.ID).Delete(&models.Permission{}).Error; err != nil {
+		t.Fatalf("delete it: %v", err)
+	}
+
+	seedEOPilot(db)
+
+	open, err := eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if open {
+		t.Fatal("the gate is open on a DELETED stale row the writer cannot converge: every boot would re-run the whole pilot seed transaction")
+	}
+	// And the row is still deleted: nothing resurrected it to shut the gate.
+	var live int64
+	if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&live).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if live != 0 {
+		t.Errorf("%q is live again; the gate shut for the wrong reason", code)
+	}
+}
+
+// TestEoReportPilotObligationsLogsATypeWithNoLiveCodes is fix round 4's
+// NEW-2, and it asserts the LINE on a boot where the convergent step is SHUT
+// — which is the only state the line exists for. Inside the writer it could
+// never fire: the deleted codes still occupy their unique codes, so the gate
+// finds nothing missing and the writer does not run.
+//
+// It follows TestEoSeedEOPilotLogsTheUnprovidedCapabilityInput, the sibling
+// line in this file that is asserted the same way.
+//
+// Mutation that makes it fail: move the eoLogTypesWithNoLiveCodes call back
+// inside eoSeedTypePermissions, or delete it from eoReportPilotObligations.
+func TestEoReportPilotObligationsLogsATypeWithNoLiveCodes(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	// Every code of one type, deleted the way DELETE /admin/permissions/:id
+	// deletes them.
+	for _, a := range models.EOTypePermissionActions {
+		code := models.EOTypePermissionCode("eo_objection", a.Action)
+		if err := db.Where("code = ?", code).Delete(&models.Permission{}).Error; err != nil {
+			t.Fatalf("delete %q: %v", code, err)
+		}
+	}
+	// The gate is SHUT in this state, which is the whole point.
+	open, err := eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if open {
+		t.Fatal("the gate is open with all three codes deleted; this test no longer covers the state it was written for")
+	}
+
+	var buf bytes.Buffer
+	out := log.Writer()
+	flags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(out); log.SetFlags(flags) })
+
+	seedEOPilot(db)
+
+	got := buf.String()
+	for _, want := range []string{
+		`record type "eo_objection" has NO live per-type permission code`,
+		"eo:eo_objection:view",
+		"only a super admin can see its records",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the boot log does not carry %q; an operator looking at a record type nobody can see has nothing to go on.\n--- output ---\n%s", want, got)
+		}
+	}
+}

@@ -613,7 +613,23 @@ const (
 // reinstates a revoked grant. But an operator looking at a record type nobody
 // can see has nothing else to go on: the type is there, the register is
 // empty, and the reason is three deleted rows in another table.
-func eoLogTypesWithNoLiveCodes(db *gorm.DB, concrete []models.EORecordType) {
+//
+// IT IS CALLED FROM eoReportPilotObligations, WHICH RUNS ON EVERY BOOT, and
+// not from eoSeedTypePermissions. Inside the writer it could not fire in the
+// state it exists for: on an already-seeded deployment the writer runs only
+// when the convergent step opens, and "all three codes deleted" is precisely
+// the state where the gate is SHUT — the codes still occupy their unique
+// codes, so the count finds nothing missing. A warning that cannot reach its
+// own case is worse than none, because it reads as coverage.
+//
+// It reads the types itself for the same reason: the obligation report is not
+// inside the seed transaction and has no list to be handed.
+func eoLogTypesWithNoLiveCodes(db *gorm.DB) {
+	var concrete []models.EORecordType
+	if err := db.Where("is_abstract = ?", false).Order("key").Find(&concrete).Error; err != nil {
+		log.Printf("EO pilot: could not list the concrete record types to check their permission codes: %v", err)
+		return
+	}
 	for _, t := range concrete {
 		codes := make([]string, 0, len(models.EOTypePermissionActions))
 		for _, a := range models.EOTypePermissionActions {
@@ -621,11 +637,11 @@ func eoLogTypesWithNoLiveCodes(db *gorm.DB, concrete []models.EORecordType) {
 		}
 		var live int64
 		if err := db.Model(&models.Permission{}).Where("code IN ?", codes).Count(&live).Error; err != nil {
-			log.Printf("EO seed: could not check the per-type permission codes of %q: %v", t.Key, err)
+			log.Printf("EO pilot: could not check the per-type permission codes of %q: %v", t.Key, err)
 			continue
 		}
 		if live == 0 {
-			log.Printf("EO seed: record type %q has NO live per-type permission code (%s): only a super admin can see its records. The codes exist but are deleted; the seed does not resurrect a deleted permission.",
+			log.Printf("EO pilot: record type %q has NO live per-type permission code (%s): only a super admin can see its records, and the register is empty for everyone else. The codes exist but are deleted, and the seed does not resurrect a deleted permission.",
 				t.Key, strings.Join(codes, ", "))
 		}
 	}
@@ -762,13 +778,13 @@ func eoSeedTypePermissions(db *gorm.DB) error {
 	// The GRANT read is deliberately scoped, unlike the existence check
 	// above: a deleted permission is not one to hand anybody. A type whose
 	// codes an administrator deleted is left with no live code, which is
-	// their act and fails closed — eoLogTypesWithNoLiveCodes says so in the
-	// boot log, because nothing else would.
+	// their act and fails closed — eoLogTypesWithNoLiveCodes says so on every
+	// boot, from eoReportPilotObligations rather than from here, because this
+	// writer does not run in that state at all.
 	var perms []models.Permission
 	if err := db.Where("code IN ?", codes).Find(&perms).Error; err != nil {
 		return fmt.Errorf("read back the per-type permissions: %w", err)
 	}
-	eoLogTypesWithNoLiveCodes(db, concrete)
 	// A missing role aborts for the same reason the transition's does: a
 	// permission code nobody holds is a type nobody can use, and the marker
 	// would commit alongside it.
