@@ -11,7 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-11-20-eo-platform-metamodel-design.md`
 
 **Two repositories, both on `rnd/temporal-workflows`:**
-- Backend: `/home/ks/lig/automax3.1/backend` — Tasks A1–C1
+- Backend: `/home/ks/lig/automax3.1/backend` — Tasks A1–A3, B1–B2, C1
 - Frontend: `/home/ks/lig/automax3.1/frontend` — Tasks D1–D3
 
 **Predecessors:** Plan 1 (engine, 21 tasks) and Plan 2 (pilot configuration, 14 tasks) are complete. The durable record is `docs/superpowers/eo-plan1-carry-forward.md` and the Plan 2 ledger. The EO UI prototype is frontend commit `526c1a0`; its own report is `frontend/EO_UI_REPORT.md` and the conventions brief it was built from is `frontend/EO_UI_BRIEF.md`.
@@ -163,6 +163,37 @@ Write-only on the **designer** path is correct and stays: a designer save must n
 - [ ] **Step 3: Implement both routes.** Discharge takes explicit ids; there is no "clear all", because the whole point of the marker is that someone looked at each one.
 - [ ] **Step 4: Run the tests and `go test ./internal/handlers/ ./internal/database/`.**
 - [ ] **Step 5: Commit** — `feat(eo): sign-off obligations are queryable and dischargeable`
+
+---
+
+### Task A3: The seed stops reverting an administrator's capability edit
+
+**Files:**
+- Modify: `internal/database/seed_eo_pilot.go`, `internal/database/seed_eo_platform.go:620-651`, `internal/services/eo_transition_service.go:779`, `internal/services/eo_record_service.go` (`eoFolderFailureComment`), `internal/services/eo_record_service_test.go:1239`, `:1410`
+- Test: `internal/database/seed_eo_pilot_test.go`, `internal/services/eo_transition_service_test.go`
+
+**Interfaces:**
+- Consumes: the `convergent` step kind added by Plan 2's fix wave.
+- Produces: no new exported surface — this is a behaviour correction plus six small accuracy fixes.
+
+Plan 2's fix wave made `seed_type_permissions` and `enable_capabilities` **convergent** so a record type appended later still gets its codes. That was right. But it also means `eoEnableCapabilities` now overwrites `EORecordType.Capabilities` at every boot whenever it differs from the seeded value — and there is an admin route that writes exactly that field (`internal/handlers/eo_record_type_handler.go:74,92-94`, routed at `cmd/server/main.go:872-877`). Under the old one-shot gate an administrator's edit stuck; now it is silently reverted on the next restart.
+
+The fix wave's own author made the opposite call for the sibling step and wrote the reasoning down — *"a grant revoked by an administrator is a deliberate act and must not be reinstated at boot"* (`seed_eo_pilot.go:3115-3118`) — and never applied it to capabilities. **Apply the same rule to capabilities:** converge a type that has never been configured, leave a type an administrator has edited alone.
+
+Six accuracy fixes ride along, all found by the same re-review:
+
+1. `seed_eo_platform.go:620-651` — a new `var` was inserted between `eoSeedTypePermissions`' doc comment and the function, so the function has no doc comment and the var's comment opens mid-sentence with a dangling "this function". Its "IT IS CALLED TWICE" paragraph is also now stale: with the second convergent pass it can run three times in one boot.
+2. `eoFolderFailureComment` — a **user-visible** history row now ends "files cannot be attached to it until a folder is created for it by hand", but there is no EO upload route at all (`eo_fields.go:437`), so that remedy is not actionable. Task B1 of this plan builds the route; make this text true for both before and after.
+3–4. `eo_record_service_test.go:1239` and `:1410` still say "a backfill greps for" and "is backfillable". **There is no EO backfill in this repository.** These are the last two survivors of a false premise the controller wrote and the fix wave corrected everywhere else.
+5. `eo_transition_service.go:779` — `eoCheckCloseParentHasAParent` matches on `strings.TrimSpace(cfg.LinkType)` while `closeParent` compares the untrimmed value, so a config with stray whitespace passes the pre-commit check and still fails after the commit: precisely the outcome that check exists to prevent.
+6. `eoCheckCloseParentHasAParent` validates `link_type` but never `transition`, though `closeParent` errors on an empty `Transition` — so one "parent left open after the commit" path still survives a check whose own comment claims *"a transition that cannot run its closing action must not pretend it did"*.
+
+- [ ] **Step 1: Write the failing tests** — `TestEoSeedDoesNotRevertAnAdministratorsCapabilityEdit` (write a capability blob through the model, re-run the seed, assert it survives); `TestEoSeedStillConvergesATypeNeverConfigured` (the Plan 2 behaviour must not regress — assert BOTH in the same run, since a fix that simply stops converging would pass the first test alone); `TestCloseParentCheckMatchesTheExecutorOnWhitespace`; `TestCloseParentCheckRefusesAnEmptyTransition`.
+- [ ] **Step 2: Run them to verify they fail.**
+- [ ] **Step 3: Implement the capability rule**, mirroring the permissions reasoning, and make the two close-parent checks agree with the executor exactly.
+- [ ] **Step 4: Fix the six accuracy items.** These are comments and test strings; no behaviour changes.
+- [ ] **Step 5: Run `go test ./internal/database/ ./internal/services/` and `TestEOCOMEndToEnd`.**
+- [ ] **Step 6: Commit** — `fix(eo): the seed converges new types without reverting administrators`
 
 ---
 
