@@ -1013,8 +1013,12 @@ func TestCreateEORecordLinkEnforcesTheLinkTypeRules(t *testing.T) {
 				if _, ok := errs[tc.wantErrKey]; !ok {
 					t.Errorf("errors = %v, want a message under %q", body["errors"], tc.wantErrKey)
 				}
-				if _, isStringShape := body["error"]; isStringShape {
-					t.Errorf("body carries the %q string shape, want the errors map", "error")
+				// BOTH KEYS: the per-field map a form needs, and the one
+				// line a client that is not that form can show. The EO
+				// client renders `message || error`.
+				line, _ := body["error"].(string)
+				if !strings.Contains(line, tc.wantErrKey) {
+					t.Errorf("error = %q, want a human-readable line naming %q alongside the field map", line, tc.wantErrKey)
 				}
 			}
 			if tc.wantStatus == fiber.StatusCreated {
