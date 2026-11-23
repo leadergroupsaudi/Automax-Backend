@@ -131,13 +131,17 @@ Spec §7.12 fixes the pattern: *"`EnsureFolder`, then `UploadFile` with metadata
 - Consumes: B1's upload route.
 - Produces: a new seed step `relax_file_requiredness_until_documenta`.
 
-Five fields are `required_mode = always` and hold files: `eo_incoming_correspondence.attachments`, `eo_draft_decision_study.draft_file` and `.study_report`, `eo_objection.proof`. With EO Documenta disabled — the pilot's default — B1 refuses to mint an id, so those four registers cannot be created by a real user at all.
+Six fields hold files and are demanded: four at `required_mode = always` (`eo_incoming_correspondence.attachments`, `eo_draft_decision_study.draft_file` and `.study_report`, `eo_objection.proof`) and two at `at_state` (`eo_assignment.evidence`, `eo_task.evidence`). **Corrected during execution:** this section originally said five fields on four types; the implementer queried the seeded database and found six on five. With EO Documenta disabled — the pilot's default — B1 refuses to mint an id, so four registers cannot be created and two cannot be closed.
 
-**Ruling, recorded here because it is a product decision and not an implementation detail:** the requirement is relaxed to `never` while Documenta is off, rather than weakening B1 into minting stub ids. A register that quietly stores fake document references is worse than one that does not require a document yet. Re-tightening is a configuration change through the type designer once the client's Documenta is connected — it does not need a release.
+**Ruling, recorded here because it is a product decision and not an implementation detail:** the requirement is relaxed to `never` while Documenta is off, rather than weakening B1 into minting stub ids. A register that quietly stores fake document references is worse than one that does not require a document yet.
 
-- [ ] **Step 1: Write the failing test** — `TestEoFileFieldsAreNotRequiredWithoutDocumenta` asserting all five fields are `never` after the seed, and `TestEoIncomingCorrespondenceIsCreatableWithoutAttachments` driving a real create.
+> **CORRECTION, 2026-11-23 — the sentence that stood here was false and this is the controller's error.** It read: *"Re-tightening is a configuration change through the type designer once the client's Documenta is connected — it does not need a release."* It is not. `internal/models/eo_record_type.go:410` refuses `never → always` **and** `never → at_state` while the type holds records, and `eoGuardTypeEdit` computes `hasRecords` over the type **and every type beneath it**. So the designer route is open only while the type and its descendants hold no records; after the pilot files its first record — which is exactly what this task enables — **no supported route remains**, because §7.14's confirmed-destructive edit with a stated backfill rule is not built.
+>
+> The relaxation is therefore **one-way** on any deployment that has filed a record. The seed says so on every boot. Restoring these six fields is a **blocker gating `EO_DOCUMENTA_ENABLED=true`**, alongside verifying Documenta's real file-id spelling and the save-time folder-membership check. Do not re-introduce the original sentence anywhere.
+
+- [ ] **Step 1: Write the failing test** — `TestEoFileFieldsAreNotRequiredWithoutDocumenta` asserting every file field is `never` after the seed — query for `kind IN (file,multi_file) AND required_mode <> 'never'` and assert zero rows, rather than naming the fields you know about, and `TestEoIncomingCorrespondenceIsCreatableWithoutAttachments` driving a real create.
 - [ ] **Step 2: Run them to verify they fail.**
-- [ ] **Step 3: Add the seed step**, with a doc comment naming the four registers, the reason, and what to change to re-tighten.
+- [ ] **Step 3: Add the seed step**, with a doc comment naming the affected registers, the reason, and — truthfully — what re-tightening would require.
 - [ ] **Step 4: Run the tests and `go test ./internal/database/`.**
 - [ ] **Step 5: Commit** — `feat(eo): file fields are not required while Documenta is disabled`
 
