@@ -186,16 +186,25 @@ func eoUntranslatedLabel(d models.EOFieldDef, english string) models.EOFieldDef 
 }
 
 // eoUntranslatedField names one field awaiting Arabic sign-off.
+//
+// ID and Label are here for the SIGN-OFF ROUTE (handlers.EOSignoffHandler),
+// which answers the same question over HTTP and must name a row the operator
+// can then discharge; the boot report prints only the count. They come from
+// the SAME query so that the log line and the route cannot drift apart —
+// which is the whole reason EOUntranslatedLabels below is a wrapper rather
+// than a second copy of this SQL.
 type eoUntranslatedField struct {
+	ID       uuid.UUID
 	TypeKey  string
 	FieldKey string
+	Label    string
 }
 
 // eoUntranslatedFields is the set, in a stable order.
 func eoUntranslatedFields(db *gorm.DB) ([]eoUntranslatedField, error) {
 	var out []eoUntranslatedField
 	err := db.Table("eo_field_defs AS f").
-		Select("t.key AS type_key, f.key AS field_key").
+		Select("f.id AS id, t.key AS type_key, f.key AS field_key, f.label AS label").
 		Joins("JOIN eo_record_types t ON t.id = f.record_type_id AND t.deleted_at IS NULL").
 		Where("f.ar_untranslated = ? AND f.deleted_at IS NULL", true).
 		Order("t.key, f.sort_order, f.key").

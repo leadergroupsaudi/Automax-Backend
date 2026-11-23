@@ -224,14 +224,20 @@ type EOFieldDef struct {
 	// column is not one the request carries. Nothing clears it automatically;
 	// see the pilot seed (internal/database/seed_eo_pilot.go).
 	//
-	// WRITE-ONLY BY DESIGN. Nothing in the application clears it, and it must
-	// NEVER be added to the designer's eoFieldDefRequest: that is exactly what
-	// would let any designer save clear it silently
+	// WRITE-ONLY ON THE DESIGNER PATH, BY DESIGN. It must NEVER be added to
+	// the designer's eoFieldDefRequest: that is exactly what would let any
+	// designer save clear it silently
 	// (handlers.TestFieldDefRequestCannotCarryTheUntranslatedMarker pins the
-	// absence). It is cleared by a deliberate, separate operation when the
-	// client's signed-off Arabic list arrives; see "Arabic sign-off clearing" in
-	// docs/superpowers/eo-plan1-carry-forward.md. An administrator retyping
-	// label_ar is not client sign-off, so editing it does not clear the flag.
+	// absence). An administrator retyping label_ar is not client sign-off, so
+	// editing it does not clear the flag.
+	//
+	// THE ONE THING THAT CLEARS IT is POST /api/v1/admin/eo-signoff/discharge
+	// (handlers.EOSignoffHandler), which clears the marker on the field
+	// definitions whose ids it is GIVEN — never all of them — and records who
+	// did it in the action log, in the same transaction. That route, with GET
+	// /api/v1/admin/eo-signoff which lists what is still outstanding, is the
+	// deliberate operation "Arabic sign-off clearing" in
+	// docs/superpowers/eo-plan1-carry-forward.md asked for.
 	ArUntranslated bool           `gorm:"not null;default:false;index" json:"ar_untranslated"`
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`

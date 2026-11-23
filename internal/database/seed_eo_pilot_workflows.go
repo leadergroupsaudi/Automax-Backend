@@ -584,7 +584,13 @@ func eoClosureArtefactFieldKeys(typeKey string) []string {
 // ── the query that makes the gap findable ───────────────────────────────────
 
 // eoUnconfirmedStep is one state or transition awaiting the client's sign-off.
+//
+// ID is here for the SIGN-OFF ROUTE (handlers.EOSignoffHandler): the boot
+// report prints only a count, but an operator discharging a confirmed step
+// must be able to name the row. Kind says which TABLE the id is in, and the
+// route keeps the two apart for the same reason.
 type eoUnconfirmedStep struct {
+	ID           uuid.UUID
 	WorkflowCode string
 	Kind         string // "state" or "transition"
 	Code         string
@@ -598,11 +604,11 @@ type eoUnconfirmedStep struct {
 func eoUnconfirmedStateMachines(db *gorm.DB) ([]eoUnconfirmedStep, error) {
 	var out []eoUnconfirmedStep
 	err := db.Raw(`
-		SELECT w.code AS workflow_code, 'state' AS kind, s.code AS code, s.name AS name
+		SELECT s.id AS id, w.code AS workflow_code, 'state' AS kind, s.code AS code, s.name AS name
 		FROM workflow_states s JOIN workflows w ON w.id = s.workflow_id
 		WHERE s.eo_client_unconfirmed = TRUE AND s.deleted_at IS NULL AND w.deleted_at IS NULL
 		UNION ALL
-		SELECT w.code AS workflow_code, 'transition' AS kind, t.code AS code, t.name AS name
+		SELECT t.id AS id, w.code AS workflow_code, 'transition' AS kind, t.code AS code, t.name AS name
 		FROM workflow_transitions t JOIN workflows w ON w.id = t.workflow_id
 		WHERE t.eo_client_unconfirmed = TRUE AND t.deleted_at IS NULL AND w.deleted_at IS NULL
 		ORDER BY workflow_code, kind, code`).Scan(&out).Error

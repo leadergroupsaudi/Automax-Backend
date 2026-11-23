@@ -156,11 +156,14 @@ type WorkflowState struct {
 	// rather than a memory, exactly as eo_field_defs.ar_untranslated does for
 	// the Arabic labels.
 	//
-	// It is write-only by design, like ar_untranslated: no handler sets it and
-	// it is absent from WorkflowStateCreateRequest and
-	// WorkflowStateUpdateRequest, so a designer save cannot clear it silently
-	// and the sign-off round works from the whole marked set. The column is
-	// additive and defaults false, exactly as Workflow.RecordTypeID and
+	// It is write-only on the DESIGNER path, like ar_untranslated: it is
+	// absent from WorkflowStateCreateRequest and WorkflowStateUpdateRequest,
+	// so a designer save cannot clear it silently and the sign-off round
+	// works from the whole marked set. The one thing that clears it is POST
+	// /api/v1/admin/eo-signoff/discharge (handlers.EOSignoffHandler), for the
+	// state and transition ids it is GIVEN and no others, recorded in the
+	// action log in the same transaction. The column is additive and defaults
+	// false, exactly as Workflow.RecordTypeID and
 	// WorkflowTransition.EOActorRules are, so no incident workflow is changed
 	// by it.
 	EOClientUnconfirmed bool `gorm:"column:eo_client_unconfirmed;not null;default:false;index" json:"eo_client_unconfirmed"`

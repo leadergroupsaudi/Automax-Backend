@@ -924,6 +924,32 @@ func main() {
 	}))
 	eoRecordTypeHandler.RegisterRoutes(eoRecordTypes, authMiddleware.RequirePermission)
 
+	// Executive Office client sign-off. GET /eo-signoff answers what the
+	// pilot still owes the client — the field labels whose Arabic an
+	// implementer wrote, and the workflow states and transitions that were
+	// DERIVED from the client's field matrix rather than transcribed — and
+	// POST /eo-signoff/discharge clears those markers on the rows it is
+	// NAMED, which is how a sign-off is recorded. Before this the markers
+	// were write-only, so a sign-off meant hand-written SQL on a government
+	// deployment; see handlers.EOSignoffHandler for the whole of it.
+	//
+	// Same gates as the designer group above, and for the same reason: both
+	// are EO configuration administration, so both carry the EO platform
+	// feature gate and eo:types:manage (the permission itself is named in
+	// handlers.EOSignoffHandler.RegisterRoutes).
+	//
+	// ActionLogger logs the CALL, as it does for every admin mutation,
+	// including one that never reaches the handler. It captures no request
+	// body, so it cannot say which rows were discharged; the handler writes
+	// that itself, in the discharge's own transaction. The two are
+	// complementary.
+	eoSignoff := admin.Group("/eo-signoff", licenseMiddleware.RequireLicensedFeature(string(licensing.FeatureEOPlatform)), middleware.ActionLogger(middleware.ActionLoggerConfig{
+		Enabled:     true,
+		LogService:  actionLogService,
+		SkipMethods: []string{"GET"},
+	}))
+	handlers.NewEOSignoffHandler(db).RegisterRoutes(eoSignoff, authMiddleware.RequirePermission)
+
 	// User management (action logging handled by service layer for detailed old/new values)
 	usersGroup := admin.Group("/users")
 	usersGroup.Get("/", authMiddleware.RequirePermission("users:view"), userHandler.ListUsers)
