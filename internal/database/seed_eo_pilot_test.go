@@ -2104,6 +2104,21 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 							row.Required, provenance, got.Provenance)
 					}
 				}
+				// TASK B2, BEFORE THE SWITCH BECAUSE IT SPANS TWO OF ITS
+				// ARMS. A row that holds a DOCUMENTA FILE ID is seeded by
+				// its spec as the matrix asks — "Yes" becomes `always`,
+				// "Yes at closure" becomes `at_state` — and is then relaxed
+				// to `never` by the last step of the seed, because B1's
+				// upload route mints no id while Documenta is disabled, so
+				// neither demand could ever be met. The registry says which
+				// rows, why, and which mode each is restored to, and
+				// TestNoPilotFileFieldIsDemandedAtAll checks the converse,
+				// that no file field anywhere is left demanded. This is
+				// therefore not a way round the matrix.
+				if eoIsRelaxedUntilDocumenta(typeKey, row.Key) {
+					want(models.EORequiredNever, models.EOProvenanceUser)
+					return
+				}
 				switch row.Required {
 				case "Yes":
 					// TASK A5, ADDENDUM 4. A "Yes" row the matrix's own Why
@@ -2116,19 +2131,6 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 					// is the place where "the matrix says Yes and the step
 					// it names is the last one" is written down. Every other
 					// "Yes" stays `always`.
-					// TASK B2. A "Yes" row that holds a DOCUMENTA FILE ID
-					// is seeded `always` by its spec and then relaxed to
-					// `never` by the last step of the seed, because B1's
-					// upload route mints no id while Documenta is disabled
-					// and the register would otherwise be uncreatable. The
-					// registry says which rows and why, and
-					// TestNoPilotFileFieldIsRequiredAtCreation checks the
-					// converse — that no file field anywhere is left
-					// `always` — so this is not a way round the matrix.
-					if eoIsRelaxedUntilDocumenta(typeKey, row.Key) {
-						want(models.EORequiredNever, models.EOProvenanceUser)
-						return
-					}
 					if eoIsResolvedClosureArtefact(typeKey, row.Key) {
 						want(models.EORequiredAtState, models.EOProvenanceUser)
 						return
@@ -2977,8 +2979,19 @@ func TestEoAtClosureFieldsAwaitTheirState(t *testing.T) {
 
 	for _, f := range eoAtClosureFields {
 		def := eoEffectiveField(t, db, f.TypeKey, f.FieldKey)
-		if def.RequiredMode != models.EORequiredAtState {
-			t.Errorf("%s.%s required_mode = %q, want %q", f.TypeKey, f.FieldKey, def.RequiredMode, models.EORequiredAtState)
+		// TASK B2's ADDENDUM. Both of these hold Documenta file ids, so both
+		// are relaxed to `never`: an at-closure demand no client can satisfy
+		// does not protect the closure, it deadlocks it. THE STATE POINTER
+		// BELOW IS DELIBERATELY STILL CHECKED — the step leaves
+		// required_at_state_ids intact, the engine ignores it while the mode
+		// is `never`, and it is what makes restoring the mode restore a
+		// working control rather than an unarmed one.
+		wantMode := models.EORequiredAtState
+		if eoIsRelaxedUntilDocumenta(f.TypeKey, f.FieldKey) {
+			wantMode = models.EORequiredNever
+		}
+		if def.RequiredMode != wantMode {
+			t.Errorf("%s.%s required_mode = %q, want %q", f.TypeKey, f.FieldKey, def.RequiredMode, wantMode)
 		}
 		// TASK A5 HAS NOW POINTED THEM AT A STATE, and the empty list this
 		// test used to assert is the thing that is gone. The original
@@ -4000,22 +4013,30 @@ func TestEoFileFieldsAreNotRequiredWithoutDocumenta(t *testing.T) {
 	}
 }
 
-// TestNoPilotFileFieldIsRequiredAtCreation is the COMPLETENESS half, and the
+// TestNoPilotFileFieldIsDemandedAtAll is the COMPLETENESS half, and the
 // reason a one-shot step is safe here.
 //
 // The objection to a one-shot step is that it cannot reach a field definition
 // created after it ran. The only two things that create one are a later seed
 // step and an administrator in the type designer; the second is a deliberate
 // choice this step must not undo, and the first is what this test catches. A
-// twelfth record type with an `always` file field fails CI here, with the
+// twelfth record type with a demanded file field fails CI here, with the
 // registry named, long before it reaches a pilot database.
+//
+// IT ASKS FOR ANYTHING THAT IS NOT `never`, not for the modes this task
+// happened to find. The first draft asked for `always` and would have missed
+// the two `at_state` evidence fields it was written beside — a requirement
+// satisfied at a CLOSING TRANSITION is no more satisfiable than one satisfied
+// at creation when no file id can be minted either way, and it fails worse:
+// the record is created and then deadlocks. A query for the modes already
+// known would miss the next one too, so it asks the complement.
 //
 // It asks the DATABASE, over every seeded type, rather than the spec tables,
 // so a field that arrives by any route at all is in scope.
 //
-// Mutation: add a `file` field with required: models.EORequiredAlways to any
-// pilot type spec without registering it.
-func TestNoPilotFileFieldIsRequiredAtCreation(t *testing.T) {
+// Mutation: add a `file` field with any required mode but `never` to a pilot
+// type spec without registering it.
+func TestNoPilotFileFieldIsDemandedAtAll(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
@@ -4029,14 +4050,18 @@ func TestNoPilotFileFieldIsRequiredAtCreation(t *testing.T) {
 	err := db.Table("eo_field_defs AS f").
 		Select("t.key AS type_key, f.key AS key, f.kind AS kind, f.required_mode AS required_mode").
 		Joins("JOIN eo_record_types t ON t.id = f.record_type_id AND t.deleted_at IS NULL").
-		Where("f.deleted_at IS NULL AND f.kind IN ? AND f.required_mode = ?",
-			[]string{models.EOKindFile, models.EOKindMultiFile}, models.EORequiredAlways).
+		// COALESCE: the column defaults to 'never' but a row written before
+		// it existed carries NULL, which is the same thing and must not be
+		// reported.
+		Where("f.deleted_at IS NULL AND f.kind IN ? AND COALESCE(f.required_mode, ?) NOT IN ?",
+			[]string{models.EOKindFile, models.EOKindMultiFile}, models.EORequiredNever,
+			[]string{"", models.EORequiredNever}).
 		Order("t.key, f.key").Scan(&rows).Error
 	if err != nil {
-		t.Fatalf("look for file fields required at creation: %v", err)
+		t.Fatalf("look for file fields that are still demanded: %v", err)
 	}
 	for _, r := range rows {
-		t.Errorf("%s.%s is kind %q and required_mode %q: no upload route can mint a file id while EO Documenta is disabled, so this register cannot be created. Register it in eoFileFieldsRelaxedUntilDocumenta or seed it `never`.",
+		t.Errorf("%s.%s is kind %q and required_mode %q: no upload route can mint a file id while EO Documenta is disabled, so nothing can satisfy it — at creation or at a closing transition. Register it in eoFileFieldsRelaxedUntilDocumenta or seed it `never`.",
 			r.TypeKey, r.Key, r.Kind, r.RequiredMode)
 	}
 }
@@ -4097,8 +4122,11 @@ func TestEoFileRelaxationReachesADatabaseSeededBeforeIt(t *testing.T) {
 
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
 		def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+		// Each field goes back to ITS OWN previous mode, not to a single
+		// one: four were `always` and two `at_state`, and a step that only
+		// recognised `always` would leave the two at-closure fields behind.
 		if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
-			Update("required_mode", models.EORequiredAlways).Error; err != nil {
+			Update("required_mode", r.From).Error; err != nil {
 			t.Fatalf("put %s.%s back as the previous release left it: %v", r.TypeKey, r.FieldKey, err)
 		}
 	}

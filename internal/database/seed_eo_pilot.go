@@ -392,12 +392,15 @@ var eoPilotSteps = []eoPilotStep{
 	// TASK A6 LEFT THEM, which is the check the plan names.
 	{key: eoSeedSpawnActionsStepKey, run: eoSeedPilotSpawnActions},
 	// TASK B2. ONE-SHOT, and appended LAST because it edits what the type
-	// steps wrote and must see their final requiredness. It relaxes the four
-	// `always` file fields that B1's upload route cannot supply an id for
-	// while EO Documenta is disabled; see eoFileFieldsRelaxedUntilDocumenta
-	// for the ruling and for how to re-tighten. It is deliberately NOT
-	// convergent: re-tightening is an administrator's edit through the type
-	// designer, and a convergent step would undo it on the next boot.
+	// steps wrote and must see their final requiredness — including the
+	// at-closure arming eoRequireAtClosureState performs inside
+	// seed_workflows. It relaxes the six file fields that B1's upload route
+	// cannot supply an id for while EO Documenta is disabled, four demanded
+	// at creation and two at a closing transition; see
+	// eoFileFieldsRelaxedUntilDocumenta for the ruling and for how to
+	// re-tighten. It is deliberately NOT convergent: re-tightening is an
+	// administrator's edit through the type designer, and a convergent step
+	// would undo it on the next boot.
 	{key: eoRelaxFileRequirednessStepKey, run: eoRelaxFileRequirednessUntilDocumenta},
 }
 
@@ -566,6 +569,13 @@ type eoFileRequirednessRelaxation struct {
 	// Register is the client's name for the record this field blocks, for
 	// the operator-facing line.
 	Register string
+	// From is the required_mode the SEED wrote and this step is entitled to
+	// change. It is the step's WHERE clause and the mode the boot report
+	// tells an administrator to RESTORE, which are the same fact and must
+	// not be written twice: `always` and `at_state` are different controls
+	// and re-tightening an at-closure field to `always` would demand closing
+	// evidence at creation.
+	From string
 }
 
 // eoFileFieldsRelaxedUntilDocumenta is the whole of it: every field definition
@@ -578,6 +588,8 @@ type eoFileRequirednessRelaxation struct {
 // nothing in the running system can issue one — so the register cannot be
 // created at all. Three record types and four fields were in that state:
 // Incoming Correspondence, Draft Decision Study (two fields) and Objection.
+// Two more, on Assignment and Task, were demanded at a closing transition
+// instead; see IT COVERS `at_state` TOO below.
 //
 // WHY NOT MINT A STUB ID INSTEAD. That was the alternative and it was refused
 // as a product decision: a statutory register that quietly stores a fake
@@ -593,16 +605,36 @@ type eoFileRequirednessRelaxation struct {
 // eoLogFileFieldsAwaitingDocumenta reports these fields as an OBLIGATION on
 // every boot of a deployment that has EO_DOCUMENTA_ENABLED=true.
 //
-// WHAT IS NOT HERE. `eo_assignment.evidence` and `eo_task.evidence` are
-// `multi_file` required AT A STATE, not at creation. They are equally
-// unfillable while Documenta is off, but they block a CLOSING TRANSITION
-// rather than the creation of a register, so they are outside this task's
-// ruling and are left as they are.
+// IT COVERS `at_state` TOO, and the addendum that extended it says why. The
+// ruling was first written against the CREATE path because that was the
+// failure that had been measured. `eo_assignment.evidence` and
+// `eo_task.evidence` are `multi_file` required AT A CLOSING TRANSITION, and
+// no client can produce a file id for them either; the consequence is worse,
+// not lesser, because the record is created and then DEADLOCKS at its last
+// step — for EO-DIR, directives whose tasks can never close. The principle
+// does not change at the boundary of the original wording: A REQUIREMENT
+// THAT CANNOT BE SATISFIED IS NOT A CONTROL, IT IS A DEADLOCK.
+//
+// THEY ARE RELAXED TO `never` LIKE THE REST, not to some weaker at-state
+// variant, so there is ONE state to re-tighten from rather than two. What
+// tells an administrator which mode to restore is `From`, which the boot
+// report prints per field: restoring an at-closure field to `always` would
+// demand closing evidence at creation, which is a different and wrong
+// control. `required_at_state_ids` is deliberately LEFT INTACT — the engine
+// reads it only when the mode is `at_state`, so it is inert meanwhile, and
+// it means re-tightening does not have to rediscover the terminal state.
 var eoFileFieldsRelaxedUntilDocumenta = []eoFileRequirednessRelaxation{
-	{eoIncomingTypeKey, "attachments", "Incoming Correspondence"},
-	{eoDraftStudyTypeKey, "draft_file", "Draft Decision Study"},
-	{eoDraftStudyTypeKey, "study_report", "Draft Decision Study"},
-	{eoObjectionTypeKey, "proof", "Objection"},
+	{eoIncomingTypeKey, "attachments", "Incoming Correspondence", models.EORequiredAlways},
+	{eoDraftStudyTypeKey, "draft_file", "Draft Decision Study", models.EORequiredAlways},
+	{eoDraftStudyTypeKey, "study_report", "Draft Decision Study", models.EORequiredAlways},
+	{eoObjectionTypeKey, "proof", "Objection", models.EORequiredAlways},
+	// THE TWO CLOSING-TRANSITION FIELDS. The matrix marks both "Yes at
+	// closure"; eoAtClosureFields names them and eoRequireAtClosureState has
+	// already pointed them at their type's terminal state by the time this
+	// step runs, which is why it runs last and why it leaves those state ids
+	// alone.
+	{eoAssignmentTypeKey, "evidence", "Assignment", models.EORequiredAtState},
+	{eoTaskTypeKey, "evidence", "Task", models.EORequiredAtState},
 }
 
 // eoIsRelaxedUntilDocumenta reports whether (typeKey, fieldKey) is recorded as
@@ -629,7 +661,7 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // convergent step would read that edit as work to do and undo it on the next
 // boot — the precise defect this programme has already shipped twice. The
 // thing a one-shot step cannot do, reach a field definition created after it
-// ran, is covered instead by TestNoPilotFileFieldIsRequiredAtCreation, which
+// ran, is covered instead by TestNoPilotFileFieldIsDemandedAtAll, which
 // fails CI if a later type seeds an `always` file field without registering
 // it here.
 //
@@ -669,20 +701,25 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 		// ONLY WHAT THE SEED ITSELF LEFT. The one-shot gate already means
 		// this runs once, but the WHERE clause says what the step is
 		// entitled to change in one place: a field an administrator has
-		// already moved off `always` is that administrator's, not this
-		// step's, and is left exactly as found.
+		// already moved off the mode the seed wrote is that administrator's,
+		// not this step's, and is left exactly as found.
+		//
+		// required_at_state_ids is NOT cleared. The engine consults it only
+		// while the mode is `at_state` (services.ValidateRecordValues), so
+		// it is inert under `never`, and leaving it means re-tightening
+		// restores a working control instead of an unarmed one.
 		res := tx.Model(&models.EOFieldDef{}).
-			Where("id = ? AND required_mode = ?", def.ID, models.EORequiredAlways).
+			Where("id = ? AND required_mode = ?", def.ID, r.From).
 			Update("required_mode", models.EORequiredNever)
 		if res.Error != nil {
 			return false, fmt.Errorf("relax field %q on %q: %w", r.FieldKey, r.TypeKey, res.Error)
 		}
 		if res.RowsAffected == 0 {
-			log.Printf("EO pilot: %s.%s is already %q, not %q; left as it is", r.TypeKey, r.FieldKey, def.RequiredMode, models.EORequiredAlways)
+			log.Printf("EO pilot: %s.%s is %q, not the %q this step relaxes; left as it is", r.TypeKey, r.FieldKey, def.RequiredMode, r.From)
 			continue
 		}
-		log.Printf("EO pilot: %s.%s (%s) is no longer required at creation: EO Documenta mints no file id while it is disabled, so the client's \"Yes\" could not be met. Re-tighten it through the type designer once Documenta is connected.",
-			r.TypeKey, r.FieldKey, def.Kind)
+		log.Printf("EO pilot: %s.%s (%s) was %q and is now %q: EO Documenta mints no file id while it is disabled, so nothing could satisfy it. Restore it to %q through the type designer once Documenta is connected.",
+			r.TypeKey, r.FieldKey, def.Kind, r.From, models.EORequiredNever, r.From)
 	}
 	return true, nil
 }
@@ -699,6 +736,10 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 // the registry's intent, so a field an administrator has already re-tightened
 // drops out of the list by itself.
 func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
+	// Each entry is printed as "type.field (restore: <mode>)". The mode is
+	// the whole value of the line for the two at-closure fields: an
+	// administrator who restored them to `always` instead would demand
+	// closing evidence at creation.
 	var relaxed []string
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
 		var mode string
@@ -713,18 +754,18 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 		// An empty mode is `never`: the column defaults to it and a row
 		// written before it existed carries no value.
 		if mode == "" || mode == models.EORequiredNever {
-			relaxed = append(relaxed, r.TypeKey+"."+r.FieldKey)
+			relaxed = append(relaxed, fmt.Sprintf("%s.%s (restore: %s)", r.TypeKey, r.FieldKey, r.From))
 		}
 	}
 	if len(relaxed) == 0 {
 		return
 	}
 	if config.EODocumentaEnabled() {
-		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY — set required_mode back to %q on each through the type designer.",
-			len(relaxed), strings.Join(relaxed, ", "), models.EORequiredAlways)
+		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY — set each field's required_mode back to the mode shown in its own brackets through the type designer. The mode differs by field: an at-closure field restored to \"always\" would demand closing evidence at creation.",
+			len(relaxed), strings.Join(relaxed, ", "))
 		return
 	}
-	log.Printf("EO pilot: %d file field(s) are optional while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. The client's matrix marks them Required; re-tighten them through the type designer once Documenta is connected.",
+	log.Printf("EO pilot: %d file field(s) are optional while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. The client's matrix marks them Required; restore each to the mode shown in its own brackets through the type designer once Documenta is connected.",
 		len(relaxed), strings.Join(relaxed, ", "))
 }
 

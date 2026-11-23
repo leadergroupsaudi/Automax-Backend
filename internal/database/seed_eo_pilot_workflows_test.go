@@ -350,8 +350,18 @@ func TestEoClosureArtefactsNameTheirTypesTerminalState(t *testing.T) {
 			}
 			for _, key := range keys {
 				def := eoEffectiveField(t, db, typeKey, key)
-				if def.RequiredMode != models.EORequiredAtState {
-					t.Errorf("%s.%s required_mode = %q, want %q", typeKey, key, def.RequiredMode, models.EORequiredAtState)
+				// TASK B2's ADDENDUM: a closure artefact that holds a
+				// Documenta file id is relaxed to `never` while no id can be
+				// minted. THE STATE POINTER IS STILL REQUIRED OF IT — the
+				// step leaves required_at_state_ids alone precisely so that
+				// restoring the mode restores an armed control, and the
+				// assertions below are what prove it survived.
+				wantMode := models.EORequiredAtState
+				if eoIsRelaxedUntilDocumenta(typeKey, key) {
+					wantMode = models.EORequiredNever
+				}
+				if def.RequiredMode != wantMode {
+					t.Errorf("%s.%s required_mode = %q, want %q", typeKey, key, def.RequiredMode, wantMode)
 				}
 				var ids []uuid.UUID
 				if s := strings.TrimSpace(string(def.RequiredAtStateIDs)); s == "" || s == "null" {

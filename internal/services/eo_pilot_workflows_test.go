@@ -284,7 +284,15 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 		close string
 		// artefacts are the field keys the closure must refuse to go without.
 		artefacts []string
-		supply    map[string]any
+		// relaxed are field keys the matrix marks "Yes at closure" that the
+		// closure must NOT demand, because they hold Documenta file ids and
+		// Task B2 relaxed them to `never` while EO_DOCUMENTA_ENABLED=false.
+		// They are listed rather than deleted: a demand nothing can satisfy
+		// would deadlock the closure, and this is the assertion that the
+		// relaxation reached the TRANSITION path and not only the create
+		// path. (database.eoFileFieldsRelaxedUntilDocumenta.)
+		relaxed []string
+		supply  map[string]any
 	}{
 		{
 			name: "an assignment closes with its evidence or it does not close",
@@ -295,9 +303,9 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 				return f.move(t, a, "submit_evidence", models.EOTransitionInput{})
 			},
 			close:     "verify_and_close",
-			artefacts: []string{"evidence", "verified_by", "verified_on"},
+			artefacts: []string{"verified_by", "verified_on"},
+			relaxed:   []string{"evidence"},
 			supply: map[string]any{
-				"evidence":    []any{uuid.NewString()},
 				"verified_by": uuid.New().String(),
 				"verified_on": time.Now().Format(time.RFC3339),
 			},
@@ -310,9 +318,9 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 				return f.move(t, task, "start", models.EOTransitionInput{})
 			},
 			close:     "verify_and_close",
-			artefacts: []string{"evidence", "verified_by"},
+			artefacts: []string{"verified_by"},
+			relaxed:   []string{"evidence"},
 			supply: map[string]any{
-				"evidence":    []any{uuid.NewString()},
 				"verified_by": map[string]any{"user_id": uuid.New().String(), "at": time.Now().Format(time.RFC3339)},
 			},
 		},
@@ -334,9 +342,16 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 					t.Errorf("the refusal does not name %q: %v", key, invalid.Fields)
 				}
 			}
+			for _, key := range tc.relaxed {
+				if _, named := invalid.Fields[key]; named {
+					t.Errorf("the closure demands %q, which holds a Documenta file id that no route can mint while EO_DOCUMENTA_ENABLED=false; the record would be created and then never closable: %v", key, invalid.Fields)
+				}
+			}
 
 			// And with them, it closes — so the rule is a requirement and
-			// not a wall.
+			// not a wall. `supply` no longer carries an evidence id, so this
+			// is also the proof that the closure goes through on what a real
+			// officer could type in the pilot deployment.
 			fresh := f.reread(t, rec)
 			closed, err := f.try(t, fresh, tc.close, models.EOTransitionInput{Values: tc.supply})
 			if err != nil {
