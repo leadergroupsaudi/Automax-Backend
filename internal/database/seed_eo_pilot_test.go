@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -520,6 +521,73 @@ func TestEOPilotRunsAStepAddedAfterTheOthersWereApplied(t *testing.T) {
 	seedEOPilot(db)
 	if ran {
 		t.Error("an applied step ran again")
+	}
+}
+
+// eoCaptureSeed runs seedEOPilot with the standard logger redirected and
+// returns everything it wrote. The package's tests run sequentially, so
+// capturing the global logger is safe — TestEoSeedEOPilotLogsTheUnprovidedCapabilityInput
+// already does it.
+func eoCaptureSeed(t *testing.T, db *gorm.DB) string {
+	t.Helper()
+	var buf bytes.Buffer
+	out, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() { log.SetOutput(out); log.SetFlags(flags) }()
+	seedEOPilot(db)
+	return buf.String()
+}
+
+// eoObligationReportLines is one marker per boot-time obligation report, in
+// the order seedEOPilot writes them: the untranslated labels, the unconfirmed
+// state machines, and the capability inputs the configuration does not
+// provide.
+var eoObligationReportLines = []string{
+	"field labels await Arabic sign-off",
+	"await client sign-off (workflow_states/workflow_transitions.eo_client_unconfirmed)",
+	`capability "decisions_base" on "eo_draft_decision_study"`,
+}
+
+// TestSeedEOPilotReportsOnEveryBoot is the guard against the three reports
+// drifting back under a short-circuit return.
+//
+// All three used to sit at the BOTTOM of seedEOPilot, below the `!needed`
+// return, so they printed only on the boot that applied the seed — on every
+// database in the world, the lists the client sign-off round depends on
+// existed only in the log of the day the database was created. Each of the
+// three reports arrived in a different task, and each inherited the same gate
+// without anybody noticing it was shared.
+//
+// IT SEEDS TWICE ON PURPOSE. Every existing test of these lines calls
+// seedEOPilot once, on a fresh database, where the gate is open and the bug
+// is invisible; no such test can catch this, however many of them there are.
+// The SECOND call is the whole test.
+//
+// Mutation that makes it fail: move any of the three report calls from
+// eoReportPilotObligations back below the `!needed` return in seedEOPilot, or
+// drop the `defer`.
+func TestSeedEOPilotReportsOnEveryBoot(t *testing.T) {
+	db := eoPilotDB(t)
+
+	first := eoCaptureSeed(t, db)
+	for _, want := range eoObligationReportLines {
+		if !strings.Contains(first, want) {
+			t.Fatalf("fixture error: the boot that APPLIES the seed does not report %q, so a second boot proves nothing.\n--- output ---\n%s", want, first)
+		}
+	}
+	if open, err := eoPilotSeedNeeded(db); err != nil || open {
+		t.Fatalf("fixture error: the seed should be fully applied (needed=%v err=%v)", open, err)
+	}
+
+	second := eoCaptureSeed(t, db)
+	if strings.Contains(second, "Applying the EO pilot configuration") {
+		t.Fatalf("fixture error: the second boot applied seed steps, so it is not the boot this test is about.\n--- output ---\n%s", second)
+	}
+	for _, want := range eoObligationReportLines {
+		if !strings.Contains(second, want) {
+			t.Errorf("a boot that applied no seed step does not report %q; the client sign-off round can then read that list only from the log of the day the database was created.\n--- output ---\n%s", want, second)
+		}
 	}
 }
 

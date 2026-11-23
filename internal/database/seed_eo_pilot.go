@@ -230,6 +230,27 @@ func seedEOPilot(db *gorm.DB) {
 	if base == 0 {
 		return
 	}
+	// THE THREE OBLIGATION REPORTS RUN ON EVERY BOOT. They are DEFERRED, and
+	// deliberately: every return below this line is a path on which no seed
+	// step applied, and those are exactly the boots — every boot after the
+	// first — on which an operator still needs the lists. They used to sit
+	// at the bottom of this function, under the `!needed` return, so the
+	// three sign-off lists the client round depends on could be read only
+	// from the log of the day the database was created. Three separate tasks
+	// each added a report and each inherited the same one-shot gate.
+	//
+	// DO NOT MOVE THEM BACK BELOW A RETURN, and do not fold them into
+	// eoSeedPilotTx. They READ; they write nothing, so there is no
+	// transaction to join and nothing to be idempotent about.
+	// (TestSeedEOPilotReportsOnEveryBoot calls seedEOPilot twice and requires
+	// all three lines the second time, which no test on a fresh database can
+	// catch.)
+	//
+	// The defer covers the failure path too. A seed that rolled back leaves
+	// the database as it was, and the lists then describe what is really
+	// configured — which is what an operator reading the failure needs.
+	defer eoReportPilotObligations(db)
+
 	needed, err := eoPilotSeedNeeded(db)
 	if err != nil {
 		log.Printf("EO pilot seed: could not check whether it is needed: %v", err)
@@ -244,6 +265,18 @@ func seedEOPilot(db *gorm.DB) {
 		log.Printf("EO pilot: PILOT CONFIGURATION WAS NOT APPLIED. This will repeat on every boot until the cause is removed.")
 		return
 	}
+}
+
+// eoReportPilotObligations writes the three boot-time lists the client
+// sign-off round reads: the field labels awaiting Arabic, the workflow states
+// and transitions awaiting confirmation, and the capability inputs the
+// configuration does not yet provide.
+//
+// It is SEPARATE FROM THE SEED because it is not part of it: it answers "what
+// does this database still owe the client", which is a question about the
+// database as it stands, not about what this boot happened to apply. Each of
+// the three reports its own error and none can stop another.
+func eoReportPilotObligations(db *gorm.DB) {
 	if set, err := eoUntranslatedFields(db); err != nil {
 		log.Printf("EO pilot seed: %v", err)
 	} else if len(set) > 0 {
