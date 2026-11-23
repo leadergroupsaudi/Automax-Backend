@@ -283,8 +283,10 @@ func seedEOPilot(db *gorm.DB) {
 // round reads: the field labels awaiting Arabic, the workflow states and
 // transitions awaiting confirmation, the capability inputs the configuration
 // does not yet provide, the record types whose capability configuration an
-// administrator has edited, the types with no live permission codes, and the
-// file fields relaxed for want of Documenta.
+// administrator has edited, the types with no live permission codes, the
+// roles that hold an EO module permission and no per-type code — and will
+// therefore see an empty register — and the file fields relaxed for want of
+// Documenta.
 //
 // It is SEPARATE FROM THE SEED because it is not part of it: it answers "what
 // does this database still owe the client", which is a question about the
@@ -300,6 +302,7 @@ func eoReportPilotObligations(db *gorm.DB) {
 	eoLogCapabilityInputGaps(db)
 	eoLogCapabilitiesAnAdministratorHasEdited(db)
 	eoLogTypesWithNoLiveCodes(db)
+	eoLogRolesWithNoTypeCodes(db)
 	eoLogFileFieldsAwaitingDocumenta(db)
 }
 

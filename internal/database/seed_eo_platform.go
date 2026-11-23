@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
@@ -644,6 +645,95 @@ func eoLogTypesWithNoLiveCodes(db *gorm.DB) {
 			log.Printf("EO pilot: record type %q has NO live per-type permission code (%s): only a super admin can see its records, and the register is empty for everyone else. The codes exist but are deleted, and the seed does not resurrect a deleted permission.",
 				t.Key, strings.Join(codes, ", "))
 		}
+	}
+}
+
+// eoPermissionModule is the permissions.module value every EO permission
+// carries, module-level and per-type alike; licensing.FeatureForModule
+// resolves it to the eo_platform feature.
+const eoPermissionModule = "eo"
+
+// eoIsEOPerTypeCode answers whether a permission code is one of the per-type
+// codes (eo:<type_key>:view|create|update) rather than a module-level one
+// (eo:view, eo:create, eo:update, eo:delete, eo:transition, eo:types:manage).
+//
+// It asks models.EOTypeKeysFromPermissionCodes — the SAME inverse the
+// register's filter uses — rather than re-deriving the spelling here, because
+// a second spelling of the code format is the defect the filter's own comment
+// records. In particular "eo:view" is not a grant on a type called "view",
+// and that is decided there, once.
+func eoIsEOPerTypeCode(code string) bool {
+	for _, a := range models.EOTypePermissionActions {
+		if len(models.EOTypeKeysFromPermissionCodes([]string{code}, a.Action)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// eoLogRolesWithNoTypeCodes writes one line per ROLE that holds a
+// module-level EO permission and no per-type permission code at all.
+//
+// WHAT IT IS FOR. Since Task A2 the register is restricted to the types whose
+// eo:<type_key>:view code the caller holds (repository.applyEORecordTypePermissions)
+// and a record of an ungranted type is refused 403
+// (middleware.EOTypePermission). A role with eo:view and no per-type code
+// therefore passes every route guard, reaches every EO screen, and sees
+// NOTHING — an empty register on every route and a 403 on every record.
+// Five of the seven seeded EO roles are in exactly that state:
+// head_of_office, public_relations, protocol, department_user and
+// escalation_manager hold eo:view, eo:update and eo:transition, and the
+// per-type codes are granted only to models.EOTypePermissionRoleCodes
+// (admin and executive_office), which is what spec §7.11 names. eo_admin is
+// in the same state by the same arithmetic: it holds eo:view and
+// eo:types:manage, so it can design types and read none of their records.
+//
+// THE SEED DOES NOT FIX IT, and must not: §7.11 names two roles for the
+// per-type grants, and who else may see which record type is the client's
+// decision, taken through the permissions UI. What the seed owes an operator
+// is that the state is not SILENT. It is invisible everywhere else:
+// eoLogTypesWithNoLiveCodes cannot fire, because the codes exist and are
+// merely ungranted; nothing in the UI distinguishes "no records" from "no
+// grant"; and no log line is written when the filter derives zero keys,
+// because that is a legitimate answer on a per-request path.
+//
+// IT MATCHES models.User.PermissionCodes EXACTLY on the one thing that can
+// differ: an INACTIVE permission is skipped there, so it is skipped here too.
+// A role whose only per-type codes are deactivated sees an empty register and
+// must be named.
+//
+// IT IS CALLED FROM eoReportPilotObligations, WHICH RUNS ON EVERY BOOT, for
+// the reason its siblings record about themselves: the state it reports is
+// one in which no writer runs.
+func eoLogRolesWithNoTypeCodes(db *gorm.DB) {
+	var roles []models.Role
+	if err := db.Preload("Permissions").Order("code").Find(&roles).Error; err != nil {
+		log.Printf("EO pilot: could not list the roles to check their per-type permission codes: %v", err)
+		return
+	}
+	for _, r := range roles {
+		moduleCodes := make([]string, 0, len(models.EOTypePermissionActions))
+		perType := 0
+		for _, p := range r.Permissions {
+			// The EO permissions are identified by their MODULE, which
+			// both the module-level rows (postgres.go) and the per-type
+			// rows (models.EOTypePermissionsFor) carry as the literal
+			// "eo" — the same column licensing.FeatureForModule resolves.
+			if !p.IsActive || p.Module != eoPermissionModule {
+				continue
+			}
+			if eoIsEOPerTypeCode(p.Code) {
+				perType++
+				continue
+			}
+			moduleCodes = append(moduleCodes, p.Code)
+		}
+		if len(moduleCodes) == 0 || perType > 0 {
+			continue
+		}
+		sort.Strings(moduleCodes)
+		log.Printf("EO pilot: role %q holds EO module permissions (%s) and NO per-type permission code: every register is EMPTY for it and every record answers 403, because spec §7.11 restricts both to the types whose eo:<type_key>:view code the caller holds. The seed grants the per-type codes to %s only, as §7.11 names, and does not decide who else should see which record type: grant eo:<type_key>:view|create|update to this role through the permissions UI if its holders are meant to see records.",
+			r.Code, strings.Join(moduleCodes, ", "), strings.Join(models.EOTypePermissionRoleCodes, " and "))
 	}
 }
 

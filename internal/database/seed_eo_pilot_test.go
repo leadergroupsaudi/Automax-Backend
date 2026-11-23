@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -544,11 +545,13 @@ func eoCaptureSeed(t *testing.T, db *gorm.DB) string {
 // untranslated labels, the unconfirmed state machines, the capability inputs
 // the configuration does not provide, and the relaxed file fields.
 //
-// IT IS NOT ONE LINE PER CALL. eoReportPilotObligations makes SIX calls; the
-// two missing here are conditional on a state a clean database is not in —
-// eoLogCapabilitiesAnAdministratorHasEdited (a capability column edited away
-// from the registry) and eoLogTypesWithNoLiveCodes (a deleted permission) —
-// and each has a test of its own that puts the database into that state.
+// IT IS NOT ONE LINE PER CALL. eoReportPilotObligations makes SEVEN calls;
+// the three missing here are conditional on a state a clean database is not
+// in — eoLogCapabilitiesAnAdministratorHasEdited (a capability column edited
+// away from the registry), eoLogTypesWithNoLiveCodes (a deleted permission)
+// and eoLogRolesWithNoTypeCodes (a role holding an EO module permission,
+// which eoSeedRoles does not grant) — and each has a test of its own that
+// puts the database into that state.
 var eoObligationReportLines = []string{
 	"field labels await Arabic sign-off",
 	"await client sign-off (workflow_states/workflow_transitions.eo_client_unconfirmed)",
@@ -567,9 +570,9 @@ var eoObligationReportLines = []string{
 // in the world, the lists the client sign-off round depends on existed only
 // in the log of the day the database was created. Each report arrived in a
 // different task, and each inherited the same gate without anybody noticing
-// it was shared. There were three then and there are six now; this asserts
+// it was shared. There were three then and there are seven now; this asserts
 // the four that fire in the default environment (eoObligationReportLines),
-// and the other two are covered where their state is set up.
+// and the other three are covered where their state is set up.
 //
 // IT SEEDS TWICE ON PURPOSE. Every existing test of these lines calls
 // seedEOPilot once, on a fresh database, where the gate is open and the bug
@@ -4302,6 +4305,163 @@ func TestEoRelaxedFileFieldsAreAnObligationOnceDocumentaIsEnabled(t *testing.T) 
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
 		if !strings.Contains(out, r.TypeKey+"."+r.FieldKey) {
 			t.Errorf("the obligation line does not name %s.%s, so the operator is not told which field to re-tighten.\n--- output ---\n%s", r.TypeKey, r.FieldKey, out)
+		}
+	}
+}
+
+// ── Plan 3 fix wave: the inert EO grants announce themselves ────────────────
+
+// eoSeedTheRealEORoles creates the EO platform's module-level permissions and
+// its roles FROM THE TABLES Seed itself reads (eoModulePermissions,
+// eoSeededRoles). It is deliberately not a hand-written copy: a copy would
+// keep passing after somebody granted head_of_office a per-type code, which
+// is the one change the test below exists to notice.
+//
+// Roles eoPilotDB has already created (admin, executive_office) get the
+// permissions APPENDED rather than being skipped, so that executive_office
+// ends the fixture holding what it holds in production — its module codes
+// from here and its per-type codes from the pilot seed.
+func eoSeedTheRealEORoles(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	byCode := make(map[string]models.Permission, len(eoModulePermissions))
+	for _, p := range eoModulePermissions {
+		perm := p
+		perm.IsActive = true
+		if err := db.Where("code = ?", perm.Code).FirstOrCreate(&perm).Error; err != nil {
+			t.Fatalf("create permission %q: %v", perm.Code, err)
+		}
+		byCode[perm.Code] = perm
+	}
+	for _, r := range eoSeededRoles {
+		perms := make([]models.Permission, 0, len(r.perms))
+		for _, code := range r.perms {
+			p, ok := byCode[code]
+			if !ok {
+				t.Fatalf("role %q is seeded with %q, which is not in eoModulePermissions", r.code, code)
+			}
+			perms = append(perms, p)
+		}
+		var role models.Role
+		err := db.Where("code = ?", r.code).First(&role).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			role = models.Role{Name: r.name, NameAr: r.nameAr, Code: r.code, Description: r.desc, DescriptionAr: r.descAr, IsSystem: true, IsActive: true, Permissions: perms}
+			if err := db.Create(&role).Error; err != nil {
+				t.Fatalf("create role %q: %v", r.code, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read role %q: %v", r.code, err)
+		}
+		if err := db.Model(&role).Association("Permissions").Append(perms); err != nil {
+			t.Fatalf("grant the module codes to %q: %v", r.code, err)
+		}
+	}
+}
+
+// eoRolesTheSeedLeavesWithoutTypeCodes derives, from the real tables, which
+// seeded roles hold a module-level EO permission and no per-type code. That
+// is a PROPERTY OF THE SEED, not a list this test chose: spec §7.11 names
+// only models.EOTypePermissionRoleCodes for the per-type grants, so every
+// other EO role is in this state by arithmetic.
+func eoRolesTheSeedLeavesWithoutTypeCodes() []string {
+	holdsTypeCodes := make(map[string]bool, len(models.EOTypePermissionRoleCodes))
+	for _, c := range models.EOTypePermissionRoleCodes {
+		holdsTypeCodes[c] = true
+	}
+	module := make(map[string]bool, len(eoModulePermissions))
+	for _, p := range eoModulePermissions {
+		module[p.Code] = true
+	}
+	out := []string{}
+	for _, r := range eoSeededRoles {
+		if holdsTypeCodes[r.code] {
+			continue
+		}
+		for _, code := range r.perms {
+			if module[code] {
+				out = append(out, r.code)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// TestEOBootReportNamesRolesWithNoPerTypeCodes is the Plan 3 fix wave's
+// CRITICAL 2.
+//
+// Five seeded roles — head_of_office, public_relations, protocol,
+// department_user and escalation_manager — hold eo:view, eo:update and
+// eo:transition and no per-type code at all, and eo_admin holds eo:view and
+// eo:types:manage on the same terms. Since Task A2 that means an empty
+// register on every route and a 403 on every record, with nothing in the UI
+// or the log to explain it: eoLogTypesWithNoLiveCodes cannot fire, because
+// the codes exist and are merely ungranted.
+//
+// The seed does NOT grant anything to fix it — §7.11 names two roles and who
+// else should see what is the client's decision. What it owes is that the
+// state is not silent, and that is what this asserts.
+//
+// IT GOES THROUGH seedEOPilot, not through the reporter: a report that is
+// written and never called is the defect this programme has shipped twice,
+// and calling eoLogRolesWithNoTypeCodes directly could not see it.
+//
+// Mutation that makes it fail: drop the eoLogRolesWithNoTypeCodes call from
+// eoReportPilotObligations, or move it back under seedEOPilot's `!needed`
+// return.
+func TestEOBootReportNamesRolesWithNoPerTypeCodes(t *testing.T) {
+	db := eoPilotDB(t)
+	eoSeedTheRealEORoles(t, db)
+	seedEOPilot(db)
+
+	want := eoRolesTheSeedLeavesWithoutTypeCodes()
+	for _, required := range []string{"head_of_office", "public_relations", "protocol", "department_user", "escalation_manager", "eo_admin"} {
+		found := false
+		for _, w := range want {
+			if w == required {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("fixture error: %q is no longer a role with a module-level EO grant and no per-type code (derived: %v). If it was GRANTED per-type codes, that is a client decision somebody took and this list is what records it.", required, want)
+		}
+	}
+
+	var buf bytes.Buffer
+	out, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(out); log.SetFlags(flags) })
+
+	// The SECOND boot: the seed is fully applied, so this is the boot every
+	// real deployment does, and the one on which the line must still appear.
+	seedEOPilot(db)
+	got := buf.String()
+	if strings.Contains(got, "Applying the EO pilot configuration") {
+		t.Fatalf("fixture error: the second boot applied seed steps.\n--- output ---\n%s", got)
+	}
+
+	for _, role := range want {
+		line := `role "` + role + `" holds EO module permissions`
+		if !strings.Contains(got, line) {
+			t.Errorf("the boot log does not carry %q: this role reaches every EO screen and sees an empty register, and nothing else in the system says so.\n--- output ---\n%s", line, got)
+		}
+	}
+	for _, phrase := range []string{
+		"every register is EMPTY for it and every record answers 403",
+		"grant eo:<type_key>:view|create|update to this role through the permissions UI",
+	} {
+		if !strings.Contains(got, phrase) {
+			t.Errorf("the boot log does not say %q, so the line names a state without naming what it means or what to do about it.\n--- output ---\n%s", phrase, got)
+		}
+	}
+
+	// The other direction: a role that DOES hold the per-type codes must not
+	// be named, or the line is noise on every boot of every deployment.
+	for _, granted := range models.EOTypePermissionRoleCodes {
+		if strings.Contains(got, `role "`+granted+`" holds EO module permissions`) {
+			t.Errorf("the boot log names %q, which holds the per-type codes: its register is not empty.\n--- output ---\n%s", granted, got)
 		}
 	}
 }

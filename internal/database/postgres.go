@@ -659,6 +659,58 @@ func slugifyCategoryCode(s string) string {
 	return out
 }
 
+// eoModulePermissions are the EO platform's MODULE-LEVEL permission codes:
+// the ones that gate the API surface. They are NOT the per-type codes
+// (eo:<type_key>:view|create|update) that spec §7.11's register filter and
+// route gate consult — those are written by seedEOPlatform for every concrete
+// record type, from models.EOTypePermissionsFor, and granted to
+// models.EOTypePermissionRoleCodes.
+//
+// Holding one of these and none of those is a real and reachable state, and
+// the one eoLogRolesWithNoTypeCodes reports on every boot: the module code
+// passes the route guard, the missing per-type code empties the register.
+var eoModulePermissions = []models.Permission{
+	{Name: "EO View Records", Code: "eo:view", Module: "eo", Action: "view", ActionAr: "عرض", Description: "View executive-office records"},
+	{Name: "EO Create Records", Code: "eo:create", Module: "eo", Action: "create", ActionAr: "إنشاء", Description: "Create executive-office records"},
+	{Name: "EO Update Records", Code: "eo:update", Module: "eo", Action: "update", ActionAr: "تحديث", Description: "Update executive-office records"},
+	{Name: "EO Delete Records", Code: "eo:delete", Module: "eo", Action: "delete", ActionAr: "حذف", Description: "Delete executive-office records"},
+	{Name: "EO Transition Records", Code: "eo:transition", Module: "eo", Action: "transition", ActionAr: "نقل", Description: "Move executive-office records between workflow stages"},
+	{Name: "EO Manage Record Types", Code: "eo:types:manage", Module: "eo", Action: "types:manage", ActionAr: "إدارة الأنواع", Description: "Create and configure executive-office record types"},
+}
+
+// eoSeededRole is one EO platform role as Seed creates it.
+type eoSeededRole struct {
+	code, name, nameAr, desc, descAr string
+	perms                            []string
+}
+
+// eoParticipantPerms is the module-level grant the five PARTICIPANT roles
+// share. Spec §7.11 names only admin and executive_office for the per-type
+// codes, so these five hold a module-level grant and no per-type code: they
+// reach every EO screen and see an empty register until an administrator
+// grants them eo:<type_key>:view. That is the client's decision and the seed
+// does not take it — it announces it, on every boot, through
+// eoLogRolesWithNoTypeCodes.
+var eoParticipantPerms = []string{"eo:view", "eo:update", "eo:transition"}
+
+// eoSeededRoles is the EO platform's role table. Roles are data: created only
+// when absent, never touched afterwards, so a configured role keeps its
+// permissions. Only eo_admin and admin hold eo:types:manage;
+// executive_office (the operators) holds the record permissions.
+//
+// It is a package var rather than a local so that TestEOBootReportNamesRoles-
+// WithNoPerTypeCodes can seed the REAL roles: a test that wrote its own copy
+// would keep passing after this table changed.
+var eoSeededRoles = []eoSeededRole{
+	{"executive_office", "Executive Office", "المكتب التنفيذي", "Office staff who operate and transition executive-office records", "موظفو المكتب الذين يديرون السجلات وينقلونها بين المراحل", []string{"eo:view", "eo:create", "eo:update", "eo:delete", "eo:transition"}},
+	{"head_of_office", "Head of Office", "رئيس المكتب", "Oversees executive-office records", "يشرف على سجلات المكتب التنفيذي", eoParticipantPerms},
+	{"public_relations", "Public Relations", "العلاقات العامة", "Public relations participant in executive-office records", "مشارك من العلاقات العامة في سجلات المكتب التنفيذي", eoParticipantPerms},
+	{"protocol", "Protocol", "المراسم", "Protocol participant in executive-office records", "مشارك من المراسم في سجلات المكتب التنفيذي", eoParticipantPerms},
+	{"department_user", "Department User", "مستخدم الإدارة", "Department participant in executive-office records", "مشارك من الإدارة في سجلات المكتب التنفيذي", eoParticipantPerms},
+	{"escalation_manager", "Escalation Manager", "مدير التصعيد", "Handles escalated executive-office records", "يتعامل مع سجلات المكتب التنفيذي المصعّدة", eoParticipantPerms},
+	{"eo_admin", "EO Administrator", "مسؤول المكتب التنفيذي", "Administers executive-office record types", "يدير أنواع سجلات المكتب التنفيذي", []string{"eo:view", "eo:types:manage"}},
+}
+
 func Seed(db *gorm.DB, cfg *config.Config) error {
 	log.Println("Seeding database...")
 
@@ -867,15 +919,13 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		// Department-scoped permissions (configurable scoping)
 		{Name: "View Only Department Incidents", Code: "incidents:view_department_only", Module: "incidents", Action: "view_department_only", ActionAr: "عرض القسم فقط", Description: "Restrict incident view to own department"},
 		{Name: "View Only Department Users", Code: "users:view_department_only", Module: "users", Action: "view_department_only", ActionAr: "عرض القسم فقط", Description: "Restrict user view to own department"},
-
-		// EO platform permissions
-		{Name: "EO View Records", Code: "eo:view", Module: "eo", Action: "view", ActionAr: "عرض", Description: "View executive-office records"},
-		{Name: "EO Create Records", Code: "eo:create", Module: "eo", Action: "create", ActionAr: "إنشاء", Description: "Create executive-office records"},
-		{Name: "EO Update Records", Code: "eo:update", Module: "eo", Action: "update", ActionAr: "تحديث", Description: "Update executive-office records"},
-		{Name: "EO Delete Records", Code: "eo:delete", Module: "eo", Action: "delete", ActionAr: "حذف", Description: "Delete executive-office records"},
-		{Name: "EO Transition Records", Code: "eo:transition", Module: "eo", Action: "transition", ActionAr: "نقل", Description: "Move executive-office records between workflow stages"},
-		{Name: "EO Manage Record Types", Code: "eo:types:manage", Module: "eo", Action: "types:manage", ActionAr: "إدارة الأنواع", Description: "Create and configure executive-office record types"},
 	}
+
+	// The EO platform's MODULE-LEVEL permissions. They live in a package var
+	// rather than inline so the boot-report test can seed the real ones; the
+	// per-type codes (eo:<type_key>:view|create|update) are a different set,
+	// written by seedEOPlatform from models.EOTypePermissionsFor.
+	permissions = append(permissions, eoModulePermissions...)
 
 	if cfg.GoalManagement.Enabled {
 		permissions = append(permissions,
@@ -1115,23 +1165,7 @@ func Seed(db *gorm.DB, cfg *config.Config) error {
 		db.Model(&supervisorRole).Association("Permissions").Append(supervisorPerms)
 	}
 
-	// EO platform roles. Roles are data: created only when absent, never touched
-	// afterwards so a configured role keeps its permissions. Only eo_admin holds
-	// eo:types:manage; executive_office (the operators) holds the record permissions.
-	eoParticipant := []string{"eo:view", "eo:update", "eo:transition"}
-	eoRoles := []struct {
-		code, name, nameAr, desc, descAr string
-		perms                            []string
-	}{
-		{"executive_office", "Executive Office", "المكتب التنفيذي", "Office staff who operate and transition executive-office records", "موظفو المكتب الذين يديرون السجلات وينقلونها بين المراحل", []string{"eo:view", "eo:create", "eo:update", "eo:delete", "eo:transition"}},
-		{"head_of_office", "Head of Office", "رئيس المكتب", "Oversees executive-office records", "يشرف على سجلات المكتب التنفيذي", eoParticipant},
-		{"public_relations", "Public Relations", "العلاقات العامة", "Public relations participant in executive-office records", "مشارك من العلاقات العامة في سجلات المكتب التنفيذي", eoParticipant},
-		{"protocol", "Protocol", "المراسم", "Protocol participant in executive-office records", "مشارك من المراسم في سجلات المكتب التنفيذي", eoParticipant},
-		{"department_user", "Department User", "مستخدم الإدارة", "Department participant in executive-office records", "مشارك من الإدارة في سجلات المكتب التنفيذي", eoParticipant},
-		{"escalation_manager", "Escalation Manager", "مدير التصعيد", "Handles escalated executive-office records", "يتعامل مع سجلات المكتب التنفيذي المصعّدة", eoParticipant},
-		{"eo_admin", "EO Administrator", "مسؤول المكتب التنفيذي", "Administers executive-office record types", "يدير أنواع سجلات المكتب التنفيذي", []string{"eo:view", "eo:types:manage"}},
-	}
-	for _, r := range eoRoles {
+	for _, r := range eoSeededRoles {
 		var eoRole models.Role
 		if db.Where("code = ?", r.code).First(&eoRole).Error != gorm.ErrRecordNotFound {
 			continue
