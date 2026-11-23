@@ -1492,3 +1492,44 @@ func TestEOFileDownloadRefusesAFileFiledOutsideTheRecordsFolder(t *testing.T) {
 		})
 	}
 }
+
+// TestCORSExposesContentDisposition reads cmd/server/main.go as TEXT, like
+// TestEOFileRoutesAreWiredInMain above, because the CORS middleware is
+// configured there and nothing in this package can reach it.
+//
+// eoContentDisposition's whole job is the RFC-5987 filename* that carries an
+// Arabic document's real name to the browser. A cross-origin client — which
+// every deployment of this product has, the UI being served from its own
+// origin — cannot read Content-Disposition at all unless
+// Access-Control-Expose-Headers names it: the CORS safelist exposed to script
+// is Cache-Control, Content-Language, Content-Length, Content-Type, Expires,
+// Last-Modified and Pragma, and nothing else. So the filename machinery was
+// unreachable by any browser client and every download landed under the
+// URL's last path segment, a uuid.
+//
+// Mutation that makes it fail: drop ExposeHeaders from the cors.Config.
+func TestCORSExposesContentDisposition(t *testing.T) {
+	const mainPath = "../../cmd/server/main.go"
+	raw, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", mainPath, err)
+	}
+	flat := strings.Join(strings.Fields(string(raw)), "")
+
+	// The VALUE is read out of the config, not looked for anywhere in the
+	// file: the header names appear in comments too, and a test that matched
+	// those would pass with no ExposeHeaders at all.
+	_, after, found := strings.Cut(flat, `ExposeHeaders:"`)
+	if !found {
+		t.Fatalf("cmd/server/main.go configures no ExposeHeaders: a cross-origin client cannot read Content-Disposition, so eoContentDisposition's filename* reaches nobody")
+	}
+	exposed, _, _ := strings.Cut(after, `"`)
+	// Every non-safelisted header a browser client reads must be named.
+	// Content-Range and Accept-Ranges are the attachment handler's ranged
+	// reads.
+	for _, want := range []string{"Content-Disposition", "Content-Range", "Accept-Ranges"} {
+		if !strings.Contains(exposed, want) {
+			t.Errorf("Access-Control-Expose-Headers is %q, which does not name %q: a cross-origin client cannot read that header", exposed, want)
+		}
+	}
+}

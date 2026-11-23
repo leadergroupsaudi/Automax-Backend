@@ -629,6 +629,29 @@ func main() {
 		AllowMethods:     "GET,POST,PUT,DELETE,PATCH,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
 		AllowCredentials: corsAllowCredentials,
+		// WITHOUT THIS A CROSS-ORIGIN CLIENT CANNOT READ THESE HEADERS AT
+		// ALL. The CORS safelist a browser exposes to script is
+		// Cache-Control, Content-Language, Content-Length, Content-Type,
+		// Expires, Last-Modified and Pragma; everything else is dropped
+		// before the response reaches fetch/XHR unless it is named here.
+		//
+		// Content-Disposition is the one that was actually broken:
+		// handlers.eoContentDisposition builds an RFC-5987 filename* so an
+		// Arabic document downloads under its own name, and the UI (served
+		// from a different origin in every deployment this ships to) could
+		// not see the header, so every such download fell back to the URL's
+		// last path segment — a uuid. Every other download route in the
+		// product sets it too.
+		//
+		// Content-Range and Accept-Ranges are the attachment handler's
+		// ranged reads: a <video> element handles ranges itself, but a
+		// client that fetches a range in script cannot tell a 206 of the
+		// part it asked for from a 206 of something else without them.
+		//
+		// The EPM login route's Token and User-ID are deliberately NOT
+		// here: that contract is server-to-server, and a token is not
+		// something to hand to script on every allowed origin.
+		ExposeHeaders: "Content-Disposition,Content-Range,Accept-Ranges",
 	}))
 
 	app.Use(middleware.RequestContext())
