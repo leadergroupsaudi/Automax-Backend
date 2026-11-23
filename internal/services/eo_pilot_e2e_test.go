@@ -101,8 +101,9 @@ type eoComFixture struct {
 //
 //   - FALSE is the pilot default, EO_DOCUMENTA_ENABLED=false. No client is
 //     wired, so every record is created with an empty documenta_folder_id,
-//     and that is CORRECT — the register's documented no-folder value, which
-//     the backfill selects on (services.eoFolderFailureNote).
+//     and that is CORRECT — the register's documented no-folder value, the
+//     handle a repair would select on beside the history note
+//     (services.eoFolderFailureNote). No such repair exists here.
 //   - TRUE wires storage.StubDocumentaClient through
 //     services.EOWithDocumentaFolders, which is the shape of an enabled
 //     deployment: every record gets a folder id of its own.
@@ -784,7 +785,7 @@ func (f *eoComFixture) runEOCOM(t *testing.T) {
 			case f.documenta && strings.TrimSpace(stored.DocumentaFolderID) == "":
 				t.Errorf("%s has no Documenta folder although a client is wired; an enabled deployment files every record", stored.Reference)
 			case !f.documenta && stored.DocumentaFolderID != "":
-				t.Errorf("%s carries the folder id %q with EO Documenta disabled; '' is the register's no-folder value and the handle its backfill selects on",
+				t.Errorf("%s carries the folder id %q with EO Documenta disabled; '' is the register's no-folder value and the handle a later repair would select on",
 					stored.Reference, stored.DocumentaFolderID)
 			}
 			// Either way the record EXISTS and is whole: the folder is never

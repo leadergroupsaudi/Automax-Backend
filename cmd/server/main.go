@@ -248,10 +248,14 @@ func main() {
 	// StubDocumentaClient.CreateFolder invents "stub-folder-<uuid>", and
 	// persisting that into eo_records would file every record of a disabled
 	// deployment under an id that resolves to nothing. Empty is the register's
-	// documented no-folder value and the handle its backfill selects on
-	// (services.eoFolderFailureNote, and the empty documenta_folder_id), so a
-	// fabricated id would make those records LOOK filed and hide them from the
-	// backfill. Goals has no such contract to break; this register does.
+	// documented no-folder value, and together with the history note
+	// (services.eoFolderFailureNote) it is the whole of what identifies a
+	// record whose folder is missing. THERE IS NO EO BACKFILL IN THIS
+	// REPOSITORY: nothing repairs these records today, so the two handles are
+	// what a later repair — or an operator with a SQL prompt — would have to
+	// select on, and a fabricated id would make the affected records LOOK
+	// filed and leave them unfindable by either. Goals has no such contract
+	// to break; this register does.
 	var eoFolderOption services.EORecordOption
 	if cfg.EODocumenta.Enabled {
 		if err := services.EOCheckDocumentaBaseURL(cfg.EODocumenta.BaseURL); err != nil {

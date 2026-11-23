@@ -362,9 +362,14 @@ func (d *eoRecordDeps) Ancestor(ctx context.Context, rec *models.EORecord, direc
 const eoFolderNameMax = 120
 
 // eoFolderFailureNote prefixes the history row written when a record is
-// created without its folder. It is a fixed string so an operator (or a
-// backfill) can find every affected record by it, beside the column query for
-// an empty documenta_folder_id.
+// created without its folder. It is a fixed string so an operator can find
+// every affected record by it, beside the column query for an empty
+// documenta_folder_id.
+//
+// NOTHING IN THIS REPOSITORY CONSUMES IT. There is no EO backfill: this note
+// and the empty column are the two handles a later repair, or a manual one,
+// would select on, which is why the string must stay stable and why a
+// fabricated folder id (cmd/server/main.go) would be worse than none.
 const eoFolderFailureNote = "documenta folder not created"
 
 // eoDocumentaFolders creates the Documenta folder an EO record owns: one
@@ -993,8 +998,13 @@ func (s *eoRecordService) createRecordFolder(ctx context.Context, t *models.EORe
 
 // eoFolderFailureComment is the history row an operator reads to find out why
 // a record has no folder, and which record it is.
+//
+// IT PROMISES NOTHING IT CANNOT KEEP. It used to end "and can be backfilled",
+// which named a tool that does not exist anywhere in this repository; a user
+// reading it would wait for a repair that is never coming. It says instead
+// what is true and what to do.
 func eoFolderFailureComment(rec *models.EORecord, err error) string {
-	return fmt.Sprintf("%s for %s: %v. The record was created without one (documenta_folder_id is empty) and can be backfilled.",
+	return fmt.Sprintf("%s for %s: %v. The record was created without one (documenta_folder_id is empty); it is complete and usable, but files cannot be attached to it until a folder is created for it by hand.",
 		eoFolderFailureNote, rec.Reference, err)
 }
 
