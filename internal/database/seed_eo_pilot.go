@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -296,9 +297,28 @@ func eoReportPilotObligations(db *gorm.DB) {
 // execute on a database that had already booted an earlier version.
 //
 // ADDING A STEP: append it to eoPilotSteps. That is the whole of it — the fast
-// path compares applied rows with len(eoPilotSteps), so a new step reopens it
-// on every existing database by construction, and there is no predicate to
-// forget. (TestEOPilotRunsAStepAddedAfterTheOthersWereApplied pins this.)
+// path compares applied rows with the number of ONE-SHOT steps, so a new step
+// reopens it on every existing database by construction, and there is no
+// predicate to forget. (TestEOPilotRunsAStepAddedAfterTheOthersWereApplied
+// pins this.)
+//
+// ADDING A RECORD TYPE: appending a step is also how a twelfth record type
+// arrives, and the applied row is then the wrong gate for the two steps whose
+// JOB IS TO COVER EVERY TYPE. `seed_type_permissions` and
+// `enable_capabilities` already have applied rows on every existing database,
+// so under a pure one-shot gate the new type would silently get no permission
+// codes and no capability configuration — everywhere except CI. Those two are
+// marked CONVERGENT: they are never gated on an applied row, they are asked
+// `pending` instead, and they run whenever the answer is yes. The class is
+// the one Task A6 fixed a single instance of (see the comment on
+// TestEoEveryConcreteTypeHasItsThreePermissions); this is the class.
+//
+// WHICH KIND IS A NEW STEP? One-shot, unless the step's own description is
+// "every X must have a Y". A one-shot step does something ONCE to the
+// database as it was (re-marking labels an administrator has since approved
+// is the harm it prevents); a convergent step restates a rule that must hold
+// for whatever the configuration now contains, and must therefore be
+// idempotent, incremental, and cheap to ask.
 //
 // THE KEY IS A PERMANENT IDENTIFIER, NOT A DESCRIPTION, AND MUST NEVER BE
 // RENAMED. It is the whole of what "this step has run" means: the applied row
@@ -313,32 +333,52 @@ func eoReportPilotObligations(db *gorm.DB) {
 // and no error (TestEOPilotStepKeysAreUnique).
 //
 // run returns done=false when it deliberately did nothing and wants to be
-// asked again next boot (smoke types kept because they hold records).
+// asked again next boot (smoke types kept because they hold records). A
+// convergent step's done is ignored: `pending` is the only thing that decides
+// whether it runs, and there is no row for it to write.
 type eoPilotStep struct {
 	key string
 	run func(tx *gorm.DB) (done bool, err error)
+
+	// convergent marks a step that must cover whatever the configuration now
+	// contains rather than happen once. It is NEVER gated on an applied row
+	// and never writes one; `pending` is its whole gate. See ADDING A RECORD
+	// TYPE above. (TestEveryConvergentStepIsAskedWhetherItHasWork pins the
+	// pairing with `pending`.)
+	convergent bool
+
+	// pending reports whether a convergent step has work to do. It must be
+	// CHEAP — it is on the boot fast path — and it must answer from the
+	// database's own content, which is the point: content is what a new
+	// record type changes. Required for a convergent step, and nil for a
+	// one-shot one. It is given the transaction when the seed runs, so a
+	// convergent step sees what the steps before it wrote in the same
+	// transaction.
+	pending func(db *gorm.DB) (bool, error)
 }
 
 var eoPilotSteps = []eoPilotStep{
-	{"remove_smoke_configuration", eoRemoveSmokeConfiguration},
-	{"mark_base_labels_unsigned", func(tx *gorm.DB) (bool, error) { return true, eoMarkBaseLabelsUnsigned(tx) }},
-	{"seed_root_types", eoSeedRootTypes},
-	{"seed_child_types", eoSeedChildTypes},
-	{"seed_link_types", eoSeedLinkTypes},
+	{key: "remove_smoke_configuration", run: eoRemoveSmokeConfiguration},
+	{key: "mark_base_labels_unsigned", run: func(tx *gorm.DB) (bool, error) { return true, eoMarkBaseLabelsUnsigned(tx) }},
+	{key: "seed_root_types", run: eoSeedRootTypes},
+	{key: "seed_child_types", run: eoSeedChildTypes},
+	{key: "seed_link_types", run: eoSeedLinkTypes},
 	// ADDENDUM 1: the workflows MUST be seeded from here. Task A4's
 	// TestEoBlockedTransitionNamesATransitionItsWorkflowHas calls
 	// seedEOPilot and checks only the workflows that call creates, so a
 	// workflow seeded from a function this list does not reach would leave
 	// that guard vacuous for ever — and the guard exists precisely to catch a
 	// raise-to-H.E. transition seeded under the wrong code.
-	{eoSeedWorkflowsStepKey, eoSeedPilotWorkflows},
+	{key: eoSeedWorkflowsStepKey, run: eoSeedPilotWorkflows},
 	// TASK A6. The per-type permission codes come FIRST because they are
 	// independent of everything after them and must exist for every concrete
 	// type the seed has created by now; the capability enablement comes LAST
 	// because it is the step that decides whether those types are usable, and
 	// it removes a field definition an earlier step wrote.
-	{eoSeedTypePermissionsStepKey, eoSeedPilotTypePermissions},
-	{eoEnableCapabilitiesStepKey, eoEnableCapabilities},
+	{key: eoSeedTypePermissionsStepKey, run: eoSeedPilotTypePermissions,
+		convergent: true, pending: eoTypePermissionsPending},
+	{key: eoEnableCapabilitiesStepKey, run: eoEnableCapabilities,
+		convergent: true, pending: eoCapabilitiesPending},
 	// TASK A7. A STEP OF ITS OWN, not a field on eoTransitionSpec: the
 	// `seed_workflows` applied row already exists on every database that has
 	// booted Task A5, so a spawn_record action folded into that step would be
@@ -346,32 +386,70 @@ var eoPilotSteps = []eoPilotStep{
 	// reads what every step before it wrote — the transition A5 seeded, the
 	// link type A4 seeded, and the field definitions of the target type AS
 	// TASK A6 LEFT THEM, which is the check the plan names.
-	{eoSeedSpawnActionsStepKey, eoSeedPilotSpawnActions},
+	{key: eoSeedSpawnActionsStepKey, run: eoSeedPilotSpawnActions},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
-// other key in the list above: a renamed key is a step that has never run, so
-// it would execute again on every database that has already booted.
+// other key in the list above, and they MUST NOT BE REUSED for anything else.
+//
+// Both steps are CONVERGENT, so nothing reads their applied rows any more.
+// Databases that booted Task A6 under the one-shot gate still carry a row for
+// each; those rows are inert, and are deliberately left in place rather than
+// deleted — a key that is never compared cannot be wrong, and a delete would
+// be a migration bought for nothing. What it does mean is that neither key may
+// later become a one-shot step: its row already exists, so such a step would
+// be skipped on every database that has booted today's code.
 const (
 	eoSeedTypePermissionsStepKey = "seed_type_permissions"
 	eoEnableCapabilitiesStepKey  = "enable_capabilities"
 )
 
-// eoPilotSeedNeeded is the fast path: one count of applied-step rows.
+// eoPilotSeedNeeded is the fast path: one count of applied-step rows for the
+// one-shot steps, and then each convergent step's own cheap question.
+//
+// The convergent steps are asked ONLY when every one-shot step has applied.
+// When one has not, the seed is running anyway and there is nothing to decide.
 func eoPilotSeedNeeded(db *gorm.DB) (bool, error) {
 	keys := make([]string, 0, len(eoPilotSteps))
 	for _, st := range eoPilotSteps {
+		if st.convergent {
+			continue
+		}
 		keys = append(keys, st.key)
 	}
 	var applied int64
 	if err := db.Model(&models.EOSeedStep{}).Where("key IN ?", keys).Count(&applied).Error; err != nil {
 		return false, err
 	}
-	return applied < int64(len(keys)), nil
+	if applied < int64(len(keys)) {
+		return true, nil
+	}
+	for _, st := range eoPilotSteps {
+		if !st.convergent {
+			continue
+		}
+		open, err := st.pending(db)
+		if err != nil {
+			return false, fmt.Errorf("ask step %q whether it has work to do: %w", st.key, err)
+		}
+		if open {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func eoSeedPilotTx(tx *gorm.DB) error {
 	for _, st := range eoPilotSteps {
+		// A convergent step has no applied row to consult and writes none:
+		// it is asked, in the transaction, whether the configuration as the
+		// steps before it have just left it still needs it.
+		if st.convergent {
+			if err := eoRunConvergentStep(tx, st); err != nil {
+				return err
+			}
+			continue
+		}
 		var n int64
 		if err := tx.Model(&models.EOSeedStep{}).Where("key = ?", st.key).Count(&n).Error; err != nil {
 			return fmt.Errorf("check step %q: %w", st.key, err)
@@ -389,6 +467,45 @@ func eoSeedPilotTx(tx *gorm.DB) error {
 		if err := tx.Create(&models.EOSeedStep{Key: st.key}).Error; err != nil {
 			return fmt.Errorf("record step %q: %w", st.key, err)
 		}
+	}
+
+	// THE SECOND CONVERGENT PASS, and why there are two.
+	//
+	// A convergent step is asked once AT ITS POSITION in the list, because
+	// `seed_spawn_actions` reads the field definitions `enable_capabilities`
+	// leaves behind and must therefore run after it.
+	//
+	// It is asked again AFTER THE WHOLE LIST, because appending a step is how
+	// the mechanism says a later change is made — including a twelfth record
+	// type — and an appended step comes after both convergent steps. Without
+	// this pass the new type would wait for the NEXT boot to get its
+	// permission codes and its capability configuration, which is a database
+	// that is briefly wrong in a way nothing announces. Asking twice costs
+	// two cheap queries when there is nothing to do.
+	for _, st := range eoPilotSteps {
+		if !st.convergent {
+			continue
+		}
+		if err := eoRunConvergentStep(tx, st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// eoRunConvergentStep asks a convergent step whether it has work and runs it
+// if so. Its `done` is discarded: there is no applied row to write, and a
+// step that did nothing will simply be asked again.
+func eoRunConvergentStep(tx *gorm.DB, st eoPilotStep) error {
+	open, err := st.pending(tx)
+	if err != nil {
+		return fmt.Errorf("ask step %q whether it has work to do: %w", st.key, err)
+	}
+	if !open {
+		return nil
+	}
+	if _, err := st.run(tx); err != nil {
+		return fmt.Errorf("step %q: %w", st.key, err)
 	}
 	return nil
 }
@@ -2705,6 +2822,16 @@ type eoCapabilityEnablement struct {
 }
 
 // eoPilotCapabilities is every capability the pilot enables.
+//
+// ENABLING ONE ON A RECORD TYPE THAT DOES NOT EXIST YET. `enable_capabilities`
+// is convergent, so an entry added here reaches every existing database — but
+// it is also fail-closed, and a type key that resolves to nothing rolls the
+// whole pilot seed back with that type named. If the type is being added in
+// the same change, put the step that CREATES it before the
+// `enable_capabilities` entry in eoPilotSteps rather than appending it at the
+// end. (The per-type permission codes need no such care: that step is asked
+// again after the whole list, so a type created by an appended step still
+// gets its codes on the same boot.)
 var eoPilotCapabilities = []eoCapabilityEnablement{
 	{
 		TypeKey:       eoDraftStudyTypeKey,
@@ -2852,14 +2979,7 @@ func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 			r.FieldKey, r.TypeKey, r.CapabilityKey, res.RowsAffected)
 	}
 
-	byType := map[string][]eoCapabilityEnablement{}
-	order := []string{}
-	for _, e := range eoPilotCapabilities {
-		if _, seen := byType[e.TypeKey]; !seen {
-			order = append(order, e.TypeKey)
-		}
-		byType[e.TypeKey] = append(byType[e.TypeKey], e)
-	}
+	order, byType := eoCapabilitiesByType()
 	for _, typeKey := range order {
 		blob, err := eoCapabilityBlob(byType[typeKey])
 		if err != nil {
@@ -2883,6 +3003,136 @@ func eoEnableCapabilities(tx *gorm.DB) (bool, error) {
 		log.Printf("EO pilot: record type %q enables %v", typeKey, keys)
 	}
 	return true, nil
+}
+
+// eoCapabilitiesByType groups eoPilotCapabilities by the type that enables
+// them, keeping first-appearance order. Shared by the step and by its pending
+// check so the two cannot disagree about what "configured" means.
+func eoCapabilitiesByType() ([]string, map[string][]eoCapabilityEnablement) {
+	byType := map[string][]eoCapabilityEnablement{}
+	order := []string{}
+	for _, e := range eoPilotCapabilities {
+		if _, seen := byType[e.TypeKey]; !seen {
+			order = append(order, e.TypeKey)
+		}
+		byType[e.TypeKey] = append(byType[e.TypeKey], e)
+	}
+	return order, byType
+}
+
+// eoCapabilitiesPending is eoEnableCapabilities' gate: it asks the database
+// whether the configuration eoPilotCapabilities describes is the one the
+// database carries.
+//
+// WHY THIS AND NOT AN APPLIED ROW. The step's job is "every type that enables
+// a capability has it enabled, and no type declares a key a capability
+// reserves". That is a statement about the configuration as it NOW stands, so
+// adding a twelfth record type with a capability must make it true again —
+// which an applied row from a boot months ago cannot express.
+//
+// It is deliberately conservative: anything it cannot confirm is reported as
+// pending, and eoEnableCapabilities — which is fail-closed — then either does
+// the work or produces the error. It never swallows a problem to stay quiet.
+func eoCapabilitiesPending(db *gorm.DB) (bool, error) {
+	for _, r := range eoCapabilityReservedFieldRemovals {
+		var ty models.EORecordType
+		if err := db.Where("key = ?", r.TypeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", r.TypeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			// Either the type steps have not run yet on this database, or
+			// the type key is wrong. The step says which, loudly.
+			return true, nil
+		}
+		// Unscoped for the same reason the removal is: a soft-deleted
+		// definition still holds the (record_type_id, key) unique index.
+		var n int64
+		if err := db.Unscoped().Model(&models.EOFieldDef{}).
+			Where("record_type_id = ? AND key = ?", ty.ID, r.FieldKey).Count(&n).Error; err != nil {
+			return false, fmt.Errorf("look for the reserved field %q on %q: %w", r.FieldKey, r.TypeKey, err)
+		}
+		if n > 0 {
+			return true, nil
+		}
+	}
+
+	order, byType := eoCapabilitiesByType()
+	for _, typeKey := range order {
+		want, err := eoCapabilityBlob(byType[typeKey])
+		if err != nil {
+			// A malformed config is a seed failure with a precise message,
+			// and that message is the step's to write.
+			return true, nil
+		}
+		var ty models.EORecordType
+		if err := db.Where("key = ?", typeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", typeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			return true, nil
+		}
+		same, err := eoSameJSON(want, []byte(ty.Capabilities))
+		if err != nil {
+			return false, fmt.Errorf("compare the capabilities of %q with the configuration: %w", typeKey, err)
+		}
+		if !same {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// eoSameJSON compares two JSON documents by VALUE. The column is jsonb, which
+// normalises whitespace and reorders object keys, so comparing the bytes we
+// wrote with the bytes Postgres returns would report a difference on every
+// boot and rewrite every blob for ever.
+func eoSameJSON(a, b []byte) (bool, error) {
+	var av, bv any
+	if len(a) == 0 {
+		a = []byte("null")
+	}
+	if len(b) == 0 {
+		b = []byte("null")
+	}
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false, fmt.Errorf("decode %s: %w", a, err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false, fmt.Errorf("decode %s: %w", b, err)
+	}
+	return reflect.DeepEqual(av, bv), nil
+}
+
+// eoTypePermissionsPending is eoSeedPilotTypePermissions' gate: does every
+// concrete record type already carry spec §7.11's three codes?
+//
+// ONE COUNT, whatever the number of types, because this is on the boot fast
+// path. The codes are built from the same eoTypePermissionActions the writer
+// uses, so the question and the answer cannot drift apart.
+//
+// It does not check the GRANTS. A missing code is what a newly added type
+// has, and the writer re-applies the grant for every code on every call, so
+// the code's absence is a sufficient trigger. A grant revoked by an
+// administrator is a deliberate act and must not be reinstated at boot.
+func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
+	var concrete []models.EORecordType
+	if err := db.Where("is_abstract = ?", false).Find(&concrete).Error; err != nil {
+		return false, fmt.Errorf("list concrete record types: %w", err)
+	}
+	if len(concrete) == 0 {
+		return false, nil
+	}
+	codes := make([]string, 0, len(concrete)*len(eoTypePermissionActions))
+	for _, t := range concrete {
+		for _, a := range eoTypePermissionActions {
+			codes = append(codes, fmt.Sprintf("eo:%s:%s", t.Key, a.action))
+		}
+	}
+	var have int64
+	if err := db.Model(&models.Permission{}).Where("code IN ?", codes).Count(&have).Error; err != nil {
+		return false, fmt.Errorf("count the per-type permission codes: %w", err)
+	}
+	return have < int64(len(codes)), nil
 }
 
 // eoCapabilityBlob renders one type's entries as the list

@@ -591,6 +591,104 @@ func TestSeedEOPilotReportsOnEveryBoot(t *testing.T) {
 	}
 }
 
+// TestEveryConvergentStepIsAskedWhetherItHasWork is the structural half of the
+// convergent mechanism: a step marked convergent with no `pending` would panic
+// at boot, and a one-shot step carrying a `pending` would have it silently
+// ignored.
+//
+// Mutation: drop `pending` from either convergent entry of eoPilotSteps, or
+// add one to a one-shot entry.
+func TestEveryConvergentStepIsAskedWhetherItHasWork(t *testing.T) {
+	for _, st := range eoPilotSteps {
+		switch {
+		case st.convergent && st.pending == nil:
+			t.Errorf("step %q is convergent and has no pending check; it is gated on nothing and would panic at boot", st.key)
+		case !st.convergent && st.pending != nil:
+			t.Errorf("step %q is one-shot and carries a pending check, which nothing reads; mark it convergent or remove it", st.key)
+		case st.run == nil:
+			t.Errorf("step %q has no run function", st.key)
+		}
+	}
+}
+
+// TestEOPilotGivesARecordTypeAddedLaterItsPermissionCodes is Important B: the
+// class of defect A6 fixed one instance of.
+//
+// `seed_type_permissions` and `enable_capabilities` exist to cover EVERY
+// concrete type, and both had applied rows on every database that had booted
+// Task A6. Under a pure one-shot gate, a twelfth record type — added the way
+// the mechanism's own instructions say a later change is made, by appending a
+// step — would get no permission codes and no capability configuration
+// anywhere except on a database created after the change. The engine is not
+// the problem: eoSeedTypePermissions is written to be re-runnable and
+// incremental, and the gate was the only thing defeating it.
+//
+// THE NEW TYPE IS CREATED BY A STEP APPENDED AFTER BOTH OF THEM, which is
+// where a real one would go, and the codes must still be there when the same
+// boot ends — that is what the second convergent pass in eoSeedPilotTx is for.
+//
+// Mutations that make it fail: take `convergent: true` off the
+// seed_type_permissions entry; or delete the second convergent pass at the
+// end of eoSeedPilotTx.
+func TestEOPilotGivesARecordTypeAddedLaterItsPermissionCodes(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	if open, err := eoPilotSeedNeeded(db); err != nil || open {
+		t.Fatalf("fixture error: everything should be applied (needed=%v err=%v)", open, err)
+	}
+	if pending := eoTypesAwaitingPermissions(t, db); pending != 0 {
+		t.Fatalf("fixture error: %d types still await their codes before the twelfth is added", pending)
+	}
+
+	const newKey = "eo_twelfth_record_type"
+	savedSteps := eoPilotSteps
+	t.Cleanup(func() { eoPilotSteps = savedSteps })
+	eoPilotSteps = append(append([]eoPilotStep{}, savedSteps...), eoPilotStep{
+		key: "seed_a_twelfth_record_type",
+		run: func(tx *gorm.DB) (bool, error) {
+			var base models.EORecordType
+			if err := tx.Where("key = ?", eoBaseTypeKey).First(&base).Error; err != nil {
+				return false, err
+			}
+			return true, tx.Create(&models.EORecordType{
+				ID: uuid.New(), Key: newKey, Name: "Twelfth", NameAr: "الثاني عشر",
+				ParentTypeID: &base.ID, ReferenceMode: models.EOReferenceModeOwn,
+				ReferencePrefix: "TWF", ReferencePattern: "TWF-YYYY-NNN", IsActive: true,
+			}).Error
+		},
+	})
+
+	seedEOPilot(db)
+
+	for _, action := range []string{"view", "create", "update"} {
+		code := "eo:" + newKey + ":" + action
+		var n int64
+		if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&n).Error; err != nil {
+			t.Fatalf("count %q: %v", code, err)
+		}
+		if n != 1 {
+			t.Errorf("the record type added after the steps had run carries %d rows for %q, want 1; a type seeded on a live database gets no permission codes at all", n, code)
+		}
+	}
+
+	// The type really is there, so the codes above are about a real type and
+	// not about three rows nobody can use.
+	var ty models.EORecordType
+	if err := db.Where("key = ?", newKey).First(&ty).Error; err != nil {
+		t.Fatalf("read the added record type: %v", err)
+	}
+	if pending := eoTypesAwaitingPermissions(t, db); pending != 0 {
+		t.Errorf("%d concrete types still await their per-type codes after the seed ran", pending)
+	}
+
+	// And it converges: a boot with nothing left to do changes nothing and
+	// does not re-enter the transaction.
+	out := eoCaptureSeed(t, db)
+	if strings.Contains(out, "Applying the EO pilot configuration") {
+		t.Errorf("the convergent steps report work to do on a database that already has everything; they would rewrite the configuration on every boot.\n--- output ---\n%s", out)
+	}
+}
+
 // The descendant-keep branch: a type beneath a smoke type, holding NO records,
 // still blocks removal (deleting the parent would orphan it).
 // Mutation: delete the `if len(subtree) != len(smokeIDs) { ... }` block.

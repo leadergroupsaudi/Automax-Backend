@@ -635,20 +635,30 @@ const (
 // deletes), but a future change to the wording will not reach rows already in
 // a customer's database. The grant is re-applied on every call and is safe:
 // GORM's many-to-many Append writes the join rows ON CONFLICT DO NOTHING.
+// eoTypePermissionActions is spec §7.11's three actions, in the order the
+// codes are written.
+//
+// IT IS PACKAGE-LEVEL so eoTypePermissionsPending can build exactly the codes
+// this function writes. That step is convergent — it is gated on whether the
+// codes exist, not on an applied row — and a second copy of this list would
+// make the gate and the writer able to disagree: a fourth action added here
+// and missed there would never be written on any database that already had
+// the first three.
+var eoTypePermissionActions = []struct{ action, verb, verbAr string }{
+	{"view", "View", "عرض"},
+	{"create", "Create", "إنشاء"},
+	{"update", "Update", "تحديث"},
+}
+
 func eoSeedTypePermissions(db *gorm.DB) error {
 	var concrete []models.EORecordType
 	if err := db.Where("is_abstract = ?", false).Order("key").Find(&concrete).Error; err != nil {
 		return fmt.Errorf("list concrete record types: %w", err)
 	}
 
-	actions := []struct{ action, verb, verbAr string }{
-		{"view", "View", "عرض"},
-		{"create", "Create", "إنشاء"},
-		{"update", "Update", "تحديث"},
-	}
 	var codes []string
 	for _, t := range concrete {
-		for _, a := range actions {
+		for _, a := range eoTypePermissionActions {
 			// Permission.Name is uniquely indexed, so it is built from the
 			// type KEY — which eo_record_types.key already makes unique —
 			// and not from the display Name, which two types may share. The
