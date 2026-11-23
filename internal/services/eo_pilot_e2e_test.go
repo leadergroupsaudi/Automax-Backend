@@ -47,15 +47,18 @@ import (
 // (lines 529-552), and every step runs through EORecordService.Create or
 // EOTransitionService.Execute.
 //
-// THE ONE THING THE TEST SUPPLIES THAT A USER COULD NOT: Documenta file ids.
-// `attachments` is Required Always on Incoming Correspondence and Task C3
-// shape-checks `file`/`multi_file` values against a canonical uuid or
-// storage.StubFileIDPrefix — and THERE IS NO EO UPLOAD ROUTE IN THE SERVER,
-// so nothing can legitimately produce one. The ids below are minted through
-// eoPilotFieldValue, the helper Task C3 changed for exactly this, and shared
-// with the two older pilot fixtures rather than invented a third time. This
-// is a PRODUCT GAP, recorded in the ledger: four pilot types cannot be
-// created by a real user today. It is not this test's to close.
+// IT NO LONGER SUPPLIES ANYTHING A USER COULD NOT, and that changed in Task
+// B2. It used to mint Documenta file ids: `attachments` was Required Always
+// on Incoming Correspondence, Task C3 shape-checks `file`/`multi_file` values
+// against a canonical uuid or storage.StubFileIDPrefix, and B1's upload route
+// refuses with 503 and mints no id while EO_DOCUMENTA_ENABLED=false — so the
+// register could not be created by a real user, and this test passed only
+// because it fabricated the ids. B2 relaxed the four such fields to `never`
+// (database.eoFileFieldsRelaxedUntilDocumenta), so `values` below — which
+// fills every user field the SEEDED configuration requires — no longer
+// selects a file field at all, and the scenario now runs on submissions a
+// clerk could type. eoPilotFieldValue keeps its file arms for the older pilot
+// fixtures and for the day the fields are re-tightened.
 
 // eoComFixture is the seeded pilot plus the whole service stack. documenta
 // says which of the two deployments is under test; see eoComNewFixture.
@@ -826,4 +829,54 @@ func (f *eoComFixture) runEOCOM(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestEoIncomingCorrespondenceIsCreatableWithoutAttachments is Task B2's
+// acceptance test, and the one a user would have run.
+//
+// Until B2 the pilot's Incoming Correspondence could not be created by anyone
+// at all. `attachments` was Required Always and holds Documenta file ids;
+// B1's upload route refuses with 503 and mints no id while
+// EO_DOCUMENTA_ENABLED=false, which is what the pilot deploys. The form asked
+// for something the running system could not issue, so the register was
+// closed. The seed now relaxes it (database.eoFileFieldsRelaxedUntilDocumenta)
+// rather than letting B1 mint a stub, because a statutory register holding a
+// fake document reference is worse than one that does not require a document
+// yet.
+//
+// IT RUNS IN THE PILOT DEPLOYMENT, with no Documenta client wired, which is
+// the configuration the claim is about. The submission comes from the
+// fixture's `values`, which reads the SEEDED field definitions and fills
+// every user field that is Required Always — so the assertion that it carries
+// no file id is a statement about the configuration, not about this test's
+// taste in fixtures.
+//
+// Mutation: put `required: models.EORequiredAlways` back on any of the four
+// registered fields, or drop the step from database.eoPilotSteps.
+func TestEoIncomingCorrespondenceIsCreatableWithoutAttachments(t *testing.T) {
+	f := eoComNewFixture(t, false)
+
+	vals := f.values(t, eoPilotIncomingTypeKey)
+	if _, asked := vals["attachments"]; asked {
+		t.Fatalf("the seeded configuration still requires `attachments` at creation; no upload route can mint a file id with Documenta disabled, so a real clerk cannot satisfy it")
+	}
+
+	rec, err := f.records.Create(context.Background(),
+		&models.EORecordCreateRequest{
+			RecordTypeID: f.typeIDs[eoPilotIncomingTypeKey],
+			Values:       vals,
+		}, f.officer)
+	if err != nil {
+		t.Fatalf("file a letter with no attachment: %v", err)
+	}
+	if rec == nil || rec.Reference == "" {
+		t.Fatalf("the letter was created without a reference: %+v", rec)
+	}
+
+	// The field is still THERE — relaxed, not removed — so a clerk may still
+	// attach the letter once Documenta is connected.
+	fresh := f.reread(t, rec)
+	if fresh == nil {
+		t.Fatal("the letter cannot be read back")
+	}
 }

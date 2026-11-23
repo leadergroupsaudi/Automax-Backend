@@ -547,6 +547,10 @@ var eoObligationReportLines = []string{
 	"field labels await Arabic sign-off",
 	"await client sign-off (workflow_states/workflow_transitions.eo_client_unconfirmed)",
 	`capability "decisions_base" on "eo_draft_decision_study"`,
+	// TASK B2. The default deployment has EO_DOCUMENTA_ENABLED unset, so
+	// this is the disabled wording; the enabled one has a test of its own,
+	// because no run in the default environment can reach it.
+	"file field(s) are optional while EO Documenta is disabled",
 }
 
 // TestSeedEOPilotReportsOnEveryBoot is the guard against the three reports
@@ -1284,10 +1288,17 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	// Required: Yes there while the base type seeds it `never`. Without the
 	// declaration the pilot files a government letter with no letter attached.
 	// A1 marked the key engine-managed; A2's fix round corrected that.
-	t.Run("attachments is declared and required on Incoming Correspondence", func(t *testing.T) {
+	//
+	// TASK B2 RELAXED THE REQUIREDNESS AND NOTHING ELSE. The narrowing still
+	// exists — its own definition, at the base's slot — because `always` was
+	// a demand no clerk could meet while B1's upload route mints no file id
+	// (eoFileFieldsRelaxedUntilDocumenta). That is what makes re-tightening
+	// one column through the type designer rather than a re-seed, and it is
+	// why this subtest still checks the override's identity below.
+	t.Run("attachments is declared on Incoming Correspondence and relaxed for want of Documenta", func(t *testing.T) {
 		got := eoEffectiveField(t, db, eoIncomingTypeKey, "attachments")
-		if got.RequiredMode != models.EORequiredAlways {
-			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredAlways)
+		if got.RequiredMode != models.EORequiredNever {
+			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredNever)
 		}
 		// The override, not a second field: it replaces the base's definition
 		// at the base's slot, so the key appears once.
@@ -2105,6 +2116,19 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 					// is the place where "the matrix says Yes and the step
 					// it names is the last one" is written down. Every other
 					// "Yes" stays `always`.
+					// TASK B2. A "Yes" row that holds a DOCUMENTA FILE ID
+					// is seeded `always` by its spec and then relaxed to
+					// `never` by the last step of the seed, because B1's
+					// upload route mints no id while Documenta is disabled
+					// and the register would otherwise be uncreatable. The
+					// registry says which rows and why, and
+					// TestNoPilotFileFieldIsRequiredAtCreation checks the
+					// converse — that no file field anywhere is left
+					// `always` — so this is not a way round the matrix.
+					if eoIsRelaxedUntilDocumenta(typeKey, row.Key) {
+						want(models.EORequiredNever, models.EOProvenanceUser)
+						return
+					}
 					if eoIsResolvedClosureArtefact(typeKey, row.Key) {
 						want(models.EORequiredAtState, models.EOProvenanceUser)
 						return
@@ -3928,4 +3952,210 @@ func eoIsResolvedClosureArtefact(typeKey, matrixKey string) bool {
 		}
 	}
 	return false
+}
+
+// ── Task B2: the file fields are not required while Documenta is off ────────
+
+// TestEoFileFieldsAreNotRequiredWithoutDocumenta is the task's first
+// requirement: after the real seed, none of the registered file fields demands
+// a value.
+//
+// THE PRODUCT FACT IT ENCODES. B1's upload route refuses with 503 and mints no
+// id while EO_DOCUMENTA_ENABLED=false, which is the pilot's default. A field
+// that is `always` and holds a file is therefore a demand no user can meet:
+// the form asks for a document id and nothing in the running system can issue
+// one, so the register cannot be created at all. The ruling is to relax the
+// requirement rather than weaken B1 into minting stubs, because a register
+// that stores a fake document reference is worse than one that does not
+// require a document yet.
+//
+// IT GOES THROUGH seedEOPilot, not through the writer. A test that called
+// eoRelaxFileRequirednessUntilDocumenta directly would pass with the step
+// absent from eoPilotSteps, which is this programme's recurring defect: a
+// seed step that is never reached, proved correct by a test that bypassed the
+// gate.
+//
+// Mutation: delete the eoRelaxFileRequirednessStepKey entry from eoPilotSteps.
+func TestEoFileFieldsAreNotRequiredWithoutDocumenta(t *testing.T) {
+	if len(eoFileFieldsRelaxedUntilDocumenta) == 0 {
+		t.Fatal("eoFileFieldsRelaxedUntilDocumenta is empty; this test would prove nothing")
+	}
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		t.Run(r.TypeKey+"."+r.FieldKey, func(t *testing.T) {
+			got := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+			switch got.Kind {
+			case models.EOKindFile, models.EOKindMultiFile:
+			default:
+				t.Fatalf("the registry relaxes %q on %q, whose kind is %q; this step is only about fields that hold a Documenta file id",
+					r.FieldKey, r.TypeKey, got.Kind)
+			}
+			if got.RequiredMode != models.EORequiredNever {
+				t.Errorf("required_mode is %q; while EO Documenta is disabled no file id can be minted, so a %q file field makes the register uncreatable",
+					got.RequiredMode, got.RequiredMode)
+			}
+		})
+	}
+}
+
+// TestNoPilotFileFieldIsRequiredAtCreation is the COMPLETENESS half, and the
+// reason a one-shot step is safe here.
+//
+// The objection to a one-shot step is that it cannot reach a field definition
+// created after it ran. The only two things that create one are a later seed
+// step and an administrator in the type designer; the second is a deliberate
+// choice this step must not undo, and the first is what this test catches. A
+// twelfth record type with an `always` file field fails CI here, with the
+// registry named, long before it reaches a pilot database.
+//
+// It asks the DATABASE, over every seeded type, rather than the spec tables,
+// so a field that arrives by any route at all is in scope.
+//
+// Mutation: add a `file` field with required: models.EORequiredAlways to any
+// pilot type spec without registering it.
+func TestNoPilotFileFieldIsRequiredAtCreation(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	type row struct {
+		TypeKey      string
+		Key          string
+		Kind         string
+		RequiredMode string
+	}
+	var rows []row
+	err := db.Table("eo_field_defs AS f").
+		Select("t.key AS type_key, f.key AS key, f.kind AS kind, f.required_mode AS required_mode").
+		Joins("JOIN eo_record_types t ON t.id = f.record_type_id AND t.deleted_at IS NULL").
+		Where("f.deleted_at IS NULL AND f.kind IN ? AND f.required_mode = ?",
+			[]string{models.EOKindFile, models.EOKindMultiFile}, models.EORequiredAlways).
+		Order("t.key, f.key").Scan(&rows).Error
+	if err != nil {
+		t.Fatalf("look for file fields required at creation: %v", err)
+	}
+	for _, r := range rows {
+		t.Errorf("%s.%s is kind %q and required_mode %q: no upload route can mint a file id while EO Documenta is disabled, so this register cannot be created. Register it in eoFileFieldsRelaxedUntilDocumenta or seed it `never`.",
+			r.TypeKey, r.Key, r.Kind, r.RequiredMode)
+	}
+}
+
+// TestEoFileRelaxationDoesNotRevertAnAdministratorsRetightening is the
+// ADMINISTRATOR'S EDIT guard, and the reason this step is NOT convergent.
+//
+// The ruling says re-tightening is a configuration change through the type
+// designer once the client's Documenta is connected — no release needed. A
+// convergent step gated on "any registered field is not `never`" would see
+// that change as work to do and undo it on the very next boot, silently, which
+// is a defect this programme has shipped twice. A one-shot step cannot: its
+// applied row is written on the boot that ran it and nothing asks again.
+//
+// Mutation: mark the step `convergent: true` with a pending check that looks
+// for a field that is not `never`.
+func TestEoFileRelaxationDoesNotRevertAnAdministratorsRetightening(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	r := eoFileFieldsRelaxedUntilDocumenta[0]
+	def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+	if def.RequiredMode != models.EORequiredNever {
+		t.Fatalf("fixture error: %s.%s is %q after the seed, so there is nothing for an administrator to re-tighten", r.TypeKey, r.FieldKey, def.RequiredMode)
+	}
+	// What the type designer does once Documenta is connected.
+	if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
+		Update("required_mode", models.EORequiredAlways).Error; err != nil {
+		t.Fatalf("re-tighten %s.%s: %v", r.TypeKey, r.FieldKey, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		seedEOPilot(db)
+	}
+
+	again := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+	if again.RequiredMode != models.EORequiredAlways {
+		t.Errorf("after three more boots %s.%s is %q; an administrator set it to %q through the type designer and the seed reverted it",
+			r.TypeKey, r.FieldKey, again.RequiredMode, models.EORequiredAlways)
+	}
+}
+
+// TestEoFileRelaxationReachesADatabaseSeededBeforeIt is the OTHER trap: a step
+// whose gate can never open on the databases it was written for.
+//
+// Every pilot database in existence has already applied the type-seeding
+// steps, so editing a field spec would change nothing there; the step is the
+// only thing that reaches them. This test puts a fully seeded database back
+// into the state the previous release left — the fields `always`, the step's
+// applied row absent — and requires the ordinary boot path to notice and fix
+// it. Nothing here calls the writer.
+//
+// Mutation: gate the step on anything other than its applied row, or seed the
+// relaxation from the field specs instead of from a step.
+func TestEoFileRelaxationReachesADatabaseSeededBeforeIt(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
+		if err := db.Model(&models.EOFieldDef{}).Where("id = ?", def.ID).
+			Update("required_mode", models.EORequiredAlways).Error; err != nil {
+			t.Fatalf("put %s.%s back as the previous release left it: %v", r.TypeKey, r.FieldKey, err)
+		}
+	}
+	if err := db.Where("key = ?", eoRelaxFileRequirednessStepKey).
+		Delete(&models.EOSeedStep{}).Error; err != nil {
+		t.Fatalf("remove the applied row of %q: %v", eoRelaxFileRequirednessStepKey, err)
+	}
+
+	open, err := eoPilotSeedNeeded(db)
+	if err != nil {
+		t.Fatalf("ask whether the seed is needed: %v", err)
+	}
+	if !open {
+		t.Fatalf("the boot fast path stays SHUT on a database that has not applied %q, so the step can never run on any existing pilot database", eoRelaxFileRequirednessStepKey)
+	}
+
+	seedEOPilot(db)
+
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		if got := eoEffectiveField(t, db, r.TypeKey, r.FieldKey); got.RequiredMode != models.EORequiredNever {
+			t.Errorf("%s.%s is still %q on a database seeded before the step existed", r.TypeKey, r.FieldKey, got.RequiredMode)
+		}
+	}
+}
+
+// TestEoRelaxedFileFieldsAreAnObligationOnceDocumentaIsEnabled is the line the
+// operator needs and the one a naive implementation cannot fire.
+//
+// The relaxation is UNCONDITIONAL — the seed reads no runtime configuration —
+// and nothing re-tightens a deployment that later connects Documenta. That is
+// accepted, and it is exactly why the boot report must say so: with Documenta
+// enabled the relaxed fields stop being a workaround and become a gap in the
+// client's matrix that only the type designer can close.
+//
+// The disabled wording is covered on every boot by
+// TestSeedEOPilotReportsOnEveryBoot, through eoObligationReportLines. This
+// test covers the OTHER branch, which no test run with the default
+// environment can reach.
+//
+// Mutation: drop the enabled arm of eoLogFileFieldsAwaitingDocumenta, or read
+// the flag at package init instead of per boot.
+func TestEoRelaxedFileFieldsAreAnObligationOnceDocumentaIsEnabled(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	t.Setenv("EO_DOCUMENTA_ENABLED", "true")
+	out := eoCaptureSeed(t, db)
+	if strings.Contains(out, "Applying the EO pilot configuration") {
+		t.Fatalf("fixture error: this boot applied seed steps, so it is not the every-boot report under test.\n--- output ---\n%s", out)
+	}
+	const want = "EO Documenta is ENABLED"
+	if !strings.Contains(out, want) {
+		t.Errorf("a boot with EO_DOCUMENTA_ENABLED=true does not report %q, so nothing tells the operator that the file fields relaxed for the pilot are still optional.\n--- output ---\n%s", want, out)
+	}
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		if !strings.Contains(out, r.TypeKey+"."+r.FieldKey) {
+			t.Errorf("the obligation line does not name %s.%s, so the operator is not told which field to re-tighten.\n--- output ---\n%s", r.TypeKey, r.FieldKey, out)
+		}
+	}
 }

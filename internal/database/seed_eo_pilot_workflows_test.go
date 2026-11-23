@@ -531,8 +531,18 @@ func TestEoClosureArtefactDecisionsMatchTheMatrix(t *testing.T) {
 				t.Errorf("the decision quotes the matrix as %q; the matrix says %q", a.MatrixRequired, r.Required)
 			}
 			def := eoEffectiveField(t, db, a.TypeKey, a.FieldKey)
-			if def.RequiredMode != models.EORequiredAlways {
-				t.Errorf("seeded %q; a row left for the client stays %q — strict, and recoverable in both directions", def.RequiredMode, models.EORequiredAlways)
+			// TASK B2. A row left for the client stays `always` — unless it
+			// holds a Documenta file id, in which case `always` is not
+			// strictness but a demand no user can meet while the upload
+			// route mints nothing (eoFileFieldsRelaxedUntilDocumenta). The
+			// client question this registry records stays open either way;
+			// only the requiredness moved, and the entry's Why says so.
+			want := models.EORequiredAlways
+			if eoIsRelaxedUntilDocumenta(a.TypeKey, a.FieldKey) {
+				want = models.EORequiredNever
+			}
+			if def.RequiredMode != want {
+				t.Errorf("seeded %q, want %q — strict, and recoverable in both directions", def.RequiredMode, want)
 			}
 		})
 	}

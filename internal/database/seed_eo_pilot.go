@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/automax/backend/internal/config"
 	"github.com/automax/backend/internal/database/migrations"
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -231,7 +232,7 @@ func seedEOPilot(db *gorm.DB) {
 	if base == 0 {
 		return
 	}
-	// THE THREE OBLIGATION REPORTS RUN ON EVERY BOOT. They are DEFERRED, and
+	// THE OBLIGATION REPORTS RUN ON EVERY BOOT. They are DEFERRED, and
 	// deliberately: every return below this line is a path on which no seed
 	// step applied, and those are exactly the boots — every boot after the
 	// first — on which an operator still needs the lists. They used to sit
@@ -268,15 +269,16 @@ func seedEOPilot(db *gorm.DB) {
 	}
 }
 
-// eoReportPilotObligations writes the three boot-time lists the client
-// sign-off round reads: the field labels awaiting Arabic, the workflow states
-// and transitions awaiting confirmation, and the capability inputs the
-// configuration does not yet provide.
+// eoReportPilotObligations writes the boot-time lists the client sign-off
+// round reads: the field labels awaiting Arabic, the workflow states and
+// transitions awaiting confirmation, the capability inputs the configuration
+// does not yet provide, the types with no live permission codes, and the file
+// fields relaxed for want of Documenta.
 //
 // It is SEPARATE FROM THE SEED because it is not part of it: it answers "what
 // does this database still owe the client", which is a question about the
-// database as it stands, not about what this boot happened to apply. Each of
-// the three reports its own error and none can stop another.
+// database as it stands, not about what this boot happened to apply. Each
+// report reports its own error and none can stop another.
 func eoReportPilotObligations(db *gorm.DB) {
 	if set, err := eoUntranslatedFields(db); err != nil {
 		log.Printf("EO pilot seed: %v", err)
@@ -286,6 +288,7 @@ func eoReportPilotObligations(db *gorm.DB) {
 	eoLogUnconfirmedStateMachines(db)
 	eoLogCapabilityInputGaps(db)
 	eoLogTypesWithNoLiveCodes(db)
+	eoLogFileFieldsAwaitingDocumenta(db)
 }
 
 // eoPilotStep is one unit of the pilot seed.
@@ -388,6 +391,14 @@ var eoPilotSteps = []eoPilotStep{
 	// link type A4 seeded, and the field definitions of the target type AS
 	// TASK A6 LEFT THEM, which is the check the plan names.
 	{key: eoSeedSpawnActionsStepKey, run: eoSeedPilotSpawnActions},
+	// TASK B2. ONE-SHOT, and appended LAST because it edits what the type
+	// steps wrote and must see their final requiredness. It relaxes the four
+	// `always` file fields that B1's upload route cannot supply an id for
+	// while EO Documenta is disabled; see eoFileFieldsRelaxedUntilDocumenta
+	// for the ruling and for how to re-tighten. It is deliberately NOT
+	// convergent: re-tightening is an administrator's edit through the type
+	// designer, and a convergent step would undo it on the next boot.
+	{key: eoRelaxFileRequirednessStepKey, run: eoRelaxFileRequirednessUntilDocumenta},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -531,6 +542,190 @@ func eoMarkBaseLabelsUnsigned(tx *gorm.DB) error {
 		return fmt.Errorf("mark inherited labels: %w", err)
 	}
 	return nil
+}
+
+// ── Task B2: the file fields that nothing can fill ──────────────────────────
+
+// eoRelaxFileRequirednessStepKey is a PERMANENT identifier, like every key in
+// eoPilotSteps, and must never be renamed or reused: the applied row keyed on
+// it is the whole of what "this step has run" means, and the step must run
+// exactly once per database.
+const eoRelaxFileRequirednessStepKey = "relax_file_requiredness_until_documenta"
+
+// eoFileRequirednessRelaxation is one field definition the pilot seeded as
+// `always` and this step relaxes to `never`.
+//
+// It is keyed by the ENGINE key, which for all four is the client matrix's
+// spelling too. The registry is read by the step, by the obligation report
+// that names these fields on every boot, and by
+// TestSeededRequiredModesMatchTheMatrix, which would otherwise read the
+// matrix's "Yes" and find `never` with nothing to explain it.
+type eoFileRequirednessRelaxation struct {
+	TypeKey  string
+	FieldKey string
+	// Register is the client's name for the record this field blocks, for
+	// the operator-facing line.
+	Register string
+}
+
+// eoFileFieldsRelaxedUntilDocumenta is the whole of it: every field definition
+// the pilot seeds as `always` whose value is a Documenta file id.
+//
+// WHY THEY ARE RELAXED. B1's upload route (POST /eo-records/:id/files) refuses
+// with 503 and mints NO id while EO_DOCUMENTA_ENABLED=false, which is what the
+// pilot deploys. A `file` or `multi_file` field that is required at creation
+// is then a demand no user can meet — the form asks for a document id and
+// nothing in the running system can issue one — so the register cannot be
+// created at all. Three record types and four fields were in that state:
+// Incoming Correspondence, Draft Decision Study (two fields) and Objection.
+//
+// WHY NOT MINT A STUB ID INSTEAD. That was the alternative and it was refused
+// as a product decision: a statutory register that quietly stores a fake
+// document reference is worse than one that does not require a document yet.
+// The reference would be indistinguishable from a real filing and nothing
+// would ever reconcile it.
+//
+// HOW TO RE-TIGHTEN, once the client's Documenta is connected. It is a
+// CONFIGURATION change and needs no release: set required_mode back to
+// `always` on each field through the type designer. Nothing in this seed will
+// undo that — the step is one-shot and its applied row already exists — and
+// nothing will do it for you either, which is why
+// eoLogFileFieldsAwaitingDocumenta reports these fields as an OBLIGATION on
+// every boot of a deployment that has EO_DOCUMENTA_ENABLED=true.
+//
+// WHAT IS NOT HERE. `eo_assignment.evidence` and `eo_task.evidence` are
+// `multi_file` required AT A STATE, not at creation. They are equally
+// unfillable while Documenta is off, but they block a CLOSING TRANSITION
+// rather than the creation of a register, so they are outside this task's
+// ruling and are left as they are.
+var eoFileFieldsRelaxedUntilDocumenta = []eoFileRequirednessRelaxation{
+	{eoIncomingTypeKey, "attachments", "Incoming Correspondence"},
+	{eoDraftStudyTypeKey, "draft_file", "Draft Decision Study"},
+	{eoDraftStudyTypeKey, "study_report", "Draft Decision Study"},
+	{eoObjectionTypeKey, "proof", "Objection"},
+}
+
+// eoIsRelaxedUntilDocumenta reports whether (typeKey, fieldKey) is recorded as
+// relaxed for want of Documenta. The matrix-reading tests use it to tell a
+// deliberate deviation from the client's "Yes" apart from a seeding mistake.
+func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		if r.TypeKey == typeKey && r.FieldKey == fieldKey {
+			return true
+		}
+	}
+	return false
+}
+
+// eoRelaxFileRequirednessUntilDocumenta is Task B2's step: it sets each
+// registered field's required_mode from `always` to `never`.
+//
+// IT IS ONE-SHOT, AND DELIBERATELY SO. The convergent kind exists for a step
+// whose job is "every X must have a Y" — a rule that must hold again whenever
+// the configuration grows. This is not such a rule. It is a one-time
+// remediation of a configuration the seed itself wrote, and the ruling that
+// authorises it also says how it ends: an administrator sets these fields back
+// to `always` through the type designer once Documenta is connected. A
+// convergent step would read that edit as work to do and undo it on the next
+// boot — the precise defect this programme has already shipped twice. The
+// thing a one-shot step cannot do, reach a field definition created after it
+// ran, is covered instead by TestNoPilotFileFieldIsRequiredAtCreation, which
+// fails CI if a later type seeds an `always` file field without registering
+// it here.
+//
+// IT IS UNCONDITIONAL: it does not read EO_DOCUMENTA_ENABLED. The seed reads
+// no runtime configuration today, and making a once-per-database write depend
+// on an environment variable would mean a boot that happened to have the flag
+// set consumed the step for ever and left the register uncreatable with
+// nothing said. Relaxing on a Documenta-enabled deployment costs a field that
+// is optional instead of mandatory, which the type designer can correct and
+// the boot report asks it to.
+//
+// It is fail-closed, like every other step: a registered type or field that
+// does not exist is an error that rolls the pilot seed back, not a relaxation
+// silently applied to nothing.
+func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		var ty models.EORecordType
+		if err := tx.Where("key = ?", r.TypeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", r.TypeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			return false, fmt.Errorf("field %q is relaxed on record type %q, which is not seeded", r.FieldKey, r.TypeKey)
+		}
+		var def models.EOFieldDef
+		if err := tx.Where("record_type_id = ? AND key = ?", ty.ID, r.FieldKey).Limit(1).
+			Find(&def).Error; err != nil {
+			return false, fmt.Errorf("read field %q on %q: %w", r.FieldKey, r.TypeKey, err)
+		}
+		if def.ID == uuid.Nil {
+			return false, fmt.Errorf("record type %q does not define %q, so there is nothing to relax", r.TypeKey, r.FieldKey)
+		}
+		switch def.Kind {
+		case models.EOKindFile, models.EOKindMultiFile:
+		default:
+			return false, fmt.Errorf("field %q on %q is kind %q; this step relaxes only fields that hold a Documenta file id", r.FieldKey, r.TypeKey, def.Kind)
+		}
+		// ONLY WHAT THE SEED ITSELF LEFT. The one-shot gate already means
+		// this runs once, but the WHERE clause says what the step is
+		// entitled to change in one place: a field an administrator has
+		// already moved off `always` is that administrator's, not this
+		// step's, and is left exactly as found.
+		res := tx.Model(&models.EOFieldDef{}).
+			Where("id = ? AND required_mode = ?", def.ID, models.EORequiredAlways).
+			Update("required_mode", models.EORequiredNever)
+		if res.Error != nil {
+			return false, fmt.Errorf("relax field %q on %q: %w", r.FieldKey, r.TypeKey, res.Error)
+		}
+		if res.RowsAffected == 0 {
+			log.Printf("EO pilot: %s.%s is already %q, not %q; left as it is", r.TypeKey, r.FieldKey, def.RequiredMode, models.EORequiredAlways)
+			continue
+		}
+		log.Printf("EO pilot: %s.%s (%s) is no longer required at creation: EO Documenta mints no file id while it is disabled, so the client's \"Yes\" could not be met. Re-tighten it through the type designer once Documenta is connected.",
+			r.TypeKey, r.FieldKey, def.Kind)
+	}
+	return true, nil
+}
+
+// eoLogFileFieldsAwaitingDocumenta is the operator-facing half, and it runs on
+// EVERY BOOT from eoReportPilotObligations rather than from the seed.
+//
+// The relaxation is permanent until somebody undoes it, and nothing undoes it
+// automatically — least of all connecting Documenta, which this seed never
+// hears about. The only thing standing between a Documenta-enabled deployment
+// and a statutory register whose mandatory attachment is quietly optional is
+// this line, so it reads the flag on every boot and says which of the two
+// states the deployment is in. It reports the DATABASE's current modes, not
+// the registry's intent, so a field an administrator has already re-tightened
+// drops out of the list by itself.
+func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
+	var relaxed []string
+	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
+		var mode string
+		err := db.Table("eo_field_defs AS f").
+			Joins("JOIN eo_record_types t ON t.id = f.record_type_id AND t.deleted_at IS NULL").
+			Where("t.key = ? AND f.key = ? AND f.deleted_at IS NULL", r.TypeKey, r.FieldKey).
+			Limit(1).Pluck("f.required_mode", &mode).Error
+		if err != nil {
+			log.Printf("EO pilot seed: could not read the requiredness of %s.%s: %v", r.TypeKey, r.FieldKey, err)
+			return
+		}
+		// An empty mode is `never`: the column defaults to it and a row
+		// written before it existed carries no value.
+		if mode == "" || mode == models.EORequiredNever {
+			relaxed = append(relaxed, r.TypeKey+"."+r.FieldKey)
+		}
+	}
+	if len(relaxed) == 0 {
+		return
+	}
+	if config.EODocumentaEnabled() {
+		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY — set required_mode back to %q on each through the type designer.",
+			len(relaxed), strings.Join(relaxed, ", "), models.EORequiredAlways)
+		return
+	}
+	log.Printf("EO pilot: %d file field(s) are optional while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. The client's matrix marks them Required; re-tighten them through the type designer once Documenta is connected.",
+		len(relaxed), strings.Join(relaxed, ", "))
 }
 
 // ── removing Plan 1's smoke configuration ───────────────────────────────────

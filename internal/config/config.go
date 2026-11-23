@@ -557,7 +557,7 @@ func Load() *Config {
 			ClientID:      getEnv("EO_DOCUMENTA_CLIENT_ID", ""),
 			ClientSecret:  getEnv("EO_DOCUMENTA_CLIENT_SECRET", ""),
 			WorkspaceName: getEnv("EO_DOCUMENTA_WORKSPACE_NAME", ""),
-			Enabled:       getEnvAsBool("EO_DOCUMENTA_ENABLED", false),
+			Enabled:       EODocumentaEnabled(),
 		},
 		ReadyToClose: ReadyToCloseConfig{
 			DefaultDurationOptions:     getEnvAsStringSlice("READY_TO_CLOSE_DURATION_OPTIONS", []string{"1 Day", "2 Days", "1 Week", "2 Weeks", "1 Month", "3 Months"}),
@@ -703,6 +703,19 @@ func getEnvAsInt(key string, defaultValue int) int {
 	}
 	return defaultValue
 }
+
+// EODocumentaEnabled reports whether the Executive Office's Documenta client
+// is configured, and is the ONE place EO_DOCUMENTA_ENABLED's name and its
+// default are written. Config.EODocumenta.Enabled is this value; it is
+// exported because the EO pilot seed's boot-time obligation report must say
+// which of the two deployments it is looking at
+// (database.eoLogFileFieldsAwaitingDocumenta), and a second reading of the
+// variable elsewhere could drift from this one.
+//
+// It reads the environment on every call, deliberately: nothing is cached at
+// init, so a boot report says what the running process was given and a test
+// may set the variable with t.Setenv.
+func EODocumentaEnabled() bool { return getEnvAsBool("EO_DOCUMENTA_ENABLED", false) }
 
 func getEnvAsBool(key string, defaultValue bool) bool {
 	if value, exists := os.LookupEnv(key); exists {
