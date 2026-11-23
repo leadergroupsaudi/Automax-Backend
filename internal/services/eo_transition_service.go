@@ -327,7 +327,15 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
-		// 5. the field changes the transition declares, validated against the
+		// 5. a close_parent action on this transition must have a parent to
+		// close. It runs AFTER the commit and nothing retries it, so this is
+		// the last moment at which the outcome can still be prevented rather
+		// than merely reported.
+		if err := eoCheckCloseParentHasAParent(ctx, r, fresh, transition); err != nil {
+			return err
+		}
+
+		// 6. the field changes the transition declares, validated against the
 		// TARGET state so that "required at closure" is asked of the state
 		// being entered.
 		before := eoFlattenStored(fresh)
@@ -359,7 +367,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
-		// 5a. the attachments the actor supplied are FILED on the record.
+		// 6a. the attachments the actor supplied are FILED on the record.
 		// After the field changes, so a transition that declares
 		// `attachments` as a field change of its own has already written
 		// what it writes and these are added to it; before the capabilities
@@ -368,7 +376,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
-		// 5b. the capabilities: their save-time checks over the record with the
+		// 6b. the capabilities: their save-time checks over the record with the
 		// field changes applied, then their transition hooks, which may write
 		// engine-owned values (the approval stamp). Both run before the derived
 		// step so a formula can read what they wrote, and an error from either
@@ -392,7 +400,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			}
 		}
 
-		// 6. the new state. A terminal state closes the record; leaving one
+		// 7. the new state. A terminal state closes the record; leaving one
 		// re-opens it, so closed_at is cleared rather than left stale.
 		fresh.StateID = &transition.ToStateID
 		if IsTerminal(toState) {
@@ -402,7 +410,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			fresh.ClosedAt = nil
 		}
 
-		// 7. the derived fields, over the values and the state written
+		// 8. the derived fields, over the values and the state written
 		// above. A transition field change is a declared dependency
 		// changing (spec §7.5), so a roll-up must not go stale at the exact
 		// moment the record moves. It runs AFTER the state and closed_at are
@@ -422,7 +430,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
-		// 8. the record and its journal entry are one write.
+		// 9. the record and its journal entry are one write.
 		if err := r.Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -449,7 +457,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
-		// 9. the SLA clock. The record has left its old state, so that state's
+		// 10. the SLA clock. The record has left its old state, so that state's
 		// escalation timers stop; the state it entered starts its own. Both go
 		// through the transaction's timer handle, so a transition that rolls
 		// back leaves neither a cancelled clock nor a stray one behind.
@@ -464,7 +472,7 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			}
 		}
 
-		// 10. capability timers. Each enabled capability re-declares its
+		// 11. capability timers. Each enabled capability re-declares its
 		// timers for the state the record has just entered. The old ones are
 		// cancelled FIRST: a capability may legitimately re-arm a timer for the
 		// state it is entering, and cancelling after scheduling would destroy
@@ -707,6 +715,86 @@ func eoCheckRequirements(transition *models.WorkflowTransition, input models.EOT
 		default:
 			return fmt.Errorf("transition %q requires %q, which the EO engine does not evaluate; configure it as a field requirement instead",
 				transition.Code, req.RequirementType)
+		}
+	}
+	return nil
+}
+
+// ── close_parent needs a parent, and the time to say so is BEFORE the move ──
+
+// ErrEOCloseParentHasNoParent is the refusal: the transition carries a
+// close_parent action and the record carries no link of the kind that action
+// names.
+//
+// THE OUTCOME IT REMOVES. close_parent runs AFTER the commit, and nothing
+// retries it. Decision Record, Outgoing Reply and Task take their own
+// reference sequences, so nothing anywhere requires them to have a parent
+// (docs/superpowers/eo-plan1-carry-forward.md, "Nothing refuses a parentless
+// Decision Record, Outgoing Reply or Task"). Compose the two and a clerk who
+// issues a Decision Record they never linked gets: the issue succeeds, the
+// record reaches its terminal state and looks finished, close_parent returns
+// "carries no link", and the Draft Decision Study it was meant to close stays
+// open FOR EVER. Nor can the executor's parent-side failure note stand in for
+// the retry here, because there is no parent record to write it on — the
+// engine does not know which study was meant. One log line is the whole trace.
+//
+// WHY REFUSE RATHER THAN REPORT. Everything else this transition does is
+// recoverable by hand; the open parent is the one thing nobody is looking at.
+// Refusing costs the clerk one correction with the remedy in the message —
+// link the record to its parent and issue it again — and the pilot's matrix
+// marks `parent_ticket` mandatory on every sub type, so a parentless child at
+// its closing transition is a record that should not exist. It is also the
+// only answer available before the commit: once the child is closed, every
+// cheaper option is a note on a record that already looks finished.
+//
+// WHAT IT DOES NOT DO. It does not require a parent of every record, only of
+// one about to run a transition that closes a parent, and it checks the link
+// the ACTION names rather than parent_record_id. The create-path rule that
+// would refuse a parentless child outright is still the carry-forward item it
+// was; this closes the composition, not the gap underneath it.
+var ErrEOCloseParentHasNoParent = errors.New("this transition closes the record's parent and the record has no parent to close")
+
+// eoCheckCloseParentHasAParent reads the transition's own close_parent
+// actions and refuses when the record carries no link of the kind one names.
+//
+// A config this cannot read is also a refusal. The action would fail after
+// the commit for exactly the same reason, and a transition that cannot run
+// its closing action must not pretend it did.
+func eoCheckCloseParentHasAParent(ctx context.Context, r repository.EORecordRepository, rec *models.EORecord, transition *models.WorkflowTransition) error {
+	var wanted []string
+	for i := range transition.Actions {
+		a := transition.Actions[i]
+		if !a.IsActive || a.ActionType != eoActionTypeCloseParent {
+			continue
+		}
+		var cfg eoCloseParentConfig
+		if err := json.Unmarshal([]byte(a.Config), &cfg); err != nil {
+			return fmt.Errorf("transition %q carries a close_parent action %q whose configuration cannot be read (%v), so it cannot close anything",
+				transition.Code, a.Name, err)
+		}
+		key := strings.TrimSpace(cfg.LinkType)
+		if key == "" {
+			return fmt.Errorf("transition %q carries a close_parent action %q that names no link type, so it cannot say which parent to close",
+				transition.Code, a.Name)
+		}
+		wanted = append(wanted, key)
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	links, err := r.LinksFrom(ctx, rec.ID)
+	if err != nil {
+		return fmt.Errorf("read the links of %s: %w", rec.Reference, err)
+	}
+	have := make(map[string]bool, len(links))
+	for _, l := range links {
+		have[l.LinkTypeKey] = true
+	}
+	for _, key := range wanted {
+		if !have[key] {
+			return fmt.Errorf("%w: %s carries no %q link. Link it to its parent and run this transition again; otherwise the parent would stay open with nothing left to close it",
+				ErrEOCloseParentHasNoParent, rec.Reference, key)
 		}
 	}
 	return nil
@@ -1032,7 +1120,7 @@ func (s *eoTransitionService) applyFieldChanges(
 	baseline := eoValidationBaseline(stored, eoFlattenStored(rec), input.Values)
 
 	// The attachments the actor supplied are filed immediately after this
-	// (step 5a), so requiredness must be asked of the record the transition
+	// (step 6a), so requiredness must be asked of the record the transition
 	// WILL leave behind. They arrive on input.Attachments rather than in
 	// input.Values, so without this a field required at the target state is
 	// reported missing to an actor who has just supplied it.

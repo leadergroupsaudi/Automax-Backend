@@ -262,7 +262,7 @@ func (e *eoActionExecutor) dispatch(ctx context.Context, action *models.Transiti
 		return e.executeFieldUpdate(ctx, action, rec, performedBy)
 	case "spawn_record":
 		return e.executeSpawnRecord(ctx, action, rec, transition, performedBy)
-	case "close_parent":
+	case eoActionTypeCloseParent:
 		return e.executeCloseParent(ctx, action, rec, transition, performedBy)
 	default:
 		return fmt.Errorf("unknown action type: %s", action.ActionType)
@@ -879,6 +879,11 @@ type eoCloseParentConfig struct {
 	// workflow.
 	Transition string `json:"transition"`
 }
+
+// eoActionTypeCloseParent is the action type string, shared with
+// eoCheckCloseParentHasAParent so the pre-commit refusal and the post-commit
+// dispatch can never disagree about which actions close a parent.
+const eoActionTypeCloseParent = "close_parent"
 
 // executeCloseParent is the client's "Closes the parent": a Decision Record
 // closes its Draft Decision Study (matrix:165) and an Outgoing Reply closes

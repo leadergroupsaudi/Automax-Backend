@@ -700,22 +700,44 @@ func TestEoCloseParentActionsNameASeededLinkTypeAndARealTransition(t *testing.T)
 // would report it. So this reads the executor's source and compares, the way
 // TestEoAnyTargetSentinelMatchesTheEngineConstant does for the "any" sentinel.
 //
+// THE CASE LABEL MAY BE THE LITERAL OR A CONSTANT BOUND TO IT. The engine
+// declares `const eoActionTypeCloseParent = "close_parent"` so its
+// post-commit dispatch and its pre-commit refusal cannot disagree about which
+// actions close a parent; a test that insisted on the literal would forbid
+// exactly that. Either form is accepted, and a constant is only accepted when
+// its VALUE is this string.
+//
 // Mutation: rename eoCloseParentActionType, or rename the case label in
-// services.eoActionExecutor.dispatch.
+// services.eoActionExecutor.dispatch, or change the engine constant's value.
 func TestEoCloseParentActionTypeMatchesTheEngine(t *testing.T) {
 	const src = "../services/eo_action_executor.go"
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		t.Fatalf("read %s: %v", src, err)
 	}
-	want := fmt.Sprintf("case %q:", eoCloseParentActionType)
-	if !strings.Contains(string(raw), want) {
-		t.Fatalf("%s has no %s in its dispatch switch: an action seeded under %q would be logged as an unknown action type and the transition would succeed with the parent left open",
-			src, want, eoCloseParentActionType)
+	text := string(raw)
+
+	// The literal, plus the name of any constant in that file bound to it.
+	labels := []string{fmt.Sprintf("%q", eoCloseParentActionType)}
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 4 && fields[0] == "const" && fields[2] == "=" && fields[3] == fmt.Sprintf("%q", eoCloseParentActionType) {
+			labels = append(labels, fields[1])
+		}
+	}
+	found := false
+	for _, label := range labels {
+		if strings.Contains(text, "case "+label+":") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s dispatches on none of %v in its switch: an action seeded under %q would be logged as an unknown action type and the transition would succeed with the parent left open",
+			src, labels, eoCloseParentActionType)
 	}
 	// And the config keys the executor decodes are the ones the seed writes.
 	for _, tag := range []string{`json:"link_type"`, `json:"transition"`} {
-		if !strings.Contains(string(raw), tag) {
+		if !strings.Contains(text, tag) {
 			t.Errorf("%s does not decode %s, which the seeded config carries", src, tag)
 		}
 	}

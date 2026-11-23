@@ -610,6 +610,74 @@ func TestEoPilotDirectiveArmsItsEscalationLadder(t *testing.T) {
 	}
 }
 
+// THE COMPOSITION THAT HAD NO OWNER: a parentless child running a transition
+// that closes a parent.
+//
+// Decision Record, Outgoing Reply and Task take their OWN reference sequences,
+// so nothing in the engine requires them to have a parent
+// (docs/superpowers/eo-plan1-carry-forward.md). Put that beside `close_parent`
+// — dispatched after the commit, never retried — and a clerk who issues a
+// Decision Record they never linked used to get: `issue` succeeds, the record
+// reaches its terminal state and LOOKS FINISHED, the action returns "carries
+// no link", and the Draft Decision Study stays open for ever. The parent-side
+// history note that stands in for the missing retry cannot help here, because
+// there is no parent record to write it on — the engine does not know which
+// study was meant. One log line was the whole trace.
+//
+// The transition is refused instead, before it commits, with the remedy in
+// the message. Both configured close_parent paths are covered: the Decision
+// Record's `issue` and the Outgoing Reply's `send`.
+//
+// Mutation: delete the eoCheckCloseParentHasAParent call from
+// eoTransitionService.Execute, or make it return nil for a missing link.
+func TestEoPilotAParentlessChildIsRefusedItsClosingTransition(t *testing.T) {
+	t.Run("a decision record with no draft study", func(t *testing.T) {
+		f := eoWfNewFixture(t)
+		decision := f.create(t, eoPilotDecisionTypeKey, nil, "", nil)
+
+		_, err := f.try(t, decision, "issue", models.EOTransitionInput{Comment: "issued"})
+		if err == nil {
+			t.Fatal("a decision record with no parent was issued; its close_parent action had nothing to close and the study it was meant to close stays open for ever, with one log line to say so")
+		}
+		if !errors.Is(err, ErrEOCloseParentHasNoParent) {
+			t.Fatalf("err = %v, want ErrEOCloseParentHasNoParent; the refusal must be the one that names this cause, so a caller can tell it from a requirement or a role refusal", err)
+		}
+		if !strings.Contains(err.Error(), eoPilotDecisionLinkKey) {
+			t.Errorf("err = %v, and it does not name the link the record is missing, so a clerk cannot act on it", err)
+		}
+		// AND THE CHILD DID NOT MOVE. A refusal that still closed the record
+		// would be the same outcome with a louder log.
+		stayed := f.reread(t, decision)
+		if stayed.ClosedAt != nil {
+			t.Error("the decision record closed although its transition was refused")
+		}
+		if stayed.StateID == nil || decision.StateID == nil || *stayed.StateID != *decision.StateID {
+			t.Errorf("the record left state %v for %v although its transition was refused", decision.StateID, stayed.StateID)
+		}
+	})
+
+	t.Run("an outgoing reply with no letter", func(t *testing.T) {
+		f := eoWfNewFixture(t)
+		reply := f.create(t, eoPilotOutgoingTypeKey, nil, "", nil)
+
+		// `approve` carries no close_parent action and must still run: the
+		// refusal is scoped to the transition that closes a parent, not to
+		// every transition of a parentless record.
+		reply = f.move(t, reply, "approve", models.EOTransitionInput{})
+
+		_, err := f.try(t, f.reread(t, reply), "send", models.EOTransitionInput{Comment: "sent"})
+		if err == nil {
+			t.Fatal("an outgoing reply with no incoming correspondence was sent; the letter it was meant to close stays open for ever")
+		}
+		if !errors.Is(err, ErrEOCloseParentHasNoParent) {
+			t.Fatalf("err = %v, want ErrEOCloseParentHasNoParent", err)
+		}
+		if f.reread(t, reply).ClosedAt != nil {
+			t.Error("the reply closed although its transition was refused")
+		}
+	})
+}
+
 // THE FAILURE THE RETRY GAP MAKES EXPENSIVE, AND WHAT STANDS IN FOR IT.
 // `close_parent` passes no `Values` (see services.closeParent's note on why),
 // and this same task made the Draft Decision Study's `he_decision`,
