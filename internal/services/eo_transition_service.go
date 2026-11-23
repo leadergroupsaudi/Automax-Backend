@@ -351,6 +351,15 @@ func (s *eoTransitionService) Execute(ctx context.Context, rec *models.EORecord,
 			return err
 		}
 
+		// 5a. the attachments the actor supplied are FILED on the record.
+		// After the field changes, so a transition that declares
+		// `attachments` as a field change of its own has already written
+		// what it writes and these are added to it; before the capabilities
+		// and the derived step, so both see the record's whole file.
+		if err := eoFileAttachments(fields, fresh, input.Attachments); err != nil {
+			return err
+		}
+
 		// 5b. the capabilities: their save-time checks over the record with the
 		// field changes applied, then their transition hooks, which may write
 		// engine-owned values (the approval stamp). Both run before the derived
@@ -674,17 +683,17 @@ func eoCheckRequirements(transition *models.WorkflowTransition, input models.EOT
 				return eoRequirementError(req, "a comment is required for this transition")
 			}
 		case "attachment":
-			// NOTE: attachments are checked for PRESENCE and then dropped.
-			// Nothing here stores them and no eo_record_attachments table
-			// exists: spec §7.12 puts all file handling in Documenta, and
-			// the attachments field itself lives in the values bag, so
-			// persisting them belongs with the Documenta integration (a
-			// later plan). Until then input.Attachments satisfies a
-			// requirement and goes no further — it is not an upload path.
-			if len(input.Attachments) == 0 {
+			// The ids are counted here and FILED by eoFileAttachments after
+			// the field changes are applied — this is the presence check, not
+			// the end of the road. Blank entries are not attachments: a list
+			// holding one empty string must not satisfy a mandatory
+			// requirement, so the count is over the ids that survive
+			// eoAttachmentIDs.
+			ids := eoAttachmentIDs(input.Attachments)
+			if len(ids) == 0 {
 				return eoRequirementError(req, "an attachment is required for this transition")
 			}
-			if (req.IsMultiple == nil || !*req.IsMultiple) && len(input.Attachments) > 1 {
+			if (req.IsMultiple == nil || !*req.IsMultiple) && len(ids) > 1 {
 				return errors.New("only one attachment is allowed for this transition")
 			}
 		default:
@@ -702,6 +711,139 @@ func eoRequirementError(req models.TransitionRequirement, fallback string) error
 		return errors.New(msg)
 	}
 	return errors.New(fallback)
+}
+
+// ── attachments ─────────────────────────────────────────────────────────────
+
+// eoAttachmentsFieldKey is the values-bag key every record type inherits for
+// its files: seed_eo_platform.go seeds it on the EO base type as a
+// models.EOKindMultiFile field, and seed_eo_pilot.go narrows it to required on
+// Incoming Correspondence. It is a bag key, not a column — it is absent from
+// eoEngineOwnedKeys and from eoRecordColumnWriters — so eoApplyValues routes
+// it into the jsonb exactly as it routes any other field.
+const eoAttachmentsFieldKey = "attachments"
+
+// eoAttachmentIDs drops the entries that are not ids at all: a blank or
+// whitespace-only string is "no attachment", by the same rule eoIsEmpty
+// applies to every other string value. Ids that are not blank are kept
+// VERBATIM — an id is Documenta's string, not ours to trim or normalise, and
+// one with spaces around it is refused by the shape check rather than quietly
+// repaired into a different id.
+func eoAttachmentIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// eoFileAttachments files the transition's attachments into the record's
+// attachments field (spec §7.12: all file and multi-file fields store
+// Documenta file IDs).
+//
+// Plan 1 left these ids checked for presence and DROPPED, which meant a
+// transition could demand a letter, refuse to run without one, and keep
+// nothing — the record passed its control and ended up with no file. They are
+// MERGED, not replaced: the field is the record's dossier, so a second
+// transition adds to it and an id already filed is not filed twice. Order is
+// preserved, oldest first, because that is the order the files arrived in.
+//
+// Three refusals, none of them silent:
+//
+//   - a record type with no attachments field has nowhere to put them. That
+//     is configuration, not input, so it returns a plain error (a 500 and a
+//     log) rather than a field map a client could act on: no form the client
+//     can fill would fix it.
+//   - a `file` field holds ONE id, so a second one is refused rather than
+//     overwriting the first.
+//   - an id that is not shaped like a Documenta file id is refused as a
+//     field error, the same shape check ValidateRecordValues applies to the
+//     same field on the create and update paths.
+func eoFileAttachments(fields []models.EOFieldDef, rec *models.EORecord, attachments []string) error {
+	ids := eoAttachmentIDs(attachments)
+	if len(ids) == 0 {
+		return nil
+	}
+
+	var def *models.EOFieldDef
+	for i := range fields {
+		if fields[i].Key == eoAttachmentsFieldKey {
+			def = &fields[i]
+			break
+		}
+	}
+	if def == nil {
+		return fmt.Errorf("record %s: %d attachment(s) were supplied but record type %s has no %q field to file them in; add the field to the type rather than letting the ids be dropped",
+			rec.Reference, len(ids), rec.RecordTypeID, eoAttachmentsFieldKey)
+	}
+	if def.Kind != models.EOKindFile && def.Kind != models.EOKindMultiFile {
+		return fmt.Errorf("record %s: field %q is of kind %q, which does not hold Documenta file ids; attachments can only be filed in a %q or %q field",
+			rec.Reference, eoAttachmentsFieldKey, def.Kind, models.EOKindFile, models.EOKindMultiFile)
+	}
+
+	name := def.Label
+	if name == "" {
+		name = def.Key
+	}
+	for _, id := range ids {
+		if !eoIsDocumentaFileID(id) {
+			return eoValidationError(map[string]string{eoAttachmentsFieldKey: name + " must be a Documenta file id"})
+		}
+	}
+
+	// What the record already holds is kept VERBATIM, whatever it is. A
+	// record created before the shape check may hold a value that is not an
+	// id at all, and filing a new attachment is not the moment to delete it:
+	// the merge adds, and nothing here removes.
+	merged := eoStoredAttachmentValues(rec)
+	seen := make(map[string]bool, len(merged)+len(ids))
+	for _, v := range merged {
+		if s, ok := v.(string); ok {
+			seen[s] = true
+		}
+	}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		merged = append(merged, id)
+	}
+
+	var value any = merged
+	if def.Kind == models.EOKindFile {
+		if len(merged) > 1 {
+			return eoValidationError(map[string]string{eoAttachmentsFieldKey: name + " holds one file, and this record already has one"})
+		}
+		value = merged[0]
+	}
+	return eoValidationError(eoApplyValues(rec, map[string]any{eoAttachmentsFieldKey: value}))
+}
+
+// eoStoredAttachmentValues reads what the record's attachments field already
+// holds, as a list: a `multi_file` field's list, a `file` field's single id,
+// or — for a record saved before the shape check existed — whatever else is
+// there, kept as one entry rather than discarded. An empty or absent value is
+// no entries.
+func eoStoredAttachmentValues(rec *models.EORecord) []any {
+	raw, ok := eoDecodeValues(rec.Values)[eoAttachmentsFieldKey]
+	if !ok || eoIsEmpty(raw) {
+		return nil
+	}
+	if list, ok := raw.([]any); ok {
+		out := make([]any, 0, len(list))
+		for _, item := range list {
+			if eoIsEmpty(item) {
+				continue
+			}
+			out = append(out, item)
+		}
+		return out
+	}
+	return []any{raw}
 }
 
 // ── blocking children ───────────────────────────────────────────────────────

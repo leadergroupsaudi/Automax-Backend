@@ -3,12 +3,15 @@ package services
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/services/eoformula"
+	"github.com/automax/backend/internal/storage"
 	"github.com/google/uuid"
 )
 
@@ -176,6 +179,20 @@ func ValidateRecordValues(
 			}
 		}
 
+		// Per-kind shape, for the two kinds spec §7.12 pins to Documenta.
+		//
+		// Only the SUBMITTED value is checked, never the stored one: an edit
+		// that leaves a file field alone must not be refused because of what
+		// an earlier save — one made before this check existed — put there.
+		// A client that ECHOES such a value back does get the error, which is
+		// the honest answer: it is asking for that value to be written again.
+		if has {
+			if msg := eoFileValueError(f.Kind, name, submitted); msg != "" {
+				errs[f.Key] = msg
+				continue
+			}
+		}
+
 		effective := stored[f.Key]
 		if has {
 			effective = submitted
@@ -221,6 +238,21 @@ func ValidateRecordValues(
 			}
 			ok, err := eval.EvalBool(f.RequiredRule, env)
 			if err != nil {
+				// An unresolved reference is not a failure of the machinery:
+				// it means the rule asked about a field nobody supplied and
+				// the record does not hold, so the condition it tests CANNOT
+				// be met and the field is not required. Returning it made the
+				// handler answer 500 to an ordinary empty create — measured
+				// on three of the pilot's four conditional rules, whose
+				// subject fields (direction_pattern, directive_origin,
+				// recommendation) are values-bag keys absent from a blank
+				// form. A genuinely broken rule — a syntax error, a function
+				// formulas do not have, a result that is not a boolean —
+				// still returns, because that is configuration to fix rather
+				// than a value to supply.
+				if eoRequiredRuleUnmet(err) {
+					continue
+				}
 				return nil, fmt.Errorf("validate record values: field %q required_rule: %w", f.Key, err)
 			}
 			required = ok
@@ -230,6 +262,127 @@ func ValidateRecordValues(
 		}
 	}
 	return errs, nil
+}
+
+// eoRequiredRuleUnmet reports whether an EvalBool failure is ONLY an
+// unresolved reference, and therefore a condition that cannot be met rather
+// than a rule that is broken.
+//
+// It is shaped on eoClassifyDeriveError (eo_record_service.go), which splits
+// the same error for derived fields into "waiting on data" and "broken
+// configuration". The joined case is walked arm by arm on purpose: errors.Is
+// alone reports true for a join that holds one unresolved reference beside a
+// real failure, and that join is a broken rule.
+func eoRequiredRuleUnmet(err error) bool {
+	if err == nil {
+		return false
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		arms := joined.Unwrap()
+		if len(arms) == 0 {
+			return false
+		}
+		for _, e := range arms {
+			if !eoRequiredRuleUnmet(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, eoformula.ErrUnresolvedReference)
+}
+
+// ── file and multi_file carry Documenta ids (spec §7.12) ────────────────────
+
+// eoFileValueError validates a submitted value against the two field kinds
+// that hold Documenta file ids, and returns the message for the field error
+// map, or "" when the value is acceptable or the kind is not a file kind.
+//
+// An EMPTY value is acceptable here whatever the kind: whether a field may be
+// empty is the requiredness question, decided a few lines below this call,
+// and answering it twice would report "is required" as a shape error.
+//
+// `file` holds ONE id and `multi_file` a LIST of them. Neither stands in for
+// the other: a one-element list in a `file` field, or a bare id in a
+// `multi_file` field, is refused rather than coerced, so the value a register
+// reads back has the shape its field definition promises.
+func eoFileValueError(kind, name string, v any) string {
+	switch kind {
+	case models.EOKindFile:
+		if eoIsEmpty(v) {
+			return ""
+		}
+		s, ok := v.(string)
+		if !ok || !eoIsDocumentaFileID(s) {
+			return fmt.Sprintf("%s must be a Documenta file id", name)
+		}
+	case models.EOKindMultiFile:
+		if eoIsEmpty(v) {
+			return ""
+		}
+		list, ok := eoValueList(v)
+		if !ok {
+			return fmt.Sprintf("%s must be a list of Documenta file ids", name)
+		}
+		for _, item := range list {
+			s, ok := item.(string)
+			if !ok || !eoIsDocumentaFileID(s) {
+				return fmt.Sprintf("%s must be a list of Documenta file ids", name)
+			}
+		}
+	}
+	return ""
+}
+
+// eoValueList normalises the two ways a list reaches this function: []any, as
+// a JSON body decodes it, and a typed slice, as a Go caller writes it.
+func eoValueList(v any) ([]any, bool) {
+	if list, ok := v.([]any); ok {
+		return list, true
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil, false
+	}
+	out := make([]any, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		out[i] = rv.Index(i).Interface()
+	}
+	return out, true
+}
+
+// eoIsDocumentaFileID reports whether s has the shape of a Documenta file id.
+//
+// It is a SHAPE check and nothing more: it never asks Documenta whether the
+// file exists. The pilot's default deployment runs with EO Documenta DISABLED
+// (EO_DOCUMENTA_ENABLED=false), where no Documenta client exists at all, so a
+// check that called out would accept a form on one deployment and refuse it on
+// another — and would turn saving a record into an upstream round trip per
+// attachment. Whether an id still resolves is a question for the moment the
+// file is opened, not for the moment it is referenced.
+//
+// Two shapes are accepted, and they are the only two a storage.DocumentaClient
+// in this repository hands out:
+//
+//   - a canonical 36-character uuid, which is what the HTTP client reports as
+//     DmsFile.UUID and what UploadFile returns;
+//   - storage.StubFileIDPrefix followed by one, which is what
+//     StubDocumentaClient returns when Documenta is disabled, and therefore
+//     what such a deployment genuinely holds.
+//
+// The 36-character check is deliberate: uuid.Parse also accepts the
+// unhyphenated, braced and urn: spellings, and none of those is the string
+// Documenta gave out. Accepting them would mean the register stores an id in a
+// spelling Documenta never used, and a later equality check against the
+// upstream one would fail.
+func eoIsDocumentaFileID(s string) bool {
+	id := strings.TrimPrefix(s, storage.StubFileIDPrefix)
+	if len(id) != 36 {
+		return false
+	}
+	_, err := uuid.Parse(id)
+	return err == nil
 }
 
 func eoIsEmpty(v any) bool {

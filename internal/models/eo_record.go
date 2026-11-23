@@ -128,12 +128,24 @@ type EORecordUpdateRequest struct {
 // the field rules.
 type EOTransitionInput struct {
 	Comment string `json:"comment"`
-	// Attachments satisfies an "attachment" transition requirement and is NOT
-	// stored: spec §7.12 puts file handling in Documenta and the attachments
-	// field lives in the values bag, so persistence belongs with that
-	// integration. Until it lands, these ids are checked for presence and
-	// dropped.
-	Attachments []uuid.UUID    `json:"attachments"`
+	// Attachments are Documenta FILE IDS, and they are STORED: the engine
+	// files them into the record's `attachments` values key — the multi_file
+	// field every type inherits (§7.12) — after the transition's field
+	// changes are applied, so a transition that demands a letter leaves the
+	// letter on the record instead of discarding it.
+	//
+	// The type is []string, not []uuid.UUID, because a Documenta id is an
+	// OPAQUE STRING. storage.DocumentaClient takes and returns file ids as
+	// strings everywhere, and StubDocumentaClient — what a deployment with
+	// DOCUMENTA_ENABLED=false runs — returns storage.StubFileIDPrefix + a
+	// uuid, which uuid.Parse rejects outright. Parsing an id into a
+	// uuid.UUID would therefore refuse ids Documenta itself handed out, and
+	// re-rendering the parsed value would normalise an id the engine does
+	// not own. The SHAPE of an id is checked by services.ValidateRecordValues
+	// (eo_fields.go), which never calls Documenta: EO Documenta is disabled
+	// in the pilot's default deployment, and validation must not depend on
+	// that switch.
+	Attachments []string       `json:"attachments"`
 	Values      map[string]any `json:"values"`
 }
 

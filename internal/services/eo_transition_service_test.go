@@ -380,6 +380,10 @@ func eoNewTxFixture(t *testing.T) *eoTxFixture {
 		eoTxField("he_reason", models.EOKindLongText, models.EORequiredNever, f.recordType.ID),
 		eoTxField("chair", models.EOKindUser, models.EORequiredNever, f.recordType.ID),
 		eoTxField("members", models.EOKindMultiUser, models.EORequiredNever, f.recordType.ID),
+		// Every type inherits `attachments` from the EO base type
+		// (seed_eo_platform.go:303), and it is where a transition's
+		// attachments are filed.
+		eoTxField("attachments", models.EOKindMultiFile, models.EORequiredNever, f.recordType.ID),
 		eoTxClosureNote(f.recordType.ID, f.closed.ID),
 	}
 
@@ -759,7 +763,7 @@ func TestExecuteEnforcesRequirements(t *testing.T) {
 		if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err == nil {
 			t.Fatal("a transition requiring an attachment ran without one")
 		}
-		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []uuid.UUID{uuid.New()}}); err != nil {
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{uuid.NewString()}}); err != nil {
 			t.Fatalf("one attachment was supplied and still refused: %v", err)
 		}
 	})
@@ -769,7 +773,7 @@ func TestExecuteEnforcesRequirements(t *testing.T) {
 		f.transition("raise").Requirements = []models.TransitionRequirement{
 			{RequirementType: "attachment", IsMandatory: eoTxMandatory(true)},
 		}
-		two := []uuid.UUID{uuid.New(), uuid.New()}
+		two := []string{uuid.NewString(), uuid.NewString()}
 		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: two}); err == nil {
 			t.Fatal("two attachments satisfied a single-attachment requirement")
 		}
@@ -807,7 +811,7 @@ func TestExecuteEnforcesRequirements(t *testing.T) {
 				f.transition("raise").Requirements = []models.TransitionRequirement{
 					{RequirementType: kind, IsMandatory: eoTxMandatory(true)},
 				}
-				if _, err := f.run("raise", f.actor, models.EOTransitionInput{Comment: "x", Attachments: []uuid.UUID{uuid.New()}}); err == nil {
+				if _, err := f.run("raise", f.actor, models.EOTransitionInput{Comment: "x", Attachments: []string{uuid.NewString()}}); err == nil {
 					t.Fatalf("a mandatory %q requirement passed although the EO engine never evaluates it", kind)
 				}
 			})
@@ -1835,3 +1839,162 @@ type eoBridgeFailingTimers struct {
 }
 
 func (f *eoBridgeFailingTimers) Schedule(context.Context, *models.EOTimer) error { return f.err }
+
+// ── transition attachments are filed, not dropped ───────────────────────────
+
+// eoTxAttachments decodes the record's attachments values key as a list of
+// ids, so a test reads what was actually persisted rather than what was
+// passed in.
+func eoTxAttachments(t *testing.T, rec models.EORecord) []string {
+	t.Helper()
+	bag := map[string]any{}
+	if len(rec.Values) > 0 {
+		if err := json.Unmarshal(rec.Values, &bag); err != nil {
+			t.Fatalf("decode values: %v", err)
+		}
+	}
+	raw, ok := bag["attachments"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("attachments = %#v, want a list", raw)
+	}
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("attachment %#v is not an id", v)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func TestTransitionAttachmentsArePersisted(t *testing.T) {
+	a, b := uuid.NewString(), uuid.NewString()
+
+	t.Run("the ids reach the record", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a, b}}); err != nil {
+			t.Fatalf("transition refused: %v", err)
+		}
+		got := eoTxAttachments(t, f.records.updated[len(f.records.updated)-1])
+		if strings.Join(got, ",") != a+","+b {
+			t.Fatalf("attachments = %v, want [%s %s] filed in the record, not dropped", got, a, b)
+		}
+	})
+
+	t.Run("the history says so", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("transition refused: %v", err)
+		}
+		h := f.records.history[len(f.records.history)-1]
+		if !strings.Contains(string(h.NewValues), a) {
+			t.Fatalf("history new_values = %s, want the attachment id", h.NewValues)
+		}
+	})
+
+	t.Run("a second transition adds to the file rather than replacing it", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("first transition refused: %v", err)
+		}
+		// The record is now in escalated; move it back with the second id.
+		f.addTransition(&models.WorkflowTransition{
+			Code: "settle", Name: "Settle", FromStateID: f.escalated.ID, ToStateID: f.review.ID, IsActive: true,
+		})
+		f.rec = f.records.stored[f.rec.ID]
+		if _, err := f.run("settle", f.actor, models.EOTransitionInput{Attachments: []string{a, b}}); err != nil {
+			t.Fatalf("second transition refused: %v", err)
+		}
+		got := eoTxAttachments(t, f.records.updated[len(f.records.updated)-1])
+		if strings.Join(got, ",") != a+","+b {
+			t.Fatalf("attachments = %v, want [%s %s]: the first id kept and the second added once", got, a, b)
+		}
+	})
+
+	t.Run("a value that is not a Documenta id is refused", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		_, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{"not-a-documenta-id-at-all"}})
+		if err == nil {
+			t.Fatal("a transition filed an attachment that is not a Documenta file id")
+		}
+		var invalid *EOValidationError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("err = %v (%T), want a validation error so the handler answers 400", err, err)
+		}
+		if len(f.records.updated) != 0 {
+			t.Fatalf("the record was written anyway: %v", f.records.updated)
+		}
+	})
+
+	t.Run("nowhere to file them is refused, not dropped", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		defs := f.types.defs[:0:0]
+		for _, d := range f.types.defs {
+			if d.Key != "attachments" {
+				defs = append(defs, d)
+			}
+		}
+		f.types.defs = defs
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err == nil {
+			t.Fatal("a record type with no attachments field accepted attachments and dropped them")
+		}
+	})
+
+	t.Run("a single file field takes one and refuses a second", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		for i := range f.types.defs {
+			if f.types.defs[i].Key == "attachments" {
+				f.types.defs[i].Kind = models.EOKindFile
+			}
+		}
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("one file was refused: %v", err)
+		}
+		got := f.records.updated[len(f.records.updated)-1]
+		bag := map[string]any{}
+		if err := json.Unmarshal(got.Values, &bag); err != nil {
+			t.Fatalf("decode values: %v", err)
+		}
+		if bag["attachments"] != a {
+			t.Fatalf("attachments = %#v, want the single id %s", bag["attachments"], a)
+		}
+		f.addTransition(&models.WorkflowTransition{
+			Code: "settle", Name: "Settle", FromStateID: f.escalated.ID, ToStateID: f.review.ID, IsActive: true,
+		})
+		f.rec = f.records.stored[f.rec.ID]
+		if _, err := f.run("settle", f.actor, models.EOTransitionInput{Attachments: []string{b}}); err == nil {
+			t.Fatal("a second file overwrote the one a file field holds")
+		}
+	})
+
+	t.Run("a value stored before the shape check is not deleted", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		f.setValues(t, map[string]any{"attachments": []any{"not-a-documenta-id-at-all", float64(12345)}})
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{Attachments: []string{a}}); err != nil {
+			t.Fatalf("transition refused: %v", err)
+		}
+		bag := map[string]any{}
+		if err := json.Unmarshal(f.records.updated[len(f.records.updated)-1].Values, &bag); err != nil {
+			t.Fatalf("decode values: %v", err)
+		}
+		list, ok := bag["attachments"].([]any)
+		if !ok || len(list) != 3 || list[0] != "not-a-documenta-id-at-all" || list[2] != a {
+			t.Fatalf("attachments = %#v, want the two stored values kept and %s appended", bag["attachments"], a)
+		}
+	})
+
+	t.Run("no attachments writes nothing", func(t *testing.T) {
+		f := eoNewTxFixture(t)
+		if _, err := f.run("raise", f.actor, models.EOTransitionInput{}); err != nil {
+			t.Fatalf("transition refused: %v", err)
+		}
+		if got := eoTxAttachments(t, f.records.updated[len(f.records.updated)-1]); got != nil {
+			t.Fatalf("attachments = %v, want the key absent", got)
+		}
+	})
+}

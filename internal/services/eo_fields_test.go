@@ -11,6 +11,7 @@ import (
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/services/eoformula"
+	"github.com/automax/backend/internal/storage"
 	"github.com/google/uuid"
 )
 
@@ -436,3 +437,195 @@ func TestValidateTypedNilStoredValuesAreEmpty(t *testing.T) {
 // The real evaluator must satisfy the consumer interface. A compile error here
 // is the test.
 var _ FormulaEvaluator = (*eoformula.Evaluator)(nil)
+
+// ── file and multi_file carry Documenta ids (spec §7.12) ────────────────────
+
+// eoDocID is a canonical Documenta node id: what the HTTP client reports as
+// DmsFile.UUID and what UploadFile returns.
+func eoDocID() string { return uuid.NewString() }
+
+// eoStubDocID is what storage.StubDocumentaClient.UploadFile returns when
+// Documenta is disabled, which a deployment running the stub genuinely holds.
+func eoStubDocID() string { return storage.StubFileIDPrefix + uuid.NewString() }
+
+func TestFileFieldsRejectANonDocumentaValue(t *testing.T) {
+	fields := []models.EOFieldDef{
+		{Key: "letter", Label: "Letter", Kind: models.EOKindFile},
+		{Key: "attachments", Label: "Attachments", Kind: models.EOKindMultiFile},
+	}
+	good, stub := eoDocID(), eoStubDocID()
+
+	tests := []struct {
+		name    string
+		values  map[string]any
+		wantErr []string // keys expected to carry a message
+	}{
+		// The live reproduction: POST /eo-records with these two values
+		// answered 201 and stored both verbatim — a bare string and an
+		// integer in a multi_file field.
+		{"the live repro", map[string]any{"attachments": []any{"not-a-documenta-id-at-all", 12345}}, []string{"attachments"}},
+		{"a bare word in a file field", map[string]any{"letter": "not-a-documenta-id-at-all"}, []string{"letter"}},
+		{"a number in a file field", map[string]any{"letter": 12345}, []string{"letter"}},
+		{"a list in a single file field", map[string]any{"letter": []any{good}}, []string{"letter"}},
+		{"a bare id where a set belongs", map[string]any{"attachments": good}, []string{"attachments"}},
+		{"a nested list", map[string]any{"attachments": []any{[]any{good}}}, []string{"attachments"}},
+		{"an id with spaces around it", map[string]any{"letter": " " + good + " "}, []string{"letter"}},
+		{"an unhyphenated uuid is not the id Documenta gave", map[string]any{"letter": strings.ReplaceAll(good, "-", "")}, []string{"letter"}},
+		{"a urn-wrapped uuid is not the id Documenta gave", map[string]any{"letter": "urn:uuid:" + good}, []string{"letter"}},
+		{"both fields wrong are both reported", map[string]any{"letter": "x", "attachments": []any{"y"}}, []string{"attachments", "letter"}},
+
+		{"a Documenta id", map[string]any{"letter": good}, nil},
+		{"a stub id, so a disabled deployment behaves the same", map[string]any{"letter": stub}, nil},
+		{"an empty file field is a requiredness question, not a shape one", map[string]any{"letter": ""}, nil},
+		{"an explicit nil likewise", map[string]any{"letter": nil}, nil},
+		{"an empty set likewise", map[string]any{"attachments": []any{}}, nil},
+		{"a set of ids", map[string]any{"attachments": []any{good, stub}}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := eoValidate(t, fields, nil, tc.values, nil, nil, nil)
+			var got []string
+			for k := range errs {
+				got = append(got, k)
+			}
+			sort.Strings(got)
+			if strings.Join(got, ",") != strings.Join(tc.wantErr, ",") {
+				t.Fatalf("errs = %v, want messages on %v", errs, tc.wantErr)
+			}
+		})
+	}
+
+	t.Run("a stored value is not re-validated", func(t *testing.T) {
+		// Only what is SUBMITTED is checked: a record created before this
+		// validation existed must still be loadable and editable.
+		stored := map[string]any{"attachments": []any{"not-a-documenta-id-at-all"}}
+		if errs := eoValidate(t, fields, stored, map[string]any{"letter": good}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+	})
+
+	t.Run("no Documenta call is made either way", func(t *testing.T) {
+		// The shape check takes no client and cannot reach one: EO Documenta
+		// is disabled in the pilot's default deployment, and a check that
+		// asked Documenta would pass there and fail here, or the reverse.
+		if errs := eoValidate(t, fields, nil, map[string]any{"letter": eoDocID()}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v: a well-formed id that no Documenta holds must still pass", errs)
+		}
+	})
+}
+
+func TestMultiFileAcceptsASet(t *testing.T) {
+	fields := []models.EOFieldDef{{Key: "attachments", Label: "Attachments", Kind: models.EOKindMultiFile}}
+	a, b, c := eoDocID(), eoDocID(), eoStubDocID()
+
+	t.Run("several ids, as the body decodes them", func(t *testing.T) {
+		if errs := eoValidate(t, fields, nil, map[string]any{"attachments": []any{a, b, c}}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+	})
+	t.Run("several ids, as a Go caller passes them", func(t *testing.T) {
+		if errs := eoValidate(t, fields, nil, map[string]any{"attachments": []string{a, b, c}}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+	})
+	t.Run("one bad member spoils the set", func(t *testing.T) {
+		errs := eoValidate(t, fields, nil, map[string]any{"attachments": []any{a, "not-a-documenta-id-at-all", b}}, nil, nil, nil)
+		if len(errs) != 1 {
+			t.Fatalf("errs = %v, want exactly one message", errs)
+		}
+	})
+	t.Run("a set satisfies requiredness", func(t *testing.T) {
+		req := []models.EOFieldDef{{Key: "attachments", Label: "Attachments", Kind: models.EOKindMultiFile, RequiredMode: models.EORequiredAlways}}
+		if errs := eoValidate(t, req, nil, map[string]any{"attachments": []any{a}}, nil, nil, nil); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+		if errs := eoValidate(t, req, nil, map[string]any{"attachments": []any{}}, nil, nil, nil); len(errs) != 1 {
+			t.Fatalf("errs = %v, want attachments required", errs)
+		}
+	})
+}
+
+// ── a required_rule that names a field nobody supplied ──────────────────────
+
+// An unresolved reference in a required_rule means the referenced field was
+// not supplied, so the condition is UNMET and the field is not required.
+// Measured before this: POST /eo-records with values:{} answered 500 for
+// three of the pilot's four conditional rules.
+func TestValidateConditionalUnresolvedReferenceIsNotRequired(t *testing.T) {
+	ev := eoformula.New(0)
+	// The three rules measured at 500, verbatim from the pilot seed.
+	for _, tc := range []struct{ field, rule string }{
+		{"coordinator", `direction_pattern == "refer_and_consolidate"`},
+		{"origin_record", `directive_origin == "incoming"`},
+		{"redraft_text", `recommendation == "redraft"`},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			f := []models.EOFieldDef{{Key: tc.field, Label: tc.field, RequiredMode: models.EORequiredConditional, RequiredRule: tc.rule}}
+			errs, err := ValidateRecordValues(f, nil, map[string]any{}, nil, nil, ev)
+			if err != nil {
+				t.Fatalf("err = %v, want none: an unresolved reference makes the handler answer 500 instead of a 400 field map", err)
+			}
+			if len(errs) != 0 {
+				t.Fatalf("errs = %v, want none: the condition cannot be met by a value nobody supplied", errs)
+			}
+		})
+	}
+
+	t.Run("the rule still decides once the reference resolves", func(t *testing.T) {
+		f := []models.EOFieldDef{{Key: "coordinator", Label: "Coordinating body", RequiredMode: models.EORequiredConditional,
+			RequiredRule: `direction_pattern == "refer_and_consolidate"`}}
+		if errs := eoValidate(t, f, nil, map[string]any{"direction_pattern": "refer_and_consolidate"}, nil, nil, ev); len(errs) != 1 {
+			t.Fatalf("errs = %v, want coordinator required", errs)
+		}
+		if errs := eoValidate(t, f, nil, map[string]any{"direction_pattern": "refer_out"}, nil, nil, ev); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+		// Stored counts as supplied: the reference resolves from the record.
+		if errs := eoValidate(t, f, map[string]any{"direction_pattern": "refer_and_consolidate"}, map[string]any{}, nil, nil, ev); len(errs) != 1 {
+			t.Fatalf("errs = %v, want coordinator required from the stored value", errs)
+		}
+	})
+
+	t.Run("every arm of a joined error unresolved is still unmet", func(t *testing.T) {
+		f := []models.EOFieldDef{{Key: "x", RequiredMode: models.EORequiredConditional, RequiredRule: "r"}}
+		joined := errors.Join(
+			fmt.Errorf("a: %w", eoformula.ErrUnresolvedReference),
+			fmt.Errorf("b: %w", eoformula.ErrUnresolvedReference),
+		)
+		if errs := eoValidate(t, f, nil, map[string]any{}, nil, nil, &eoStubEval{err: joined}); len(errs) != 0 {
+			t.Fatalf("errs = %v, want none", errs)
+		}
+	})
+}
+
+// A rule that is genuinely broken must STILL be a hard error: it is a
+// configuration defect, not a missing value, and silently treating it as
+// "not required" would make a misconfigured rule indistinguishable from a
+// correct one that happens not to fire.
+func TestValidateConditionalMalformedRuleIsMachineryError(t *testing.T) {
+	ev := eoformula.New(0)
+	for _, tc := range []struct{ name, rule string }{
+		{"a syntax error", `direction_pattern ==`},
+		{"a function formulas do not have", `sum(direction_pattern)`},
+		{"a rule that is not a condition", `1 + 1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := []models.EOFieldDef{{Key: "coordinator", RequiredMode: models.EORequiredConditional, RequiredRule: tc.rule}}
+			errs, err := ValidateRecordValues(f, nil, map[string]any{"direction_pattern": "x"}, nil, nil, ev)
+			if err == nil {
+				t.Fatalf("errs = %v, err = nil: a broken rule must not pass as an unmet condition", errs)
+			}
+			if errs != nil {
+				t.Fatalf("errs = %v, want nil on a machinery error", errs)
+			}
+		})
+	}
+
+	t.Run("an unresolved reference joined to a real failure is still a failure", func(t *testing.T) {
+		f := []models.EOFieldDef{{Key: "x", RequiredMode: models.EORequiredConditional, RequiredRule: "r"}}
+		joined := errors.Join(fmt.Errorf("a: %w", eoformula.ErrUnresolvedReference), errors.New("boom"))
+		if _, err := ValidateRecordValues(f, nil, map[string]any{}, nil, nil, &eoStubEval{err: joined}); err == nil {
+			t.Fatal("want error")
+		}
+	})
+}

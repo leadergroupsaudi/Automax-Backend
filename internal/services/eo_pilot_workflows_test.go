@@ -142,14 +142,7 @@ func (f *eoWfFixture) eoWfValues(t *testing.T, typeKey string) map[string]any {
 		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
 			continue
 		}
-		switch d.Key {
-		case "owning_body_id":
-			out[d.Key] = f.bodyID.String()
-		case "due_date":
-			out[d.Key] = time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339)
-		default:
-			out[d.Key] = "x"
-		}
+		out[d.Key] = eoPilotFieldValue(d, f.bodyID)
 	}
 	out["subject_ar"] = "اختبار"
 	return out
@@ -304,7 +297,7 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 			close:     "verify_and_close",
 			artefacts: []string{"evidence", "verified_by", "verified_on"},
 			supply: map[string]any{
-				"evidence":    []any{"evidence.pdf"},
+				"evidence":    []any{uuid.NewString()},
 				"verified_by": uuid.New().String(),
 				"verified_on": time.Now().Format(time.RFC3339),
 			},
@@ -319,7 +312,7 @@ func TestEoPilotClosureIsRefusedWithoutItsClosureArtefacts(t *testing.T) {
 			close:     "verify_and_close",
 			artefacts: []string{"evidence", "verified_by"},
 			supply: map[string]any{
-				"evidence":    []any{"proof.pdf"},
+				"evidence":    []any{uuid.NewString()},
 				"verified_by": map[string]any{"user_id": uuid.New().String(), "at": time.Now().Format(time.RFC3339)},
 			},
 		},
@@ -875,7 +868,7 @@ func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
 		task = f.move(t, task, "start", models.EOTransitionInput{})
 		f.move(t, f.reread(t, task), "verify_and_close", models.EOTransitionInput{
 			Comment: "verified",
-			Values:  map[string]any{"evidence": []any{"file-1"}, "verified_by": "officer-99"},
+			Values:  map[string]any{"evidence": []any{uuid.NewString()}, "verified_by": "officer-99"},
 		})
 		if _, err := f.try(t, f.reread(t, d), "close", models.EOTransitionInput{
 			Comment: "checked",

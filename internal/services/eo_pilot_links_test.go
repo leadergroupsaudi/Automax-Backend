@@ -285,17 +285,32 @@ func (f *eoPilotFixture) eoPilotValues(t *testing.T, typeKey string) map[string]
 		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
 			continue
 		}
-		switch d.Key {
-		case "owning_body_id":
-			out[d.Key] = f.bodyID.String()
-		case "due_date":
-			out[d.Key] = time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339)
-		default:
-			out[d.Key] = "x"
-		}
+		out[d.Key] = eoPilotFieldValue(d, f.bodyID)
 	}
 	out["subject_ar"] = "اختبار"
 	return out
+}
+
+// eoPilotFieldValue is a placeholder submission value of the right SHAPE for
+// one field definition, read from the seeded configuration.
+//
+// "x" satisfies a text field and nothing else. A `file` or `multi_file` field
+// holds a Documenta file id (spec §7.12) and a filename is not one, so these
+// stand in for the id an upload would have returned — which is the whole of
+// what the engine can check without calling Documenta.
+func eoPilotFieldValue(d models.EOFieldDef, bodyID uuid.UUID) any {
+	switch {
+	case d.Key == "owning_body_id":
+		return bodyID.String()
+	case d.Key == "due_date":
+		return time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339)
+	case d.Kind == models.EOKindFile:
+		return uuid.NewString()
+	case d.Kind == models.EOKindMultiFile:
+		return []any{uuid.NewString()}
+	default:
+		return "x"
+	}
 }
 
 // eoPilotCreate creates one record of typeKey, under parent when given.

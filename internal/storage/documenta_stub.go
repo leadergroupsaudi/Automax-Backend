@@ -10,6 +10,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// StubFileIDPrefix is what StubDocumentaClient.UploadFile puts in front of the
+// uuid it invents, so a stub file id is recognisable as one.
+//
+// It is exported because the id the stub produces is what a deployment running
+// it (DOCUMENTA_ENABLED=false) genuinely holds and submits, so a consumer that
+// checks the SHAPE of a Documenta file id — ValidateRecordValues for the EO
+// file kinds, spec §7.12 — has to accept it, and must not do so by repeating
+// the literal.
+const StubFileIDPrefix = "stub-file-"
+
 // StubDocumentaClient is a placeholder implementation that logs all calls
 // and returns mock data. Used when DOCUMENTA_ENABLED=false.
 type StubDocumentaClient struct{}
@@ -41,7 +51,7 @@ func (s *StubDocumentaClient) EnsureFolder(ctx context.Context, workspaceName st
 }
 
 func (s *StubDocumentaClient) UploadFile(ctx context.Context, folderID, fileName string, fileData io.Reader, fileSize int64, metadata map[string]string) (string, error) {
-	id := "stub-file-" + uuid.New().String()
+	id := StubFileIDPrefix + uuid.New().String()
 	log.Printf("[DOCUMENTA STUB] UploadFile: folder=%s, file=%s, size=%d → fileID=%s", folderID, fileName, fileSize, id)
 	return id, nil
 }

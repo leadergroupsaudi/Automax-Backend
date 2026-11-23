@@ -66,9 +66,11 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// declare it. It was marked engine-managed in Task A1 and that was wrong:
 	// it is absent from services.eoEngineOwnedKeys, from
 	// services.eoRecordColumnWriters and from services.eoFlattenStored, so
-	// eoApplyValues routes it into the bag exactly as it routes a user field,
-	// and services.EOTransitionInput.Attachments is a separate thing (its ids
-	// are checked for presence and dropped, never stored here). The
+	// eoApplyValues routes it into the bag exactly as it routes a user field.
+	// models.EOTransitionInput.Attachments is the same field reached another
+	// way: services.eoFileAttachments merges the ids a transition carries
+	// INTO this bag key (Task C3; until then they were checked for presence
+	// and dropped). The
 	// consequence of the old marking was concrete: the matrix marks
 	// `attachments` **Yes** on Incoming Correspondence and the seed could not
 	// say so, so the pilot would file a government letter with no letter
@@ -794,7 +796,7 @@ var eoRootConditionalDecisions = []eoConditionalDecision{
 	{eoDirectiveTypeKey, "corrective_action",
 		"5.2 — recorded alongside the delay reason.",
 		models.EORequiredConditional,
-		"Expressed as a rule over delay_reason, which is an eo_records COLUMN and so is present in the rule's environment on every save of every record, whether or not the client submitted it — the one conditional rule here that can never meet an unresolved reference. \"Alongside the delay reason\" means: once a delay has been recorded, the corrective action is not optional. The rule tests for a non-space character rather than a non-empty string, to match services.eoIsEmpty, which trims."},
+		"Expressed as a rule over delay_reason, which is an eo_records COLUMN and so is present in the rule's environment on every save of every record, whether or not the client submitted it — the one conditional rule here that can never meet an unresolved reference. The other three no longer need that property: Task C3 made services.ValidateRecordValues treat an unresolved reference in a required_rule as a condition that cannot be met, where it used to return a machinery error and answer 500 to an empty create. \"Alongside the delay reason\" means: once a delay has been recorded, the corrective action is not optional. The rule tests for a non-space character rather than a non-empty string, to match services.eoIsEmpty, which trims."},
 	{eoDraftStudyTypeKey, "redraft_text",
 		"3.2 — the Office's rewrite, with the differences shown.",
 		models.EORequiredConditional,
