@@ -3103,17 +3103,37 @@ func eoSameJSON(a, b []byte) (bool, error) {
 	return reflect.DeepEqual(av, bv), nil
 }
 
-// eoTypePermissionsPending is eoSeedPilotTypePermissions' gate: does every
-// concrete record type already carry spec §7.11's three codes?
+// eoTypePermissionsPending is eoSeedPilotTypePermissions' gate. It asks two
+// questions, and the second one is the one that was missing:
 //
-// ONE COUNT, whatever the number of types, because this is on the boot fast
-// path. The codes are built from the same eoTypePermissionActions the writer
-// uses, so the question and the answer cannot drift apart.
+//  1. does every concrete record type already carry spec §7.11's three codes?
+//  2. does any row still carry the PRE-A2 inert sentence?
+//
+// TWO COUNTS, whatever the number of types, because this is on the boot fast
+// path. The codes are built by models.EOTypePermissionCode — the same
+// function the writer, the route gate and the register's list filter use — so
+// the question and the answer cannot drift apart. Hand-spelling the format
+// here was harmless while the format was fixed, and silently catastrophic if
+// it ever changed: `pending` would compare old-format codes against a
+// new-format table, return true for ever, and run the seed transaction on
+// every boot.
+//
+// WHY THE SECOND QUESTION EXISTS. Task A2 replaced the seeded wording, which
+// used to tell an administrator the code "applies no control", with wording
+// that says it is enforced. On an already-seeded database this step is the
+// ONLY path that reaches the writer — seedEOPlatform returns early once
+// eo_base exists — so a gate that asked only about MISSING CODES left every
+// production database reading the old sentence for ever. A stale description
+// is not a missing code, and the first question cannot see it.
 //
 // It does not check the GRANTS. A missing code is what a newly added type
 // has, and the writer re-applies the grant for every code on every call, so
 // the code's absence is a sufficient trigger. A grant revoked by an
-// administrator is a deliberate act and must not be reinstated at boot.
+// administrator is a deliberate act and must not be reinstated at boot — and
+// for the same reason the stale check keys on the OLD SENTENCE rather than on
+// "the description differs from the computed one": an administrator may edit a
+// description through PUT /api/v1/admin/permissions/:id, and that edit is not
+// drift to be corrected.
 func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 	var concrete []models.EORecordType
 	if err := db.Where("is_abstract = ?", false).Find(&concrete).Error; err != nil {
@@ -3122,17 +3142,34 @@ func eoTypePermissionsPending(db *gorm.DB) (bool, error) {
 	if len(concrete) == 0 {
 		return false, nil
 	}
-	codes := make([]string, 0, len(concrete)*len(eoTypePermissionActions))
+	codes := make([]string, 0, len(concrete)*len(models.EOTypePermissionActions))
 	for _, t := range concrete {
-		for _, a := range eoTypePermissionActions {
-			codes = append(codes, fmt.Sprintf("eo:%s:%s", t.Key, a.action))
+		for _, a := range models.EOTypePermissionActions {
+			codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
 		}
 	}
 	var have int64
 	if err := db.Model(&models.Permission{}).Where("code IN ?", codes).Count(&have).Error; err != nil {
 		return false, fmt.Errorf("count the per-type permission codes: %w", err)
 	}
-	return have < int64(len(codes)), nil
+	if have < int64(len(codes)) {
+		return true, nil
+	}
+	// The stale rows are found by reading the two description columns of the
+	// rows the codes name. The sentences hold no LIKE metacharacter, so they
+	// are matched literally; the predicate itself is eoTypePermissionIsStale,
+	// which the writer also applies, so the step cannot open on a row the
+	// writer would then decline to rewrite.
+	var rows []models.Permission
+	if err := db.Where("code IN ?", codes).Find(&rows).Error; err != nil {
+		return false, fmt.Errorf("read the per-type permission descriptions: %w", err)
+	}
+	for _, p := range rows {
+		if eoTypePermissionIsStale(p) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // eoCapabilityBlob renders one type's entries as the list

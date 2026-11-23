@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -191,63 +192,153 @@ func TestEoPerTypePermissionDescriptionsSayTheyAreEnforced(t *testing.T) {
 	// strings.Contains(x, "") is true for every x, so an emptied constant
 	// would make every assertion below pass while the administrator read a
 	// description that says nothing. Checked first, and loudly.
-	if len(eoTypePermissionEnforcedEN) < 20 || len(eoTypePermissionEnforcedAR) < 20 {
+	if len(models.EOTypePermissionEnforcedEN) < 20 || len(models.EOTypePermissionEnforcedAR) < 20 {
 		t.Fatalf("the enforcement sentences are %d and %d characters; substring assertions against a near-empty needle prove nothing",
-			len(eoTypePermissionEnforcedEN), len(eoTypePermissionEnforcedAR))
+			len(models.EOTypePermissionEnforcedEN), len(models.EOTypePermissionEnforcedAR))
 	}
-	if !strings.Contains(strings.ToLower(eoTypePermissionEnforcedEN), "enforced") {
-		t.Errorf("the English sentence %q does not tell the administrator the code is enforced", eoTypePermissionEnforcedEN)
+	if !strings.Contains(strings.ToLower(models.EOTypePermissionEnforcedEN), "enforced") {
+		t.Errorf("the English sentence %q does not tell the administrator the code is enforced", models.EOTypePermissionEnforcedEN)
 	}
-	if strings.Contains(strings.ToLower(eoTypePermissionEnforcedEN), "not yet enforced") {
-		t.Errorf("the English sentence %q still says the code is inert", eoTypePermissionEnforcedEN)
+	if strings.Contains(strings.ToLower(models.EOTypePermissionEnforcedEN), "not yet enforced") {
+		t.Errorf("the English sentence %q still says the code is inert", models.EOTypePermissionEnforcedEN)
 	}
 	for _, p := range perms {
 		t.Run(p.Code, func(t *testing.T) {
-			if !strings.Contains(p.Description, eoTypePermissionEnforcedEN) {
-				t.Errorf("Description %q does not carry %q", p.Description, eoTypePermissionEnforcedEN)
+			if !strings.Contains(p.Description, models.EOTypePermissionEnforcedEN) {
+				t.Errorf("Description %q does not carry %q", p.Description, models.EOTypePermissionEnforcedEN)
 			}
-			if !strings.Contains(p.DescriptionAr, eoTypePermissionEnforcedAR) {
-				t.Errorf("DescriptionAr %q does not carry %q", p.DescriptionAr, eoTypePermissionEnforcedAR)
+			if !strings.Contains(p.DescriptionAr, models.EOTypePermissionEnforcedAR) {
+				t.Errorf("DescriptionAr %q does not carry %q", p.DescriptionAr, models.EOTypePermissionEnforcedAR)
 			}
 		})
 	}
 }
 
-// TestEoPerTypePermissionDescriptionsAreRefreshed covers the database that
-// already exists. eoSeedTypePermissions keys its existence check on Code and
-// never used to touch a row it found, so every database seeded before Task A2
-// would keep telling its administrator that the code applies no control while
-// the gate refused their users. The description is refreshed in place.
+// TestEoStaleInertDescriptionsAreRefreshedByTheRealSeed drives seedEOPilot,
+// NOT the writer.
 //
-// Mutation that makes it fail: drop the Updates branch and create only.
-func TestEoPerTypePermissionDescriptionsAreRefreshed(t *testing.T) {
+// The first attempt at this fix tested eoSeedTypePermissions directly. It
+// proved the function refreshes a stale row and could not see that nothing
+// ever called it: seedEOPlatform returns early once eo_base exists, and the
+// pilot step's gate asked only whether a CODE WAS MISSING — a stale
+// description is not a missing code. Every production database would have
+// kept reading "NOT YET ENFORCED: nothing in the platform consults this code"
+// while the gate refused their users. The gate is the thing under test, so
+// the test goes through it.
+//
+// Mutation that makes it fail: drop the stale check from
+// eoTypePermissionsPending and the step never opens.
+func TestEoStaleInertDescriptionsAreRefreshedByTheRealSeed(t *testing.T) {
 	db := eoPilotDB(t)
 	seedEOPilot(db)
 
-	var before models.Permission
-	if err := db.Where("code LIKE ?", "eo:eo\\_%").Order("code").First(&before).Error; err != nil {
+	var row models.Permission
+	if err := db.Where("code LIKE ?", "eo:eo\\_%").Order("code").First(&row).Error; err != nil {
 		t.Fatalf("read a per-type permission: %v", err)
 	}
-	stale := "Stale. NOT YET ENFORCED: nothing in the platform consults this code."
-	if err := db.Model(&models.Permission{}).Where("id = ?", before.ID).
-		Updates(map[string]any{"description": stale, "description_ar": stale}).Error; err != nil {
+	fresh := row.Description
+	freshAr := row.DescriptionAr
+
+	// Exactly what a database seeded before Task A2 holds.
+	stale := "View executive-office records of type Assignment (eo_assignment). " + eoTypePermissionLegacyInertEN
+	staleAr := "عرض سجلات المكتب التنفيذي من نوع تكليف. " + eoTypePermissionLegacyInertAR
+	if err := db.Model(&models.Permission{}).Where("id = ?", row.ID).
+		Updates(map[string]any{"description": stale, "description_ar": staleAr}).Error; err != nil {
 		t.Fatalf("write the stale description: %v", err)
 	}
 
-	if err := eoSeedTypePermissions(db); err != nil {
-		t.Fatalf("re-run the per-type permission seed: %v", err)
+	// The gate must OPEN for it. Without this the assertion below could pass
+	// because the seed ran for some other reason.
+	open, err := eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if !open {
+		t.Fatal("the convergent step is shut on a database carrying the pre-A2 inert sentence, so nothing will ever rewrite it")
 	}
 
+	seedEOPilot(db)
+
 	var after models.Permission
-	if err := db.First(&after, "id = ?", before.ID).Error; err != nil {
+	if err := db.First(&after, "id = ?", row.ID).Error; err != nil {
 		t.Fatalf("read it back: %v", err)
 	}
-	if after.Description != before.Description || after.DescriptionAr != before.DescriptionAr {
-		t.Errorf("description = %q / %q, want it refreshed to %q / %q", after.Description, after.DescriptionAr, before.Description, before.DescriptionAr)
+	if after.Description != fresh || after.DescriptionAr != freshAr {
+		t.Errorf("description = %q / %q, want it refreshed to %q / %q", after.Description, after.DescriptionAr, fresh, freshAr)
 	}
-	// Nothing else about the row may move: the grants hang off its id.
-	if after.ID != before.ID || after.Code != before.Code || after.Name != before.Name {
-		t.Errorf("the refresh rewrote more than the description: %+v, want id/code/name of %+v", after, before)
+	if after.ID != row.ID || after.Code != row.Code || after.Name != row.Name {
+		t.Errorf("the refresh rewrote more than the description: %+v", after)
+	}
+
+	// And it must SHUT again, or the seed transaction runs on every boot.
+	open, err = eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate again: %v", err)
+	}
+	if open {
+		t.Error("the gate is still open after the rewrite: the seed would run on every boot for ever")
+	}
+}
+
+// TestEoSeedDoesNotRevertAnAdministratorsDescriptionEdit is the other side of
+// the same narrowing. PUT /api/v1/admin/permissions/:id writes Description, so
+// an edited description is a deliberate administrative act, not drift. A
+// refresh keyed on "differs from the computed text" reverts every one of them
+// — Plan 2's fix wave shipped that regression once already — and the trigger
+// is ordinary: adding a twelfth concrete type, which is exactly what the
+// convergent step exists for.
+//
+// Mutation that makes it fail: refresh on any difference instead of on the
+// legacy sentence.
+func TestEoSeedDoesNotRevertAnAdministratorsDescriptionEdit(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	var row models.Permission
+	if err := db.Where("code LIKE ?", "eo:eo\\_%").Order("code").First(&row).Error; err != nil {
+		t.Fatalf("read a per-type permission: %v", err)
+	}
+	edited := "Only the Minister's office may read these. Ask the Secretary General before granting."
+	if err := db.Model(&models.Permission{}).Where("id = ?", row.ID).
+		Updates(map[string]any{"description": edited, "description_ar": edited}).Error; err != nil {
+		t.Fatalf("apply the administrator's edit: %v", err)
+	}
+
+	// A twelfth concrete type: the case the convergent step is for. It opens
+	// the gate through the MISSING-CODE question, so the writer runs over
+	// every row — including the edited one.
+	twelfth := models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", NameAr: "قرار مجلس", IsActive: true}
+	if err := db.Create(&twelfth).Error; err != nil {
+		t.Fatalf("create a twelfth type: %v", err)
+	}
+	open, err := eoTypePermissionsPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if !open {
+		t.Fatal("a type with no codes did not open the step, so the rest of this test proves nothing")
+	}
+
+	seedEOPilot(db)
+
+	var after models.Permission
+	if err := db.First(&after, "id = ?", row.ID).Error; err != nil {
+		t.Fatalf("read it back: %v", err)
+	}
+	if after.Description != edited || after.DescriptionAr != edited {
+		t.Errorf("the seed reverted an administrator's edit: %q / %q, want %q", after.Description, after.DescriptionAr, edited)
+	}
+	// The twelfth type's codes WERE written: the narrowing must not have
+	// turned the step into a no-op.
+	for _, a := range models.EOTypePermissionActions {
+		code := models.EOTypePermissionCode(twelfth.Key, a.Action)
+		var n int64
+		if err := db.Model(&models.Permission{}).Where("code = ?", code).Count(&n).Error; err != nil {
+			t.Fatalf("count %q: %v", code, err)
+		}
+		if n != 1 {
+			t.Errorf("%d rows for %q, want 1", n, code)
+		}
 	}
 }
 

@@ -907,16 +907,37 @@ out of it, and none of them lives anywhere else.
   the register — the route check answers 403 for one record and a route check
   cannot narrow a result set. The module-level `eo:*` codes stay; the per-type
   codes narrow them. The two inert sentences went in the same change, replaced
-  by `database.eoTypePermissionEnforcedEN` / `…AR`, and
-  `eoSeedTypePermissions` now REFRESHES the description of a row it finds
-  (and only the description), so a database seeded before A2 stops telling its
-  administrator that the box applies no control.
+  by `models.EOTypePermissionEnforcedEN` / `…AR`.
+
+  **How an existing database stops reading the old sentence, and the one case
+  where it does not.** `eoSeedTypePermissions` rewrites the description of a
+  row that still carries `database.eoTypePermissionLegacyInertEN` / `…AR` —
+  that text, and nothing else, because
+  `PUT /api/v1/admin/permissions/:id` makes an edited description a deliberate
+  administrative act that a convergent seed must not revert. Reaching that
+  writer on an already-seeded database needs the PILOT seed: `seedEOPlatform`
+  returns early once `eo_base` exists, so the `seed_type_permissions`
+  convergent step is the only live path, and its gate
+  (`eoTypePermissionsPending`) now opens for a stale sentence as well as for a
+  missing code. A database that has the platform seed but never runs the pilot
+  seed is therefore NOT refreshed — it also has no pilot types, so the rows in
+  question are the smoke types' the pilot would have deleted. Pinned by
+  `TestEoStaleInertDescriptionsAreRefreshedByTheRealSeed`, which drives
+  `seedEOPilot` rather than the writer.
+
+  **A record type created through the designer carries its own codes.**
+  `repository.eoRecordTypeRepository.Create` writes the three codes and grants
+  them to `models.EOTypePermissionRoleCodes` in the type's own transaction.
+  Before that fix a runtime-created type was invisible to every
+  non-super-admin until the next restart, which would have made spec §7.13's
+  "a configuration change rather than a release" false.
 
 - **The per-type permission sentences are implementer-written ARABIC, and this
   is the only place the sign-off round can find them.** The string is
-  `database.eoTypePermissionEnforcedAR` in
-  `internal/database/seed_eo_platform.go` (Task A2 replaced the inert sentence
-  it was opened for; the obligation is unchanged).
+  `models.EOTypePermissionEnforcedAR` in
+  `internal/models/eo_type_permission.go` (Task A2 replaced the inert sentence
+  it was opened for, and moved it beside the constructor both writers share;
+  the obligation is unchanged).
   Tasks A4 and A5 met the same situation — no `ar_untranslated` marker on the
   table — and left the ENGLISH standing rather than invent Arabic. A6 could not
   do that: the `DescriptionAr` the sentence is appended to is ALREADY Plan 1
