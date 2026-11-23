@@ -149,9 +149,25 @@ func eoComNewFixture(t *testing.T, withDocumenta bool) *eoComFixture {
 		bodies[spec.code] = &id
 	}
 
+	// The role is read WITH its permissions, because §7.11's per-type gate
+	// now reads them: the register restricts itself to the types the caller
+	// holds eo:<type_key>:view on. These are the codes the pilot seed granted
+	// this role a moment ago, so what the readers below hold is what a
+	// deployed Executive Office user holds — not a list this test invented.
 	var eoRole models.Role
-	if err := db.Where("code = ?", "executive_office").First(&eoRole).Error; err != nil {
+	if err := db.Preload("Permissions").Where("code = ?", "executive_office").First(&eoRole).Error; err != nil {
 		t.Fatalf("read the executive_office role: %v", err)
+	}
+	wantCode := models.EOTypePermissionCode(eoPilotReferralTypeKey, models.EOTypePermissionView)
+	granted := false
+	for _, p := range eoRole.Permissions {
+		if p.Code == wantCode {
+			granted = true
+			break
+		}
+	}
+	if !granted {
+		t.Fatalf("the executive_office role does not hold %q, so every reader below would see an empty register for a reason that has nothing to do with §7.11 row-level visibility", wantCode)
 	}
 	user := func(username, email string) *models.User {
 		u := &models.User{
@@ -328,6 +344,10 @@ func (f *eoComFixture) referralsVisibleTo(t *testing.T, reader *models.User, bod
 		SortDir:                "asc",
 		UserID:                 reader.ID,
 		VisibleToDepartmentIDs: bodies,
+		// What handlers.eoScopeFilter sets for this caller. These readers are
+		// NOT super admins, so §7.11's per-type clause applies to them: the
+		// codes come from the role the pilot seed granted.
+		PermissionCodes: reader.PermissionCodes(),
 	}
 	recs, _, err := f.repo.List(context.Background(), filter)
 	if err != nil {
