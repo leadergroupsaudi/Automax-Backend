@@ -1462,3 +1462,76 @@ func TestEoSeedLeavesEditedColumnsAloneWhenAReservedFieldReappears(t *testing.T)
 		t.Errorf("CLOBBERED on the way past a field removal: capabilities = %s, want the administrator's %s", got, editedBlob)
 	}
 }
+
+// TestEoDivergentCapabilityLineNamesARemedyThatWorks is the Plan 3 fix wave's
+// IMPORTANT 1.
+//
+// The line eoLogCapabilitiesAnAdministratorHasEdited prints on every boot
+// used to end "…or clear the column to '[]' to let the next boot write it."
+// That remedy cannot work and was verified not to: under Task A3's rule
+// eoCapabilitiesNeverConfigured needs the default column AND no
+// capabilities_configured:<key> marker, and the marker is backfilled for
+// every configured type on every boot. Clearing the column therefore leaves
+// the gate shut, converges nothing, and reprints the identical line — with
+// the stored value now '[]', which is worse than where the operator started.
+//
+// This asserts BOTH halves of the replacement: clearing the column alone
+// changes nothing and the line comes back, and deleting the eo_seed_steps
+// row the line NAMES does converge the type on the next boot.
+//
+// Mutation that makes it fail: put the old remedy back, or drop the marker
+// key from the message.
+func TestEoDivergentCapabilityLineNamesARemedyThatWorks(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+
+	seeded := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey)
+	if strings.TrimSpace(seeded) == "" || seeded == "[]" {
+		t.Fatalf("fixture error: %q carries no seeded capabilities (%q)", eoDraftStudyTypeKey, seeded)
+	}
+	var ty models.EORecordType
+	if err := db.Where("key = ?", eoDraftStudyTypeKey).First(&ty).Error; err != nil {
+		t.Fatalf("read %q: %v", eoDraftStudyTypeKey, err)
+	}
+
+	// The operator does exactly what the old line advised.
+	eoAdminEditsCapabilities(t, db, ty.ID, `[]`)
+
+	var buf bytes.Buffer
+	out, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	seedEOPilot(db)
+	log.SetOutput(out)
+	log.SetFlags(flags)
+
+	if got := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); got != "[]" {
+		t.Fatalf("fixture error: clearing the column converged after all (capabilities = %s); the message this test is about would then be unnecessary", got)
+	}
+	got := buf.String()
+	marker := eoCapabilitiesConfiguredMarker(eoDraftStudyTypeKey)
+	for _, want := range []string{
+		`DELETE the eo_seed_steps row whose key is "` + marker + `"`,
+		"Clearing the column to '[]' is NOT a remedy",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the boot log does not carry %q, so the only line an operator sees still advises a step that cannot work.\n--- output ---\n%s", want, got)
+		}
+	}
+
+	// The other half: the remedy the line names must actually converge the
+	// type. A message that named a different impossible step would pass the
+	// assertions above.
+	eoForgetCapabilityMarker(t, db, eoDraftStudyTypeKey)
+	open, err := eoCapabilitiesPending(db)
+	if err != nil {
+		t.Fatalf("ask the gate: %v", err)
+	}
+	if !open {
+		t.Fatal("the gate is still shut after deleting the marker row the message names: the remedy does not work either")
+	}
+	seedEOPilot(db)
+	if converged := eoCapabilitiesOf(t, db, eoDraftStudyTypeKey); !eoJSONEqual(t, converged, seeded) {
+		t.Errorf("after deleting the marker the next boot left capabilities = %s, want the configured %s", converged, seeded)
+	}
+}

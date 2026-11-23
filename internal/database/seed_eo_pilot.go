@@ -3753,8 +3753,8 @@ func eoLogCapabilitiesAnAdministratorHasEdited(db *gorm.DB) {
 		if same {
 			continue
 		}
-		log.Printf("EO pilot: record type %q carries a capability configuration that differs from the configuration this build seeds, and was LEFT ALONE: stored %s, configured %s. The seed converges a type that has never been configured and never overwrites one that has, because PUT /api/v1/admin/eo-record-types/:id writes this column and an edit through it is a deliberate act. A release that changes the seeded value does NOT reach this type: apply it through that route, or clear the column to '[]' to let the next boot write it.",
-			typeKey, ty.Capabilities, want)
+		log.Printf("EO pilot: record type %q carries a capability configuration that differs from the configuration this build seeds, and was LEFT ALONE: stored %s, configured %s. The seed converges a type that has never been configured and never overwrites one that has, because PUT /api/v1/admin/eo-record-types/:id writes this column and an edit through it is a deliberate act. A release that changes the seeded value does NOT reach this type. Apply it through that route; or, to let the next boot write the configured value, DELETE the eo_seed_steps row whose key is %q. Clearing the column to '[]' is NOT a remedy: \"never configured\" is the default column AND the absence of that marker row, and the marker is written for every configured type on every boot, so a cleared column converges nothing and this line reprints unchanged for ever.",
+			typeKey, ty.Capabilities, want, eoCapabilitiesConfiguredMarker(typeKey))
 	}
 }
 
