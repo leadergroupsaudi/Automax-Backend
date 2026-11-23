@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
@@ -222,6 +224,35 @@ func (r *eoRecordTypeRepository) List(ctx context.Context) ([]models.EORecordTyp
 	return out, nil
 }
 
+// ErrEOTypePermissionCodesExist marks a Create refused because spec §7.11's
+// per-type codes for that key are already in the database — which means the
+// key belonged to a record type that has since been retired (the unique index
+// on eo_record_types.key is partial on deleted_at IS NULL, so a key is
+// re-usable; a permission code is not scoped that way).
+//
+// IT IS A REFUSAL AND NOT A SKIP because of who holds those codes. The seed
+// grants them to admin and executive_office, but an administrator may have
+// granted eo:eo_objection:view to a Legal Review role so counsel could read
+// Objections. Retire the Objection type, re-use the key for Supplier
+// Objections a year later, and silently re-using the codes would hand Legal
+// Review — which nobody re-authorised — every Supplier Objection AND the
+// retained Ministerial ones, under a permission whose description still names
+// the old type. Refusing makes that an operator's deliberate act.
+//
+// WHAT HAPPENS TO A RETIRED TYPE'S CODES AND RECORDS is deliberately NOT
+// settled here: this repository neither deletes nor renames them, and the
+// register still matches a soft-deleted type's key, so a retired type's
+// retained records stay readable by whoever held its codes. Whether that is
+// right is a records-management question for the client, recorded as an open
+// product question in the task report.
+var ErrEOTypePermissionCodesExist = errors.New("per-type permission codes already exist for this record type key")
+
+// ErrEOTypePermissionRoleMissing marks a write refused because a role in
+// models.EOTypePermissionRoleCodes is not in the database. It is a sentinel so
+// the designer can tell an operator WHICH role to restore instead of showing
+// them a bare 500 and a dead screen.
+var ErrEOTypePermissionRoleMissing = errors.New("a role required to hold the per-type permission codes is missing")
+
 // Create writes the record type and, in the SAME TRANSACTION, spec §7.11's
 // three per-type permission codes, granted to the roles the seed grants them
 // to.
@@ -247,45 +278,80 @@ func (r *eoRecordTypeRepository) List(ctx context.Context) ([]models.EORecordTyp
 // AN ABSTRACT TYPE GETS NO CODES, matching the seed, which writes them for
 // concrete types only: an abstract type holds no records of its own, so a
 // code naming it would grant access to an empty set and silently widen the
-// moment a child type was added.
+// moment a child type was added. Update writes them if that type is later
+// made concrete — ValidateTypeEdit allows exactly that edit, and a Critical
+// fixed on one path only is not fixed.
 //
 // A MISSING ROLE FAILS THE WHOLE CREATE. The seed aborts for the same reason
 // — a code nobody holds is a type nobody can use — and in a transaction that
-// means no type row either. A loud 500 on a misconfigured deployment is the
-// honest outcome; the alternative is the invisible type this function exists
-// to prevent.
+// means no type row either. The alternative is the invisible type this
+// function exists to prevent.
 func (r *eoRecordTypeRepository) Create(ctx context.Context, t *models.EORecordType) error {
 	if t == nil {
 		return fmt.Errorf("create eo record type: nil record type")
 	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if !t.IsAbstract {
+			existing, err := eoExistingTypePermissionCodes(tx, *t)
+			if err != nil {
+				return err
+			}
+			if len(existing) > 0 {
+				return fmt.Errorf("create eo record type %q: %w: %s", t.Key, ErrEOTypePermissionCodesExist, strings.Join(existing, ", "))
+			}
+		}
 		if err := tx.Create(t).Error; err != nil {
 			return fmt.Errorf("create eo record type %q: %w", t.Key, err)
 		}
 		if t.IsAbstract {
 			return nil
 		}
-		return eoGrantTypePermissions(tx, *t)
+		return eoWriteTypePermissions(tx, *t)
 	})
 }
 
-// eoGrantTypePermissions writes the three codes for one concrete type and
-// grants them to models.EOTypePermissionRoleCodes.
-//
-// It skips a code that already exists rather than failing: a type key may be
-// re-created after a soft delete, and the codes of the deleted type are still
-// there under the same key — which is correct, because they name the key, and
-// whoever held them held them for this key. The grant is re-applied either
-// way; GORM's many-to-many Append writes the join rows ON CONFLICT DO
-// NOTHING, so it is safe to repeat and it does not disturb a grant an
-// administrator has since revoked on an EXISTING code (Append adds, it never
-// removes).
-func eoGrantTypePermissions(tx *gorm.DB, t models.EORecordType) error {
+// eoExistingTypePermissionCodes returns which of the type's three codes are
+// already in the database, in the order models.EOTypePermissionsFor writes
+// them. Soft-deleted permission rows are excluded by GORM, as everywhere else:
+// a code somebody deleted is not one anybody holds.
+func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string, error) {
 	want := models.EOTypePermissionsFor(t)
 	codes := make([]string, 0, len(want))
+	for _, p := range want {
+		codes = append(codes, p.Code)
+	}
+	var found []models.Permission
+	if err := tx.Where("code IN ?", codes).Find(&found).Error; err != nil {
+		return nil, fmt.Errorf("check the per-type permission codes of %q: %w", t.Key, err)
+	}
+	present := map[string]bool{}
+	for _, p := range found {
+		present[p.Code] = true
+	}
+	out := make([]string, 0, len(codes))
+	for _, code := range codes {
+		if present[code] {
+			out = append(out, code)
+		}
+	}
+	return out, nil
+}
+
+// eoWriteTypePermissions creates the codes of a concrete type that are not
+// there yet and grants THOSE to models.EOTypePermissionRoleCodes.
+//
+// IT GRANTS ONLY WHAT IT CREATED. Re-applying the grant for a code that
+// already existed would reinstate a grant an administrator deliberately
+// revoked — the rule the seed states for the same reason — and this runs on
+// every Update of a concrete type, not once at boot.
+//
+// A missing role fails, wrapping ErrEOTypePermissionRoleMissing: a code
+// nobody holds is a type nobody can use.
+func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType) error {
+	want := models.EOTypePermissionsFor(t)
+	created := make([]models.Permission, 0, len(want))
 	for i := range want {
 		perm := want[i]
-		codes = append(codes, perm.Code)
 		var existing int64
 		if err := tx.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
 			return fmt.Errorf("check permission %q: %w", perm.Code, err)
@@ -296,18 +362,17 @@ func eoGrantTypePermissions(tx *gorm.DB, t models.EORecordType) error {
 		if err := tx.Create(&perm).Error; err != nil {
 			return fmt.Errorf("create permission %q: %w", perm.Code, err)
 		}
+		created = append(created, perm)
 	}
-
-	var perms []models.Permission
-	if err := tx.Where("code IN ?", codes).Find(&perms).Error; err != nil {
-		return fmt.Errorf("read back the per-type permissions of %q: %w", t.Key, err)
+	if len(created) == 0 {
+		return nil
 	}
 	for _, roleCode := range models.EOTypePermissionRoleCodes {
 		var role models.Role
 		if err := tx.Where("code = ?", roleCode).First(&role).Error; err != nil {
-			return fmt.Errorf("role %q is required to hold the per-type permission codes of %q: %w", roleCode, t.Key, err)
+			return fmt.Errorf("%w: %q is required to hold the per-type permission codes of %q: %v", ErrEOTypePermissionRoleMissing, roleCode, t.Key, err)
 		}
-		if err := tx.Model(&role).Association("Permissions").Append(perms); err != nil {
+		if err := tx.Model(&role).Association("Permissions").Append(created); err != nil {
 			return fmt.Errorf("grant the per-type permissions of %q to role %q: %w", t.Key, roleCode, err)
 		}
 	}
@@ -317,14 +382,31 @@ func eoGrantTypePermissions(tx *gorm.DB, t models.EORecordType) error {
 // Update writes every column with Save rather than a field map: the caller has
 // already built the full after-state and had models.ValidateTypeEdit pass on
 // it, so a partial write would store something nothing validated.
+// It also writes any of spec §7.11's three codes that the type does not have.
+//
+// THE EDIT THAT NEEDS THIS is abstract → concrete, which
+// models.ValidateTypeEdit explicitly allows: a type created abstract has no
+// codes by design, and the moment it becomes concrete it can hold records that
+// nobody but a super admin could see. A key change is the same hazard by
+// another route — the codes name the KEY — and is covered by the same check.
+// A Critical fixed on the create path alone is not fixed.
+//
+// Nothing is granted when all three codes already exist, so an ordinary edit
+// of an ordinary type touches no permission row and cannot reinstate a grant
+// an administrator revoked.
 func (r *eoRecordTypeRepository) Update(ctx context.Context, t *models.EORecordType) error {
 	if t == nil {
 		return fmt.Errorf("update eo record type: nil record type")
 	}
-	if err := r.db.WithContext(ctx).Save(t).Error; err != nil {
-		return fmt.Errorf("update eo record type %q: %w", t.Key, err)
-	}
-	return nil
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(t).Error; err != nil {
+			return fmt.Errorf("update eo record type %q: %w", t.Key, err)
+		}
+		if t.IsAbstract {
+			return nil
+		}
+		return eoWriteTypePermissions(tx, *t)
+	})
 }
 
 func (r *eoRecordTypeRepository) Delete(ctx context.Context, id uuid.UUID) error {

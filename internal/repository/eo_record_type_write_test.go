@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/automax/backend/internal/models"
@@ -530,4 +532,134 @@ func TestEORecordTypeCreateRollsBackWhenARoleIsMissing(t *testing.T) {
 	if n != 0 {
 		t.Errorf("%d permission rows after a failed grant, want 0", n)
 	}
+}
+
+// TestEORecordTypeUpdateGrantsCodesWhenATypeBecomesConcrete closes the second
+// half of the Critical. Create writes no codes for an abstract type, by
+// design — and models.ValidateTypeEdit explicitly ALLOWS abstract → concrete.
+// So a type created abstract and then made concrete used to end up holding
+// records with no per-type code in existence: invisible to admin and
+// executive_office alike until the next boot. A Critical fixed on one path is
+// not fixed.
+func TestEORecordTypeUpdateGrantsCodesWhenATypeBecomesConcrete(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	records := NewEORecordRepository(db)
+	ctx := context.Background()
+
+	ty := &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsAbstract: true, IsActive: true}
+	if err := types.Create(ctx, ty); err != nil {
+		t.Fatalf("create the abstract type: %v", err)
+	}
+	if n := eoCountTypeCodes(t, db, ty.Key); n != 0 {
+		t.Fatalf("%d codes for a type created abstract, want 0: the premise of this test is gone", n)
+	}
+
+	ty.IsAbstract = false
+	if err := types.Update(ctx, ty); err != nil {
+		t.Fatalf("make it concrete: %v", err)
+	}
+	if n := eoCountTypeCodes(t, db, ty.Key); n != 3 {
+		t.Errorf("GAP: %d per-type codes after abstract->concrete, want 3", n)
+	}
+
+	rec := eoListRec(t, records, ty.ID, "EO-BR-2026-001", nil)
+	user := eoRoleUser(t, db, "executive_office")
+	f := models.EORecordFilter{UserID: user.ID, PermissionCodes: user.PermissionCodes()}
+	got, total, err := records.List(ctx, &f)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if refs := eoRefs(got); !reflect.DeepEqual(refs, []string{rec.Reference}) || total != 1 {
+		t.Errorf("an executive_office user sees %v total %d, want [%s]", refs, total, rec.Reference)
+	}
+}
+
+// TestEORecordTypeUpdateDoesNotReinstateARevokedGrant: Update runs on every
+// edit of every concrete type, so it must not re-apply a grant an
+// administrator deliberately revoked. It writes only codes that do not exist,
+// and grants only what it wrote.
+func TestEORecordTypeUpdateDoesNotReinstateARevokedGrant(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	ctx := context.Background()
+
+	ty := &models.EORecordType{ID: uuid.New(), Key: "eo_board_resolution", Name: "Board Resolution", IsActive: true}
+	if err := types.Create(ctx, ty); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	var role models.Role
+	if err := db.Where("code = ?", "executive_office").First(&role).Error; err != nil {
+		t.Fatalf("read the role: %v", err)
+	}
+	var perms []models.Permission
+	if err := db.Where("code LIKE ?", "eo:eo\\_board\\_resolution:%").Find(&perms).Error; err != nil {
+		t.Fatalf("read the codes: %v", err)
+	}
+	if err := db.Model(&role).Association("Permissions").Delete(perms); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	ty.Name = "Board Resolution (revised)"
+	if err := types.Update(ctx, ty); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	user := eoRoleUser(t, db, "executive_office")
+	if code := models.EOTypePermissionCode(ty.Key, models.EOTypePermissionView); user.HasPermission(code) {
+		t.Errorf("Update reinstated %q, which an administrator had revoked", code)
+	}
+}
+
+// TestEORecordTypeCreateRefusesAKeyWhosePermissionsExist is the SECURITY
+// finding. eo_record_types.key is unique only among LIVE rows, so a key is
+// re-usable after a type is retired — but its permission codes are not scoped
+// that way and are still held by whoever was granted them. Re-using the key
+// silently would hand the new type to a role nobody re-authorised, under a
+// permission whose description names the retired type.
+//
+// The refusal is the whole fix: an operator must decide, rather than the
+// designer deciding for them.
+func TestEORecordTypeCreateRefusesAKeyWhosePermissionsExist(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	ctx := context.Background()
+
+	retired := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Objection", IsActive: true}
+	if err := types.Create(ctx, retired); err != nil {
+		t.Fatalf("create the first type: %v", err)
+	}
+	if err := types.Delete(ctx, retired.ID); err != nil {
+		t.Fatalf("retire it: %v", err)
+	}
+
+	reused := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Supplier Objection", IsActive: true}
+	err := types.Create(ctx, reused)
+	if !errors.Is(err, ErrEOTypePermissionCodesExist) {
+		t.Fatalf("Create = %v, want ErrEOTypePermissionCodesExist: the new type would inherit the retired type's grants", err)
+	}
+	if !strings.Contains(err.Error(), models.EOTypePermissionCode("eo_objection", models.EOTypePermissionView)) {
+		t.Errorf("the refusal does not name the codes in the way: %v", err)
+	}
+	var live int64
+	if err := db.Model(&models.EORecordType{}).Where("key = ?", "eo_objection").Count(&live).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if live != 0 {
+		t.Errorf("%d live types after a refused create, want 0: the transaction did not roll back", live)
+	}
+}
+
+// eoCountTypeCodes counts the per-type permission rows for one type key.
+func eoCountTypeCodes(t *testing.T, db *gorm.DB, key string) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&models.Permission{}).Where("code IN ?", []string{
+		models.EOTypePermissionCode(key, models.EOTypePermissionView),
+		models.EOTypePermissionCode(key, models.EOTypePermissionCreate),
+		models.EOTypePermissionCode(key, models.EOTypePermissionUpdate),
+	}).Count(&n).Error; err != nil {
+		t.Fatalf("count the codes of %q: %v", key, err)
+	}
+	return n
 }

@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/automax/backend/internal/models"
@@ -312,6 +314,44 @@ func (h *EORecordTypeHandler) Get(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_record_type_retrieved"), t)
 }
 
+// eoTypeWriteError answers a metamodel write that failed, naming the two
+// causes an operator can act on.
+//
+// Both come from the per-type permission codes the write carries (spec
+// §7.11), and both used to arrive as a bare 500 with the cause in a log the
+// operator cannot read — "Internal server error" and a dead designer screen.
+//
+//   - ErrEOTypePermissionCodesExist is the operator's to resolve and names a
+//     bad KEY, so it is answered as a field error on `key`, which is where
+//     the form shows it and where the decision is made.
+//   - ErrEOTypePermissionRoleMissing is a broken deployment, not a bad
+//     request: still a 500, still logged, but it says which roles to restore.
+func eoTypeWriteError(c *fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, repository.ErrEOTypePermissionCodesExist):
+		return eoFieldErrors(c, map[string]string{
+			"key": fmt.Sprintf(i18n.T(c.UserContext(), "eo_record_type_key_has_permissions"), eoCodesFromError(err)),
+		})
+	case errors.Is(err, repository.ErrEOTypePermissionRoleMissing):
+		return utils.InternalErrorResponse(c, err,
+			fmt.Sprintf(i18n.T(c.UserContext(), "eo_record_type_role_missing"), strings.Join(models.EOTypePermissionRoleCodes, ", ")))
+	default:
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+}
+
+// eoCodesFromError lifts the comma-separated code list the repository appends
+// after the sentinel, so the operator is told WHICH codes are in the way
+// rather than being sent to look for them.
+func eoCodesFromError(err error) string {
+	msg := err.Error()
+	marker := repository.ErrEOTypePermissionCodesExist.Error() + ": "
+	if i := strings.Index(msg, marker); i >= 0 {
+		return msg[i+len(marker):]
+	}
+	return msg
+}
+
 func (h *EORecordTypeHandler) Create(c *fiber.Ctx) error {
 	if _, actorOK, actorErr := eoActor(c); !actorOK {
 		return actorErr
@@ -331,7 +371,7 @@ func (h *EORecordTypeHandler) Create(c *fiber.Ctx) error {
 	// No ValidateTypeEdit here: a brand-new type has no records, and §7.14 is
 	// a rule about changing a type that does.
 	if err := h.types.Create(c.UserContext(), t); err != nil {
-		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+		return eoTypeWriteError(c, err)
 	}
 	return utils.SuccessResponse(c, fiber.StatusCreated, i18n.T(c.UserContext(), "eo_record_type_created"), t)
 }
@@ -369,7 +409,7 @@ func (h *EORecordTypeHandler) Update(c *fiber.Ctx) error {
 		return err
 	}
 	if err := h.types.Update(c.UserContext(), &after); err != nil {
-		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+		return eoTypeWriteError(c, err)
 	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_record_type_updated"), &after)
 }

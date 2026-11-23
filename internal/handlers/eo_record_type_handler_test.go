@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/automax/backend/internal/models"
+	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -211,4 +214,86 @@ func TestEOTypeWriteRoutesStillRequireManage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// eoTypeWriteFailRepo fails every type write with a fixed error, so the
+// designer's mapping of that error can be driven from the route.
+type eoTypeWriteFailRepo struct {
+	eoFakeTypeRepo
+	err error
+}
+
+func (f *eoTypeWriteFailRepo) Create(_ context.Context, _ *models.EORecordType) error { return f.err }
+func (f *eoTypeWriteFailRepo) Update(_ context.Context, _ *models.EORecordType) error { return f.err }
+
+// TestEOTypeWriteErrorsAreActionable: both failures the per-type permission
+// write can produce used to arrive as a bare 500 with the cause in a log the
+// operator cannot read — "Internal server error" and a dead designer screen.
+// One of them is the operator's own to resolve and names a bad KEY; the other
+// names a role they must restore. Neither is readable unless the response says
+// so.
+func TestEOTypeWriteErrorsAreActionable(t *testing.T) {
+	eoInitValidator(t)
+	body := `{"key":"eo_objection","name":"Supplier Objection","reference_prefix":"EO-OBJ","reference_pattern":"EO-OBJ-YYYY-NNN"}`
+
+	t.Run("a key whose permission codes already exist is a field error naming them", func(t *testing.T) {
+		repo := &eoTypeWriteFailRepo{err: fmt.Errorf("create eo record type %q: %w: %s", "eo_objection",
+			repository.ErrEOTypePermissionCodesExist, "eo:eo_objection:view, eo:eo_objection:create")}
+		h := NewEORecordTypeHandler(repo, &eoFakeRecordRepo{})
+		app := fiber.New()
+		app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+		h.RegisterRoutes(app.Group("/eo-record-types"), eoPermFor("eo:types:manage"))
+
+		req := httptest.NewRequest("POST", "/eo-record-types", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: this is the operator's to fix, not a server fault", resp.StatusCode)
+		}
+		var out struct {
+			Errors map[string]string `json:"errors"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		msg, ok := out.Errors["key"]
+		if !ok {
+			t.Fatalf("errors = %v, want the refusal against the key field", out.Errors)
+		}
+		if !strings.Contains(msg, "eo:eo_objection:view") {
+			t.Errorf("message %q does not name the codes in the way, so the operator cannot act on it", msg)
+		}
+	})
+
+	t.Run("a missing role names the roles to restore", func(t *testing.T) {
+		repo := &eoTypeWriteFailRepo{err: fmt.Errorf("%w: %q is required", repository.ErrEOTypePermissionRoleMissing, "executive_office")}
+		h := NewEORecordTypeHandler(repo, &eoFakeRecordRepo{})
+		app := fiber.New()
+		app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+		h.RegisterRoutes(app.Group("/eo-record-types"), eoPermFor("eo:types:manage"))
+
+		req := httptest.NewRequest("POST", "/eo-record-types", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500: a deployment missing a seeded role is not a bad request", resp.StatusCode)
+		}
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		msg, _ := out["error"].(string)
+		if msg == "" {
+			msg, _ = out["message"].(string)
+		}
+		if !strings.Contains(msg, "executive_office") {
+			t.Errorf("response %v does not name executive_office; the operator is left with a dead screen", out)
+		}
+	})
 }
