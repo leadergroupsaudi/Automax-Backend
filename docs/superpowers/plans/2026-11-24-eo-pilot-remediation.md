@@ -133,7 +133,7 @@ The mapping is **provisional and goes to the client for sign-off** — print it 
 - Modify: `internal/database/seed_eo_pilot.go`
 - Test: `internal/database/seed_eo_pilot_test.go`
 
-Plan 3 relaxed six file fields. Two (`eo_task.evidence`, and its sibling) are `at_state` and were restorable — Plan 4 proved it. The other four are **create-time `always`**: `eo_incoming_correspondence.attachments`, `eo_draft_decision_study.draft_file`, `eo_draft_decision_study.study_report`, `eo_objection.proof`. Restoring those to `always` reintroduces an unfillable form whatever Documenta is doing, because `POST /eo-records/:id/files` needs a record id and a create form has none.
+Plan 3 relaxed six file fields. Two — `eo_task.evidence` and `eo_assignment.evidence` — are `at_state` and kept their `required_at_state_ids`, which is the only reason Plan 4 could restore one and prove the mechanism. The other four are **create-time `always`**: `eo_incoming_correspondence.attachments`, `eo_draft_decision_study.draft_file`, `eo_draft_decision_study.study_report`, `eo_objection.proof`. Restoring those to `always` reintroduces an unfillable form whatever Documenta is doing, because `POST /eo-records/:id/files` needs a record id and a create form has none.
 
 Decided with the client: move them to **`at_state`**, required at the first state after creation, matching what the two evidence fields already do.
 
