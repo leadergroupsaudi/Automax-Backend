@@ -1,6 +1,15 @@
 # EO Platform — Plan 1 carry-forward
 
 What Plan 1 (the engine) deliberately left for later, and why. Written at the
+
+> **UPDATE 2026-11-24 — four claims in this document about what `ValidateTypeEdit` makes permanent are now wrong, and two were always wrong.** Plan 4's Task B1 (`c55249a`, `9d3c608`) built §7.14's confirmed-destructive edit, so a destructive type or field change on a populated register is now **one confirmed PUT with a stated reason, audited** — not a seed step, a migration or a release. Specifically:
+>
+> - *"after the first Directive record it takes a seed step or a migration rather than an edit"* (below, `decision_reference`) — **false now.** One confirmed PUT. Do not schedule a release for it. Its twin in `internal/database/seed_eo_pilot.go` was corrected in the same commit.
+> - *"make several of their properties permanent"* and *"cheap now and permanent later"* — **overstated now.** True of the unconfirmed path only.
+> - *"could never be relaxed once records existed"* (of an `at_state` field made `always`) — **was false before B1 as well.** `ValidateTypeEdit` guards only `never -> required`; relaxing `always -> never` has always been allowed. This document and `seed_eo_pilot.go:2469` say irreversible while `seed_eo_pilot_workflows.go:458` and this file's own §106/§129 say otherwise. The reversible reading is the correct one.
+>
+> The paragraphs below are left as written. They record what was true when Plan 1 ran.
+
 close of Plan 1 from its execution ledger, which was scratch and is now gone —
 this file is the record. Plan 2 (pilot configuration: the 25 record types and
 281 fields) should read it before starting.
