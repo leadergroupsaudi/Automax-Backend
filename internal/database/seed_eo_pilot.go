@@ -722,10 +722,28 @@ type eoFileFieldMovedToState struct {
 // a document an officer cannot attach yet. A file is attached through
 // POST /eo-records/:id/files, which needs a record id, and a create form has
 // none — so `always` on a file field is an unfillable form whatever Documenta
-// is doing. The four are therefore `at_state`, required at the FIRST STATE
-// AFTER CREATION (the state the first transition out of the initial state
-// enters), which is what eo_task.evidence and eo_assignment.evidence already
-// do at their closing state.
+// is doing. Each is therefore `at_state`, at a state derived from the
+// matrix's own step numbers (docs/superpowers/specs/eo-field-matrix.md):
+//
+//	incoming.attachments  1.2 (registration)        -> analysis, the earliest
+//	                      state after creation, once the letter is registered
+//	draft_file            1.4 (stamped on receipt)   -> submitted, which is the
+//	                      receipt stamp itself
+//	study_report          4.2, after Q2 and before Q3 -> with_he. THIS ONE IS
+//	                      AN INFERENCE: the matrix gives a step number and no
+//	                      state, so it is the state the Office raises the
+//	                      finished report to H.E. in. Put to the client.
+//
+// A REQUIREMENT IS NEVER ATTACHED TO A TERMINAL STATE: nothing leaves one, so
+// the record could never be resolved, and ValidateRecordValues reads the
+// current state on an update, so it would also make every already-completed
+// record uneditable. eoMoveFileRequirementToState refuses one.
+//
+// eo_objection.proof IS DELIBERATELY NOT HERE. The matrix says "every
+// objection carries proof" at 3.1 (when it is raised), and the objection's
+// machine is raised -> resolved with nothing between, so no non-terminal
+// state after creation exists to require it at. It stays `never` until the
+// client chooses: an intermediate state, or a staged upload at creation.
 //
 // THE OPERATIONAL COST IS REAL AND IS THE CLIENT'S DECISION. While
 // EO_DOCUMENTA_ENABLED is false no file can be attached, so the transition
@@ -733,14 +751,10 @@ type eoFileFieldMovedToState struct {
 // and so is any edit of a record that currently sits in it
 // (services.ValidateRecordValues is given the current state on an update).
 // The boot report says so on every boot.
-//
-// eo_objection.proof's first state after creation is its TERMINAL one: the
-// objection's whole machine is raised -> resolved.
 var eoFileFieldsMovedToState = []eoFileFieldMovedToState{
 	{eoIncomingTypeKey, "attachments", "analysis"},
 	{eoDraftStudyTypeKey, "draft_file", "submitted"},
-	{eoDraftStudyTypeKey, "study_report", "submitted"},
-	{eoObjectionTypeKey, "proof", "closed"},
+	{eoDraftStudyTypeKey, "study_report", "with_he"},
 }
 
 func eoIsMovedToState(typeKey, fieldKey string) bool {
@@ -776,6 +790,9 @@ func eoMoveFileRequirementToState(tx *gorm.DB) (bool, error) {
 		}
 		if len(states) != 1 {
 			return false, fmt.Errorf("workflow %q has %d states coded %q, want exactly 1", eoWorkflowCode(m.TypeKey), len(states), m.StateCode)
+		}
+		if states[0].StateType == eoStateTerminal {
+			return false, fmt.Errorf("%s.%s cannot be required at %q, a terminal state: nothing leaves it, and an update validates against the current state, so completed records would become uneditable", m.TypeKey, m.FieldKey, m.StateCode)
 		}
 		ids, err := json.Marshal([]uuid.UUID{states[0].ID})
 		if err != nil {
@@ -4400,16 +4417,29 @@ var eoPilotRegisterKeys = []string{
 // sign-off; a correction is an edit to this table, applied on a database that
 // has already booted by a new step, never by editing history.
 //
-//   - head_of_office: oversight, so VIEW on all eleven and update on none. The
-//     matrix gives the Head of Office an approval only in EO-MED (outside the
-//     pilot); nothing in EO-DIR/DRF/COM has him edit a record.
+//   - head_of_office: oversight, so VIEW on all eleven and update on none.
+//     The matrix gives the Head of Office an approval only in EO-MED (outside
+//     the pilot); this is an invention, disclosed as such.
+//     THE eo_referral GRANT IS INERT TODAY. Row-level visibility
+//     (repository applyEORecordVisibility) admits a referral only to an
+//     admin, its creator, or a caller whose bodies match visible_to; Head of
+//     Office has no body, so the register returns 10 of the 11 registers and
+//     a referral fetched by id is 404. The grant is kept for the oversight
+//     intent. BLOCKING CLIENT QUESTION: should an oversight role bypass
+//     body-scoping on Referral, or is Head of Office not meant to see
+//     referrals? Until answered, do not read this grant as working.
 //   - escalation_manager: EO-DIR's escalation ladder (+3/+7/+14 days) acts on
 //     directives, their plans, assignments and tasks.
 //   - department_user: the executing bodies. Assignments (owner, completion,
 //     evidence), referrals (the body's view is submitted on its Referral) and
 //     tasks; plan stages are read-only context for an assignment's from_stage.
-//   - public_relations: "Public relations" is one of EO-COM's three intake
-//     routes, so Incoming Correspondence, and Task.
+//   - public_relations: Task (view+update) and Incoming Correspondence VIEW
+//     ONLY. The correspondence grant is an INFERENCE WITH NO MATRIX SUPPORT:
+//     `intake_route` ("Public relations") appears only under EO-MED Media
+//     Appearance, outside the pilot, and EO-COM's Incoming Correspondence has
+//     no such field. It is therefore read-only: a write on the Office's
+//     letter register must not ship as a default on a misread. OPEN CLIENT
+//     QUESTION: should Public Relations see, or edit, Incoming Correspondence?
 //   - protocol: no pilot process is Protocol's (EO-VIS is outside the pilot);
 //     it holds the universal Task, which is what EO-VIS raises for it.
 var eoProcessRoleRegisters = []eoRegisterGrant{
@@ -4422,7 +4452,7 @@ var eoProcessRoleRegisters = []eoRegisterGrant{
 		update: []string{"eo_assignment", "eo_referral", "eo_task"}},
 	{roleCode: "public_relations",
 		view:   []string{"eo_incoming_correspondence", "eo_task"},
-		update: []string{"eo_incoming_correspondence", "eo_task"}},
+		update: []string{"eo_task"}},
 	{roleCode: "protocol",
 		view:   []string{"eo_task"},
 		update: []string{"eo_task"}},
@@ -4459,10 +4489,14 @@ func eoGrantWorkflowsViewToEOAdmin(tx *gorm.DB) (bool, error) {
 
 // eoGrantProcessRoleRegisters applies eoProcessRoleRegisters. ALL-OR-NOTHING:
 // if any named role is missing it grants to none and returns done=false (and
-// says so), so a retry cannot re-grant what an administrator revoked in the
-// meantime from the roles that did exist. A type's code that is absent or
-// deleted is skipped and named: a deleted permission is not one to hand out.
-// The append is idempotent (the join table is keyed on the pair).
+// says so). Consequence, stated plainly: while a role is missing nothing is
+// recorded, and when it reappears the step appends to ALL five roles, so a
+// grant an administrator revoked in the meantime from the others IS
+// reinstated. This needs a database whose roles were absent at boot (Seed
+// recreates them before this runs, so in practice a fresh or test database).
+// A type's code that is absent or deleted is skipped and named: a deleted
+// permission is not one to hand out. The append is idempotent (the join table
+// is keyed on the pair).
 //
 // A record type added AFTER this step ran is not granted to these roles: who
 // else sees a new register is a decision, and the boot report says which

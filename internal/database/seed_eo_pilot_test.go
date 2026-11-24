@@ -4542,10 +4542,10 @@ func eoSeedWorkflowsViewPermission(t *testing.T, db *gorm.DB) {
 }
 
 // eoB5Grants is how many role_permissions rows Task B5 adds on a fresh seed:
-// 22 view + 10 update codes across the five process roles (counted from
+// 22 view + 9 update codes across the five process roles (counted from
 // eoWantRegisterView/Update below, which TestSeedEOPilot_EveryEORoleCanRead-
 // Something holds the seed to) plus workflows:view for eo_admin.
-const eoB5Grants = 22 + 10 + 1
+const eoB5Grants = 22 + 9 + 1
 
 // eoWantRegisterView / eoWantRegisterUpdate are WRITTEN OUT here, not derived
 // from eoProcessRoleRegisters, so editing the seed table without editing the
@@ -4561,7 +4561,7 @@ var eoWantRegisterUpdate = map[string][]string{
 	"head_of_office":     {},
 	"escalation_manager": {"eo_assignment", "eo_directive", "eo_execution_plan", "eo_task"},
 	"department_user":    {"eo_assignment", "eo_referral", "eo_task"},
-	"public_relations":   {"eo_incoming_correspondence", "eo_task"},
+	"public_relations":   {"eo_task"},
 	"protocol":           {"eo_task"},
 }
 
