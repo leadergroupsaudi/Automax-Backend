@@ -38,10 +38,16 @@ administrator author more unfillable fields. Fix before the pilot.
 **2. Link-type endpoints are never validated.** `eoValidateLinkTypeShape`
 (`internal/handlers/eo_record_type_handler.go:1051-1065`) checks key, label and
 cardinality only. An empty endpoint list, an unknown type id and the bare
-string `"any"` all store with 201. This is the ROOT CAUSE of the parked
-`eo_assignment_parent` defect: a link type can declare a pairing the reference
-pattern refuses at record-link time, and the error then lands in front of an
-officer rather than the administrator who configured it. The designer
+string `"any"` all store with 201. **CORRECTION (2026-11-24, after Plan 5 Task B2):** this is NOT the root cause
+of the parked `eo_assignment_parent` defect, as originally written here. B2
+added endpoint validation and all eight live link types pass it, that one
+included — `eo_assignment_parent` targets `eo_directive` and
+`eo_execution_plan`, both live and concrete. The defect is a **link-type
+versus reference-pattern** conflict (`eo_assignment` carries
+`reference_mode=parent` with pattern `EO-DIR-YYYY-NNN-A#`, which cannot render
+under a five-segment parent), on a different axis from endpoint validity.
+Endpoint validation cannot see it. The defect remains open and needs the
+client's decision: narrow the link type's targets, or widen the pattern. The designer
 compensates with a client-side rule, honestly labelled in the UI as the
 editor's own.
 
