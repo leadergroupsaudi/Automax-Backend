@@ -4614,3 +4614,34 @@ func TestSeedEOPilot_SubjectTaxonomyAddsAMissingValueAndKeepsEdits(t *testing.T)
 		}
 	}
 }
+
+// A value soft-deleted through DeleteValue (which has no is_system guard) must
+// come back, restored rather than duplicated.
+// Mutation: make pending Unscoped again, or make the step insert.
+func TestSeedEOPilot_SubjectTaxonomyRestoresASoftDeletedValue(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	cats, _ := eoTaxonomyValues(t, db)
+	if len(cats) != 1 {
+		t.Fatalf("fixture: category count = %d", len(cats))
+	}
+	if err := db.Where("category_id = ? AND code = ?", cats[0].ID, "drainage").Delete(&models.LookupValue{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, vals := eoTaxonomyValues(t, db); len(vals) != len(eoWantSubjectTaxonomy)-1 {
+		t.Fatalf("fixture: soft delete left %d live values", len(vals))
+	}
+	if open, err := eoSubjectTaxonomyPending(db); err != nil || !open {
+		t.Fatalf("pending with a soft-deleted value = %v (err %v), want true", open, err)
+	}
+	seedEOPilot(db)
+	_, vals := eoTaxonomyValues(t, db)
+	if len(vals) != len(eoWantSubjectTaxonomy) {
+		t.Errorf("live values after re-seed = %d, want %d", len(vals), len(eoWantSubjectTaxonomy))
+	}
+	var all int64
+	db.Unscoped().Model(&models.LookupValue{}).Where("category_id = ? AND code = ?", cats[0].ID, "drainage").Count(&all)
+	if all != 1 {
+		t.Errorf("rows for drainage = %d, want 1 (restored, not duplicated)", all)
+	}
+}

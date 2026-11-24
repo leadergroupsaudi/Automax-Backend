@@ -133,7 +133,7 @@ func (r *lookupRepository) ListValuesByCategoryCode(ctx context.Context, code st
 	var values []models.LookupValue
 	err := r.db.WithContext(ctx).
 		Joins("JOIN lookup_categories ON lookup_categories.id = lookup_values.category_id").
-		Where("lookup_categories.code = ? AND lookup_categories.is_active = ? AND lookup_values.is_active = ?", code, true, true).
+		Where("UPPER(lookup_categories.code) = UPPER(?) AND lookup_categories.deleted_at IS NULL AND lookup_categories.is_active = ? AND lookup_values.is_active = ?", code, true, true).
 		Order("lookup_values.sort_order ASC, lookup_values.name ASC").
 		Find(&values).Error
 	return values, err

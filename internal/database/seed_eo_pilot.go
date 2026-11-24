@@ -4140,9 +4140,12 @@ var eoSubjectTaxonomyValues = []eoSubjectValue{
 }
 
 // eoSubjectTaxonomyPending asks, cheaply, whether the category or any of its
-// values is missing. Soft-deleted rows count as present: an administrator who
-// deleted a value (or the category) did so deliberately, and the unique index
-// on the category code covers deleted rows too, so re-creating would fail.
+// values is missing. The category is looked up Unscoped because its code's
+// unique index covers deleted rows (and is_system blocks deleting it anyway).
+// VALUES COUNT ONLY WHEN LIVE: DeleteValue has no is_system guard, so a
+// soft-deleted value is one `keywords` has silently lost. lookup_values has no
+// unique index on (category, code), so the step restores that row rather than
+// inserting beside it.
 func eoSubjectTaxonomyPending(db *gorm.DB) (bool, error) {
 	var cat models.LookupCategory
 	res := db.Unscoped().Where("code = ?", eoSubjectTaxonomyCode).Limit(1).Find(&cat)
@@ -4157,7 +4160,7 @@ func eoSubjectTaxonomyPending(db *gorm.DB) (bool, error) {
 		codes[i] = v.code
 	}
 	var have int64
-	if err := db.Unscoped().Model(&models.LookupValue{}).
+	if err := db.Model(&models.LookupValue{}).
 		Where("category_id = ? AND code IN ?", cat.ID, codes).Count(&have).Error; err != nil {
 		return false, fmt.Errorf("count the values of %q: %w", eoSubjectTaxonomyCode, err)
 	}
@@ -4165,7 +4168,8 @@ func eoSubjectTaxonomyPending(db *gorm.DB) (bool, error) {
 }
 
 // eoSeedSubjectTaxonomy creates the category if absent and any missing value.
-// It never edits a row that exists: an administrator's rename stands.
+// It never edits a live row: an administrator's rename stands. A soft-deleted
+// value is restored (deleted_at cleared), not duplicated.
 func eoSeedSubjectTaxonomy(tx *gorm.DB) (bool, error) {
 	var cat models.LookupCategory
 	res := tx.Unscoped().Where("code = ?", eoSubjectTaxonomyCode).Limit(1).Find(&cat)
@@ -4187,12 +4191,25 @@ func eoSeedSubjectTaxonomy(tx *gorm.DB) (bool, error) {
 		}
 	}
 	for i, v := range eoSubjectTaxonomyValues {
-		var n int64
-		if err := tx.Unscoped().Model(&models.LookupValue{}).
-			Where("category_id = ? AND code = ?", cat.ID, v.code).Count(&n).Error; err != nil {
+		var existing []models.LookupValue
+		if err := tx.Unscoped().Where("category_id = ? AND code = ?", cat.ID, v.code).
+			Find(&existing).Error; err != nil {
 			return false, fmt.Errorf("check value %q: %w", v.code, err)
 		}
-		if n > 0 {
+		live := false
+		for _, e := range existing {
+			if !e.DeletedAt.Valid {
+				live = true
+			}
+		}
+		if live {
+			continue
+		}
+		if len(existing) > 0 {
+			if err := tx.Unscoped().Model(&models.LookupValue{}).Where("id = ?", existing[0].ID).
+				Update("deleted_at", nil).Error; err != nil {
+				return false, fmt.Errorf("restore value %q: %w", v.code, err)
+			}
 			continue
 		}
 		lv := models.LookupValue{CategoryID: cat.ID, Code: v.code, Name: v.name, NameAr: v.nameAr,
