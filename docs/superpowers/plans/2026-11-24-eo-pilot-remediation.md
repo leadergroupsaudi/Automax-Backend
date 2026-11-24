@@ -216,6 +216,36 @@ undiscoverable, so this is a placement fix, not a new feature.
   Screenshot.
 - [ ] **Step 5: `type-check`, `lint`, commit.**
 
+### Task F5: A register row opens the record it names
+
+**Files:**
+- Modify: `src/pages/eo/EoRecordsPage.tsx` (~`:362`, `:367`)
+
+Found while reviewing Task F4, confirmed by clicking: a register row is a
+plain `<tr>` with **no click handler**, and only the reference cell is a
+`<Link>` (`:367`). Clicking anywhere else in the row — the subject, the status,
+the row's edge — does nothing, in both languages at both widths. Every register
+in the pilot therefore requires an officer to hit one small link in the first
+column to open a record.
+
+This is pre-existing and was not caused by F4. It is the same class of fault as
+F4's: the capability exists and the obvious gesture does not reach it.
+
+- [ ] **Step 1: Make the whole row activate the record.** Keep the reference
+  `<Link>` — it is what gives middle-click, open-in-new-tab and a real URL on
+  hover, and replacing it with a handler would take those away.
+- [ ] **Step 2: Keep it reachable without a mouse.** A row that only responds
+  to `onClick` is invisible to the keyboard; whatever you use must be focusable
+  and must activate on Enter.
+- [ ] **Step 3: Do not swallow interactive children.** Any control inside a row
+  — a link, a menu, a checkbox — must still work without also triggering the
+  row. Check what the register rows actually contain before assuming the
+  reference link is the only one.
+- [ ] **Step 4: Verify by clicking** in English and Arabic: the subject cell,
+  the row's edge, the reference link itself, and Enter on a focused row. Confirm
+  each lands on the record's detail page and that none double-navigates.
+- [ ] **Step 5: `type-check`, `lint`, commit.**
+
 ---
 
 ## Done when
