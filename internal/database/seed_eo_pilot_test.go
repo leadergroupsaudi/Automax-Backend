@@ -1314,8 +1314,9 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	// override's identity below.
 	t.Run("attachments is declared on Incoming Correspondence and relaxed for want of Documenta", func(t *testing.T) {
 		got := eoEffectiveField(t, db, eoIncomingTypeKey, "attachments")
-		if got.RequiredMode != models.EORequiredNever {
-			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredNever)
+		// TASK B6 then moved it to the first state after creation.
+		if got.RequiredMode != models.EORequiredAtState {
+			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredAtState)
 		}
 		// The override, not a second field: it replaces the base's definition
 		// at the base's slot, so the key appears once.
@@ -2132,6 +2133,12 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				// TestNoPilotFileFieldIsDemandedAtAll checks the converse,
 				// that no file field anywhere is left demanded. This is
 				// therefore not a way round the matrix.
+				// TASK B6: the four create-time ones were then moved to
+				// `at_state` at the first state after creation.
+				if eoIsMovedToState(typeKey, row.Key) {
+					want(models.EORequiredAtState, models.EOProvenanceUser)
+					return
+				}
 				if eoIsRelaxedUntilDocumenta(typeKey, row.Key) {
 					want(models.EORequiredNever, models.EOProvenanceUser)
 					return
@@ -4025,9 +4032,15 @@ func TestEoFileFieldsAreNotRequiredWithoutDocumenta(t *testing.T) {
 				t.Fatalf("the registry relaxes %q on %q, whose kind is %q; this step is only about fields that hold a Documenta file id",
 					r.FieldKey, r.TypeKey, got.Kind)
 			}
-			if got.RequiredMode != models.EORequiredNever {
-				t.Errorf("required_mode is %q; while EO Documenta is disabled no file id can be minted, so a %q file field makes the register uncreatable",
-					got.RequiredMode, got.RequiredMode)
+			wantMode := models.EORequiredNever
+			if eoIsMovedToState(r.TypeKey, r.FieldKey) {
+				// Task B6: required after creation, never at it. The
+				// positive assertions are in TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState.
+				wantMode = models.EORequiredAtState
+			}
+			if got.RequiredMode != wantMode {
+				t.Errorf("required_mode is %q, want %q; while EO Documenta is disabled no file id can be minted, so a %q file field makes the register uncreatable",
+					got.RequiredMode, wantMode, got.RequiredMode)
 			}
 		})
 	}
@@ -4081,6 +4094,13 @@ func TestNoPilotFileFieldIsDemandedAtAll(t *testing.T) {
 		t.Fatalf("look for file fields that are still demanded: %v", err)
 	}
 	for _, r := range rows {
+		// Task B6's four are demanded on purpose, at the first state after
+		// creation; the client decided it and the boot report says what it
+		// costs. They are asserted positively in
+		// TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState.
+		if eoIsMovedToState(r.TypeKey, r.Key) && r.RequiredMode == models.EORequiredAtState {
+			continue
+		}
 		t.Errorf("%s.%s is kind %q and required_mode %q: no upload route can mint a file id while EO Documenta is disabled, so nothing can satisfy it — at creation or at a closing transition. Register it in eoFileFieldsRelaxedUntilDocumenta or seed it `never`.",
 			r.TypeKey, r.Key, r.Kind, r.RequiredMode)
 	}
@@ -4118,7 +4138,7 @@ func TestEoFileRelaxationDoesNotRevertAnAdministratorsRetightening(t *testing.T)
 	// guard with a hole exactly where the newer half lives.
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
 		def := eoEffectiveField(t, db, r.TypeKey, r.FieldKey)
-		if def.RequiredMode != models.EORequiredNever {
+		if def.RequiredMode != models.EORequiredNever && !eoIsMovedToState(r.TypeKey, r.FieldKey) {
 			t.Fatalf("fixture error: %s.%s is %q after the seed, so there is nothing for an administrator to restore", r.TypeKey, r.FieldKey, def.RequiredMode)
 		}
 		// What an administrator does, by whatever route is open to them.

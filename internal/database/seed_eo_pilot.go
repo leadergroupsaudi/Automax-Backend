@@ -435,6 +435,11 @@ var eoPilotSteps = []eoPilotStep{
 	// seed_type_permissions, whose codes the second one hands out.
 	{key: eoGrantWorkflowsViewStepKey, run: eoGrantWorkflowsViewToEOAdmin},
 	{key: eoGrantProcessRoleRegistersStepKey, run: eoGrantProcessRoleRegisters},
+	// TASK B6 (remediation). ONE-SHOT, and after the relaxation it follows:
+	// it moves the four create-time file fields B2 relaxed to `at_state`,
+	// required at the first state after creation. See
+	// eoFileFieldsMovedToState for the ruling and its operational cost.
+	{key: eoMoveFileRequirementToStateStepKey, run: eoMoveFileRequirementToState},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -699,6 +704,101 @@ var eoFileFieldsRelaxedUntilDocumenta = []eoFileRequirednessRelaxation{
 	{eoTaskTypeKey, "evidence", models.EORequiredAtState},
 }
 
+// ── Task B6: a required document is one an officer can attach ───────────────
+
+// eoMoveFileRequirementToStateStepKey is a PERMANENT identifier; see the
+// comment on eoPilotSteps. Never rename or reuse it.
+const eoMoveFileRequirementToStateStepKey = "move_create_time_file_requirement_to_state"
+
+// eoFileFieldMovedToState is one create-time file field and the state of its
+// OWN type's workflow at which it is now required.
+type eoFileFieldMovedToState struct {
+	TypeKey   string
+	FieldKey  string
+	StateCode string
+}
+
+// eoFileFieldsMovedToState is the client's ruling on what "Required" means for
+// a document an officer cannot attach yet. A file is attached through
+// POST /eo-records/:id/files, which needs a record id, and a create form has
+// none — so `always` on a file field is an unfillable form whatever Documenta
+// is doing. The four are therefore `at_state`, required at the FIRST STATE
+// AFTER CREATION (the state the first transition out of the initial state
+// enters), which is what eo_task.evidence and eo_assignment.evidence already
+// do at their closing state.
+//
+// THE OPERATIONAL COST IS REAL AND IS THE CLIENT'S DECISION. While
+// EO_DOCUMENTA_ENABLED is false no file can be attached, so the transition
+// into that state is unsatisfiable for every record that has not yet made it,
+// and so is any edit of a record that currently sits in it
+// (services.ValidateRecordValues is given the current state on an update).
+// The boot report says so on every boot.
+//
+// eo_objection.proof's first state after creation is its TERMINAL one: the
+// objection's whole machine is raised -> resolved.
+var eoFileFieldsMovedToState = []eoFileFieldMovedToState{
+	{eoIncomingTypeKey, "attachments", "analysis"},
+	{eoDraftStudyTypeKey, "draft_file", "submitted"},
+	{eoDraftStudyTypeKey, "study_report", "submitted"},
+	{eoObjectionTypeKey, "proof", "closed"},
+}
+
+func eoIsMovedToState(typeKey, fieldKey string) bool {
+	for _, m := range eoFileFieldsMovedToState {
+		if m.TypeKey == typeKey && m.FieldKey == fieldKey {
+			return true
+		}
+	}
+	return false
+}
+
+// eoMoveFileRequirementToState is ONE-SHOT, for the reason
+// eoRelaxFileRequirednessUntilDocumenta is: it is a one-time remediation of
+// what the seed wrote, and an administrator's later edit of these fields must
+// survive the next boot. It touches a field only while it is still `never`
+// (what B2 left), and says so when it leaves one alone. Fail-closed: a type,
+// workflow state or field that does not exist rolls the seed back.
+func eoMoveFileRequirementToState(tx *gorm.DB) (bool, error) {
+	for _, m := range eoFileFieldsMovedToState {
+		var ty models.EORecordType
+		if err := tx.Where("key = ?", m.TypeKey).Limit(1).Find(&ty).Error; err != nil {
+			return false, fmt.Errorf("find record type %q: %w", m.TypeKey, err)
+		}
+		if ty.ID == uuid.Nil {
+			return false, fmt.Errorf("field %q is moved to a state on record type %q, which is not seeded", m.FieldKey, m.TypeKey)
+		}
+		var states []models.WorkflowState
+		if err := tx.
+			Joins("JOIN workflows w ON w.id = workflow_states.workflow_id").
+			Where("w.code = ? AND workflow_states.code = ?", eoWorkflowCode(m.TypeKey), m.StateCode).
+			Find(&states).Error; err != nil {
+			return false, fmt.Errorf("read state %q of workflow %q: %w", m.StateCode, eoWorkflowCode(m.TypeKey), err)
+		}
+		if len(states) != 1 {
+			return false, fmt.Errorf("workflow %q has %d states coded %q, want exactly 1", eoWorkflowCode(m.TypeKey), len(states), m.StateCode)
+		}
+		ids, err := json.Marshal([]uuid.UUID{states[0].ID})
+		if err != nil {
+			return false, fmt.Errorf("encode the state of %s.%s: %w", m.TypeKey, m.FieldKey, err)
+		}
+		res := tx.Model(&models.EOFieldDef{}).
+			Where("record_type_id = ? AND key = ? AND required_mode = ?", ty.ID, m.FieldKey, models.EORequiredNever).
+			Updates(map[string]any{
+				"required_mode":         models.EORequiredAtState,
+				"required_at_state_ids": datatypes.JSON(ids),
+			})
+		if res.Error != nil {
+			return false, fmt.Errorf("move %s.%s to state %q: %w", m.TypeKey, m.FieldKey, m.StateCode, res.Error)
+		}
+		if res.RowsAffected == 0 {
+			log.Printf("EO pilot: %s.%s is not `never`, which is what this step moves to a state; left as it is", m.TypeKey, m.FieldKey)
+			continue
+		}
+		log.Printf("EO pilot: %s.%s is now required at state %q: a document cannot be attached at creation (no record id yet). While EO Documenta is disabled the transition into that state is unsatisfiable.", m.TypeKey, m.FieldKey, m.StateCode)
+	}
+	return true, nil
+}
+
 // eoIsRelaxedUntilDocumenta reports whether (typeKey, fieldKey) is recorded as
 // relaxed for want of Documenta. The matrix-reading tests use it to tell a
 // deliberate deviation from the client's "Yes" apart from a seeding mistake.
@@ -828,7 +928,7 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 	// whole value of the line for the two at-closure fields: an
 	// administrator who restored them to `always` instead would demand
 	// closing evidence at creation.
-	var relaxed, demanded, missing []string
+	var relaxed, demanded, missing, atState []string
 	for _, r := range eoFileFieldsRelaxedUntilDocumenta {
 		// COALESCE: required_mode is nullable, and a NULL scanned into a
 		// string errors. A row written before the column existed carries
@@ -861,6 +961,12 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 			continue
 		}
 		switch modes[0] {
+		case models.EORequiredAtState:
+			if eoIsMovedToState(r.TypeKey, r.FieldKey) {
+				atState = append(atState, r.TypeKey+"."+r.FieldKey)
+			} else {
+				demanded = append(demanded, fmt.Sprintf("%s.%s (%s)", r.TypeKey, r.FieldKey, modes[0]))
+			}
 		case "", models.EORequiredNever:
 			relaxed = append(relaxed, fmt.Sprintf("%s.%s (restore: %s)", r.TypeKey, r.FieldKey, r.From))
 		default:
@@ -884,6 +990,19 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 		} else {
 			log.Printf("EO pilot: %d file field(s) are STILL DEMANDED while EO Documenta is disabled (EO_DOCUMENTA_ENABLED=false): %s. No upload route can mint a file id, so nothing can satisfy them and those registers cannot be used. The pilot seed relaxes only a field left at the mode it seeded, so a field moved off it by anything else stays demanded until somebody changes it back by hand.",
 				len(demanded), strings.Join(demanded, ", "))
+		}
+	}
+
+	// THE MOVED ARM (Task B6): required at the first state after creation.
+	// Satisfiable only with Documenta on, so with it off the transition into
+	// that state is blocked, and the line says so.
+	if len(atState) > 0 {
+		if config.EODocumentaEnabled() {
+			log.Printf("EO pilot: %d file field(s) are required at the first state after creation and EO Documenta is enabled, so they can be satisfied: %s.",
+				len(atState), strings.Join(atState, ", "))
+		} else {
+			log.Printf("EO pilot: %d file field(s) are required at the first state after creation and EO Documenta is DISABLED (EO_DOCUMENTA_ENABLED=false): %s. No file can be attached, so the transition into that state is blocked for every record that has not yet entered it, and a record sitting in that state cannot be edited until it carries the file.",
+				len(atState), strings.Join(atState, ", "))
 		}
 	}
 

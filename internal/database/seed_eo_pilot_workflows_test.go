@@ -398,13 +398,17 @@ func TestEoClosureArtefactsNameTheirTypesTerminalState(t *testing.T) {
 			want[typeKey+"."+engineKey] = true
 		}
 	}
+	// Task B6's four name the first state after creation, on purpose.
+	for _, m := range eoFileFieldsMovedToState {
+		want[m.TypeKey+"."+m.FieldKey] = true
+	}
 	for _, r := range rows {
 		if !want[r.TypeKey+"."+r.Key] {
 			t.Errorf("%s.%s names a required-at state and is not a declared closure artefact", r.TypeKey, r.Key)
 		}
 	}
 	if len(rows) != len(want) {
-		t.Errorf("%d fields name a required-at state, %d closure artefacts are declared", len(rows), len(want))
+		t.Errorf("%d fields name a required-at state, %d closure artefacts and moved file fields are declared", len(rows), len(want))
 	}
 }
 
@@ -550,6 +554,9 @@ func TestEoClosureArtefactDecisionsMatchTheMatrix(t *testing.T) {
 			want := models.EORequiredAlways
 			if eoIsRelaxedUntilDocumenta(a.TypeKey, a.FieldKey) {
 				want = models.EORequiredNever
+			}
+			if eoIsMovedToState(a.TypeKey, a.FieldKey) {
+				want = models.EORequiredAtState // Task B6
 			}
 			if def.RequiredMode != want {
 				t.Errorf("seeded %q, want %q — strict, and recoverable in both directions", def.RequiredMode, want)
