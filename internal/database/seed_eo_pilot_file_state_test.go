@@ -107,8 +107,7 @@ func TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState(t *testing.T) {
 	want := map[string][]string{
 		"eo_incoming_correspondence.attachments": {"analysis"},
 		"eo_draft_decision_study.draft_file":     {"submitted"},
-		"eo_draft_decision_study.study_report":   {"submitted"},
-		"eo_objection.proof":                     {"closed"},
+		"eo_draft_decision_study.study_report":   {"with_he"},
 	}
 	if len(eoFileFieldsMovedToState) != len(want) {
 		t.Fatalf("registry has %d entries, this test expects %d", len(eoFileFieldsMovedToState), len(want))
@@ -137,17 +136,17 @@ func TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState(t *testing.T) {
 			if strings.Join(got, ",") != strings.Join(codes, ",") {
 				t.Errorf("required at %v, want %v", got, codes)
 			}
-			// "First state after creation": a state some transition out of the
-			// initial state enters.
-			var n int64
-			if err := db.Raw(`
-				SELECT COUNT(*) FROM workflow_transitions tr
-				JOIN workflow_states f ON f.id = tr.from_state_id AND f.state_type = 'initial'
-				WHERE tr.to_state_id IN ?`, ids).Scan(&n).Error; err != nil {
-				t.Fatal(err)
-			}
-			if n == 0 {
-				t.Errorf("no transition out of the initial state enters %v, so it is not the first state after creation", got)
+			// NEVER A TERMINAL STATE: at least one transition must leave it,
+			// or the record can never move on and (updates validate against
+			// the current state) completed records become uneditable.
+			for _, id := range ids {
+				var out int64
+				if err := db.Raw(`SELECT COUNT(*) FROM workflow_transitions WHERE from_state_id = ?`, id).Scan(&out).Error; err != nil {
+					t.Fatal(err)
+				}
+				if out == 0 {
+					t.Errorf("required at %q, from which no transition leaves", got)
+				}
 			}
 			// Never the initial state itself: creation validates against it
 			// and a create form has no record id to attach a file to.
@@ -161,6 +160,13 @@ func TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// eo_objection.proof has no non-terminal state to be required at, so it
+	// stays `never` pending a client decision; this pins that it is not
+	// silently put on its terminal state.
+	if got := eoEffectiveField(t, db, eoObjectionTypeKey, "proof").RequiredMode; got != models.EORequiredNever {
+		t.Errorf("eo_objection.proof is %q; its only post-creation state is terminal, so it stays never until the client decides", got)
 	}
 
 	// The guard: no file field anywhere is required at creation.
@@ -206,12 +212,12 @@ func TestSeedEOPilot_FileStateMoveIsIdempotentAndReachesAnExistingDatabase(t *te
 	}
 
 	// An administrator's edit survives.
-	adm := eoEffectiveField(t, db, eoObjectionTypeKey, "proof")
+	adm := eoEffectiveField(t, db, eoDraftStudyTypeKey, "study_report")
 	if err := db.Model(&models.EOFieldDef{}).Where("id = ?", adm.ID).Update("required_mode", models.EORequiredNever).Error; err != nil {
 		t.Fatal(err)
 	}
 	seedEOPilot(db)
-	if got := eoEffectiveField(t, db, eoObjectionTypeKey, "proof").RequiredMode; got != models.EORequiredNever {
+	if got := eoEffectiveField(t, db, eoDraftStudyTypeKey, "study_report").RequiredMode; got != models.EORequiredNever {
 		t.Errorf("the seed reverted an administrator's edit: %q", got)
 	}
 
@@ -231,7 +237,7 @@ func TestSeedEOPilot_FileStateMoveIsIdempotentAndReachesAnExistingDatabase(t *te
 		t.Fatalf("the fast path is shut on a database that has not applied %q (open=%v err=%v)", eoMoveFileRequirementToStateStepKey, open, err)
 	}
 	seedEOPilot(db)
-	if got := snap(); got["eo_objection.proof"] != before["eo_objection.proof"] {
-		t.Errorf("existing database not moved: %s, want %s", got["eo_objection.proof"], before["eo_objection.proof"])
+	if got := snap(); got["eo_draft_decision_study.study_report"] != before["eo_draft_decision_study.study_report"] {
+		t.Errorf("existing database not moved: %s, want %s", got["eo_draft_decision_study.study_report"], before["eo_draft_decision_study.study_report"])
 	}
 }
