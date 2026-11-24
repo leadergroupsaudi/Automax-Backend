@@ -99,6 +99,8 @@ func eoSeedTables() []any {
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
 		&models.EOSeedStep{},
+		&models.LookupCategory{},
+		&models.LookupValue{},
 	}
 }
 

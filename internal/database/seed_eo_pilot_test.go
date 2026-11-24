@@ -4477,3 +4477,140 @@ func TestEOBootReportNamesRolesWithNoPerTypeCodes(t *testing.T) {
 		}
 	}
 }
+
+// ── Task B1 (remediation): the subject taxonomy ─────────────────────────────
+
+// eoWantSubjectTaxonomy is the fixed set the category must hold, written out
+// here rather than derived from eoSubjectTaxonomyValues so that dropping or
+// renaming a value in the seed fails this test.
+var eoWantSubjectTaxonomy = []string{
+	"parking", "tariffs", "central_district", "food_trucks", "licensing",
+	"building_permits", "road_safety", "drainage", "street_lighting", "food_safety",
+}
+
+func eoTaxonomyValues(t *testing.T, db *gorm.DB) ([]models.LookupCategory, []models.LookupValue) {
+	t.Helper()
+	var cats []models.LookupCategory
+	if err := db.Where("code = ?", eoSubjectTaxonomyCode).Find(&cats).Error; err != nil {
+		t.Fatal(err)
+	}
+	var vals []models.LookupValue
+	if len(cats) == 1 {
+		if err := db.Where("category_id = ?", cats[0].ID).Order("sort_order").Find(&vals).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	return cats, vals
+}
+
+// Mutation: remove the step from eoPilotSteps; drop a value from
+// eoSubjectTaxonomyValues; remove "provisional" from the description; blank a
+// name_ar.
+func TestSeedEOPilot_SeedsSubjectTaxonomy(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	cats, vals := eoTaxonomyValues(t, db)
+	if len(cats) != 1 {
+		t.Fatalf("category %q count = %d, want 1", eoSubjectTaxonomyCode, len(cats))
+	}
+	if !strings.Contains(strings.ToLower(cats[0].Description), "provisional") ||
+		!strings.Contains(strings.ToLower(cats[0].Description), "sign-off") {
+		t.Errorf("description %q does not say the list is provisional pending client sign-off", cats[0].Description)
+	}
+	if cats[0].Name == "" || cats[0].NameAr == "" || !cats[0].IsActive {
+		t.Errorf("category lacks a name, an Arabic name, or is inactive: %+v", cats[0])
+	}
+	var got []string
+	for _, v := range vals {
+		got = append(got, v.Code)
+		if v.Name == "" || v.NameAr == "" || !v.IsActive {
+			t.Errorf("value %q lacks an English or Arabic name or is inactive: %+v", v.Code, v)
+		}
+	}
+	want := append([]string(nil), eoWantSubjectTaxonomy...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("values = %v, want %v", got, want)
+	}
+}
+
+// The demo script and the seed are two producers of the same vocabulary; this
+// reads the script's slugs as data so they cannot drift. It also fails if it
+// finds none, so a changed script format cannot make it vacuous.
+// Mutation: add a slug to a keywords list in scripts/eo-demo-data.py that the
+// taxonomy lacks.
+func TestSubjectTaxonomyCoversTheDemoScriptSlugs(t *testing.T) {
+	src, err := os.ReadFile("../../scripts/eo-demo-data.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lists := regexp.MustCompile(`"keywords":\s*\[([^\]]*)\]`).FindAllStringSubmatch(string(src), -1)
+	if len(lists) == 0 {
+		t.Fatal("found no \"keywords\" list in the demo script; the pattern no longer matches it")
+	}
+	in := map[string]bool{}
+	for _, c := range eoWantSubjectTaxonomy {
+		in[c] = true
+	}
+	seen := 0
+	for _, l := range lists {
+		for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(l[1], -1) {
+			seen++
+			if !in[m[1]] {
+				t.Errorf("the demo script stores keyword %q, which is not in the subject taxonomy", m[1])
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("the demo script's keywords lists held no slugs")
+	}
+}
+
+// Mutation: make the step create unconditionally, or make pending always true
+// while the run does not check for an existing row.
+func TestSeedEOPilot_SubjectTaxonomyIsIdempotent(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	seedEOPilot(db)
+	seedEOPilot(db)
+	cats, vals := eoTaxonomyValues(t, db)
+	if len(cats) != 1 || len(vals) != len(eoWantSubjectTaxonomy) {
+		t.Fatalf("after three seeds: %d categories, %d values; want 1 and %d", len(cats), len(vals), len(eoWantSubjectTaxonomy))
+	}
+	if open, err := eoSubjectTaxonomyPending(db); err != nil || open {
+		t.Errorf("pending after seeding = %v (err %v), want false", open, err)
+	}
+}
+
+// The convergent half: a value missing from an existing category is added
+// back, and an administrator's rename is not undone.
+// Mutation: gate the step on the category's existence alone.
+func TestSeedEOPilot_SubjectTaxonomyAddsAMissingValueAndKeepsEdits(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	cats, _ := eoTaxonomyValues(t, db)
+	if len(cats) != 1 {
+		t.Fatalf("fixture: category count = %d", len(cats))
+	}
+	if err := db.Unscoped().Where("category_id = ? AND code = ?", cats[0].ID, "drainage").Delete(&models.LookupValue{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.LookupValue{}).Where("category_id = ? AND code = ?", cats[0].ID, "parking").
+		Update("name", "Car parking (edited)").Error; err != nil {
+		t.Fatal(err)
+	}
+	if open, err := eoSubjectTaxonomyPending(db); err != nil || !open {
+		t.Fatalf("pending with a value missing = %v (err %v), want true", open, err)
+	}
+	seedEOPilot(db)
+	_, vals := eoTaxonomyValues(t, db)
+	if len(vals) != len(eoWantSubjectTaxonomy) {
+		t.Errorf("values after re-seed = %d, want %d (the missing one added back)", len(vals), len(eoWantSubjectTaxonomy))
+	}
+	for _, v := range vals {
+		if v.Code == "parking" && v.Name != "Car parking (edited)" {
+			t.Errorf("an edited value was overwritten: %q", v.Name)
+		}
+	}
+}

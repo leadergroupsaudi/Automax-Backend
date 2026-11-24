@@ -420,6 +420,14 @@ var eoPilotSteps = []eoPilotStep{
 	// administrator's edit, and a convergent step would undo it on the next
 	// boot.
 	{key: eoRelaxFileRequirednessStepKey, run: eoRelaxFileRequirednessUntilDocumenta},
+	// TASK B1 (remediation). CONVERGENT: eo_decision_record.keywords names the
+	// lookup category `eo_subject_taxonomy` as its option source, and without
+	// that category no Decision Record can be created. The step restates a
+	// rule that must hold for whatever the database now contains ("the
+	// category, and each of these values, exists"), so it is gated on
+	// `pending`, never on an applied row, and adds only what is missing.
+	{key: eoSeedSubjectTaxonomyStepKey, run: eoSeedSubjectTaxonomy,
+		convergent: true, pending: eoSubjectTaxonomyPending},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -4093,4 +4101,105 @@ func eoLogCapabilityInputGaps(db *gorm.DB) {
 		log.Printf("EO pilot: capability %q on %q reads %s=%q, which no field definition on that type provides, so it matches nothing and writes an empty result on every save; expected until the client supplies it",
 			g.CapabilityKey, g.TypeKey, g.ConfigKey, g.ValuesKey)
 	}
+}
+
+// ── the subject taxonomy (Task B1 of the pilot remediation) ─────────────────
+
+// eoSeedSubjectTaxonomyStepKey is this step's PERMANENT identifier. The step is
+// convergent, so no applied row is ever written or read; the key only has to be
+// unique in eoPilotSteps and never reused for a one-shot step.
+const eoSeedSubjectTaxonomyStepKey = "seed_subject_taxonomy"
+
+// eoSubjectTaxonomyCode is the lookup category eo_decision_record.keywords
+// resolves its options from (its option_source configuration).
+const eoSubjectTaxonomyCode = "eo_subject_taxonomy"
+
+// eoSubjectTaxonomyDescription says in plain words that the list is not the
+// client's. The category carries no other marker of that, so the words are the
+// marker; TestSeedEOPilot_SeedsSubjectTaxonomy pins them.
+const eoSubjectTaxonomyDescription = "PROVISIONAL, pending client sign-off: the subject keywords a Decision Record is filed under. Derived from the subjects the pilot demo data uses; the Executive Office has not yet approved this list or its Arabic names."
+
+type eoSubjectValue struct{ code, name, nameAr string }
+
+// eoSubjectTaxonomyValues is the provisional set. A value's code is the slug a
+// Decision Record stores in `keywords`, so the first five are exactly the
+// slugs scripts/eo-demo-data.py emits (pinned by a test that reads them from
+// the script). The Arabic names are implementer-written, like the field
+// labels, and share the category's provisional status.
+var eoSubjectTaxonomyValues = []eoSubjectValue{
+	{"parking", "Parking", "مواقف السيارات"},
+	{"tariffs", "Tariffs and fees", "التعرفة والرسوم"},
+	{"central_district", "Central district", "النطاق المركزي"},
+	{"food_trucks", "Food trucks", "عربات الأغذية المتنقلة"},
+	{"licensing", "Licensing", "التراخيص"},
+	{"building_permits", "Building permits", "رخص البناء"},
+	{"road_safety", "Road safety", "السلامة المرورية"},
+	{"drainage", "Storm-water drainage", "تصريف مياه الأمطار"},
+	{"street_lighting", "Street lighting", "إنارة الشوارع"},
+	{"food_safety", "Food safety and inspection", "سلامة الأغذية والرقابة عليها"},
+}
+
+// eoSubjectTaxonomyPending asks, cheaply, whether the category or any of its
+// values is missing. Soft-deleted rows count as present: an administrator who
+// deleted a value (or the category) did so deliberately, and the unique index
+// on the category code covers deleted rows too, so re-creating would fail.
+func eoSubjectTaxonomyPending(db *gorm.DB) (bool, error) {
+	var cat models.LookupCategory
+	res := db.Unscoped().Where("code = ?", eoSubjectTaxonomyCode).Limit(1).Find(&cat)
+	if res.Error != nil {
+		return false, fmt.Errorf("look up category %q: %w", eoSubjectTaxonomyCode, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return true, nil
+	}
+	codes := make([]string, len(eoSubjectTaxonomyValues))
+	for i, v := range eoSubjectTaxonomyValues {
+		codes[i] = v.code
+	}
+	var have int64
+	if err := db.Unscoped().Model(&models.LookupValue{}).
+		Where("category_id = ? AND code IN ?", cat.ID, codes).Count(&have).Error; err != nil {
+		return false, fmt.Errorf("count the values of %q: %w", eoSubjectTaxonomyCode, err)
+	}
+	return have < int64(len(codes)), nil
+}
+
+// eoSeedSubjectTaxonomy creates the category if absent and any missing value.
+// It never edits a row that exists: an administrator's rename stands.
+func eoSeedSubjectTaxonomy(tx *gorm.DB) (bool, error) {
+	var cat models.LookupCategory
+	res := tx.Unscoped().Where("code = ?", eoSubjectTaxonomyCode).Limit(1).Find(&cat)
+	if res.Error != nil {
+		return false, fmt.Errorf("look up category %q: %w", eoSubjectTaxonomyCode, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		cat = models.LookupCategory{
+			Code:        eoSubjectTaxonomyCode,
+			Name:        "EO subject taxonomy",
+			NameAr:      "تصنيف موضوعات المكتب التنفيذي",
+			Description: eoSubjectTaxonomyDescription,
+			IsSystem:    true,
+			IsActive:    true,
+			FieldType:   "select",
+		}
+		if err := tx.Create(&cat).Error; err != nil {
+			return false, fmt.Errorf("create category %q: %w", eoSubjectTaxonomyCode, err)
+		}
+	}
+	for i, v := range eoSubjectTaxonomyValues {
+		var n int64
+		if err := tx.Unscoped().Model(&models.LookupValue{}).
+			Where("category_id = ? AND code = ?", cat.ID, v.code).Count(&n).Error; err != nil {
+			return false, fmt.Errorf("check value %q: %w", v.code, err)
+		}
+		if n > 0 {
+			continue
+		}
+		lv := models.LookupValue{CategoryID: cat.ID, Code: v.code, Name: v.name, NameAr: v.nameAr,
+			SortOrder: i + 1, IsActive: true}
+		if err := tx.Create(&lv).Error; err != nil {
+			return false, fmt.Errorf("create value %q: %w", v.code, err)
+		}
+	}
+	return true, nil
 }
