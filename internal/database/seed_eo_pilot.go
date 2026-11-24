@@ -127,7 +127,8 @@ var eoMatrixKeys = map[string]eoMatrixKeyEntry{
 	// never heard of: the configuration would LOOK like a confidentiality
 	// control while every Referral shipped unrestricted, in a government
 	// register, with nothing reporting it — and models.ValidateTypeEdit makes
-	// the key permanent at the first Referral record.
+	// the key permanent at the first Referral record, short of §7.14's
+	// confirmed destructive edit.
 	"visibility": {"visible_to", false, false},
 
 	// `sender_deadline` IS the engine's due_date for Incoming Correspondence.
@@ -624,15 +625,26 @@ type eoFileRequirednessRelaxation struct {
 //	moment the register holds its first record. Which is precisely what this
 //	step enables.
 //
-// So the designer route is open ONLY while the type and its descendants hold
-// no records: on a fresh deployment, before go-live. After the first record
-// there is NO SUPPORTED ROUTE. Spec §7.14 contemplates a confirmed-destructive
-// edit with a stated backfill rule and IT IS NOT BUILT; building it is a
-// feature with its own risk, not a line in this seed. Until it exists, a
-// deployment that has filed records and then connects Documenta cannot
-// restore these controls through any supported path, which is a recorded
-// BLOCKER ON ENABLING EO_DOCUMENTA_ENABLED=true and not a chore for the
-// operator.
+// So the UNCONFIRMED designer route is open only while the type and its
+// descendants hold no records: on a fresh deployment, before go-live.
+//
+// AFTER THE FIRST RECORD, §7.14'S OTHER HALF IS NOW BUILT (Plan 4, task B1).
+// The same designer request carries a `confirm_destructive` block naming this
+// type, this field and the change `field_required`, together with the backfill
+// rule the operator states for the records already filed. The edit is then
+// applied, and an action-log row carrying all four — plus the refusal it
+// overrode — is written in the same transaction. A confirmation naming
+// another type or another field does not authorise it, which matters here
+// because the record count behind the refusal is taken over the type AND
+// EVERY TYPE BENEATH IT.
+//
+// WHAT THAT DOES NOT MAKE POSSIBLE, and it is the part still open to the
+// client: restoring a create-time `always` on a FILE field is unsatisfiable
+// by any route, because POST /eo-records/:id/files needs a record id and no
+// client can mint a file id before the record exists. For the four fields
+// whose From is `always`, the restoration that means anything is `at_state`
+// — the document demanded at a transition after the record exists — or
+// staged upload. Which of those the client wants is not answered here.
 //
 // Nothing in this seed will re-tighten them either: the step is one-shot and
 // its applied row already exists. eoLogFileFieldsAwaitingDocumenta therefore
@@ -691,9 +703,9 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // the configuration grows. This is not such a rule. It is a one-time
 // remediation of a configuration the seed itself wrote, and the ruling that
 // authorises it also says how it ends: an administrator restores these fields
-// once Documenta is connected — by whatever route is open to them, which is
-// the type designer only before the register is used (see HOW TO RE-TIGHTEN
-// above). A convergent step gated on "the stored value differs from the
+// once Documenta is connected — through the type designer, as an ordinary
+// edit before the register is used and as a §7.14 CONFIRMED destructive edit
+// after that (see HOW TO RE-TIGHTEN above). A convergent step gated on "the stored value differs from the
 // seeded one" would read that edit as work to do and undo it on the next
 // boot — the precise defect this programme has already shipped twice, on
 // seed_type_permissions and on enable_capabilities. (Both gates have since
@@ -709,9 +721,9 @@ func eoIsRelaxedUntilDocumenta(typeKey, fieldKey string) bool {
 // on an environment variable would mean a boot that happened to have the flag
 // set consumed the step for ever and left the register uncreatable with
 // nothing said. Relaxing on a Documenta-enabled deployment costs a field that
-// is optional instead of mandatory — correctable through the type designer
-// while that type holds no records, and reported on every boot thereafter as
-// the blocker it becomes once it does.
+// is optional instead of mandatory — correctable through the type designer,
+// unconfirmed while that type holds no records and with §7.14's confirmation
+// and stated backfill rule after that, and reported on every boot either way.
 //
 // It is fail-closed, like every other step: a registered type or field that
 // does not exist is an error that rolls the pilot seed back, not a relaxation
@@ -758,7 +770,7 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 			log.Printf("EO pilot: %s.%s is %q, not the %q this step relaxes; left as it is", r.TypeKey, r.FieldKey, def.RequiredMode, r.From)
 			continue
 		}
-		log.Printf("EO pilot: %s.%s (%s) was %q and is now %q: EO Documenta mints no file id while it is disabled, so nothing could satisfy it. Restoring it to %q is possible through the type designer only while %q holds no records; after the first one models.ValidateTypeEdit refuses the edit and no supported route remains.",
+		log.Printf("EO pilot: %s.%s (%s) was %q and is now %q: EO Documenta mints no file id while it is disabled, so nothing could satisfy it. Restoring it to %q is possible through the type designer: as an ordinary edit while %q holds no records, and after the first one only with a confirm_destructive block naming the type, the field and the change, plus the backfill rule for the records already filed.",
 			r.TypeKey, r.FieldKey, def.Kind, r.From, models.EORequiredNever, r.From, r.TypeKey)
 	}
 	return true, nil
@@ -791,9 +803,10 @@ func eoRelaxFileRequirednessUntilDocumenta(tx *gorm.DB) (bool, error) {
 // back through the type designer", which 400s: models.ValidateTypeEdit
 // refuses to make a field required while the type or any type beneath it
 // holds records, and filing a record is exactly what the relaxation enables.
-// The line now says what is actually available, and names the missing
-// capability (§7.14's confirmed-destructive edit) instead of implying a route
-// that exists.
+// The line now says what is actually available: an ordinary edit while
+// nothing is filed, and §7.14's confirmed destructive edit — a
+// confirm_destructive block naming the type, the field and the change, with a
+// stated backfill rule — once something is.
 func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 	// Each entry prints as "type.field (restore: <mode>)". The mode is the
 	// whole value of the line for the two at-closure fields: an
@@ -865,7 +878,7 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 	// constraint is the same: the type designer refuses to make a field
 	// required once the type or anything beneath it holds a record. Only
 	// the urgency differs.
-	const howToRestore = "Restoring a field is possible through the type designer ONLY while its record type and every type beneath it hold no records; after the first record models.ValidateTypeEdit refuses the edit (\"making field ... required is destructive while records exist\") and NO SUPPORTED ROUTE REMAINS — §7.14's confirmed-destructive edit with a backfill rule is not built."
+	const howToRestore = "Restoring a field is possible through the type designer as an ORDINARY edit only while its record type and every type beneath it hold no records; after the first record models.ValidateTypeEdit refuses that edit (\"making field ... required is destructive while records exist\") and the request must carry §7.14's confirm_destructive block — the type key, the field key, the change `field_required` and the backfill rule for the records already filed — which is applied and audited together."
 	if config.EODocumentaEnabled() {
 		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY. "+howToRestore+" Treat this as a BLOCKER on running enabled with these controls missing, not as a chore.",
 			len(relaxed), strings.Join(relaxed, ", "))

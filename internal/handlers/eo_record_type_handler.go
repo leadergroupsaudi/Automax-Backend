@@ -1,12 +1,16 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
+	"github.com/automax/backend/pkg/constants"
 	"github.com/automax/backend/pkg/i18n"
 	"github.com/automax/backend/pkg/utils"
 	"github.com/gofiber/fiber/v2"
@@ -108,6 +112,12 @@ type eoRecordTypeRequest struct {
 	WorkflowID       *uuid.UUID     `json:"workflow_id"`
 	Capabilities     datatypes.JSON `json:"capabilities"`
 	IsActive         *bool          `json:"is_active"`
+	// ConfirmDestructive is spec §7.14's other half: the operator's explicit
+	// authorisation of ONE destructive change, with the backfill rule they
+	// state for the records it leaves behind. It is not an attribute of the
+	// type and applyTo never writes it anywhere; it is consulted by the guard
+	// rail and recorded in the audit row.
+	ConfirmDestructive *models.EODestructiveConfirmation `json:"confirm_destructive"`
 }
 
 // applyTo writes the request onto t, which is either a fresh type or the
@@ -151,6 +161,17 @@ type eoFieldDefRequest struct {
 	SortOrder            int            `json:"sort_order"`
 	HelpText             string         `json:"help_text"`
 	HelpTextAr           string         `json:"help_text_ar"`
+	// See eoRecordTypeRequest.ConfirmDestructive. On the three field routes
+	// it authorises removing a field, changing its kind or making it
+	// required — the three §7.14 rules a field edit can break.
+	ConfirmDestructive *models.EODestructiveConfirmation `json:"confirm_destructive"`
+}
+
+// eoFieldDeleteRequest is the only thing a DELETE body may carry. It is a
+// type of its own rather than eoFieldDefRequest so that a client cannot send
+// an attribute set to a route that applies none of it.
+type eoFieldDeleteRequest struct {
+	ConfirmDestructive *models.EODestructiveConfirmation `json:"confirm_destructive"`
 }
 
 func (r *eoFieldDefRequest) applyTo(f *models.EOFieldDef) {
@@ -189,7 +210,8 @@ func (r *eoFieldDefRequest) applyTo(f *models.EOFieldDef) {
 // It answers the request itself when the edit is refused and reports that as
 // allowed=false, so a caller writes
 //
-//	if allowed, err := h.eoGuardTypeEdit(...); !allowed {
+//	allowed, overridden, err := h.eoGuardTypeEdit(...)
+//	if !allowed {
 //		return err
 //	}
 //
@@ -197,22 +219,164 @@ func (r *eoFieldDefRequest) applyTo(f *models.EOFieldDef) {
 // utils.ErrorResponse returns nil on a successful write, so a refusal handed
 // back in the error slot alone would read as "edit allowed" at every call
 // site and the destructive write would go through under a 400 response.
+//
+// `overridden` is the §7.14 refusal the confirmation authorised, empty when
+// there was nothing to confirm. It is what the audit row records, and it is
+// also the signal that an audit row is owed at all.
+//
+// IT ASKS THE MODEL TWICE, DELIBERATELY. The first call is the question §7.14
+// asks of every edit, with no confirmation, and its answer is the sentence the
+// operator would have been refused with. The second decides whether the
+// confirmation supplied authorises that edit. The DIFFERENCE between the two
+// answers is precisely "the confirmation was used" — which is the only thing
+// that may write an override into the audit log, and is not derivable from
+// "the request carried a confirmation": a client that attaches the operator's
+// last confirmation to every save would otherwise record every save as a
+// confirmed destruction. Both calls are pure and cheap.
 func (h *EORecordTypeHandler) eoGuardTypeEdit(
 	c *fiber.Ctx,
 	before, after models.EORecordType,
 	fieldsBefore, fieldsAfter []models.EOFieldDef,
-) (bool, error) {
+	confirm *models.EODestructiveConfirmation,
+) (bool, string, error) {
 	hasRecords, err := h.eoTypeHasRecords(c, before.ID)
 	if err != nil {
-		return false, utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+		return false, "", utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
-	if err := models.ValidateTypeEdit(before, after, fieldsBefore, fieldsAfter, hasRecords); err != nil {
+	refusal := models.ValidateTypeEdit(before, after, fieldsBefore, fieldsAfter, hasRecords, nil)
+	if err := models.ValidateTypeEdit(before, after, fieldsBefore, fieldsAfter, hasRecords, confirm); err != nil {
 		// The message names the field and the reason; it is the whole point
 		// of the guard rail and is returned verbatim rather than flattened
-		// into a generic "invalid".
-		return false, utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
+		// into a generic "invalid". With a confirmation that does not match,
+		// it also names what the confirmation did authorise.
+		return false, "", utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
 	}
-	return true, nil
+	if refusal == nil {
+		return true, "", nil
+	}
+	return true, refusal.Error(), nil
+}
+
+// ── the audit row a confirmed destructive edit owes ─────────────────────────
+
+// eoTypeEditAuditModule and eoTypeEditAuditAction are how the row is found
+// again. The action log's filter options are SELECT DISTINCT over the stored
+// rows (repository.actionLogRepository.GetDistinctModules/Actions), so a pair
+// of values of its own appears in the existing action-log screen by itself and
+// needs no registration anywhere.
+const (
+	eoTypeEditAuditModule = "eo_type_designer"
+	eoTypeEditAuditAction = "confirm_destructive_edit"
+)
+
+// eoTypeEditAuditDetail is what the row's new_value holds: the confirmation as
+// it arrived, plus the refusal it overrode. The refusal is the load-bearing
+// half — "an administrator confirmed a destructive edit" is not an audit of
+// what was destroyed, and §7.14's whole demand is that this never happens
+// silently.
+//
+// WHAT middleware.ActionLogger ADDS, AND WHY IT IS STILL ON THIS GROUP (see
+// cmd/server/main.go, where it wraps /admin/eo-record-types). It logs the
+// CALL — including one that never reaches this function, such as a refused
+// confirmation — but it captures no request body, so it can say that somebody
+// PUT this field definition and not which change they authorised or why. The
+// two entries are complementary and neither replaces the other.
+type eoTypeEditAuditDetail struct {
+	TypeKey  string `json:"type_key"`
+	FieldKey string `json:"field_key"`
+	Change   string `json:"change"`
+	Reason   string `json:"reason"`
+	Refusal  string `json:"refusal"`
+}
+
+// eoConfirmedEditAudit builds the row a confirmed edit owes, or (nil, true,
+// nil) when the edit overrode nothing. It follows the eoGuardTypeEdit calling
+// convention: ok=false means the request has been answered.
+//
+// AN UNATTRIBUTED OVERRIDE IS REFUSED. The row's whole value is that it names
+// who authorised the destruction, so a request that reaches here without an
+// actor is answered 401 rather than audited to nobody. The designer routes run
+// behind the auth middleware in cmd/server/main.go, so that arm is not
+// reachable through the registered route set; it is kept because eoActor is
+// the only thing in this package that establishes the fact, and a route group
+// assembled differently — as the tests assemble one — would otherwise write an
+// audit row with a zero user id.
+func (h *EORecordTypeHandler) eoConfirmedEditAudit(
+	c *fiber.Ctx,
+	t models.EORecordType,
+	confirm *models.EODestructiveConfirmation,
+	overridden string,
+) (*models.ActionLog, bool, error) {
+	if overridden == "" {
+		return nil, true, nil
+	}
+	actor, ok, err := eoActor(c)
+	if !ok {
+		return nil, false, err
+	}
+	detail, marshalErr := json.Marshal(eoTypeEditAuditDetail{
+		TypeKey:  confirm.TypeKey,
+		FieldKey: confirm.FieldKey,
+		Change:   confirm.Change,
+		Reason:   confirm.Reason,
+		Refusal:  overridden,
+	})
+	if marshalErr != nil {
+		return nil, false, utils.InternalErrorResponse(c, marshalErr, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	ip, _ := c.Locals(constants.ContextKeys.IP_ADDRESS).(string)
+	agent, _ := c.Locals(constants.ContextKeys.USER_AGENT).(string)
+	where := "the record type itself"
+	if confirm.FieldKey != "" {
+		where = fmt.Sprintf("field %q", confirm.FieldKey)
+	}
+	return &models.ActionLog{
+		UserID:     actor.ID,
+		Action:     eoTypeEditAuditAction,
+		Module:     eoTypeEditAuditModule,
+		ResourceID: t.ID.String(),
+		Description: eoTruncate(fmt.Sprintf("Confirmed a destructive edit (%s) to %s on EO record type %q, overriding spec §7.14. Stated backfill rule: %s",
+			confirm.Change, where, t.Key, confirm.Reason), 500),
+		NewValue:  string(detail),
+		IPAddress: ip,
+		UserAgent: agent,
+		Status:    "success",
+		CreatedAt: time.Now(),
+	}, true, nil
+}
+
+// eoTruncate bounds a string to n CHARACTERS, which is what Postgres counts
+// for varchar(n). models.ActionLog.Description is varchar(500) and the stated
+// rule is free text, so without this the audit INSERT could fail on a value
+// too long for its column — and because that INSERT shares the edit's
+// transaction, it would roll the edit back with an internal error instead of
+// recording it. The model caps the rule itself; this caps the sentence built
+// around it.
+func eoTruncate(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	runes := []rune(s)
+	const ellipsis = "…"
+	return string(runes[:n-1]) + ellipsis
+}
+
+// eoWriteTypeEdit applies one designer write, and when the edit was authorised
+// by a confirmation, writes the audit row IN THE SAME TRANSACTION.
+//
+// An ordinary edit takes the repository directly and opens no transaction:
+// there is no second write to be atomic with, and the single-statement writes
+// are already atomic by themselves.
+func (h *EORecordTypeHandler) eoWriteTypeEdit(c *fiber.Ctx, audit *models.ActionLog, write func(repository.EORecordTypeRepository) error) error {
+	if audit == nil {
+		return write(h.types)
+	}
+	return h.types.Transaction(c.UserContext(), func(tx repository.EORecordTypeRepository) error {
+		if err := write(tx); err != nil {
+			return err
+		}
+		return tx.WriteActionLog(c.UserContext(), audit)
+	})
 }
 
 // eoTypeHasRecords asks the register, under an admin scope: the question is
@@ -421,14 +585,25 @@ func (h *EORecordTypeHandler) Update(c *fiber.Ctx) error {
 	}
 	// The guard rail runs BEFORE the write, on the proposed after-state. The
 	// field definitions are unchanged by this route, so they are passed as
-	// both sides: what §7.14 judges here is the reference prefix and pattern.
-	if allowed, err := h.eoGuardTypeEdit(c, before, after, fields, fields); !allowed {
+	// both sides: what §7.14 judges here is the reference prefix and pattern,
+	// the workflow, the parent, the key and the abstract flag.
+	allowed, overridden, err := h.eoGuardTypeEdit(c, before, after, fields, fields, req.ConfirmDestructive)
+	if !allowed {
 		return err
 	}
 	if allowed, err := h.eoCheckReferencePrefix(c, &after); !allowed {
 		return err
 	}
-	if err := h.types.Update(c.UserContext(), &after); err != nil {
+	// The audit row names the type as it is BEFORE the edit, which is the
+	// name the confirmation had to use and the only one the stored rows and
+	// the operator agree on when a re-key is what is being confirmed.
+	audit, ok, err := h.eoConfirmedEditAudit(c, before, req.ConfirmDestructive, overridden)
+	if !ok {
+		return err
+	}
+	if err := h.eoWriteTypeEdit(c, audit, func(r repository.EORecordTypeRepository) error {
+		return r.Update(c.UserContext(), &after)
+	}); err != nil {
 		return eoTypeWriteError(c, err)
 	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_record_type_updated"), &after)
@@ -564,10 +739,28 @@ func (h *EORecordTypeHandler) CreateField(c *fiber.Ctx) error {
 	// is asked anyway, so that "every field change is judged" has no
 	// exception a later edit could widen (adding a REQUIRED field to a type
 	// with records is the case that matters).
-	if allowed, err := h.eoGuardTypeEdit(c, *t, *t, before, after); !allowed {
+	allowed, overridden, err := h.eoGuardTypeEdit(c, *t, *t, before, after, req.ConfirmDestructive)
+	if !allowed {
 		return err
 	}
-	if err := h.types.CreateFieldDef(c.UserContext(), def); err != nil {
+	// THE AUDIT ARM HERE CANNOT FIRE TODAY, and it is kept rather than
+	// dropped. `overridden` is non-empty only when ValidateTypeEdit refuses
+	// the edit without a confirmation, and this route's before-state is this
+	// route's after-state minus one ADDED definition: no field is removed,
+	// re-kinded or tightened, and the type itself is passed unchanged on both
+	// sides, so there is nothing for the model to refuse. It is kept because
+	// the alternative is to discard `overridden` here — and then the day a
+	// rule makes some addition destructive (a required field on a populated
+	// type is the standing candidate), this route would apply it with no
+	// audit row and nothing would notice. A malformed confirmation is still
+	// refused by the guard above, which is why a client may send one here.
+	audit, ok, err := h.eoConfirmedEditAudit(c, *t, req.ConfirmDestructive, overridden)
+	if !ok {
+		return err
+	}
+	if err := h.eoWriteTypeEdit(c, audit, func(r repository.EORecordTypeRepository) error {
+		return r.CreateFieldDef(c.UserContext(), def)
+	}); err != nil {
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 	return utils.SuccessResponse(c, fiber.StatusCreated, i18n.T(c.UserContext(), "eo_field_def_created"), def)
@@ -614,10 +807,17 @@ func (h *EORecordTypeHandler) UpdateField(c *fiber.Ctx) error {
 		}
 		after = append(after, f)
 	}
-	if allowed, err := h.eoGuardTypeEdit(c, *t, *t, before, after); !allowed {
+	allowed, overridden, err := h.eoGuardTypeEdit(c, *t, *t, before, after, req.ConfirmDestructive)
+	if !allowed {
 		return err
 	}
-	if err := h.types.UpdateFieldDef(c.UserContext(), &updated); err != nil {
+	audit, ok, err := h.eoConfirmedEditAudit(c, *t, req.ConfirmDestructive, overridden)
+	if !ok {
+		return err
+	}
+	if err := h.eoWriteTypeEdit(c, audit, func(r repository.EORecordTypeRepository) error {
+		return r.UpdateFieldDef(c.UserContext(), &updated)
+	}); err != nil {
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_field_def_updated"), &updated)
@@ -631,6 +831,20 @@ func (h *EORecordTypeHandler) DeleteField(c *fiber.Ctx) error {
 	fieldID, ok, err := eoParamUUID(c, "field_id")
 	if !ok {
 		return err
+	}
+	// A DELETE carries no attribute set, so §7.14's confirmation arrives in
+	// an OPTIONAL body. An absent body is the ordinary unconfirmed removal
+	// and is parsed as nothing; a body that is present and unparseable is a
+	// malformed request and is refused rather than silently read as "no
+	// confirmation", which would answer the operator who typed one with the
+	// refusal their confirmation was meant to resolve.
+	var confirm *models.EODestructiveConfirmation
+	if len(c.Body()) > 0 {
+		var req eoFieldDeleteRequest
+		if err := c.BodyParser(&req); err != nil {
+			return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
+		}
+		confirm = req.ConfirmDestructive
 	}
 	t, ok, err := h.eoLoadType(c, id)
 	if !ok {
@@ -654,10 +868,17 @@ func (h *EORecordTypeHandler) DeleteField(c *fiber.Ctx) error {
 	}
 	// This is the case §7.14 exists for: removing a field while records hold
 	// values under its key.
-	if allowed, err := h.eoGuardTypeEdit(c, *t, *t, before, after); !allowed {
+	allowed, overridden, err := h.eoGuardTypeEdit(c, *t, *t, before, after, confirm)
+	if !allowed {
 		return err
 	}
-	if err := h.types.DeleteFieldDef(c.UserContext(), fieldID); err != nil {
+	audit, ok, err := h.eoConfirmedEditAudit(c, *t, confirm, overridden)
+	if !ok {
+		return err
+	}
+	if err := h.eoWriteTypeEdit(c, audit, func(r repository.EORecordTypeRepository) error {
+		return r.DeleteFieldDef(c.UserContext(), fieldID)
+	}); err != nil {
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
 	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_field_def_deleted"), nil)

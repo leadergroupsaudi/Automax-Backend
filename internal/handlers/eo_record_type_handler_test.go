@@ -1,12 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
@@ -321,4 +325,510 @@ func TestEOTypeWriteErrorsAreActionable(t *testing.T) {
 			t.Errorf("response %v does not name executive_office; the operator is left with a dead screen", out)
 		}
 	})
+}
+
+// ── §7.14's confirmed destructive edit ──────────────────────────────────────
+
+// eoConfirmTypeRepo is the designer repository with the writes a confirmed
+// destructive edit needs, and with a transaction that behaves like one: work
+// done inside it reaches the repository only if the function returns nil.
+//
+// That is what makes "the audit row is written in the edit's transaction" a
+// testable claim rather than an assertion. A fake that appended every write
+// straight to the committed slices could not tell an audit row written WITH
+// the edit from one written beside it, which is the exact failure Plan 3's
+// Task C1 established matters here.
+type eoConfirmTypeRepo struct {
+	eoFakeTypeRepo
+	fieldDef  *models.EOFieldDef
+	writeErr  error
+	committed eoConfirmWrites
+	// lastTx is the transaction the handler opened, kept after it closes so
+	// a test can see what was done inside the SAME one.
+	lastTx *eoConfirmTypeTx
+	// auditOutsideTx counts audit rows written on the repository the handler
+	// holds rather than on a transaction-bound one. It is zero in every test
+	// here, and a non-zero value is the "separate handle" defect itself.
+	auditOutsideTx int
+}
+
+// eoConfirmWrites is what a repository (or one transaction's buffer) has done.
+type eoConfirmWrites struct {
+	fieldUpdates []models.EOFieldDef
+	fieldDeletes []uuid.UUID
+	typeUpdates  []models.EORecordType
+	audit        []models.ActionLog
+}
+
+func (w *eoConfirmWrites) merge(other eoConfirmWrites) {
+	w.fieldUpdates = append(w.fieldUpdates, other.fieldUpdates...)
+	w.fieldDeletes = append(w.fieldDeletes, other.fieldDeletes...)
+	w.typeUpdates = append(w.typeUpdates, other.typeUpdates...)
+	w.audit = append(w.audit, other.audit...)
+}
+
+func (f *eoConfirmTypeRepo) GetFieldDef(_ context.Context, id uuid.UUID) (*models.EOFieldDef, error) {
+	if f.fieldDef != nil && f.fieldDef.ID == id {
+		return f.fieldDef, nil
+	}
+	return nil, nil
+}
+
+func (f *eoConfirmTypeRepo) UpdateFieldDef(_ context.Context, def *models.EOFieldDef) error {
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	f.committed.fieldUpdates = append(f.committed.fieldUpdates, *def)
+	return nil
+}
+
+func (f *eoConfirmTypeRepo) DeleteFieldDef(_ context.Context, id uuid.UUID) error {
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	f.committed.fieldDeletes = append(f.committed.fieldDeletes, id)
+	return nil
+}
+
+func (f *eoConfirmTypeRepo) Update(_ context.Context, t *models.EORecordType) error {
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	f.committed.typeUpdates = append(f.committed.typeUpdates, *t)
+	return nil
+}
+
+func (f *eoConfirmTypeRepo) WriteActionLog(_ context.Context, entry *models.ActionLog) error {
+	f.auditOutsideTx++
+	f.committed.audit = append(f.committed.audit, *entry)
+	return nil
+}
+
+func (f *eoConfirmTypeRepo) Transaction(_ context.Context, fn func(repository.EORecordTypeRepository) error) error {
+	tx := &eoConfirmTypeTx{parent: f}
+	f.lastTx = tx
+	if err := fn(tx); err != nil {
+		return err // nothing in tx.pending reaches the repository
+	}
+	f.committed.merge(tx.pending)
+	return nil
+}
+
+// eoConfirmTypeTx is the transaction-bound repository. It embeds the interface
+// so that a write this task did not intend to make inside a transaction
+// nil-panics loudly rather than being silently accepted.
+type eoConfirmTypeTx struct {
+	repository.EORecordTypeRepository
+	parent  *eoConfirmTypeRepo
+	pending eoConfirmWrites
+}
+
+func (tx *eoConfirmTypeTx) UpdateFieldDef(_ context.Context, def *models.EOFieldDef) error {
+	if tx.parent.writeErr != nil {
+		return tx.parent.writeErr
+	}
+	tx.pending.fieldUpdates = append(tx.pending.fieldUpdates, *def)
+	return nil
+}
+
+func (tx *eoConfirmTypeTx) DeleteFieldDef(_ context.Context, id uuid.UUID) error {
+	if tx.parent.writeErr != nil {
+		return tx.parent.writeErr
+	}
+	tx.pending.fieldDeletes = append(tx.pending.fieldDeletes, id)
+	return nil
+}
+
+func (tx *eoConfirmTypeTx) CreateFieldDef(_ context.Context, def *models.EOFieldDef) error {
+	if tx.parent.writeErr != nil {
+		return tx.parent.writeErr
+	}
+	tx.pending.fieldUpdates = append(tx.pending.fieldUpdates, *def)
+	return nil
+}
+
+func (tx *eoConfirmTypeTx) Update(_ context.Context, t *models.EORecordType) error {
+	if tx.parent.writeErr != nil {
+		return tx.parent.writeErr
+	}
+	tx.pending.typeUpdates = append(tx.pending.typeUpdates, *t)
+	return nil
+}
+
+func (tx *eoConfirmTypeTx) WriteActionLog(_ context.Context, entry *models.ActionLog) error {
+	tx.pending.audit = append(tx.pending.audit, *entry)
+	return nil
+}
+
+// eoConfirmFixture is the shape the guard rail is hardest on: an ABSTRACT base
+// type holding a field, no records of its own, and a concrete descendant that
+// holds three. Every edit to the base is therefore destructive, and the
+// confirmation has to name the base — not the descendant whose records are the
+// reason the question is being asked.
+type eoConfirmFixture struct {
+	base    models.EORecordType
+	leaf    models.EORecordType
+	fieldID uuid.UUID
+	types   *eoConfirmTypeRepo
+	records *eoFakeRecordRepo
+	app     *fiber.App
+	actor   *models.User
+}
+
+func eoNewConfirmFixture(t *testing.T) *eoConfirmFixture {
+	t.Helper()
+	base := models.EORecordType{ID: uuid.New(), Key: "eo_base", Name: "Base", IsAbstract: true,
+		ReferencePrefix: "EO", ReferencePattern: "EO-YYYY-NNN"}
+	leaf := models.EORecordType{ID: uuid.New(), Key: "eo_directive", Name: "Directive",
+		ParentTypeID: &base.ID, ReferencePrefix: "EO-DIR", ReferencePattern: "EO-DIR-YYYY-NNN"}
+	field := models.EOFieldDef{
+		ID: uuid.New(), RecordTypeID: base.ID, Key: "attachments", Label: "Attachments",
+		Kind: models.EOKindFile, RequiredMode: models.EORequiredNever,
+	}
+	types := &eoConfirmTypeRepo{
+		eoFakeTypeRepo: eoFakeTypeRepo{
+			byID:      &base,
+			all:       []models.EORecordType{base, leaf},
+			fieldDefs: []models.EOFieldDef{field},
+			children:  map[uuid.UUID][]models.EORecordType{base.ID: {leaf}},
+		},
+		fieldDef: &field,
+	}
+	// The abstract base holds nothing of its own; its descendant holds three.
+	records := &eoFakeRecordRepo{totalByType: map[uuid.UUID]int64{leaf.ID: 3}}
+
+	f := &eoConfirmFixture{base: base, leaf: leaf, fieldID: field.ID, types: types, records: records,
+		actor: eoTestUser()}
+	h := NewEORecordTypeHandler(types, records)
+	f.app = fiber.New()
+	f.app.Use(eoTestActor(f.actor))
+	h.RegisterRoutes(f.app.Group("/eo-record-types"), eoNoPerm2)
+	return f
+}
+
+// eoNoPerm2 is eoNoPerm in the EOPermissionMiddleware shape RegisterRoutes
+// takes: these tests are about the guard rail, not about who may reach it.
+func eoNoPerm2(_ ...string) fiber.Handler {
+	return func(c *fiber.Ctx) error { return c.Next() }
+}
+
+// eoConfirmReason is a stated backfill rule of the kind §7.14 asks for: what
+// will be done about the records the change leaves behind.
+const eoConfirmReason = "Documenta is connected as of this morning; the registry clerk attaches the letter to each of the 3 open directives before its next transition, and the four closed ones are exempt by the client's note of 2026-11-20."
+
+// eoRequireFieldBody is the PUT body that makes the relaxed file field
+// demanded again at a state — the edit blocker 1 of the Documenta list has no
+// supported route for.
+func eoRequireFieldBody(confirm map[string]any) []byte {
+	body := map[string]any{
+		"key": "attachments", "label": "Attachments", "kind": models.EOKindFile,
+		"required_mode": models.EORequiredAtState,
+	}
+	if confirm != nil {
+		body["confirm_destructive"] = confirm
+	}
+	out, _ := json.Marshal(body)
+	return out
+}
+
+func eoConfirmBlock(typeKey, fieldKey, change string) map[string]any {
+	return map[string]any{"type_key": typeKey, "field_key": fieldKey, "change": change, "reason": eoConfirmReason}
+}
+
+func (f *eoConfirmFixture) do(t *testing.T, method, path string, body []byte) *http.Response {
+	t.Helper()
+	var req *http.Request
+	if body == nil {
+		req = httptest.NewRequest(method, path, nil)
+	} else {
+		req = httptest.NewRequest(method, path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := f.app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	return resp
+}
+
+// eoAuditDetail is what the audit row's new_value carries.
+type eoAuditDetail struct {
+	TypeKey  string `json:"type_key"`
+	FieldKey string `json:"field_key"`
+	Change   string `json:"change"`
+	Reason   string `json:"reason"`
+	Refusal  string `json:"refusal"`
+}
+
+// TestAConfirmedFieldEditAppliesAndAuditsInOneTransaction is blocker 1 of the
+// three gating EO_DOCUMENTA_ENABLED=true, driven end to end through the route:
+// a file field relaxed to `never` is made `at_state` again on a type whose
+// descendant holds records, which before this task had no supported route at
+// all.
+func TestAConfirmedFieldEditAppliesAndAuditsInOneTransaction(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+
+	resp := f.do(t, "PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		eoRequireFieldBody(eoConfirmBlock("eo_base", "attachments", models.EODestructiveFieldRequired)))
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200: a confirmation naming this type, this field and this change did not authorise the edit", resp.StatusCode)
+	}
+	if len(f.types.committed.fieldUpdates) != 1 {
+		t.Fatalf("field updates = %d, want 1", len(f.types.committed.fieldUpdates))
+	}
+	if got := f.types.committed.fieldUpdates[0].RequiredMode; got != models.EORequiredAtState {
+		t.Errorf("stored required_mode = %q, want %q", got, models.EORequiredAtState)
+	}
+	if len(f.types.committed.audit) != 1 {
+		t.Fatalf("audit rows = %d, want exactly 1", len(f.types.committed.audit))
+	}
+	if f.types.auditOutsideTx != 0 {
+		t.Errorf("%d audit row(s) written on the repository's own handle: a confirmed edit's audit row must be written on the transaction that carries the edit", f.types.auditOutsideTx)
+	}
+	// Both writes happened inside ONE transaction, which is the property
+	// Plan 3's Task C1 established: an entry written through a second handle
+	// commits for an edit that rolled back, or is lost for one that did not.
+	if f.types.lastTx == nil {
+		t.Fatal("no transaction was opened: the edit and its audit row cannot have been atomic")
+	}
+	if len(f.types.lastTx.pending.fieldUpdates) != 1 || len(f.types.lastTx.pending.audit) != 1 {
+		t.Errorf("inside the transaction: %d field update(s) and %d audit row(s), want 1 and 1",
+			len(f.types.lastTx.pending.fieldUpdates), len(f.types.lastTx.pending.audit))
+	}
+
+	entry := f.types.committed.audit[0]
+	if entry.UserID != f.actor.ID {
+		t.Errorf("audit user = %s, want the confirming actor %s", entry.UserID, f.actor.ID)
+	}
+	if entry.ResourceID != f.base.ID.String() {
+		t.Errorf("audit resource = %q, want the edited type %s", entry.ResourceID, f.base.ID)
+	}
+	if entry.Module == "" || entry.Action == "" {
+		t.Errorf("audit module/action = %q/%q, want both set so the row is findable in the action-log screen", entry.Module, entry.Action)
+	}
+	if utf8.RuneCountInString(entry.Description) > 500 {
+		t.Errorf("audit description is %d characters; action_logs.description is varchar(500) and the INSERT would fail inside the edit's transaction", utf8.RuneCountInString(entry.Description))
+	}
+	var detail eoAuditDetail
+	if err := json.Unmarshal([]byte(entry.NewValue), &detail); err != nil {
+		t.Fatalf("audit new_value is not the confirmation detail: %v (%q)", err, entry.NewValue)
+	}
+	if detail.TypeKey != "eo_base" || detail.FieldKey != "attachments" || detail.Change != models.EODestructiveFieldRequired {
+		t.Errorf("audit detail = %+v, want it to name the type, the field and the change", detail)
+	}
+	if detail.Reason != eoConfirmReason {
+		t.Errorf("audit reason = %q, want the operator's stated rule verbatim", detail.Reason)
+	}
+	// The refusal the confirmation overrode is the only durable statement of
+	// WHAT was destroyed. Without it the row says an edit was confirmed and
+	// not what the edit did to the records.
+	if !strings.Contains(detail.Refusal, "attachments") || !strings.Contains(detail.Refusal, "destructive") {
+		t.Errorf("audit refusal = %q, want the §7.14 refusal this confirmation overrode", detail.Refusal)
+	}
+}
+
+// TestAConfirmedEditThatCannotBeWrittenLeavesNoAuditRow: the audit row says a
+// destructive edit was applied. If the edit is rolled back the row must go
+// with it, or the register's history records a change that never happened.
+func TestAConfirmedEditThatCannotBeWrittenLeavesNoAuditRow(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+	f.types.writeErr = fmt.Errorf("deadlock detected")
+
+	resp := f.do(t, "PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		eoRequireFieldBody(eoConfirmBlock("eo_base", "attachments", models.EODestructiveFieldRequired)))
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	if len(f.types.committed.audit) != 0 {
+		t.Errorf("audit rows = %d after a failed edit, want 0: the row survived a write that did not",
+			len(f.types.committed.audit))
+	}
+	if len(f.types.committed.fieldUpdates) != 0 {
+		t.Errorf("field updates = %d after a failed write, want 0", len(f.types.committed.fieldUpdates))
+	}
+}
+
+// TestAnUnconfirmedDestructiveFieldEditIsStillRefused: the first half of
+// §7.14 is unchanged. Nothing about an edit that carries no confirmation
+// moved, including the refusal the operator reads.
+func TestAnUnconfirmedDestructiveFieldEditIsStillRefused(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+
+	resp := f.do(t, "PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		eoRequireFieldBody(nil))
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body := eoReadBody(t, resp)
+	if !strings.Contains(body, "attachments") || !strings.Contains(body, "destructive") {
+		t.Errorf("refusal body = %q, want the §7.14 message naming the field", body)
+	}
+	if len(f.types.committed.fieldUpdates) != 0 || len(f.types.committed.audit) != 0 {
+		t.Errorf("a refused edit wrote %d field update(s) and %d audit row(s), want none",
+			len(f.types.committed.fieldUpdates), len(f.types.committed.audit))
+	}
+}
+
+// TestAConfirmationNamingTheDescendantDoesNotAuthoriseTheAncestorEdit is the
+// hazard the handler creates and the model closes: hasRecords is computed over
+// the type AND EVERY TYPE BENEATH IT, so this edit to the ABSTRACT base is
+// destructive only because the descendant holds records. A confirmation
+// obtained while looking at that descendant names the descendant — and must
+// not carry a change to the ancestor, whose other children nobody reviewed.
+func TestAConfirmationNamingTheDescendantDoesNotAuthoriseTheAncestorEdit(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+
+	resp := f.do(t, "PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		eoRequireFieldBody(eoConfirmBlock("eo_directive", "attachments", models.EODestructiveFieldRequired)))
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: a confirmation naming %q authorised an edit to %q", resp.StatusCode, "eo_directive", "eo_base")
+	}
+	body := eoReadBody(t, resp)
+	if !strings.Contains(body, "eo_directive") || !strings.Contains(body, "eo_base") {
+		t.Errorf("refusal body = %q, want it to name the confirmed type and the edited one", body)
+	}
+	if len(f.types.committed.fieldUpdates) != 0 || len(f.types.committed.audit) != 0 {
+		t.Errorf("a refused edit wrote %d field update(s) and %d audit row(s), want none",
+			len(f.types.committed.fieldUpdates), len(f.types.committed.audit))
+	}
+}
+
+// TestAnEditWithNothingToConfirmWritesNoAuditRow: the audit row records an
+// OVERRIDE, not a request. An ordinary edit writes none — and neither does one
+// that carries a well-formed confirmation for a change it does not make, which
+// is what a client would send if it attached the operator's last confirmation
+// to every subsequent save.
+func TestAnEditWithNothingToConfirmWritesNoAuditRow(t *testing.T) {
+	relabel := func(confirm map[string]any) []byte {
+		body := map[string]any{
+			"key": "attachments", "label": "Attachments (scanned)", "kind": models.EOKindFile,
+			"required_mode": models.EORequiredNever,
+		}
+		if confirm != nil {
+			body["confirm_destructive"] = confirm
+		}
+		out, _ := json.Marshal(body)
+		return out
+	}
+	cases := map[string]map[string]any{
+		"no confirmation":       nil,
+		"an unconsumed one":     eoConfirmBlock("eo_base", "attachments", models.EODestructiveFieldRequired),
+		"one for another field": eoConfirmBlock("eo_base", "subject", models.EODestructiveFieldRemoved),
+	}
+	for name, confirm := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := eoNewConfirmFixture(t)
+			resp := f.do(t, "PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID), relabel(confirm))
+			if resp.StatusCode != fiber.StatusOK {
+				t.Fatalf("status = %d, want 200: a harmless relabel was refused", resp.StatusCode)
+			}
+			if len(f.types.committed.audit) != 0 {
+				t.Errorf("audit rows = %d, want 0: an edit that overrode nothing was recorded as a confirmed destructive edit", len(f.types.committed.audit))
+			}
+			if len(f.types.committed.fieldUpdates) != 1 {
+				t.Errorf("field updates = %d, want 1", len(f.types.committed.fieldUpdates))
+			}
+		})
+	}
+}
+
+// TestAConfirmedFieldRemovalIsAcceptedOnDelete: removing a field is the case
+// §7.14 exists for, and DELETE carries no attribute set — so the confirmation
+// arrives in an optional body, which this proves is read. The same request
+// with no body is still refused.
+func TestAConfirmedFieldRemovalIsAcceptedOnDelete(t *testing.T) {
+	path := func(f *eoConfirmFixture) string {
+		return fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID)
+	}
+
+	f := eoNewConfirmFixture(t)
+	if resp := f.do(t, "DELETE", path(f), nil); resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d for an unconfirmed removal, want 400", resp.StatusCode)
+	}
+
+	f = eoNewConfirmFixture(t)
+	body, _ := json.Marshal(map[string]any{
+		"confirm_destructive": eoConfirmBlock("eo_base", "attachments", models.EODestructiveFieldRemoved),
+	})
+	resp := f.do(t, "DELETE", path(f), body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d for a confirmed removal, want 200 (body = %q)", resp.StatusCode, eoReadBody(t, resp))
+	}
+	if len(f.types.committed.fieldDeletes) != 1 {
+		t.Errorf("field deletes = %d, want 1", len(f.types.committed.fieldDeletes))
+	}
+	if len(f.types.committed.audit) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(f.types.committed.audit))
+	}
+	var detail eoAuditDetail
+	if err := json.Unmarshal([]byte(f.types.committed.audit[0].NewValue), &detail); err != nil {
+		t.Fatalf("audit new_value: %v", err)
+	}
+	if detail.Change != models.EODestructiveFieldRemoved || detail.FieldKey != "attachments" {
+		t.Errorf("audit detail = %+v, want the removal of attachments", detail)
+	}
+}
+
+// TestAConfirmedTypeEditAuditsTheTypeLevelChange: the six changes that are not
+// about a field take the same route, and their audit row names no field.
+func TestAConfirmedTypeEditAuditsTheTypeLevelChange(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+	body, _ := json.Marshal(map[string]any{
+		"key": "eo_base", "name": "Base", "is_abstract": true,
+		"reference_prefix": "EO2", "reference_pattern": "EO-YYYY-NNN",
+		"confirm_destructive": map[string]any{
+			"type_key": "eo_base", "change": models.EODestructiveReferencePrefix, "reason": eoConfirmReason,
+		},
+	})
+	resp := f.do(t, "PUT", "/eo-record-types/"+f.base.ID.String(), body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200 (body = %q)", resp.StatusCode, eoReadBody(t, resp))
+	}
+	if len(f.types.committed.typeUpdates) != 1 || len(f.types.committed.audit) != 1 {
+		t.Fatalf("type updates = %d and audit rows = %d, want 1 and 1",
+			len(f.types.committed.typeUpdates), len(f.types.committed.audit))
+	}
+	var detail eoAuditDetail
+	if err := json.Unmarshal([]byte(f.types.committed.audit[0].NewValue), &detail); err != nil {
+		t.Fatalf("audit new_value: %v", err)
+	}
+	if detail.Change != models.EODestructiveReferencePrefix || detail.FieldKey != "" {
+		t.Errorf("audit detail = %+v, want the prefix change and no field", detail)
+	}
+}
+
+// eoReadBody reads a response body for an assertion about what the operator is
+// told.
+func eoReadBody(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(out)
+}
+
+// TestAConfirmationOnAnAddedFieldConsumesNothing pins the claim CreateField's
+// comment makes: adding a definition is additive, so there is nothing for a
+// confirmation to authorise and no audit row is owed — even on a type whose
+// descendant holds records, which is the state where every other edit to it is
+// refused. If a later rule makes some addition destructive, this fails and the
+// audit arm that route keeps becomes reachable.
+func TestAConfirmationOnAnAddedFieldConsumesNothing(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+	body, _ := json.Marshal(map[string]any{
+		"key": "decision_note", "label": "Decision note", "kind": models.EOKindText,
+		"required_mode":       models.EORequiredAlways,
+		"confirm_destructive": eoConfirmBlock("eo_base", "decision_note", models.EODestructiveFieldRequired),
+	})
+	resp := f.do(t, "POST", fmt.Sprintf("/eo-record-types/%s/fields", f.base.ID), body)
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body = %q)", resp.StatusCode, eoReadBody(t, resp))
+	}
+	if f.types.createFieldCalls != 1 {
+		t.Errorf("CreateFieldDef calls = %d, want 1", f.types.createFieldCalls)
+	}
+	if len(f.types.committed.audit) != 0 {
+		t.Errorf("audit rows = %d, want 0: adding a field overrode nothing", len(f.types.committed.audit))
+	}
 }

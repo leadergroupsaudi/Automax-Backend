@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -336,16 +337,184 @@ func ValidateReferencePrefix(t EORecordType, existing []EORecordType) error {
 	return nil
 }
 
+// ── §7.14's confirmed destructive edit ──────────────────────────────────────
+
+// The destructive changes ValidateTypeEdit refuses while records exist, one
+// identifier each. A confirmation names ONE of them, on one field, of one
+// type. Naming the type and the field is not enough on its own: an operator
+// shown "this removes field X" was asked about removing it and not about
+// re-kinding it, and a confirmation that did not say which would carry
+// whichever change the request happened to contain.
+//
+// THESE STRINGS ARE A WIRE CONTRACT. They arrive in the request body as
+// `confirm_destructive.change` and are stored verbatim in the audit row, so
+// renaming one invalidates confirmations a client already knows how to send
+// and makes the rows already stored unreadable against the new set.
+const (
+	EODestructiveWorkflow         = "workflow"
+	EODestructiveParentType       = "parent_type"
+	EODestructiveKey              = "key"
+	EODestructiveAbstract         = "abstract"
+	EODestructiveReferencePrefix  = "reference_prefix"
+	EODestructiveReferencePattern = "reference_pattern"
+	EODestructiveFieldRemoved     = "field_removed"
+	EODestructiveFieldKind        = "field_kind"
+	EODestructiveFieldRequired    = "field_required"
+)
+
+// EODestructiveChanges is every identifier a confirmation may name. It is the
+// list a client offers and the list a refusal quotes back, and it exists so
+// that neither is a second copy of the constants above.
+var EODestructiveChanges = []string{
+	EODestructiveWorkflow,
+	EODestructiveParentType,
+	EODestructiveKey,
+	EODestructiveAbstract,
+	EODestructiveReferencePrefix,
+	EODestructiveReferencePattern,
+	EODestructiveFieldRemoved,
+	EODestructiveFieldKind,
+	EODestructiveFieldRequired,
+}
+
+// EODestructiveConfirmation is spec §7.14's second half: a destructive change
+// is "blocked while records of that type exist, OR applied with explicit
+// confirmation and a stated backfill rule. Never silently."
+//
+// It names the edit it authorises rather than recording that somebody clicked
+// yes. A confirmation that named nothing would be a blanket override with
+// extra steps, and it would be worse than that here: ValidateTypeEdit's caller
+// computes hasRecords over the type AND EVERY TYPE BENEATH IT, so an edit to
+// an abstract ancestor is guarded by its descendants' records — and a
+// confirmation obtained while looking at a child register would authorise a
+// change to the parent that nobody reviewed. TypeKey is what stops that.
+//
+// Reason is the stated backfill rule, in the operator's own words. THERE IS
+// NO EO BACKFILL in this repository — nothing reads this rule and nothing acts
+// on it. It is a statement of what a human will do about the records this edit
+// leaves behind, and its whole value is that it is recorded next to the change
+// and attributed. It is required.
+//
+// FieldKey is empty for the six changes that are not about one field, and
+// that emptiness is compared like any other value: a confirmation that names
+// a field does not authorise a change to the type itself, and one that names
+// none does not authorise a change to a field.
+type EODestructiveConfirmation struct {
+	TypeKey  string `json:"type_key"`
+	FieldKey string `json:"field_key"`
+	Change   string `json:"change"`
+	Reason   string `json:"reason"`
+}
+
+// eoMaxConfirmationReason bounds the stated rule. It is a sentence an operator
+// types into a dialog, and it is rendered into models.ActionLog.Description,
+// which is varchar(500): an unbounded one would be truncated there anyway, and
+// a value too long for the column would fail the audit INSERT and — because
+// that INSERT shares the edit's transaction — roll the edit back with an
+// internal error instead of refusing the request.
+const eoMaxConfirmationReason = 1000
+
+// validate checks the confirmation is well formed, before anything is compared
+// against the edit. A malformed one is refused rather than ignored, even on an
+// edit with nothing to confirm: an unread confirmation in a request body is
+// indistinguishable, to the operator who typed it, from one that was honoured.
+func (cf EODestructiveConfirmation) validate() error {
+	if strings.TrimSpace(cf.TypeKey) == "" {
+		return fmt.Errorf("a destructive-edit confirmation must name the record type it authorises (type_key)")
+	}
+	if strings.TrimSpace(cf.Change) == "" {
+		return fmt.Errorf("a destructive-edit confirmation must name the change it authorises (change), one of: %s", strings.Join(EODestructiveChanges, ", "))
+	}
+	known := false
+	for _, change := range EODestructiveChanges {
+		if cf.Change == change {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return fmt.Errorf("a destructive-edit confirmation names change %q, which is not one of: %s", cf.Change, strings.Join(EODestructiveChanges, ", "))
+	}
+	if strings.TrimSpace(cf.Reason) == "" {
+		return fmt.Errorf("a destructive-edit confirmation must state the backfill rule (reason): what will be done about the records this change leaves behind")
+	}
+	// COUNTED IN CHARACTERS, NOT BYTES. The reason is typed in Arabic as
+	// often as in English, every letter of which is two bytes in UTF-8, so a
+	// byte count would refuse a 500-character Arabic rule while allowing a
+	// 1000-character English one — and would say "1000 characters" about a
+	// sentence half that long. Postgres varchar(n) counts characters too.
+	if utf8.RuneCountInString(cf.Reason) > eoMaxConfirmationReason {
+		return fmt.Errorf("a destructive-edit confirmation's stated backfill rule is %d characters; the limit is %d", utf8.RuneCountInString(cf.Reason), eoMaxConfirmationReason)
+	}
+	return nil
+}
+
+// eoDestructiveEdit is one destructive change a proposed edit makes: what it
+// is, where it is, and the sentence the operator is shown when there is no
+// confirmation for it.
+type eoDestructiveEdit struct {
+	Change   string
+	TypeKey  string
+	FieldKey string
+	Refusal  string
+}
+
+// authorises returns nil when cf names this exact change, and otherwise the
+// refusal plus what the confirmation names instead. Keys are compared
+// trimmed because the designer trims them before storing them, so an
+// untrimmed confirmation names the same field the stored definition does.
+func (cf EODestructiveConfirmation) authorises(e eoDestructiveEdit) error {
+	if strings.TrimSpace(cf.TypeKey) != e.TypeKey {
+		return fmt.Errorf("%s. The confirmation supplied authorises a change to record type %q, and this edit changes record type %q, so it does not authorise it",
+			e.Refusal, strings.TrimSpace(cf.TypeKey), e.TypeKey)
+	}
+	if strings.TrimSpace(cf.FieldKey) != e.FieldKey {
+		return fmt.Errorf("%s. The confirmation supplied authorises a change to %s, and this edit changes %s, so it does not authorise it",
+			e.Refusal, eoConfirmationFieldText(strings.TrimSpace(cf.FieldKey)), eoConfirmationFieldText(e.FieldKey))
+	}
+	if cf.Change != e.Change {
+		return fmt.Errorf("%s. The confirmation supplied authorises %q, and this edit is %q, so it does not authorise it",
+			e.Refusal, cf.Change, e.Change)
+	}
+	return nil
+}
+
+// eoConfirmationFieldText renders the "where" half of a mismatch, so that the
+// type-level case reads as a sentence rather than as an empty pair of quotes.
+func eoConfirmationFieldText(key string) string {
+	if key == "" {
+		return "the record type itself rather than one of its fields"
+	}
+	return fmt.Sprintf("field %q", key)
+}
+
 // ValidateTypeEdit applies the guard rails of spec §7.14. Additive changes are
 // always allowed. While records exist, removing a field, changing its kind,
 // making an existing field required, changing the reference prefix or pattern,
 // re-keying the type, repointing its workflow or its parent, or turning it
-// abstract is rejected. It never deletes anything: a removed field's data
-// stays in the values jsonb so a mistaken removal is recoverable. Fields are
-// matched by Key.
+// abstract is rejected — UNLESS confirm names that exact change and states a
+// backfill rule, which is §7.14's other half. It never deletes anything: a
+// removed field's data stays in the values jsonb so a mistaken removal is
+// recoverable. Fields are matched by Key.
+//
+// A NIL CONFIRMATION IS TODAY'S BEHAVIOUR, down to the wording of the refusal:
+// the first destructive change found is returned, in the order the rules are
+// listed above. Nothing about an unconfirmed edit changed when the confirmed
+// path was added.
+//
+// ONE CONFIRMATION AUTHORISES ONE CHANGE. An edit that makes two destructive
+// changes is refused even when the confirmation names one of them, because the
+// other would then be applied under a confirmation nobody gave for it. Both
+// are reachable in one request — a PUT replaces the whole attribute set, so
+// the prefix and the pattern, or a field's kind and its requiredness, change
+// together — and the remedy is to make them one at a time, each confirmed.
 //
 // Every rule here is conditional on hasRecords. None of them is "never": a
-// type nobody has used yet is still being designed and may be changed freely.
+// type nobody has used yet is still being designed and may be changed freely,
+// and on such a type a confirmation authorises nothing — it is still checked
+// for being well formed, because a confirmation that is read by nothing and
+// reported as nothing is indistinguishable, to the operator who typed it,
+// from one that was honoured.
 // MESSAGES ARE ENGLISH-ONLY, against spec §5's bilingual requirement. The
 // error returned here is passed to the client verbatim by the handler, so a
 // refusal reaches an Arabic UI in English. Noted, not fixed, in the Plan 1 fix
@@ -354,9 +523,46 @@ func ValidateReferencePrefix(t EORecordType, existing []EORecordType) error {
 // the client-signed Arabic labels for each field and kind arrive. Writing
 // Arabic wording the client has not approved now would only have to be
 // revised then. See spec §5.
-func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef, hasRecords bool) error {
+func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef, hasRecords bool, confirm *EODestructiveConfirmation) error {
+	if confirm != nil {
+		if err := confirm.validate(); err != nil {
+			return err
+		}
+	}
 	if !hasRecords {
 		return nil
+	}
+	changes := eoDestructiveChanges(before, after, fieldsBefore, fieldsAfter)
+	if len(changes) == 0 {
+		return nil
+	}
+	if confirm == nil {
+		return fmt.Errorf("%s", changes[0].Refusal)
+	}
+	if len(changes) > 1 {
+		named := make([]string, 0, len(changes))
+		for _, change := range changes {
+			named = append(named, change.Change)
+		}
+		return fmt.Errorf("%s. This edit makes %d destructive changes (%s) and a confirmation authorises one: make them one at a time, each with its own confirmation",
+			changes[0].Refusal, len(changes), strings.Join(named, ", "))
+	}
+	return confirm.authorises(changes[0])
+}
+
+// eoDestructiveChanges lists every destructive change the edit makes, in the
+// order spec §7.14's rules are stated. It assumes records exist: the caller
+// applies that condition.
+//
+// IT COLLECTS ALL OF THEM rather than returning at the first. The first is
+// still what an unconfirmed edit is refused with, so the operator-facing
+// behaviour is unchanged — but a confirmation has to be checked against the
+// WHOLE set, or an edit carrying a second destructive change would smuggle it
+// in behind the confirmation given for the first.
+func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef) []eoDestructiveEdit {
+	var out []eoDestructiveEdit
+	add := func(change, fieldKey, refusal string) {
+		out = append(out, eoDestructiveEdit{Change: change, TypeKey: before.Key, FieldKey: fieldKey, Refusal: refusal})
 	}
 	// A record's state_id names a state of the type's CURRENT workflow.
 	// Repointing the workflow leaves every existing record in a state its
@@ -364,8 +570,8 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 	// returns nothing, and no API path can put the record back — in a register
 	// that is a statutory audit trail. This is the worst of the five.
 	if !eoSameUUID(before.WorkflowID, after.WorkflowID) {
-		return fmt.Errorf("changing workflow from %s to %s is destructive: every existing record's state_id names a state of the old workflow, and no transition runs from a state the new workflow does not contain",
-			eoUUIDText(before.WorkflowID), eoUUIDText(after.WorkflowID))
+		add(EODestructiveWorkflow, "", fmt.Sprintf("changing workflow from %s to %s is destructive: every existing record's state_id names a state of the old workflow, and no transition runs from a state the new workflow does not contain",
+			eoUUIDText(before.WorkflowID), eoUUIDText(after.WorkflowID)))
 	}
 	// Inherited fields are resolved at read time from the ancestor chain
 	// (spec §7.2), so re-parenting changes which definitions a record's
@@ -373,33 +579,37 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 	// stop being validated, displayed or derivable — they are still in the
 	// jsonb, but nothing knows what they are.
 	if !eoSameUUID(before.ParentTypeID, after.ParentTypeID) {
-		return fmt.Errorf("changing parent type from %s to %s is destructive: effective fields are resolved from the ancestor chain at read time, so stored values can lose the definitions that give them meaning",
-			eoUUIDText(before.ParentTypeID), eoUUIDText(after.ParentTypeID))
+		add(EODestructiveParentType, "", fmt.Sprintf("changing parent type from %s to %s is destructive: effective fields are resolved from the ancestor chain at read time, so stored values can lose the definitions that give them meaning",
+			eoUUIDText(before.ParentTypeID), eoUUIDText(after.ParentTypeID)))
 	}
 	// The key identifies the type to configuration that names it by key —
 	// the reference prefix it owns, formulas that address a child type by key
 	// (eoRecordDeps.Children, .Ancestor), and seeded capability config.
+	//
+	// A CONFIRMATION FOR THIS CHANGE NAMES THE OLD KEY, like every other: the
+	// type is identified by what it is called now, which is the only name the
+	// operator and the stored rows agree on when the request arrives.
 	if before.Key != after.Key {
-		return fmt.Errorf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns and to every formula that names it",
-			before.Key, after.Key)
+		add(EODestructiveKey, "", fmt.Sprintf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns and to every formula that names it",
+			before.Key, after.Key))
 	}
 	// An abstract type holds no records of its own: the save pipeline refuses
 	// to create one. Flipping the flag on a type that already has records
 	// declares that those records cannot exist.
 	if !before.IsAbstract && after.IsAbstract {
-		return fmt.Errorf("making record type %q abstract is destructive: an abstract type holds no records of its own, and this one already has some",
-			before.Key)
+		add(EODestructiveAbstract, "", fmt.Sprintf("making record type %q abstract is destructive: an abstract type holds no records of its own, and this one already has some",
+			before.Key))
 	}
 	if before.ReferencePrefix != after.ReferencePrefix {
-		return fmt.Errorf("changing reference prefix %q to %q is destructive: existing references were issued under the old prefix",
-			before.ReferencePrefix, after.ReferencePrefix)
+		add(EODestructiveReferencePrefix, "", fmt.Sprintf("changing reference prefix %q to %q is destructive: existing references were issued under the old prefix",
+			before.ReferencePrefix, after.ReferencePrefix))
 	}
 	// The sequence scope is keyed on the pattern (services.EOSequenceScope),
 	// so changing it restarts the counter at 1 under a new scope and re-issues
 	// references that are already in use.
 	if before.ReferencePattern != after.ReferencePattern {
-		return fmt.Errorf("changing reference pattern %q to %q is destructive: the sequence counter is keyed on the pattern, so a new one restarts at 1 and re-issues references already in use",
-			before.ReferencePattern, after.ReferencePattern)
+		add(EODestructiveReferencePattern, "", fmt.Sprintf("changing reference pattern %q to %q is destructive: the sequence counter is keyed on the pattern, so a new one restarts at 1 and re-issues references already in use",
+			before.ReferencePattern, after.ReferencePattern))
 	}
 	next := make(map[string]EOFieldDef, len(fieldsAfter))
 	for _, f := range fieldsAfter {
@@ -408,16 +618,20 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 	for _, old := range fieldsBefore {
 		cur, ok := next[old.Key]
 		if !ok {
-			return fmt.Errorf("removing field %q is destructive while records exist", old.Key)
+			add(EODestructiveFieldRemoved, old.Key, fmt.Sprintf("removing field %q is destructive while records exist", old.Key))
+			// A field that is gone has no kind to change and no requiredness
+			// to tighten; the two rules below are about a field that is still
+			// there under a different definition.
+			continue
 		}
 		if cur.Kind != old.Kind {
-			return fmt.Errorf("changing kind of field %q from %q to %q is destructive while records exist", old.Key, old.Kind, cur.Kind)
+			add(EODestructiveFieldKind, old.Key, fmt.Sprintf("changing kind of field %q from %q to %q is destructive while records exist", old.Key, old.Kind, cur.Kind))
 		}
 		if isNeverRequired(old.RequiredMode) && !isNeverRequired(cur.RequiredMode) {
-			return fmt.Errorf("making field %q required is destructive while records exist", old.Key)
+			add(EODestructiveFieldRequired, old.Key, fmt.Sprintf("making field %q required is destructive while records exist", old.Key))
 		}
 	}
-	return nil
+	return out
 }
 
 func isNeverRequired(mode string) bool { return mode == "" || mode == EORequiredNever }

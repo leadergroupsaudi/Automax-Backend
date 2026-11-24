@@ -4088,7 +4088,8 @@ func TestNoPilotFileFieldIsDemandedAtAll(t *testing.T) {
 // TYPE AND EVERY TYPE BENEATH IT HOLD NO RECORDS. That qualifier is not
 // decoration: models.ValidateTypeEdit refuses `never -> always` and
 // `never -> at_state` outright once records exist, so after the first
-// filing there is no supported route at all (eoFileFieldsRelaxedUntilDocumenta
+// filing it takes §7.14's confirm_destructive block, naming the type, the
+// field and the change, with a stated backfill rule (eoFileFieldsRelaxedUntilDocumenta
 // has the whole of it, and it is the version to copy if this needs restating
 // anywhere else). What matters HERE is only that whatever an administrator
 // managed to re-tighten inside that window must survive the next boot. A
@@ -4284,10 +4285,11 @@ func TestEoFileRelaxationReachesADatabaseSeededBeforeIt(t *testing.T) {
 // and nothing re-tightens a deployment that later connects Documenta. That is
 // accepted, and it is exactly why the boot report must say so: with Documenta
 // enabled the relaxed fields stop being a workaround and become a gap in the
-// client's matrix that NOTHING CAN CLOSE once the registers hold records,
-// because models.ValidateTypeEdit refuses the edit and §7.14's
-// confirmed-destructive path is not built. The line is the only standing
-// notice of a blocker, which is why it must fire on every boot.
+// client's matrix that NO ORDINARY DESIGNER EDIT CAN CLOSE once the registers
+// hold records, because models.ValidateTypeEdit refuses it; closing it then
+// takes §7.14's confirmed destructive edit, with a stated backfill rule and an
+// audit row. The line is the only standing notice of that, which is why it
+// must fire on every boot.
 //
 // The disabled wording is covered on every boot by
 // TestSeedEOPilotReportsOnEveryBoot, through eoObligationReportLines. This

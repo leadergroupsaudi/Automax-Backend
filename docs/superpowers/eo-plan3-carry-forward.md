@@ -634,6 +634,17 @@ task and its own reviewer, not a bolt-on inside a fix round.
    interface once a type holds records. Needs the §7.14 confirmed-destructive
    path. Without it, enabling Documenta leaves the register permanently
    accepting records with no document where the client asked for one.
+
+   > **UPDATE, 2026-11-24 (Plan 4, task B1): the mechanism exists.** The
+   > designer's type and field routes now take a `confirm_destructive` block
+   > naming the type key, the field key, the change and the operator's stated
+   > backfill rule; a matching confirmation applies the edit and writes an
+   > action-log row carrying all four, plus the refusal it overrode, in the
+   > edit's own transaction. A confirmation naming another type or another
+   > field does not authorise it. What is NOT closed is D1's finding below:
+   > restoring a create-time `always` on a file field is unsatisfiable by any
+   > route, so for the four `always` fields the real options remain `at_state`
+   > or staged upload, and that is the client's decision.
 2. **Documenta's real id spelling is unverified.** `eoIsDocumentaFileID`
    accepts a canonical 36-char UUID only; nothing proves a production
    Documenta returns that. One sample upload response closes it.

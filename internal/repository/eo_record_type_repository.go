@@ -74,6 +74,25 @@ type EORecordTypeRepository interface {
 	UpdateFieldDef(ctx context.Context, f *models.EOFieldDef) error
 	DeleteFieldDef(ctx context.Context, id uuid.UUID) error
 
+	// Transaction runs fn against a repository bound to ONE transaction, so
+	// that a write and the audit row that explains it either both happen or
+	// neither does. It is how spec §7.14's CONFIRMED destructive edit is
+	// applied: the row naming the type, the field and the operator's stated
+	// backfill rule is the only durable statement that the guard rail was
+	// overridden, and an entry written through a second handle commits for an
+	// edit that rolled back or is lost for one that did not (Plan 3, Task C1).
+	//
+	// Only the designer's own writes are available inside it. Anything that
+	// needs another repository's handle does not belong in this transaction.
+	Transaction(ctx context.Context, fn func(EORecordTypeRepository) error) error
+	// WriteActionLog writes one audit row on THIS repository's handle — the
+	// transaction's, inside Transaction. It exists because
+	// repository.ActionLogRepository writes on the root handle and so cannot
+	// join a caller's transaction; the row it writes is exactly the shape
+	// services.ActionLogService writes, so it appears in the existing
+	// action-log screen like any other.
+	WriteActionLog(ctx context.Context, entry *models.ActionLog) error
+
 	ListLinkTypes(ctx context.Context) ([]models.EOLinkType, error)
 	GetLinkTypeByID(ctx context.Context, id uuid.UUID) (*models.EOLinkType, error)
 	CreateLinkType(ctx context.Context, lt *models.EOLinkType) error
@@ -540,6 +559,28 @@ func (r *eoRecordTypeRepository) DeleteFieldDef(ctx context.Context, id uuid.UUI
 		Where("eo_field_defs.id = ?", id).
 		Delete(&models.EOFieldDef{}).Error; err != nil {
 		return fmt.Errorf("delete eo field def %s: %w", id, err)
+	}
+	return nil
+}
+
+func (r *eoRecordTypeRepository) Transaction(ctx context.Context, fn func(EORecordTypeRepository) error) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(&eoRecordTypeRepository{db: tx})
+	})
+}
+
+// WriteActionLog writes the entry on this repository's handle.
+//
+// Omit("User"): models.ActionLog carries a *User association that is nil here,
+// and gorm must not try to upsert the caller's user row as a side effect of
+// auditing. The same Omit is on eo_signoff_handler.go's audit write, for the
+// same reason.
+func (r *eoRecordTypeRepository) WriteActionLog(ctx context.Context, entry *models.ActionLog) error {
+	if entry == nil {
+		return fmt.Errorf("write eo action log: nil entry")
+	}
+	if err := r.db.WithContext(ctx).Omit("User").Create(entry).Error; err != nil {
+		return fmt.Errorf("record the confirmed destructive type edit in the action log: %w", err)
 	}
 	return nil
 }
