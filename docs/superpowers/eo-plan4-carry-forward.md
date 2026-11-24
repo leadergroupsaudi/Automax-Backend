@@ -8,6 +8,12 @@ workspace; this file is what survives it.
 
 Commits: backend `613b5f3..ea2f63f` (7), frontend `83eec2a..8d9f9ad` (15).
 
+**SUPERSEDED IN PART.** Plan 5 (`docs/superpowers/plans/2026-11-24-eo-pilot-remediation.md`)
+fixed defects 1-5 below and the `EO Administrator` residual. Read
+`docs/superpowers/eo-plan5-carry-forward.md` before reopening anything here:
+it records what is still open, including the `eo_assignment_parent` conflict
+that the correction inside defect 2 leaves unresolved.
+
 ## What it delivers
 
 An administrator can create a record type, give it fields of any of the 27

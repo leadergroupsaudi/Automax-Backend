@@ -252,6 +252,36 @@ F4's: the capability exists and the obvious gesture does not reach it.
 
 An officer can create a Decision Record with keywords chosen from a taxonomy; every EO role opens a register it can read; a link type cannot declare a pairing the platform will refuse; a retired type key can be used again; a destructive refusal reads in Arabic; no required document is one an officer cannot attach; and uploaded evidence cannot run script on the application's origin.
 
+## Known unmet and deviations
+
+Three parts of "Done when" and of the Review Focus are **not fully met**, and
+the full record is in `docs/superpowers/eo-plan5-carry-forward.md`.
+
+1. **"No required document is one an officer cannot attach" is false in a
+   Documenta-off deployment.** Structurally the clause holds — the four
+   create-time file fields are off `always`, so no form demands a file at
+   creation. Operationally it does not: with `EO_DOCUMENTA_ENABLED=false` no
+   upload route can mint a file id, so a requirement at `at_state` blocks the
+   transition into that state. **Three live records are deadlocked today** —
+   `IN-2026-0005` (`received`, needs `attachments` to reach `analysis`),
+   `DRF-2026-005` (`received`, needs `draft_file` to reach `submitted`) and
+   `DRF-2026-004` (`under_study`, needs `study_report` to reach `with_he`).
+   The upload answers 503. This clears when Documenta is on; until then it is
+   a real, visible block, and the boot report names the fields on every boot.
+2. **Review Focus 1 is only partly met.** An officer without `lookups:view`
+   gets **one** notice covering both "the category does not exist" and "the
+   category exists and is empty", because `GET /api/v1/lookups/:code` returns
+   200 with an empty list for both and the privileged probe that could tell
+   them apart is correctly gated. Separating them needs a backend change (a
+   404, or an `exists` flag) that was deliberately not made at this point in
+   the plan. Today's officer at least gets an explanation instead of a
+   silently empty picker, which is the defect the focus named.
+3. **The destructive-refusal keys have no `pkg/i18n` entries.** Deliberate: §7.14
+   refusals render client-side, the Arabic lives in the frontend bundle with the
+   rest of the designer's, and the unchanged English `error` sentence is the
+   fallback for every other caller. The consequence is that a non-browser
+   caller of the admin API stays English-only for these ten sentences.
+
 ## Out of scope, recorded so nobody goes looking
 
 - **The remaining two Documenta blockers** — the unverified file-id spelling and the folderless-record placement gap. Both need the client's Documenta or a save-time membership check.
