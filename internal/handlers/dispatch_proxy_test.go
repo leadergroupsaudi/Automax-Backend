@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/automax/backend/internal/repository"
+	"github.com/automax/backend/pkg/constants"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -260,5 +261,43 @@ func TestFetchUnit(t *testing.T) {
 	status = http.StatusInternalServerError
 	if _, err := proxy.FetchUnit(context.Background(), "unit-7"); err == nil || errors.Is(err, ErrUnitDriverNotFound) {
 		t.Fatalf("expected generic error on 500, got %v", err)
+	}
+}
+
+type fakeDispatchUsers struct{}
+
+func (fakeDispatchUsers) FindByID(context.Context, uuid.UUID) (*models.User, error) {
+	return &models.User{FirstName: "Super", LastName: "Admin"}, nil
+}
+
+func TestDispatchProxyStampsAcceptorOnAssignmentWrite(t *testing.T) {
+	var got string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got = string(raw)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer upstream.Close()
+	proxy := NewDispatchProxy(upstream.URL)
+	proxy.SetUsers(fakeDispatchUsers{})
+	userID := uuid.New()
+	app := fiber.New()
+	app.Put("/api/v1/dispatch/*", func(c *fiber.Ctx) error {
+		c.Locals(constants.ContextKeys.UserID, userID)
+		return proxy.Forward(c)
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/dispatch/assignments/"+uuid.NewString(), strings.NewReader(`{"status":"accepted"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if !strings.Contains(got, userID.String()) || !strings.Contains(got, "Super Admin") {
+		t.Fatalf("body %s", got)
 	}
 }

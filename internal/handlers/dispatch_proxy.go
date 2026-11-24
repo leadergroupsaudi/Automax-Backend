@@ -28,6 +28,7 @@ import (
 type DispatchProxy struct {
 	base   string
 	client *http.Client
+	users  dispatchUserLookup
 	inApp  InAppNotifier // optional: also create in-app notifications for dispatched drivers
 }
 
@@ -57,7 +58,7 @@ func (h *DispatchProxy) forwardTo(c *fiber.Ctx, tail string) error {
 	if query := c.Request().URI().QueryString(); len(query) > 0 {
 		target += "?" + string(query)
 	}
-	req, err := http.NewRequestWithContext(c.UserContext(), c.Method(), target, bytes.NewReader(c.Body()))
+	req, err := http.NewRequestWithContext(c.UserContext(), c.Method(), target, bytes.NewReader(h.assignmentBody(c, tail)))
 	if err != nil {
 		return utils.ErrorResponse(c, fiber.StatusBadGateway, "dispatch service is unavailable")
 	}
@@ -84,6 +85,68 @@ func (h *DispatchProxy) forwardTo(c *fiber.Ctx, tail string) error {
 		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 	}
 	return c.Status(resp.StatusCode).Send(body)
+}
+
+type dispatchUserLookup interface {
+	FindByID(ctx context.Context, id uuid.UUID) (*models.User, error)
+}
+
+func (h *DispatchProxy) SetUsers(users dispatchUserLookup) {
+	if h == nil {
+		return
+	}
+	h.users = users
+}
+
+func (h *DispatchProxy) assignmentBody(c *fiber.Ctx, tail string) []byte {
+	body := c.Body()
+	if h == nil || !assignmentWrite(c.Method(), tail) || len(bytes.TrimSpace(body)) == 0 {
+		return body
+	}
+	userID, _ := c.Locals(constants.ContextKeys.UserID).(uuid.UUID)
+	if userID == uuid.Nil {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body
+	}
+	if _, ok := payload["accepted_by_id"]; !ok {
+		payload["accepted_by_id"] = userID.String()
+	}
+	if _, ok := payload["accepted_by_name"]; !ok {
+		if name := h.userName(c.UserContext(), userID); name != "" {
+			payload["accepted_by_name"] = name
+		}
+	}
+	stamped, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return stamped
+}
+
+func assignmentWrite(method, tail string) bool {
+	if method != http.MethodPost && method != http.MethodPut {
+		return false
+	}
+	tail = strings.Trim(tail, "/")
+	return tail == "assignments" || strings.HasPrefix(tail, "assignments/")
+}
+
+func (h *DispatchProxy) userName(ctx context.Context, id uuid.UUID) string {
+	if h == nil || h.users == nil || id == uuid.Nil {
+		return ""
+	}
+	user, err := h.users.FindByID(ctx, id)
+	if err != nil || user == nil {
+		return ""
+	}
+	name := strings.TrimSpace(strings.TrimSpace(user.FirstName) + " " + strings.TrimSpace(user.LastName))
+	if name == "" {
+		name = strings.TrimSpace(user.Username)
+	}
+	return name
 }
 
 // FetchUnitIncidentIDs asks Registry for the incident ids tied to a unit
