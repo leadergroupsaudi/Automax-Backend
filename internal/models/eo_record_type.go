@@ -358,6 +358,7 @@ const (
 	EODestructiveAbstract         = "abstract"
 	EODestructiveReferencePrefix  = "reference_prefix"
 	EODestructiveReferencePattern = "reference_pattern"
+	EODestructiveReferenceMode    = "reference_mode"
 	EODestructiveFieldRemoved     = "field_removed"
 	EODestructiveFieldKind        = "field_kind"
 	EODestructiveFieldRequired    = "field_required"
@@ -373,6 +374,7 @@ var EODestructiveChanges = []string{
 	EODestructiveAbstract,
 	EODestructiveReferencePrefix,
 	EODestructiveReferencePattern,
+	EODestructiveReferenceMode,
 	EODestructiveFieldRemoved,
 	EODestructiveFieldKind,
 	EODestructiveFieldRequired,
@@ -643,6 +645,16 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 		add(EODestructiveReferencePattern, "", fmt.Sprintf("changing reference pattern %q to %q is destructive: the sequence counter is keyed on the pattern, so a new one restarts at 1 and re-issues references already in use",
 			before.ReferencePattern, after.ReferencePattern))
 	}
+	// ReferenceMode decides whether a record's reference is issued from the
+	// type's own sequence or derived from its parent's reference (spec §7.9).
+	// It is a different field from the prefix and the pattern, so neither of
+	// those guards sees it: flipping own to parent leaves every issued
+	// reference in a form the new mode would not have produced. An unset mode
+	// means own (the column default), so "" to "own" is not a change.
+	if eoReferenceModeOrDefault(before.ReferenceMode) != eoReferenceModeOrDefault(after.ReferenceMode) {
+		add(EODestructiveReferenceMode, "", fmt.Sprintf("changing reference mode %q to %q is destructive: existing references were issued under the old mode, and the new one derives or numbers them differently",
+			eoReferenceModeOrDefault(before.ReferenceMode), eoReferenceModeOrDefault(after.ReferenceMode)))
+	}
 	next := make(map[string]EOFieldDef, len(fieldsAfter))
 	for _, f := range fieldsAfter {
 		next[f.Key] = f
@@ -664,6 +676,13 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 		}
 	}
 	return out
+}
+
+func eoReferenceModeOrDefault(mode string) string {
+	if mode == "" {
+		return EOReferenceModeOwn
+	}
+	return mode
 }
 
 func isNeverRequired(mode string) bool { return mode == "" || mode == EORequiredNever }

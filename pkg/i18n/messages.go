@@ -1239,4 +1239,8 @@ var messages = map[string][2]string{
 	"eo_reference_mode_invalid":          {"Unknown reference mode", "وضع الترقيم غير معروف"},
 	"eo_reference_pattern_required":      {"A reference pattern is required", "نمط الرقم المرجعي مطلوب"},
 	"eo_cardinality_invalid":             {"Unknown cardinality", "عدد الارتباطات غير معروف"},
+	"eo_link_endpoints_required":         {"Choose at least one record type, or Any record type", "اختر نوع سجل واحدًا على الأقل، أو أي نوع سجل"},
+	"eo_link_endpoints_malformed":        {"Endpoints must be a list of record type ids, or Any record type", "يجب أن تكون النهايات قائمة بمعرّفات أنواع السجلات، أو أي نوع سجل"},
+	"eo_link_endpoint_unknown":           {"Record type does not exist", "نوع السجل غير موجود"},
+	"eo_link_endpoint_abstract":          {"Record type is abstract and holds no records, so a link to it can never resolve", "نوع السجل مجرّد ولا يحتفظ بسجلات، لذا لا يمكن ربط أي سجل به"},
 }

@@ -900,3 +900,101 @@ func TestAMalformedDeleteBodyIsRefusedRatherThanIgnored(t *testing.T) {
 		t.Fatalf("status = %d for an unconfirmed removal on an empty subtree, want 200", resp.StatusCode)
 	}
 }
+
+// linkEndpointApp registers the real designer routes over a fake catalogue of
+// one concrete type, one abstract type and one stored link type.
+func linkEndpointApp(t *testing.T) (app *fiber.App, concrete, abstract, linkID uuid.UUID) {
+	t.Helper()
+	eoInitValidator(t)
+	concrete, abstract, linkID = uuid.New(), uuid.New(), uuid.New()
+	all := []models.EORecordType{
+		{ID: concrete, Key: "directive", Name: "Directive"},
+		{ID: abstract, Key: "base", Name: "Base", IsAbstract: true},
+	}
+	repo := &eoTypeAuthzRepo{
+		eoFakeTypeRepo: eoFakeTypeRepo{byID: &all[0], all: all},
+		linkTypeByID:   &models.EOLinkType{ID: linkID, Key: "covers", Label: "Covers", SourceTypeIDs: []byte(`["any"]`), TargetTypeIDs: []byte(`["any"]`)},
+	}
+	h := NewEORecordTypeHandler(repo, &eoFakeRecordRepo{})
+	app = fiber.New()
+	app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+	h.RegisterRoutes(app.Group("/eo-record-types"), eoPermFor("eo:types:manage"))
+	return app, concrete, abstract, linkID
+}
+
+func linkEndpointCall(t *testing.T, app *fiber.App, method, path, body string) (int, map[string]string) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	var out struct {
+		Errors map[string]string `json:"errors"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out.Errors
+}
+
+func TestLinkTypeEndpointsAreValidatedAtConfigurationTime(t *testing.T) {
+	app, concrete, abstract, linkID := linkEndpointApp(t)
+	missing := uuid.New()
+	mk := func(src, tgt string) string {
+		return `{"key":"k","label":"L","cardinality":"many","source_type_ids":` + src + `,"target_type_ids":` + tgt + `}`
+	}
+	ok := `["` + concrete.String() + `"]`
+	cases := []struct {
+		name, src, tgt string
+		wantField      string // "" means accepted
+	}{
+		{"empty source list", `[]`, ok, "source_type_ids"},
+		{"empty target list", ok, `[]`, "target_type_ids"},
+		{"null target", ok, `null`, "target_type_ids"},
+		{"unknown id", `["` + missing.String() + `"]`, ok, "source_type_ids"},
+		{"not a uuid", ok, `["nonsense"]`, "target_type_ids"},
+		{"abstract target", ok, `["` + abstract.String() + `"]`, "target_type_ids"},
+		{"abstract hidden in a mixed list", `["any","` + abstract.String() + `"]`, ok, "source_type_ids"},
+		{"wrong shape", ok, `{"a":1}`, "target_type_ids"},
+		{"array any", `["any"]`, ok, ""},
+		{"bare string any", ok, `"any"`, ""},
+		{"valid pairing", ok, ok, ""},
+	}
+	for _, tc := range cases {
+		for _, route := range []struct{ method, path string }{
+			{"POST", "/eo-record-types/link-types"},
+			{"PUT", "/eo-record-types/link-types/" + linkID.String()},
+		} {
+			t.Run(tc.name+" "+route.method, func(t *testing.T) {
+				status, errs := linkEndpointCall(t, app, route.method, route.path, mk(tc.src, tc.tgt))
+				if tc.wantField == "" {
+					if status >= 300 {
+						t.Fatalf("status = %d errors = %v, want accepted", status, errs)
+					}
+					return
+				}
+				if status != fiber.StatusBadRequest && status != fiber.StatusUnprocessableEntity {
+					t.Fatalf("status = %d, want a field-error refusal", status)
+				}
+				if errs[tc.wantField] == "" || len(errs) != 1 {
+					t.Fatalf("errors = %v, want exactly %q", errs, tc.wantField)
+				}
+			})
+		}
+	}
+}
+
+// An omitted endpoint list on create is empty, and refused; on update it keeps
+// the stored value, and is accepted.
+func TestLinkTypeOmittedEndpointsCreateRefusedUpdateKept(t *testing.T) {
+	app, _, _, linkID := linkEndpointApp(t)
+	body := `{"key":"k","label":"L","cardinality":"many"}`
+	status, errs := linkEndpointCall(t, app, "POST", "/eo-record-types/link-types", body)
+	if status < 400 || errs["source_type_ids"] == "" || errs["target_type_ids"] == "" {
+		t.Fatalf("create with no endpoints: status %d errors %v, want both refused", status, errs)
+	}
+	status, errs = linkEndpointCall(t, app, "PUT", "/eo-record-types/link-types/"+linkID.String(), body)
+	if status >= 300 {
+		t.Fatalf("update keeping stored endpoints: status %d errors %v", status, errs)
+	}
+}

@@ -442,6 +442,15 @@ func eoDestructiveCases() []eoDestructiveCase {
 				return fa
 			},
 		},
+		{
+			name:   "changing the reference mode",
+			change: EODestructiveReferenceMode,
+			want:   "changing reference mode",
+			edit: func(before, after *EORecordType, fa []EOFieldDef) []EOFieldDef {
+				before.ReferenceMode, after.ReferenceMode = EOReferenceModeOwn, EOReferenceModeParent
+				return fa
+			},
+		},
 	}
 }
 
@@ -769,5 +778,37 @@ func TestTheReKeyRefusalNamesThePermissionCodesItStrands(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is destructive") {
 		t.Errorf("refusal = %q, want the §7.14 refusal itself", err.Error())
+	}
+}
+
+// TestValidateTypeEdit_ReferenceModeChangeIsGuarded: reference mode is its own
+// field, so neither the prefix nor the pattern guard sees it. It is refused
+// while records exist, confirmable only under its own identifier, and unset
+// means own so "" to "own" is not a change.
+func TestValidateTypeEdit_ReferenceModeChangeIsGuarded(t *testing.T) {
+	before, fb := eoBase()
+	before.ReferenceMode = EOReferenceModeOwn
+	after := before
+	after.ReferenceMode = EOReferenceModeParent
+
+	err := ValidateTypeEdit(before, after, fb, fb, true, nil)
+	if err == nil || !strings.Contains(err.Error(), "changing reference mode") {
+		t.Fatalf("own to parent with records: err = %v, want the reference-mode refusal", err)
+	}
+	if err := ValidateTypeEdit(before, after, fb, fb, false, nil); err != nil {
+		t.Errorf("no records: refused: %v", err)
+	}
+	okConfirm := &EODestructiveConfirmation{TypeKey: before.Key, Change: EODestructiveReferenceMode, Reason: "re-derive from parent"}
+	if err := ValidateTypeEdit(before, after, fb, fb, true, okConfirm); err != nil {
+		t.Errorf("confirmed under %q still refused: %v", EODestructiveReferenceMode, err)
+	}
+	wrong := &EODestructiveConfirmation{TypeKey: before.Key, Change: EODestructiveReferencePattern, Reason: "x"}
+	if err := ValidateTypeEdit(before, after, fb, fb, true, wrong); err == nil {
+		t.Errorf("a pattern confirmation authorised a mode change")
+	}
+	unset := before
+	unset.ReferenceMode = ""
+	if err := ValidateTypeEdit(unset, before, fb, fb, true, nil); err != nil {
+		t.Errorf(`"" to "own" treated as a change: %v`, err)
 	}
 }

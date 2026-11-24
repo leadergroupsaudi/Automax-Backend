@@ -987,7 +987,11 @@ func (h *EORecordTypeHandler) CreateLinkType(c *fiber.Ctx) error {
 	}
 	lt := &models.EOLinkType{ID: uuid.New()}
 	req.applyTo(lt)
-	if fieldErrs := eoValidateLinkTypeShape(c, lt); len(fieldErrs) > 0 {
+	live, err := h.eoLiveTypes(c)
+	if err != nil {
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	if fieldErrs := eoValidateLinkTypeShape(c, lt, live); len(fieldErrs) > 0 {
 		return eoFieldErrors(c, fieldErrs)
 	}
 	existing, err := h.types.GetLinkTypeByKey(c.UserContext(), lt.Key)
@@ -1021,7 +1025,11 @@ func (h *EORecordTypeHandler) UpdateLinkType(c *fiber.Ctx) error {
 	}
 	updated := *stored
 	req.applyTo(&updated)
-	if fieldErrs := eoValidateLinkTypeShape(c, &updated); len(fieldErrs) > 0 {
+	live, err := h.eoLiveTypes(c)
+	if err != nil {
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	if fieldErrs := eoValidateLinkTypeShape(c, &updated, live); len(fieldErrs) > 0 {
 		return eoFieldErrors(c, fieldErrs)
 	}
 	if err := h.types.UpdateLinkType(c.UserContext(), &updated); err != nil {
@@ -1048,7 +1056,60 @@ func (h *EORecordTypeHandler) DeleteLinkType(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_link_type_deleted"), nil)
 }
 
-func eoValidateLinkTypeShape(c *fiber.Ctx, lt *models.EOLinkType) map[string]string {
+// eoLiveTypes indexes every live (not soft-deleted) record type by id.
+func (h *EORecordTypeHandler) eoLiveTypes(c *fiber.Ctx) (map[uuid.UUID]models.EORecordType, error) {
+	all, err := h.types.List(c.UserContext())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uuid.UUID]models.EORecordType, len(all))
+	for _, t := range all {
+		out[t.ID] = t
+	}
+	return out, nil
+}
+
+// eoValidateLinkEndpoints checks one endpoint list against the live types.
+// Spellings accepted are the ones services.eoTypeAllowed honours: the bare
+// JSON string "any", or an array of strings each of which is "any" or the id
+// of a live CONCRETE type. Everything else is refused here, in front of the
+// administrator, rather than at record-link time in front of an officer.
+//
+// THE RAW VALUE IS DECODED BEFORE ANY CHECK AND NEVER NORMALISED AWAY: the
+// empty test reads the decoded list, so "[]", "null" and a missing list all
+// land on the same refusal.
+func eoValidateLinkEndpoints(c *fiber.Ctx, raw []byte, live map[uuid.UUID]models.EORecordType) string {
+	ctx := c.UserContext()
+	if t := strings.TrimSpace(string(raw)); t == "" || t == "null" {
+		return i18n.T(ctx, "eo_link_endpoints_required")
+	}
+	var ids []string
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		ids = []string{single}
+	} else if err := json.Unmarshal(raw, &ids); err != nil {
+		return i18n.T(ctx, "eo_link_endpoints_malformed")
+	}
+	if len(ids) == 0 {
+		return i18n.T(ctx, "eo_link_endpoints_required")
+	}
+	for _, s := range ids {
+		if s == "any" {
+			continue
+		}
+		id, err := uuid.Parse(s)
+		t, found := live[id]
+		if err != nil || !found {
+			return fmt.Sprintf("%s: %s", i18n.T(ctx, "eo_link_endpoint_unknown"), s)
+		}
+		if t.IsAbstract {
+			return fmt.Sprintf("%s: %s", i18n.T(ctx, "eo_link_endpoint_abstract"), t.Key)
+		}
+	}
+	return ""
+}
+
+func eoValidateLinkTypeShape(c *fiber.Ctx, lt *models.EOLinkType, live map[uuid.UUID]models.EORecordType) map[string]string {
 	errs := map[string]string{}
 	if lt.Key == "" {
 		errs["key"] = i18n.T(c.UserContext(), "eo_key_required")
@@ -1060,6 +1121,12 @@ func eoValidateLinkTypeShape(c *fiber.Ctx, lt *models.EOLinkType) map[string]str
 	case "", models.EOCardinalityOne, models.EOCardinalityMany:
 	default:
 		errs["cardinality"] = i18n.T(c.UserContext(), "eo_cardinality_invalid")
+	}
+	if msg := eoValidateLinkEndpoints(c, lt.SourceTypeIDs, live); msg != "" {
+		errs["source_type_ids"] = msg
+	}
+	if msg := eoValidateLinkEndpoints(c, lt.TargetTypeIDs, live); msg != "" {
+		errs["target_type_ids"] = msg
 	}
 	return errs
 }
