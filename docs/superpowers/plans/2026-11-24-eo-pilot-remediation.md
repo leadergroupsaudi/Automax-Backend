@@ -188,6 +188,34 @@ Pre-existing stored XSS, unrelated to EO and shipped. `viewEvidence` builds a bl
 - [ ] **Step 3: Confirm legitimate evidence still opens** — an image and a PDF.
 - [ ] **Step 4: `type-check`, `lint`, commit.**
 
+### Task F4: Leaving the Executive Office does not require guessing
+
+**Files:**
+- Modify: `src/components/layout/EoLayout.tsx`
+
+The EO routes use a dedicated `EoLayout`, not the main application shell, and
+the only route back is a "Back to Home" entry **inside the user-avatar
+dropdown** (`:374`). Reported by the user as "there is no button to go back to
+home from EO screen" — which is the correct reading of it: a person does not
+click their own face to find navigation. The control exists and is
+undiscoverable, so this is a placement fix, not a new feature.
+
+- [ ] **Step 1: Put a visible, persistent control in the EO chrome** — in the
+  sidebar beside the brand, or in the header, where a person looks for it. Match
+  the layout's existing visual language rather than introducing a new button
+  style; `EoLayout` already defines `navLinkClass` for its nav items.
+- [ ] **Step 2: Keep the dropdown entry.** Someone may have learned it, and
+  removing a working route to improve discoverability trades one complaint for
+  another.
+- [ ] **Step 3: Reuse the existing string** `workflows.backToHome` rather than
+  adding a key that duplicates it. Check it reads correctly in Arabic and that
+  the control sits on the correct side under `dir=rtl` — a back-to-home control
+  that lands in the wrong corner in RTL is the same defect again.
+- [ ] **Step 4: Verify in a browser** at both widths the layout supports, in
+  English and Arabic, from a register, a record detail and a create form.
+  Screenshot.
+- [ ] **Step 5: `type-check`, `lint`, commit.**
+
 ---
 
 ## Done when
