@@ -670,6 +670,22 @@ func TestAnUnconfirmedDestructiveFieldEditIsStillRefused(t *testing.T) {
 	if !strings.Contains(body, "attachments") || !strings.Contains(body, "destructive") {
 		t.Errorf("refusal body = %q, want the §7.14 message naming the field", body)
 	}
+	var wire map[string]any
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		t.Fatalf("refusal body is not JSON: %v (%q)", err, body)
+	}
+	if wire["error"] != `making field "attachments" required is destructive while records exist` {
+		t.Errorf("error = %q, want the unchanged English sentence", wire["error"])
+	}
+	if wire["message_key"] != "eo_destructive_field_required" {
+		t.Errorf("message_key = %v", wire["message_key"])
+	}
+	if args, _ := wire["message_args"].(map[string]any); args["field"] != "attachments" || len(args) != 1 {
+		t.Errorf("message_args = %v, want {field: attachments}", wire["message_args"])
+	}
+	if _, has := wire["message_detail_key"]; has {
+		t.Errorf("an unconfirmed refusal carries no detail, got %v", wire["message_detail_key"])
+	}
 	if len(f.types.committed.fieldUpdates) != 0 || len(f.types.committed.audit) != 0 {
 		t.Errorf("a refused edit wrote %d field update(s) and %d audit row(s), want none",
 			len(f.types.committed.fieldUpdates), len(f.types.committed.audit))
@@ -693,6 +709,16 @@ func TestAConfirmationNamingTheDescendantDoesNotAuthoriseTheAncestorEdit(t *test
 	body := eoReadBody(t, resp)
 	if !strings.Contains(body, "eo_directive") || !strings.Contains(body, "eo_base") {
 		t.Errorf("refusal body = %q, want it to name the confirmed type and the edited one", body)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		t.Fatalf("refusal body is not JSON: %v (%q)", err, body)
+	}
+	if wire["message_key"] != "eo_destructive_field_required" || wire["message_detail_key"] != "eo_destructive_confirmation_wrong_type" {
+		t.Errorf("message_key/detail = %v / %v", wire["message_key"], wire["message_detail_key"])
+	}
+	if d, _ := wire["message_detail_args"].(map[string]any); d["confirmed_type"] != "eo_directive" || d["edit_type"] != "eo_base" {
+		t.Errorf("message_detail_args = %v", wire["message_detail_args"])
 	}
 	if len(f.types.committed.fieldUpdates) != 0 || len(f.types.committed.audit) != 0 {
 		t.Errorf("a refused edit wrote %d field update(s) and %d audit row(s), want none",

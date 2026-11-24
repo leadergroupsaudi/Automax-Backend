@@ -249,12 +249,44 @@ func (h *EORecordTypeHandler) eoGuardTypeEdit(
 		// of the guard rail and is returned verbatim rather than flattened
 		// into a generic "invalid". With a confirmation that does not match,
 		// it also names what the confirmation did authorise.
+		var destructive *models.EODestructiveRefusal
+		if errors.As(err, &destructive) {
+			return false, "", eoDestructiveRefusalResponse(c, destructive)
+		}
 		return false, "", utils.ErrorResponse(c, fiber.StatusBadRequest, err.Error())
 	}
 	if refusal == nil {
 		return true, "", nil
 	}
 	return true, refusal.Error(), nil
+}
+
+// eoDestructiveRefusalBody is a §7.14 refusal on the wire. `error` is the
+// English sentence, unchanged: the client's refusal banner reads it. The
+// message_* fields are the same refusal as an i18n key plus the named values
+// the sentence interpolates, for a client rendering it in the reader's
+// language. message_detail_* is the sentence's optional second half (a
+// confirmation that does not match, or several destructive changes at once).
+type eoDestructiveRefusalBody struct {
+	Success           bool              `json:"success"`
+	Error             string            `json:"error"`
+	MessageKey        string            `json:"message_key"`
+	MessageArgs       map[string]string `json:"message_args"`
+	MessageDetailKey  string            `json:"message_detail_key,omitempty"`
+	MessageDetailArgs map[string]string `json:"message_detail_args,omitempty"`
+}
+
+func eoDestructiveRefusalResponse(c *fiber.Ctx, r *models.EODestructiveRefusal) error {
+	// Recorded for the Error Log exactly as utils.ErrorResponse would.
+	c.Locals(utils.LocalErrorMessage, r.Message)
+	return c.Status(fiber.StatusBadRequest).JSON(eoDestructiveRefusalBody{
+		Success:           false,
+		Error:             r.Message,
+		MessageKey:        r.Key,
+		MessageArgs:       r.Args,
+		MessageDetailKey:  r.DetailKey,
+		MessageDetailArgs: r.DetailArgs,
+	})
 }
 
 // ── the audit row a confirmed destructive edit owes ─────────────────────────

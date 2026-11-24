@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -460,6 +461,45 @@ type eoDestructiveEdit struct {
 	TypeKey  string
 	FieldKey string
 	Refusal  string
+	// Key and Args are the same refusal as data: an i18n key and every value
+	// the Refusal sentence interpolates, by name.
+	Key  string
+	Args map[string]string
+}
+
+// EODestructiveRefusal is a §7.14 refusal as the handler sends it. Error()
+// is the English sentence, BYTE FOR BYTE what it has always been: Plan 4's
+// frontend gates its refusal banner's records claim on a word in that
+// sentence, so it is pinned by TestDestructiveRefusal_MessageUnchanged and is
+// never reworded for the sake of the key.
+//
+// Key and Args let a client render the refusal in the reader's language.
+// Args names EVERY value the sentence interpolates; a value that is "none" in
+// the sentence (an unset workflow or parent) is the empty string here, so the
+// client words that case itself. The sentence has an optional second half — a
+// confirmation that does not match, or an edit making several destructive
+// changes — and DetailKey/DetailArgs describe it the same way (empty when
+// there is none). The Arabic wording lives with the client's forms (spec §5).
+type EODestructiveRefusal struct {
+	Message    string
+	Key        string
+	Args       map[string]string
+	DetailKey  string
+	DetailArgs map[string]string
+}
+
+func (r *EODestructiveRefusal) Error() string { return r.Message }
+
+// withDetail appends the second half of a refusal: ". <sentence>".
+func (r *EODestructiveRefusal) withDetail(sentence, key string, args map[string]string) *EODestructiveRefusal {
+	out := *r
+	out.Message = r.Message + ". " + sentence
+	out.DetailKey, out.DetailArgs = key, args
+	return &out
+}
+
+func (e eoDestructiveEdit) refusal() *EODestructiveRefusal {
+	return &EODestructiveRefusal{Message: e.Refusal, Key: e.Key, Args: e.Args}
 }
 
 // authorises returns nil when cf names this exact change, and otherwise the
@@ -468,16 +508,25 @@ type eoDestructiveEdit struct {
 // untrimmed confirmation names the same field the stored definition does.
 func (cf EODestructiveConfirmation) authorises(e eoDestructiveEdit) error {
 	if strings.TrimSpace(cf.TypeKey) != e.TypeKey {
-		return fmt.Errorf("%s. The confirmation supplied authorises a change to record type %q, and this edit changes record type %q, so it does not authorise it",
-			e.Refusal, strings.TrimSpace(cf.TypeKey), e.TypeKey)
+		return e.refusal().withDetail(
+			fmt.Sprintf("The confirmation supplied authorises a change to record type %q, and this edit changes record type %q, so it does not authorise it",
+				strings.TrimSpace(cf.TypeKey), e.TypeKey),
+			"eo_destructive_confirmation_wrong_type",
+			map[string]string{"confirmed_type": strings.TrimSpace(cf.TypeKey), "edit_type": e.TypeKey})
 	}
 	if strings.TrimSpace(cf.FieldKey) != e.FieldKey {
-		return fmt.Errorf("%s. The confirmation supplied authorises a change to %s, and this edit changes %s, so it does not authorise it",
-			e.Refusal, eoConfirmationFieldText(strings.TrimSpace(cf.FieldKey)), eoConfirmationFieldText(e.FieldKey))
+		// An empty field is "the record type itself", in both args.
+		return e.refusal().withDetail(
+			fmt.Sprintf("The confirmation supplied authorises a change to %s, and this edit changes %s, so it does not authorise it",
+				eoConfirmationFieldText(strings.TrimSpace(cf.FieldKey)), eoConfirmationFieldText(e.FieldKey)),
+			"eo_destructive_confirmation_wrong_field",
+			map[string]string{"confirmed_field": strings.TrimSpace(cf.FieldKey), "edit_field": e.FieldKey})
 	}
 	if cf.Change != e.Change {
-		return fmt.Errorf("%s. The confirmation supplied authorises %q, and this edit is %q, so it does not authorise it",
-			e.Refusal, cf.Change, e.Change)
+		return e.refusal().withDetail(
+			fmt.Sprintf("The confirmation supplied authorises %q, and this edit is %q, so it does not authorise it", cf.Change, e.Change),
+			"eo_destructive_confirmation_wrong_change",
+			map[string]string{"confirmed_change": cf.Change, "edit_change": e.Change})
 	}
 	return nil
 }
@@ -518,14 +567,9 @@ func eoConfirmationFieldText(key string) string {
 // for being well formed, because a confirmation that is read by nothing and
 // reported as nothing is indistinguishable, to the operator who typed it,
 // from one that was honoured.
-// MESSAGES ARE ENGLISH-ONLY, against spec §5's bilingual requirement. The
-// error returned here is passed to the client verbatim by the handler, so a
-// refusal reaches an Arabic UI in English. Noted, not fixed, in the Plan 1 fix
-// wave (2026-11-22): the fix is to return an i18n KEY plus its arguments
-// instead of a sentence, and it belongs with Plan 2's forms, which is where
-// the client-signed Arabic labels for each field and kind arrive. Writing
-// Arabic wording the client has not approved now would only have to be
-// revised then. See spec §5.
+// EVERY REFUSAL IS AN *EODestructiveRefusal: the English sentence (Error(),
+// unchanged and pinned) plus an i18n key and named args, so the client can
+// render it in the reader's language. See EODestructiveRefusal.
 func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef, hasRecords bool, confirm *EODestructiveConfirmation) error {
 	if confirm != nil {
 		if err := confirm.validate(); err != nil {
@@ -540,15 +584,18 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 		return nil
 	}
 	if confirm == nil {
-		return fmt.Errorf("%s", changes[0].Refusal)
+		return changes[0].refusal()
 	}
 	if len(changes) > 1 {
 		named := make([]string, 0, len(changes))
 		for _, change := range changes {
 			named = append(named, change.Change)
 		}
-		return fmt.Errorf("%s. This edit makes %d destructive changes (%s) and a confirmation authorises one: make them one at a time, each with its own confirmation",
-			changes[0].Refusal, len(changes), strings.Join(named, ", "))
+		joined := strings.Join(named, ", ")
+		return changes[0].refusal().withDetail(
+			fmt.Sprintf("This edit makes %d destructive changes (%s) and a confirmation authorises one: make them one at a time, each with its own confirmation", len(changes), joined),
+			"eo_destructive_multiple",
+			map[string]string{"count": strconv.Itoa(len(changes)), "changes": joined})
 	}
 	return confirm.authorises(changes[0])
 }
@@ -572,8 +619,15 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 // in behind the confirmation given for the first.
 func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter []EOFieldDef) []eoDestructiveEdit {
 	var out []eoDestructiveEdit
-	add := func(change, fieldKey, refusal string) {
-		out = append(out, eoDestructiveEdit{Change: change, TypeKey: before.Key, FieldKey: fieldKey, Refusal: refusal})
+	add := func(change, fieldKey, refusal, key string, args map[string]string) {
+		out = append(out, eoDestructiveEdit{Change: change, TypeKey: before.Key, FieldKey: fieldKey, Refusal: refusal, Key: key, Args: args})
+	}
+	// An unset id is "none" in the sentence and "" in the args.
+	idArg := func(id *uuid.UUID) string {
+		if id == nil {
+			return ""
+		}
+		return id.String()
 	}
 	// A record's state_id names a state of the type's CURRENT workflow.
 	// Repointing the workflow leaves every existing record in a state its
@@ -582,7 +636,8 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 	// that is a statutory audit trail. This is the worst of the five.
 	if !eoSameUUID(before.WorkflowID, after.WorkflowID) {
 		add(EODestructiveWorkflow, "", fmt.Sprintf("changing workflow from %s to %s is destructive: every existing record's state_id names a state of the old workflow, and no transition runs from a state the new workflow does not contain",
-			eoUUIDText(before.WorkflowID), eoUUIDText(after.WorkflowID)))
+			eoUUIDText(before.WorkflowID), eoUUIDText(after.WorkflowID)),
+			"eo_destructive_workflow", map[string]string{"from": idArg(before.WorkflowID), "to": idArg(after.WorkflowID)})
 	}
 	// Inherited fields are resolved at read time from the ancestor chain
 	// (spec §7.2), so re-parenting changes which definitions a record's
@@ -591,7 +646,8 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 	// jsonb, but nothing knows what they are.
 	if !eoSameUUID(before.ParentTypeID, after.ParentTypeID) {
 		add(EODestructiveParentType, "", fmt.Sprintf("changing parent type from %s to %s is destructive: effective fields are resolved from the ancestor chain at read time, so stored values can lose the definitions that give them meaning",
-			eoUUIDText(before.ParentTypeID), eoUUIDText(after.ParentTypeID)))
+			eoUUIDText(before.ParentTypeID), eoUUIDText(after.ParentTypeID)),
+			"eo_destructive_parent_type", map[string]string{"from": idArg(before.ParentTypeID), "to": idArg(after.ParentTypeID)})
 	}
 	// The key identifies the type to configuration that names it by key —
 	// the reference prefix it owns, formulas that address a child type by key
@@ -619,31 +675,37 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 		// abstract ancestor is reachable — its descendants' records are what
 		// make the edit destructive — and telling that operator their grants
 		// were stranded would be false.
+		keyID := "eo_destructive_key"
 		permissions := fmt.Sprintf(", and to its three per-type permission codes — saving writes the codes for %q and leaves %q's codes and every role grant on them behind, so a role holding them loses this register and renaming back is refused outright",
 			after.Key, before.Key)
 		if before.IsAbstract || after.IsAbstract {
 			permissions = ""
+			keyID = "eo_destructive_key_abstract"
 		}
 		add(EODestructiveKey, "", fmt.Sprintf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns, to every formula that names it%s",
-			before.Key, after.Key, permissions))
+			before.Key, after.Key, permissions),
+			keyID, map[string]string{"from": before.Key, "to": after.Key})
 	}
 	// An abstract type holds no records of its own: the save pipeline refuses
 	// to create one. Flipping the flag on a type that already has records
 	// declares that those records cannot exist.
 	if !before.IsAbstract && after.IsAbstract {
 		add(EODestructiveAbstract, "", fmt.Sprintf("making record type %q abstract is destructive: an abstract type holds no records of its own, and this one already has some",
-			before.Key))
+			before.Key),
+			"eo_destructive_abstract", map[string]string{"type": before.Key})
 	}
 	if before.ReferencePrefix != after.ReferencePrefix {
 		add(EODestructiveReferencePrefix, "", fmt.Sprintf("changing reference prefix %q to %q is destructive: existing references were issued under the old prefix",
-			before.ReferencePrefix, after.ReferencePrefix))
+			before.ReferencePrefix, after.ReferencePrefix),
+			"eo_destructive_reference_prefix", map[string]string{"from": before.ReferencePrefix, "to": after.ReferencePrefix})
 	}
 	// The sequence scope is keyed on the pattern (services.EOSequenceScope),
 	// so changing it restarts the counter at 1 under a new scope and re-issues
 	// references that are already in use.
 	if before.ReferencePattern != after.ReferencePattern {
 		add(EODestructiveReferencePattern, "", fmt.Sprintf("changing reference pattern %q to %q is destructive: the sequence counter is keyed on the pattern, so a new one restarts at 1 and re-issues references already in use",
-			before.ReferencePattern, after.ReferencePattern))
+			before.ReferencePattern, after.ReferencePattern),
+			"eo_destructive_reference_pattern", map[string]string{"from": before.ReferencePattern, "to": after.ReferencePattern})
 	}
 	// ReferenceMode decides whether a record's reference is issued from the
 	// type's own sequence or derived from its parent's reference (spec §7.9).
@@ -653,7 +715,8 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 	// means own (the column default), so "" to "own" is not a change.
 	if eoReferenceModeOrDefault(before.ReferenceMode) != eoReferenceModeOrDefault(after.ReferenceMode) {
 		add(EODestructiveReferenceMode, "", fmt.Sprintf("changing reference mode %q to %q is destructive: existing references were issued under the old mode, and the new one derives or numbers them differently",
-			eoReferenceModeOrDefault(before.ReferenceMode), eoReferenceModeOrDefault(after.ReferenceMode)))
+			eoReferenceModeOrDefault(before.ReferenceMode), eoReferenceModeOrDefault(after.ReferenceMode)),
+			"eo_destructive_reference_mode", map[string]string{"from": eoReferenceModeOrDefault(before.ReferenceMode), "to": eoReferenceModeOrDefault(after.ReferenceMode)})
 	}
 	next := make(map[string]EOFieldDef, len(fieldsAfter))
 	for _, f := range fieldsAfter {
@@ -662,17 +725,20 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 	for _, old := range fieldsBefore {
 		cur, ok := next[old.Key]
 		if !ok {
-			add(EODestructiveFieldRemoved, old.Key, fmt.Sprintf("removing field %q is destructive while records exist", old.Key))
+			add(EODestructiveFieldRemoved, old.Key, fmt.Sprintf("removing field %q is destructive while records exist", old.Key),
+				"eo_destructive_field_removed", map[string]string{"field": old.Key})
 			// A field that is gone has no kind to change and no requiredness
 			// to tighten; the two rules below are about a field that is still
 			// there under a different definition.
 			continue
 		}
 		if cur.Kind != old.Kind {
-			add(EODestructiveFieldKind, old.Key, fmt.Sprintf("changing kind of field %q from %q to %q is destructive while records exist", old.Key, old.Kind, cur.Kind))
+			add(EODestructiveFieldKind, old.Key, fmt.Sprintf("changing kind of field %q from %q to %q is destructive while records exist", old.Key, old.Kind, cur.Kind),
+				"eo_destructive_field_kind", map[string]string{"field": old.Key, "from": old.Kind, "to": cur.Kind})
 		}
 		if isNeverRequired(old.RequiredMode) && !isNeverRequired(cur.RequiredMode) {
-			add(EODestructiveFieldRequired, old.Key, fmt.Sprintf("making field %q required is destructive while records exist", old.Key))
+			add(EODestructiveFieldRequired, old.Key, fmt.Sprintf("making field %q required is destructive while records exist", old.Key),
+				"eo_destructive_field_required", map[string]string{"field": old.Key})
 		}
 	}
 	return out
