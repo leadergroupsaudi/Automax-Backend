@@ -12,6 +12,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/automax/backend/internal/middleware"
 	"github.com/automax/backend/internal/models"
 	"github.com/automax/backend/internal/repository"
 	"github.com/automax/backend/pkg/utils"
@@ -501,6 +502,12 @@ func eoNewConfirmFixture(t *testing.T) *eoConfirmFixture {
 		actor: eoTestUser()}
 	h := NewEORecordTypeHandler(types, records)
 	f.app = fiber.New()
+	// THE REAL RequestContext MIDDLEWARE, which main.go installs app-wide
+	// (cmd/server/main.go) and which is what puts the caller's IP and
+	// User-Agent where the audit row reads them from. A fixture without it
+	// would hand the handler two empty strings, and the truncation test below
+	// would pass against a handler that did not truncate.
+	f.app.Use(middleware.RequestContext())
 	f.app.Use(eoTestActor(f.actor))
 	h.RegisterRoutes(f.app.Group("/eo-record-types"), eoNoPerm2)
 	return f
@@ -830,5 +837,66 @@ func TestAConfirmationOnAnAddedFieldConsumesNothing(t *testing.T) {
 	}
 	if len(f.types.committed.audit) != 0 {
 		t.Errorf("audit rows = %d, want 0: adding a field overrode nothing", len(f.types.committed.audit))
+	}
+}
+
+// TestAConfirmedEditIsNotLostToAnOverlongUserAgent: the audit row carries two
+// client-controlled columns, and it is written INSIDE the edit's transaction —
+// so a value too long for its column does not merely truncate the row, it
+// fails the INSERT (SQLSTATE 22001) and rolls back the destructive edit the
+// operator just confirmed, with an opaque 500.
+func TestAConfirmedEditIsNotLostToAnOverlongUserAgent(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+
+	req := httptest.NewRequest("PUT", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		bytes.NewReader(eoRequireFieldBody(eoConfirmBlock("eo_base", "attachments", models.EODestructiveFieldRequired))))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", strings.Repeat("Mozilla/5.0 ", 50)) // 600 characters
+	resp, err := f.app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(f.types.committed.audit) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(f.types.committed.audit))
+	}
+	entry := f.types.committed.audit[0]
+	// action_logs.user_agent is varchar(500) and .ip_address is varchar(45).
+	if n := utf8.RuneCountInString(entry.UserAgent); n > 500 {
+		t.Errorf("audit user_agent is %d characters; the column holds 500 and the INSERT shares the edit's transaction", n)
+	}
+	if n := utf8.RuneCountInString(entry.IPAddress); n > 45 {
+		t.Errorf("audit ip_address is %d characters; the column holds 45", n)
+	}
+}
+
+// TestAMalformedDeleteBodyIsRefusedRatherThanIgnored: the optional body is the
+// only way to confirm a removal, so reading an unparseable one as "no
+// confirmation" would turn a typo into either the wrong refusal or — here,
+// where the subtree holds no records and the removal needs no confirmation —
+// a silent 200 that deletes the field the operator was still deciding about.
+func TestAMalformedDeleteBodyIsRefusedRatherThanIgnored(t *testing.T) {
+	f := eoNewConfirmFixture(t)
+	// Nothing anywhere in the subtree: without the body check this request is
+	// an ordinary allowed removal and answers 200.
+	f.records.totalByType = map[uuid.UUID]int64{}
+
+	resp := f.do(t, "DELETE", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID),
+		[]byte(`{"confirm_destructive": {"type_key": "eo_base",`))
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d for an unparseable DELETE body, want 400", resp.StatusCode)
+	}
+	if len(f.types.committed.fieldDeletes) != 0 {
+		t.Errorf("the field was deleted under a request body nothing could read")
+	}
+
+	// The control: the same request with no body at all is the ordinary
+	// removal, so the 400 above is the body check and not the guard rail.
+	f = eoNewConfirmFixture(t)
+	f.records.totalByType = map[uuid.UUID]int64{}
+	if resp := f.do(t, "DELETE", fmt.Sprintf("/eo-record-types/%s/fields/%s", f.base.ID, f.fieldID), nil); resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d for an unconfirmed removal on an empty subtree, want 200", resp.StatusCode)
 	}
 }

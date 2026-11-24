@@ -324,8 +324,17 @@ func (h *EORecordTypeHandler) eoConfirmedEditAudit(
 	if marshalErr != nil {
 		return nil, false, utils.InternalErrorResponse(c, marshalErr, i18n.T(c.UserContext(), "internal_server_error"))
 	}
+	// BOTH ARE TRUNCATED, AND BOTH ARE CLIENT-CONTROLLED. action_logs
+	// .user_agent is varchar(500) and .ip_address is varchar(45); a request
+	// with a 600-character User-Agent header fails the INSERT with SQLSTATE
+	// 22001, and because that INSERT shares the edit's transaction it rolls
+	// the confirmed destructive edit back with an opaque 500. The IP is
+	// within 45 only because no ProxyHeader is configured today
+	// (cmd/server/main.go) — configuring one makes c.IP() return the whole
+	// X-Forwarded-For chain, which a client writes.
 	ip, _ := c.Locals(constants.ContextKeys.IP_ADDRESS).(string)
 	agent, _ := c.Locals(constants.ContextKeys.USER_AGENT).(string)
+	ip, agent = eoTruncate(ip, 45), eoTruncate(agent, 500)
 	where := "the record type itself"
 	if confirm.FieldKey != "" {
 		where = fmt.Sprintf("field %q", confirm.FieldKey)

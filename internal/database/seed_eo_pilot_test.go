@@ -2341,7 +2341,8 @@ func TestSeedsEveryPilotChildType(t *testing.T) {
 // Addendum 4. A parent-derived type issues every reference inside its
 // parent's, so it owns no prefix and ValidateReferencePrefix must not be asked
 // of it — a blank prefix would be rejected outright and an invented one is
-// made permanent by ValidateTypeEdit.
+// then held in place by ValidateTypeEdit once records exist, correctable
+// after that only as a §7.14 confirmed destructive edit.
 // Mutation: set eoExecutionPlanTypeKey's mode to models.EOReferenceModeOwn.
 func TestChildTypesUseParentDerivedReferences(t *testing.T) {
 	db := eoPilotDB(t)
@@ -3057,8 +3058,10 @@ func TestEoAtClosureFieldsAwaitTheirState(t *testing.T) {
 // eoSeedPilotTypes' own refusals, which eoPilotFieldDefs cannot make because
 // they are about the TYPE rather than its fields. Each is a configuration that
 // would be accepted silently and then misnumber every record of the type —
-// and models.ValidateTypeEdit makes a reference mode, prefix or pattern
-// permanent once records exist.
+// and models.ValidateTypeEdit refuses to change a prefix or pattern once
+// records exist, which after that takes a §7.14 confirmed destructive edit
+// with a stated backfill rule. (A reference MODE is not one of §7.14's
+// guarded attributes at all, so nothing refuses changing it.)
 // Mutation: delete either guard at the top of eoSeedPilotTypes.
 func TestEoSeedRefusesAnIncoherentTypeSpec(t *testing.T) {
 	db := eoPilotDB(t)

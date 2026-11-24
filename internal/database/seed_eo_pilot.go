@@ -414,7 +414,8 @@ var eoPilotSteps = []eoPilotStep{
 	// cannot supply an id for while EO Documenta is disabled, four demanded
 	// at creation and two at a closing transition; see
 	// eoFileFieldsRelaxedUntilDocumenta for the ruling and for how to
-	// re-tighten and for the narrow window in which that is possible at all.
+	// re-tighten, including what only a §7.14 confirmed edit can do and what
+	// no route can do at all.
 	// It is deliberately NOT convergent: restoring one of these fields is an
 	// administrator's edit, and a convergent step would undo it on the next
 	// boot.
@@ -611,7 +612,7 @@ type eoFileRequirednessRelaxation struct {
 // The reference would be indistinguishable from a real filing and nothing
 // would ever reconcile it.
 //
-// HOW TO RE-TIGHTEN, AND THE WINDOW IN WHICH IT IS POSSIBLE AT ALL. The task
+// HOW TO RE-TIGHTEN, AND WHAT NO ROUTE CAN DO. The task
 // that authorised this relaxation said re-tightening was "a configuration
 // change through the type designer that does not need a release". THAT IS
 // NOT TRUE ONCE THE REGISTER IS IN USE, and the correction is recorded here
@@ -878,7 +879,7 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 	// constraint is the same: the type designer refuses to make a field
 	// required once the type or anything beneath it holds a record. Only
 	// the urgency differs.
-	const howToRestore = "Restoring a field is possible through the type designer as an ORDINARY edit only while its record type and every type beneath it hold no records; after the first record models.ValidateTypeEdit refuses that edit (\"making field ... required is destructive while records exist\") and the request must carry §7.14's confirm_destructive block — the type key, the field key, the change `field_required` and the backfill rule for the records already filed — which is applied and audited together."
+	const howToRestore = "Restoring a field is possible through the type designer as an ORDINARY edit only while its record type and every type beneath it hold no records; after the first record models.ValidateTypeEdit refuses that edit (\"making field ... required is destructive while records exist\") and the request must carry §7.14's confirm_destructive block — the type key, the field key, the change `field_required` and the backfill rule for the records already filed — which is applied and audited together. BUT RESTORE ONLY TO THE MODE PRINTED, AND NOT EVERY ONE OF THEM IS RESTORABLE: a field shown (restore: at_state) can be restored exactly as shown, because the record exists by the time the document is demanded. A field shown (restore: always) CANNOT — POST /eo-records/:id/files needs a record id, so a document demanded at creation can never be supplied and setting it back to `always` makes that register uncreatable again, confirmed edit or not. For those the client chooses between `at_state` at a transition after the record exists and a staged upload (create, upload, then update); `always` is not one of the options."
 	if config.EODocumentaEnabled() {
 		log.Printf("EO pilot: %d file field(s) are OPTIONAL although EO Documenta is ENABLED: %s. They were relaxed because no file id could be minted while it was off, and NOTHING RE-TIGHTENS THEM AUTOMATICALLY. "+howToRestore+" Treat this as a BLOCKER on running enabled with these controls missing, not as a chore.",
 			len(relaxed), strings.Join(relaxed, ", "))
@@ -1078,10 +1079,13 @@ func SeedEOPilot(db *gorm.DB) { seedEOPilot(db) }
 // ── Task A2: the three root types of the pilot ──────────────────────────────
 
 // The keys of the three root record types of the client's field matrix
-// (docs/superpowers/specs/eo-field-matrix.md). A record type key is a
-// PERMANENT identifier: models.ValidateTypeEdit refuses to change it once
-// records exist, because the key is what the reference prefix, the seeded
-// capability config and every formula that names a child type address.
+// (docs/superpowers/specs/eo-field-matrix.md). TREAT A RECORD TYPE KEY AS
+// PERMANENT: models.ValidateTypeEdit refuses to change it once records exist,
+// because the key is what the reference prefix, the seeded capability config,
+// the three per-type permission codes and every formula that names a child
+// type address. §7.14's confirmed destructive edit can override that refusal,
+// but it does not make a re-key safe — it strands the old key's permission
+// codes and every grant on them, which is why the refusal says so.
 const (
 	eoDirectiveTypeKey  = "eo_directive"               // EO-DIR, matrix line 68
 	eoDraftStudyTypeKey = "eo_draft_decision_study"    // EO-DRF, matrix line 124
@@ -1184,8 +1188,9 @@ type eoPilotTypeSpec struct {
 	// the zero value would silently make every type own-sequence, and a
 	// parent-derived type seeded own-mode is rejected by
 	// models.ValidateReferencePrefix for its blank prefix — or, worse,
-	// accepted with an invented one that ValidateTypeEdit then makes
-	// permanent.
+	// accepted with an invented one that ValidateTypeEdit then holds in place
+	// once records exist, correctable after that only as a §7.14 confirmed
+	// destructive edit.
 	mode            string
 	prefix, pattern string
 	fields          []eoPilotFieldSpec
@@ -1298,7 +1303,7 @@ var eoRootConditionalDecisions = []eoConditionalDecision{
 	{eoDirectiveTypeKey, "decision_reference",
 		"The matrix marks the field Conditional and names NO condition: the Options column is empty and the Why column gives only an example reference (EO-DEC-2026-311).",
 		models.EORequiredNever,
-		"Not expressible because the condition is UNSTATED, not because the engine cannot evaluate it. Any rule written here would be invented client policy — the plausible reading is \"when directive_origin is committee or weekly_meeting\", but the matrix does not say so and the cost of guessing is permanent: models.ValidateTypeEdit treats never -> required as destructive once records exist, so the designer could not correct it. THIS ONE NEEDS THE CLIENT'S ANSWER BEFORE THE FIRST DIRECTIVE RECORD; after that it takes a migration rather than an edit."},
+		"Not expressible because the condition is UNSTATED, not because the engine cannot evaluate it. Any rule written here would be invented client policy — the plausible reading is \"when directive_origin is committee or weekly_meeting\", but the matrix does not say so and the cost of guessing is high: models.ValidateTypeEdit treats never -> required as destructive once records exist, so after the first Directive record the designer takes the correction only as a §7.14 CONFIRMED destructive edit — the request carries a confirm_destructive block naming eo_directive, decision_reference, the change `field_required` and the backfill rule for the directives already filed, and the override is audited (Plan 4, task B1). SO THIS ANSWER IS BEST HAD BEFORE THE FIRST DIRECTIVE RECORD, but after that it is one confirmed PUT and NOT a migration. Do not schedule a release for it."},
 	{eoDirectiveTypeKey, "corrective_action",
 		"5.2 — recorded alongside the delay reason.",
 		models.EORequiredConditional,
@@ -1666,7 +1671,8 @@ func eoSeedPilotTypes(tx *gorm.DB, specs []eoPilotTypeSpec, base models.EORecord
 		}
 		// A parent-derived type issues every reference inside its parent's, so
 		// a prefix of its own would be a small lie that ValidateTypeEdit then
-		// makes permanent (a prefix change is destructive once records exist).
+		// holds in place (a prefix change is destructive once records exist,
+		// and after that takes a §7.14 confirmed destructive edit).
 		if spec.mode == models.EOReferenceModeParent && spec.prefix != "" {
 			return fmt.Errorf("record type %q is parent-derived and carries the prefix %q; a parent-derived type owns no prefix", spec.key, spec.prefix)
 		}

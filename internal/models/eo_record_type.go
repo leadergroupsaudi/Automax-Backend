@@ -304,8 +304,9 @@ func (x *EOLinkType) BeforeCreate(tx *gorm.DB) error {
 //     parent's own sequence can never produce, and the parent's prefix is
 //     already guarded here. Without this exemption every parent-derived type
 //     has to carry a prefix that is a small lie about the references it issues
-//     — and ValidateTypeEdit makes that lie permanent, because changing a
-//     prefix is a destructive edit once records exist.
+//     — and ValidateTypeEdit then holds that lie in place, because changing a
+//     prefix is a destructive edit once records exist, correctable after that
+//     only as a §7.14 confirmed destructive edit with a stated backfill rule.
 //
 // On an update, the caller MUST exclude the type being edited from existing,
 // otherwise a type that keeps its own prefix is rejected against itself.
@@ -554,6 +555,14 @@ func ValidateTypeEdit(before, after EORecordType, fieldsBefore, fieldsAfter []EO
 // order spec §7.14's rules are stated. It assumes records exist: the caller
 // applies that condition.
 //
+// IT IS ORDERED, AND THE ORDER IS LOAD-BEARING. Its caller asks it twice for
+// the same edit — once with a confirmation and once without — and compares the
+// answers, so the sequence must be the same both times. It is, because every
+// rule below is a straight-line check and the field loop iterates fieldsBefore,
+// a SLICE. A guard added later that ranges over a MAP would make the first
+// refusal differ between two calls on identical input, and the audit row would
+// then record a refusal the operator was never shown.
+//
 // IT COLLECTS ALL OF THEM rather than returning at the first. The first is
 // still what an unconfirmed edit is refused with, so the operator-facing
 // behaviour is unchanged — but a confirmation has to be checked against the
@@ -584,14 +593,37 @@ func eoDestructiveChanges(before, after EORecordType, fieldsBefore, fieldsAfter 
 	}
 	// The key identifies the type to configuration that names it by key —
 	// the reference prefix it owns, formulas that address a child type by key
-	// (eoRecordDeps.Children, .Ancestor), and seeded capability config.
+	// (eoRecordDeps.Children, .Ancestor), seeded capability config, and spec
+	// §7.11's three per-type permission codes.
+	//
+	// THE PERMISSION CODES ARE IN THE MESSAGE BECAUSE THE MESSAGE IS WHAT AN
+	// OPERATOR READS BEFORE DECIDING TO OVERRIDE IT. On a concrete type the
+	// repository writes the codes for the NEW key on save and leaves the old
+	// key's codes, and every role grant on them, behind: a custom role holding
+	// `<old>:view` silently loses the register, and renaming back is then
+	// refused outright because those stranded codes still occupy their names
+	// (repository.ErrEOTypePermissionCodesExist). That consequence is parked
+	// rather than fixed — it needs ownership metadata on the shared
+	// permissions table — so until it is fixed, saying so here is the whole of
+	// the protection.
 	//
 	// A CONFIRMATION FOR THIS CHANGE NAMES THE OLD KEY, like every other: the
 	// type is identified by what it is called now, which is the only name the
 	// operator and the stored rows agree on when the request arrives.
 	if before.Key != after.Key {
-		add(EODestructiveKey, "", fmt.Sprintf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns and to every formula that names it",
-			before.Key, after.Key))
+		// THE PERMISSION CLAUSE IS OMITTED FOR AN ABSTRACT TYPE, on either
+		// side of the edit, because an abstract type HAS no per-type codes:
+		// the repository writes them for concrete types only. Re-keying an
+		// abstract ancestor is reachable — its descendants' records are what
+		// make the edit destructive — and telling that operator their grants
+		// were stranded would be false.
+		permissions := fmt.Sprintf(", and to its three per-type permission codes — saving writes the codes for %q and leaves %q's codes and every role grant on them behind, so a role holding them loses this register and renaming back is refused outright",
+			after.Key, before.Key)
+		if before.IsAbstract || after.IsAbstract {
+			permissions = ""
+		}
+		add(EODestructiveKey, "", fmt.Sprintf("changing key %q to %q is destructive: the key identifies this type to the reference prefix it owns, to every formula that names it%s",
+			before.Key, after.Key, permissions))
 	}
 	// An abstract type holds no records of its own: the save pipeline refuses
 	// to create one. Flipping the flag on a type that already has records

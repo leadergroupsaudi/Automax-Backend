@@ -729,3 +729,45 @@ func TestValidateTypeEditRefusesAMalformedConfirmation(t *testing.T) {
 		})
 	}
 }
+
+// TestTheReKeyRefusalNamesThePermissionCodesItStrands: this sentence is what
+// an operator reads before deciding to override it, and the consequence it has
+// to carry is the one §7.14's own list does not mention — the old key's three
+// per-type permission codes, and every role grant on them, are left behind.
+// Plan 3 parked the fix for that; until it lands, the sentence is the whole of
+// the protection.
+//
+// The abstract half is not symmetry for its own sake: re-keying an ABSTRACT
+// ancestor is refused because its DESCENDANTS hold records, and an abstract
+// type has no per-type codes at all, so the same sentence would be a false
+// statement to that operator.
+func TestTheReKeyRefusalNamesThePermissionCodesItStrands(t *testing.T) {
+	concrete, fb := eoBase()
+	after := concrete
+	after.Key = "directive_v2"
+
+	err := ValidateTypeEdit(concrete, after, fb, fb, true, nil)
+	if err == nil {
+		t.Fatal("re-keying a populated concrete type was allowed")
+	}
+	for _, want := range []string{"permission codes", `"directive"`, `"directive_v2"`, "renaming back is refused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+
+	abstract, fb := eoBase()
+	abstract.Key, abstract.IsAbstract = "eo_base", true
+	afterAbstract := abstract
+	afterAbstract.Key = "eo_base_v2"
+	err = ValidateTypeEdit(abstract, afterAbstract, fb, fb, true, nil)
+	if err == nil {
+		t.Fatal("re-keying a populated abstract ancestor was allowed")
+	}
+	if strings.Contains(err.Error(), "permission codes") {
+		t.Errorf("refusal = %q: an abstract type has no per-type permission codes, so this names a consequence that does not happen", err.Error())
+	}
+	if !strings.Contains(err.Error(), "is destructive") {
+		t.Errorf("refusal = %q, want the §7.14 refusal itself", err.Error())
+	}
+}

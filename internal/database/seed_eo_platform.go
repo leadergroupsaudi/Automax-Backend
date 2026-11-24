@@ -370,8 +370,9 @@ func eoSeedSmokeParentType(db *gorm.DB, baseID uuid.UUID) (*models.EORecordType,
 // models.ValidateReferencePrefix exempts ReferenceMode "parent" types for
 // exactly that reason, so the designer accepts it; before that exemption
 // existed this type had to carry a placeholder prefix that was a small lie
-// about the references it issues, made permanent by ValidateTypeEdit's rule
-// that a prefix change is destructive once records exist.
+// about the references it issues, held in place by ValidateTypeEdit's rule
+// that a prefix change is destructive once records exist — correctable after
+// that only as a §7.14 confirmed destructive edit with a stated backfill rule.
 func eoSeedSmokeChildType(db *gorm.DB, baseID uuid.UUID) (*models.EORecordType, error) {
 	t := models.EORecordType{
 		ID:               uuid.New(),
