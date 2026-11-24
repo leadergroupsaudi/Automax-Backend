@@ -2,6 +2,7 @@ package database
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"reflect"
@@ -428,6 +429,12 @@ var eoPilotSteps = []eoPilotStep{
 	// `pending`, never on an applied row, and adds only what is missing.
 	{key: eoSeedSubjectTaxonomyStepKey, run: eoSeedSubjectTaxonomy,
 		convergent: true, pending: eoSubjectTaxonomyPending},
+	// TASK B5 (remediation). TWO ONE-SHOT STEPS, deliberately not convergent:
+	// each is a GRANT, and a grant an administrator later revokes is a
+	// deliberate act the next boot must not reinstate. They come after
+	// seed_type_permissions, whose codes the second one hands out.
+	{key: eoGrantWorkflowsViewStepKey, run: eoGrantWorkflowsViewToEOAdmin},
+	{key: eoGrantProcessRoleRegistersStepKey, run: eoGrantProcessRoleRegisters},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -4216,6 +4223,173 @@ func eoSeedSubjectTaxonomy(tx *gorm.DB) (bool, error) {
 			SortOrder: i + 1, IsActive: true}
 		if err := tx.Create(&lv).Error; err != nil {
 			return false, fmt.Errorf("create value %q: %w", v.code, err)
+		}
+	}
+	return true, nil
+}
+
+// ── Task B5 (remediation): the process roles can read their registers ───────
+//
+// Measured before this task: head_of_office, public_relations, protocol,
+// department_user and escalation_manager held eo:view, eo:update and
+// eo:transition and NOT ONE per-type code, so each could open a register and
+// read no row of it (the server requires the module code AND the per-type
+// code). eo_admin held eo:types:manage and no workflows:view, so the type
+// designer's workflow tab met an open gate with a disabled picker.
+
+const (
+	// PERMANENT identifiers; never rename or reuse (see eoPilotStep).
+	eoGrantWorkflowsViewStepKey        = "grant_workflows_view_to_eo_admin"
+	eoGrantProcessRoleRegistersStepKey = "grant_process_role_registers"
+)
+
+// eoAdminRoleCode is the role that configures the platform.
+const eoAdminRoleCode = "eo_admin"
+
+// eoRolesDeliberatelyWithoutTypeCodes are the roles that hold an EO module
+// permission and NO per-type record code BY DECISION, not by oversight.
+//
+// EO ADMINISTRATOR GETS NO PER-TYPE RECORD CODES, ON PURPOSE. It configures
+// the platform (types, fields, workflow association); it does not need to
+// read the Executive Office's correspondence, and handing it every register
+// would give the person who designs the forms sight of the records. That its
+// per-type count is zero looks exactly like the defect this task fixed for
+// five other roles. It is not one. Do not "fix" it: decided with the client.
+var eoRolesDeliberatelyWithoutTypeCodes = map[string]bool{eoAdminRoleCode: true}
+
+// eoRegisterGrant is one role's reach into the registers: the type keys it may
+// VIEW and the (sub)set it may UPDATE. `create` is granted to nobody here: none
+// of these roles holds the module-level eo:create, so a per-type create code
+// would be inert and would only suggest an ability they do not have.
+type eoRegisterGrant struct {
+	roleCode string
+	view     []string
+	update   []string
+}
+
+// eoPilotRegisterKeys is the eleven concrete pilot registers, in one place so the
+// oversight role's "all of them" is a list and not a claim.
+var eoPilotRegisterKeys = []string{
+	"eo_directive", "eo_execution_plan", "eo_execution_plan_stage", "eo_assignment",
+	"eo_draft_decision_study", "eo_objection", "eo_decision_record",
+	"eo_incoming_correspondence", "eo_referral", "eo_outgoing_reply", "eo_task",
+}
+
+// eoProcessRoleRegisters is the PROVISIONAL mapping from the pilot's three
+// processes (EO-DIR, EO-DRF, EO-COM in docs/superpowers/specs/eo-field-matrix.md)
+// to the registers each process role touches. It goes to the client for
+// sign-off; a correction is an edit to this table, applied on a database that
+// has already booted by a new step, never by editing history.
+//
+//   - head_of_office: oversight, so VIEW on all eleven and update on none. The
+//     matrix gives the Head of Office an approval only in EO-MED (outside the
+//     pilot); nothing in EO-DIR/DRF/COM has him edit a record.
+//   - escalation_manager: EO-DIR's escalation ladder (+3/+7/+14 days) acts on
+//     directives, their plans, assignments and tasks.
+//   - department_user: the executing bodies. Assignments (owner, completion,
+//     evidence), referrals (the body's view is submitted on its Referral) and
+//     tasks; plan stages are read-only context for an assignment's from_stage.
+//   - public_relations: "Public relations" is one of EO-COM's three intake
+//     routes, so Incoming Correspondence, and Task.
+//   - protocol: no pilot process is Protocol's (EO-VIS is outside the pilot);
+//     it holds the universal Task, which is what EO-VIS raises for it.
+var eoProcessRoleRegisters = []eoRegisterGrant{
+	{roleCode: "head_of_office", view: eoPilotRegisterKeys},
+	{roleCode: "escalation_manager",
+		view:   []string{"eo_directive", "eo_execution_plan", "eo_assignment", "eo_task"},
+		update: []string{"eo_directive", "eo_execution_plan", "eo_assignment", "eo_task"}},
+	{roleCode: "department_user",
+		view:   []string{"eo_assignment", "eo_referral", "eo_task", "eo_execution_plan_stage"},
+		update: []string{"eo_assignment", "eo_referral", "eo_task"}},
+	{roleCode: "public_relations",
+		view:   []string{"eo_incoming_correspondence", "eo_task"},
+		update: []string{"eo_incoming_correspondence", "eo_task"}},
+	{roleCode: "protocol",
+		view:   []string{"eo_task"},
+		update: []string{"eo_task"}},
+}
+
+// eoGrantWorkflowsViewToEOAdmin gives eo_admin workflows:view, which is what
+// makes the type designer's workflow tab usable for the persona it was built
+// for. The role and the permission are both created by Seed before the EO
+// seed runs; if either is absent (a database that predates them, a role an
+// administrator deleted) the step grants nothing and returns done=false so it
+// is asked again, rather than recording a grant that never happened.
+func eoGrantWorkflowsViewToEOAdmin(tx *gorm.DB) (bool, error) {
+	var role models.Role
+	if err := tx.Where("code = ?", eoAdminRoleCode).First(&role).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("EO pilot: role %q not found; workflows:view was not granted and will be retried on the next boot", eoAdminRoleCode)
+			return false, nil
+		}
+		return false, fmt.Errorf("read role %q: %w", eoAdminRoleCode, err)
+	}
+	var perm models.Permission
+	if err := tx.Where("code = ?", "workflows:view").First(&perm).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("EO pilot: permission workflows:view not found; it was not granted to %q and will be retried on the next boot", eoAdminRoleCode)
+			return false, nil
+		}
+		return false, fmt.Errorf("read permission workflows:view: %w", err)
+	}
+	if err := tx.Model(&role).Association("Permissions").Append(&perm); err != nil {
+		return false, fmt.Errorf("grant workflows:view to %q: %w", eoAdminRoleCode, err)
+	}
+	return true, nil
+}
+
+// eoGrantProcessRoleRegisters applies eoProcessRoleRegisters. ALL-OR-NOTHING:
+// if any named role is missing it grants to none and returns done=false (and
+// says so), so a retry cannot re-grant what an administrator revoked in the
+// meantime from the roles that did exist. A type's code that is absent or
+// deleted is skipped and named: a deleted permission is not one to hand out.
+// The append is idempotent (the join table is keyed on the pair).
+//
+// A record type added AFTER this step ran is not granted to these roles: who
+// else sees a new register is a decision, and the boot report says which
+// roles hold no code at all.
+func eoGrantProcessRoleRegisters(tx *gorm.DB) (bool, error) {
+	roles := make(map[string]models.Role, len(eoProcessRoleRegisters))
+	for _, g := range eoProcessRoleRegisters {
+		var role models.Role
+		if err := tx.Where("code = ?", g.roleCode).First(&role).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Printf("EO pilot: role %q not found; the register grants were NOT applied to any role and will be retried on the next boot", g.roleCode)
+				return false, nil
+			}
+			return false, fmt.Errorf("read role %q: %w", g.roleCode, err)
+		}
+		roles[g.roleCode] = role
+	}
+	for _, g := range eoProcessRoleRegisters {
+		var codes []string
+		for _, k := range g.view {
+			codes = append(codes, models.EOTypePermissionCode(k, models.EOTypePermissionView))
+		}
+		for _, k := range g.update {
+			codes = append(codes, models.EOTypePermissionCode(k, models.EOTypePermissionUpdate))
+		}
+		var perms []models.Permission
+		if err := tx.Where("code IN ?", codes).Find(&perms).Error; err != nil {
+			return false, fmt.Errorf("read the per-type permissions for %q: %w", g.roleCode, err)
+		}
+		if len(perms) != len(codes) {
+			have := map[string]bool{}
+			for _, p := range perms {
+				have[p.Code] = true
+			}
+			for _, c := range codes {
+				if !have[c] {
+					log.Printf("EO pilot: per-type permission %q has no live row; not granted to %q", c, g.roleCode)
+				}
+			}
+		}
+		if len(perms) == 0 {
+			continue
+		}
+		role := roles[g.roleCode]
+		if err := tx.Model(&role).Association("Permissions").Append(perms); err != nil {
+			return false, fmt.Errorf("grant the registers to %q: %w", g.roleCode, err)
 		}
 	}
 	return true, nil

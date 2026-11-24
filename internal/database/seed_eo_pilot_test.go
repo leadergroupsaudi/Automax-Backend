@@ -128,6 +128,9 @@ func eoPilotDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := eoSeedTestDB(t)
 	eoSeedRoles(t, db)
+	// workflows:view is created by Seed's permission block in production; the
+	// pilot seed grants it to eo_admin (Task B5).
+	eoSeedWorkflowsViewPermission(t, db)
 	if err := migrations.MigrateEOPlatform(db); err != nil {
 		t.Fatalf("create eo_records and its siblings: %v", err)
 	}
@@ -258,7 +261,7 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 		// executive_office. TestEoEveryConcreteTypeHasItsThreePermissions is
 		// what holds those rows to spec §7.11; this is the arithmetic that
 		// stops the smoke removal hiding behind them.
-		grants: before.grants - 12 + 6*int64(len(eoPilotTypeKeys)),
+		grants: before.grants - 12 + 6*int64(len(eoPilotTypeKeys)) + eoB5Grants,
 	}
 	want.perms = before.perms - 6 + 3*int64(len(eoPilotTypeKeys))
 	// Plan 1's two smoke workflows and its one-step escalation policy go;
@@ -381,7 +384,7 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			// theirs, while a type the case above invented does not.
 			pending := eoTypesAwaitingPermissions(t, db) + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes))
 			want.perms += 3 * pending
-			want.grants += 6 * pending
+			want.grants += 6*pending + eoB5Grants
 			// And A6's removal of a field definition an enabled capability
 			// reserves.
 			want.fields -= int64(len(eoCapabilityReservedFieldRemovals))
@@ -4372,14 +4375,16 @@ func eoSeedTheRealEORoles(t *testing.T, db *gorm.DB) {
 }
 
 // eoRolesTheSeedLeavesWithoutTypeCodes derives, from the real tables, which
-// seeded roles hold a module-level EO permission and no per-type code. That
-// is a PROPERTY OF THE SEED, not a list this test chose: spec §7.11 names
-// only models.EOTypePermissionRoleCodes for the per-type grants, so every
-// other EO role is in this state by arithmetic.
+// seeded roles hold a module-level EO permission and no per-type code after
+// the seed: those that are neither in models.EOTypePermissionRoleCodes nor in
+// eoProcessRoleRegisters (Task B5). Today that is eo_admin alone, by design.
 func eoRolesTheSeedLeavesWithoutTypeCodes() []string {
 	holdsTypeCodes := make(map[string]bool, len(models.EOTypePermissionRoleCodes))
 	for _, c := range models.EOTypePermissionRoleCodes {
 		holdsTypeCodes[c] = true
+	}
+	for _, g := range eoProcessRoleRegisters {
+		holdsTypeCodes[g.roleCode] = true
 	}
 	module := make(map[string]bool, len(eoModulePermissions))
 	for _, p := range eoModulePermissions {
@@ -4425,19 +4430,12 @@ func eoRolesTheSeedLeavesWithoutTypeCodes() []string {
 func TestEOBootReportNamesRolesWithNoPerTypeCodes(t *testing.T) {
 	db := eoPilotDB(t)
 	eoSeedTheRealEORoles(t, db)
+	eoSeedWorkflowsViewPermission(t, db)
 	seedEOPilot(db)
 
 	want := eoRolesTheSeedLeavesWithoutTypeCodes()
-	for _, required := range []string{"head_of_office", "public_relations", "protocol", "department_user", "escalation_manager", "eo_admin"} {
-		found := false
-		for _, w := range want {
-			if w == required {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("fixture error: %q is no longer a role with a module-level EO grant and no per-type code (derived: %v). If it was GRANTED per-type codes, that is a client decision somebody took and this list is what records it.", required, want)
-		}
+	if len(want) != 1 || want[0] != "eo_admin" {
+		t.Fatalf("fixture error: the only role the seed should leave without per-type codes is eo_admin (by design), derived: %v. If another role was left out, the report must name it; if one was GRANTED, that is a client decision and this list records it.", want)
 	}
 
 	var buf bytes.Buffer
@@ -4457,24 +4455,244 @@ func TestEOBootReportNamesRolesWithNoPerTypeCodes(t *testing.T) {
 	for _, role := range want {
 		line := `role "` + role + `" holds EO module permissions`
 		if !strings.Contains(got, line) {
-			t.Errorf("the boot log does not carry %q: this role reaches every EO screen and sees an empty register, and nothing else in the system says so.\n--- output ---\n%s", line, got)
+			t.Errorf("the boot log does not carry %q: nothing else in the system says this role sees no register.\n--- output ---\n%s", line, got)
 		}
 	}
-	for _, phrase := range []string{
-		"every register is EMPTY for it and every record answers 403",
-		"grant eo:<type_key>:view|create|update to this role through the permissions UI",
-	} {
-		if !strings.Contains(got, phrase) {
-			t.Errorf("the boot log does not say %q, so the line names a state without naming what it means or what to do about it.\n--- output ---\n%s", phrase, got)
-		}
+	// eo_admin's line must say it is deliberate, and must NOT tell the reader
+	// to grant it codes: that advice is the "fix" its seed comment forbids.
+	if !strings.Contains(got, "BY DESIGN") {
+		t.Errorf("the eo_admin line does not say the absence is by design.\n--- output ---\n%s", got)
+	}
+	if strings.Contains(got, "grant eo:<type_key>:view|create|update to this role through the permissions UI") {
+		t.Errorf("the boot log tells an operator to grant per-type codes to a role that is deliberately without them.\n--- output ---\n%s", got)
 	}
 
 	// The other direction: a role that DOES hold the per-type codes must not
-	// be named, or the line is noise on every boot of every deployment.
-	for _, granted := range models.EOTypePermissionRoleCodes {
-		if strings.Contains(got, `role "`+granted+`" holds EO module permissions`) {
-			t.Errorf("the boot log names %q, which holds the per-type codes: its register is not empty.\n--- output ---\n%s", granted, got)
+	// be named, or the line is noise on every boot of every deployment. That
+	// is the two roles of §7.11 AND the five process roles Task B5 granted.
+	granted := append([]string(nil), models.EOTypePermissionRoleCodes...)
+	for _, g := range eoProcessRoleRegisters {
+		granted = append(granted, g.roleCode)
+	}
+	for _, r := range granted {
+		if strings.Contains(got, `role "`+r+`" holds EO module permissions`) {
+			t.Errorf("the boot log names %q, which holds per-type codes: its register is not empty.\n--- output ---\n%s", r, got)
 		}
+	}
+}
+
+// And the report still fires for a role outside both lists, with the grant
+// advice, so extending the table cannot turn the report off for the rest.
+func TestEOBootReportStillWarnsForAnUnmappedEORole(t *testing.T) {
+	db := eoPilotDB(t)
+	eoSeedTheRealEORoles(t, db)
+	eoSeedWorkflowsViewPermission(t, db)
+	var view models.Permission
+	if err := db.Where("code = ?", "eo:view").First(&view).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.Role{Name: "Stray", Code: "stray_eo", IsActive: true, Permissions: []models.Permission{view}}).Error; err != nil {
+		t.Fatal(err)
+	}
+	seedEOPilot(db)
+	var buf bytes.Buffer
+	out, flags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(out); log.SetFlags(flags) })
+	eoLogRolesWithNoTypeCodes(db)
+	got := buf.String()
+	if !strings.Contains(got, `role "stray_eo" holds EO module permissions`) ||
+		!strings.Contains(got, "grant eo:<type_key>:view|create|update to this role through the permissions UI") {
+		t.Errorf("an unmapped role is not warned about with the grant advice:\n%s", got)
+	}
+}
+
+// ── Task B5 (remediation): every process role reads its registers ───────────
+
+// eoSeedWorkflowsViewPermission creates the workflows:view permission, which
+// Seed creates in production and eoSeedTheRealEORoles (module codes only)
+// does not.
+func eoSeedWorkflowsViewPermission(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	p := models.Permission{Name: "View Workflows", Code: "workflows:view", Module: "workflows", Action: "view", IsActive: true}
+	if err := db.Where("code = ?", p.Code).FirstOrCreate(&p).Error; err != nil {
+		t.Fatalf("create workflows:view: %v", err)
+	}
+}
+
+// eoB5Grants is how many role_permissions rows Task B5 adds on a fresh seed:
+// 22 view + 10 update codes across the five process roles (counted from
+// eoWantRegisterView/Update below, which TestSeedEOPilot_EveryEORoleCanRead-
+// Something holds the seed to) plus workflows:view for eo_admin.
+const eoB5Grants = 22 + 10 + 1
+
+// eoWantRegisterView / eoWantRegisterUpdate are WRITTEN OUT here, not derived
+// from eoProcessRoleRegisters, so editing the seed table without editing the
+// sign-off mapping fails a test.
+var eoWantRegisterView = map[string][]string{
+	"head_of_office":     {"eo_assignment", "eo_decision_record", "eo_directive", "eo_draft_decision_study", "eo_execution_plan", "eo_execution_plan_stage", "eo_incoming_correspondence", "eo_objection", "eo_outgoing_reply", "eo_referral", "eo_task"},
+	"escalation_manager": {"eo_assignment", "eo_directive", "eo_execution_plan", "eo_task"},
+	"department_user":    {"eo_assignment", "eo_execution_plan_stage", "eo_referral", "eo_task"},
+	"public_relations":   {"eo_incoming_correspondence", "eo_task"},
+	"protocol":           {"eo_task"},
+}
+var eoWantRegisterUpdate = map[string][]string{
+	"head_of_office":     {},
+	"escalation_manager": {"eo_assignment", "eo_directive", "eo_execution_plan", "eo_task"},
+	"department_user":    {"eo_assignment", "eo_referral", "eo_task"},
+	"public_relations":   {"eo_incoming_correspondence", "eo_task"},
+	"protocol":           {"eo_task"},
+}
+
+// eoSessionFor builds what a login builds: a user carrying the role, with its
+// permissions preloaded, whose PermissionCodes the route guard and the
+// register filter both read.
+func eoSessionFor(t *testing.T, db *gorm.DB, roleCode string) *models.User {
+	t.Helper()
+	var role models.Role
+	if err := db.Preload("Permissions").Where("code = ?", roleCode).First(&role).Error; err != nil {
+		t.Fatalf("read role %q: %v", roleCode, err)
+	}
+	return &models.User{Roles: []models.Role{role}}
+}
+
+func eoB5Fixture(t *testing.T) *gorm.DB {
+	db := eoPilotDB(t)
+	eoSeedTheRealEORoles(t, db)
+	eoSeedWorkflowsViewPermission(t, db)
+	// The generic platform-wide role: holds eo:view and workflows:view in
+	// production, and must come out of the seed with no register.
+	var view, wf models.Permission
+	db.Where("code = ?", "eo:view").First(&view)
+	db.Where("code = ?", "workflows:view").First(&wf)
+	if err := db.Create(&models.Role{Name: "User", Code: "user", IsActive: true, Permissions: []models.Permission{view, wf}}).Error; err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// Mutation: drop a register from eoProcessRoleRegisters; grant protocol a
+// second type; empty the table; delete the workflows:view step; grant
+// eo_admin a per-type code; grant `user` any per-type code.
+func TestSeedEOPilot_EveryEORoleCanReadSomething(t *testing.T) {
+	db := eoB5Fixture(t)
+	seedEOPilot(db)
+
+	for role, view := range eoWantRegisterView {
+		u := eoSessionFor(t, db, role)
+		codes := u.PermissionCodes()
+		gotView := models.EOTypeKeysFromPermissionCodes(codes, models.EOTypePermissionView)
+		gotUpdate := models.EOTypeKeysFromPermissionCodes(codes, models.EOTypePermissionUpdate)
+		gotCreate := models.EOTypeKeysFromPermissionCodes(codes, models.EOTypePermissionCreate)
+		sort.Strings(gotView)
+		sort.Strings(gotUpdate)
+		if len(gotView) == 0 {
+			t.Errorf("%s holds eo:view and no per-type view code: it opens a register and reads no row", role)
+		}
+		if !reflect.DeepEqual(gotView, view) {
+			t.Errorf("%s can view %v, want %v", role, gotView, view)
+		}
+		if len(gotUpdate) != len(eoWantRegisterUpdate[role]) || (len(gotUpdate) > 0 && !reflect.DeepEqual(gotUpdate, eoWantRegisterUpdate[role])) {
+			t.Errorf("%s can update %v, want %v", role, gotUpdate, eoWantRegisterUpdate[role])
+		}
+		if len(gotCreate) != 0 {
+			t.Errorf("%s was granted create on %v; none of these roles holds eo:create", role, gotCreate)
+		}
+		if !contains(codes, "eo:view") {
+			t.Errorf("%s lost eo:view", role)
+		}
+	}
+
+	// EO Administrator: workflows:view yes, and NO per-type code, on purpose.
+	admin := eoSessionFor(t, db, "eo_admin").PermissionCodes()
+	if !contains(admin, "workflows:view") {
+		t.Errorf("eo_admin lacks workflows:view: the workflow picker is disabled for it")
+	}
+	if n := len(models.EOTypeKeysFromPermissionCodes(admin, "view")) + len(models.EOTypeKeysFromPermissionCodes(admin, "update")) + len(models.EOTypeKeysFromPermissionCodes(admin, "create")); n != 0 {
+		t.Errorf("eo_admin holds %d per-type codes; it must hold none (configures the platform, does not read correspondence)", n)
+	}
+
+	// The generic User role must not gain any register.
+	user := eoSessionFor(t, db, "user").PermissionCodes()
+	for _, a := range []string{"view", "create", "update"} {
+		if k := models.EOTypeKeysFromPermissionCodes(user, a); len(k) != 0 {
+			t.Errorf("the generic user role gained %s on %v", a, k)
+		}
+	}
+	if !contains(user, "eo:view") || !contains(user, "workflows:view") {
+		t.Errorf("fixture error: user lost its own codes: %v", user)
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// Executive Office's 33 and admin's are untouched, and a re-run adds nothing.
+// Mutation: make the grant step Replace rather than Append; drop the applied
+// row's guard so the step re-runs and duplicates (the join table is keyed on
+// the pair, so a duplicate would be an error, which also fails this).
+func TestSeedEOPilot_B5IsIdempotentAndLeavesExistingGrants(t *testing.T) {
+	db := eoB5Fixture(t)
+	seedEOPilot(db)
+	perTypeFor := func(role string) int {
+		return len(models.EOTypeKeysFromPermissionCodes(eoSessionFor(t, db, role).PermissionCodes(), "view")) +
+			len(models.EOTypeKeysFromPermissionCodes(eoSessionFor(t, db, role).PermissionCodes(), "update")) +
+			len(models.EOTypeKeysFromPermissionCodes(eoSessionFor(t, db, role).PermissionCodes(), "create"))
+	}
+	if got := perTypeFor("executive_office"); got != 33 {
+		t.Errorf("executive_office holds %d per-type codes, want 33", got)
+	}
+	if got := perTypeFor("admin"); got != 33 {
+		t.Errorf("admin holds %d per-type codes, want 33", got)
+	}
+	before := eoCountRaw(t, db, "role_permissions")
+
+	// Force both B5 steps to run again, and the whole seed to be asked.
+	if err := db.Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Delete(&models.EOSeedStep{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	seedEOPilot(db)
+	if after := eoCountRaw(t, db, "role_permissions"); after != before {
+		t.Errorf("re-running the grant steps changed the grant count from %d to %d", before, after)
+	}
+	var steps int64
+	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Count(&steps)
+	if steps != 2 {
+		t.Errorf("%d B5 step rows after the re-run, want 2", steps)
+	}
+}
+
+// A database whose roles are not there yet grants nothing and says so, then
+// grants once they are: the step must not record itself done for a grant that
+// did not happen. Mutation: return true on the missing-role path.
+func TestSeedEOPilot_B5RetriesWhenARoleIsMissing(t *testing.T) {
+	db := eoPilotDB(t)
+	// Only admin + executive_office, as a database that predates the roles.
+	for _, code := range []string{"head_of_office", "public_relations", "protocol", "department_user", "escalation_manager", "eo_admin"} {
+		if err := db.Unscoped().Where("code = ?", code).Delete(&models.Role{}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedEOPilot(db)
+	var n int64
+	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Count(&n)
+	if n != 0 {
+		t.Fatalf("%d B5 steps recorded as applied with the roles missing", n)
+	}
+	eoSeedTheRealEORoles(t, db)
+	seedEOPilot(db)
+	if got := models.EOTypeKeysFromPermissionCodes(eoSessionFor(t, db, "protocol").PermissionCodes(), "view"); len(got) != 1 || got[0] != "eo_task" {
+		t.Errorf("after the roles appeared, protocol can view %v, want [eo_task]", got)
+	}
+	if !contains(eoSessionFor(t, db, "eo_admin").PermissionCodes(), "workflows:view") {
+		t.Errorf("eo_admin did not receive workflows:view on the retry")
 	}
 }
 

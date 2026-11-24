@@ -681,7 +681,9 @@ func eoIsEOPerTypeCode(code string) bool {
 // (middleware.EOTypePermission). A role with eo:view and no per-type code
 // therefore passes every route guard, reaches every EO screen, and sees
 // NOTHING — an empty register on every route and a 403 on every record.
-// Five of the seven seeded EO roles are in exactly that state:
+// Before Task B5, five of the seven seeded EO roles were in exactly that state
+// (B5 now grants them their process's registers; eo_admin stays without, by
+// design, and the report says so in different words):
 // head_of_office, public_relations, protocol, department_user and
 // escalation_manager hold eo:view, eo:update and eo:transition, and the
 // per-type codes are granted only to models.EOTypePermissionRoleCodes
@@ -689,10 +691,11 @@ func eoIsEOPerTypeCode(code string) bool {
 // in the same state by the same arithmetic: it holds eo:view and
 // eo:types:manage, so it can design types and read none of their records.
 //
-// THE SEED DOES NOT FIX IT, and must not: §7.11 names two roles for the
-// per-type grants, and who else may see which record type is the client's
-// decision, taken through the permissions UI. What the seed owes an operator
-// is that the state is not SILENT. It is invisible everywhere else:
+// THE SEED NOW FIXES IT FOR THE FIVE PROCESS ROLES (Task B5,
+// eoProcessRoleRegisters, a provisional mapping awaiting client sign-off) and
+// still does not decide the rest: a role outside that table, or a record type
+// added later, stays ungranted and is reported here. What the seed owes an
+// operator is that the state is not SILENT. It is invisible everywhere else:
 // eoLogTypesWithNoLiveCodes cannot fire, because the codes exist and are
 // merely ungranted; nothing in the UI distinguishes "no records" from "no
 // grant"; and no log line is written when the filter derives zero keys,
@@ -733,7 +736,17 @@ func eoLogRolesWithNoTypeCodes(db *gorm.DB) {
 			continue
 		}
 		sort.Strings(moduleCodes)
-		log.Printf("EO pilot: role %q holds EO module permissions (%s) and NO per-type permission code: every register is EMPTY for it and every record answers 403, because spec §7.11 restricts both to the types whose eo:<type_key>:view code the caller holds. The seed grants the per-type codes to %s only, as §7.11 names, and does not decide who else should see which record type: grant eo:<type_key>:view|create|update to this role through the permissions UI if its holders are meant to see records.",
+		// A role left without codes ON PURPOSE is reported in its own words:
+		// the warning below tells the reader to grant codes, which is the
+		// wrong advice for eo_admin and would invite the "fix" its seed
+		// comment forbids. Still one line per role per boot, so the state is
+		// never silent.
+		if eoRolesDeliberatelyWithoutTypeCodes[r.Code] {
+			log.Printf("EO pilot: role %q holds EO module permissions (%s) and NO per-type permission code, BY DESIGN: it configures the platform and is not meant to read the Executive Office's records, so its registers are empty. Do not grant it eo:<type_key>:view|create|update without a client decision.",
+				r.Code, strings.Join(moduleCodes, ", "))
+			continue
+		}
+		log.Printf("EO pilot: role %q holds EO module permissions (%s) and NO per-type permission code: every register is EMPTY for it and every record answers 403, because spec §7.11 restricts both to the types whose eo:<type_key>:view code the caller holds. The seed grants the per-type codes to %s, and to the five process roles per eoProcessRoleRegisters, and does not decide who else should see which record type: grant eo:<type_key>:view|create|update to this role through the permissions UI if its holders are meant to see records.",
 			r.Code, strings.Join(moduleCodes, ", "), strings.Join(models.EOTypePermissionRoleCodes, " and "))
 	}
 }

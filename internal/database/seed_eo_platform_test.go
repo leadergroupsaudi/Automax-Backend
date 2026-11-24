@@ -112,6 +112,16 @@ func eoSeedRoles(t *testing.T, db *gorm.DB) {
 	for _, r := range []models.Role{
 		{Name: "Administrator", Code: "admin", IsSystem: true, IsActive: true},
 		{Name: "Executive Office", Code: "executive_office", IsSystem: true, IsActive: true},
+		// Task B5: the pilot seed grants register codes to these six, and
+		// does not record that grant as applied while any is absent, so a
+		// fixture without them would re-run the seed on every boot. In
+		// production the role block of Seed creates all of them first.
+		{Name: "Head of Office", Code: "head_of_office", IsSystem: true, IsActive: true},
+		{Name: "Public Relations", Code: "public_relations", IsSystem: true, IsActive: true},
+		{Name: "Protocol", Code: "protocol", IsSystem: true, IsActive: true},
+		{Name: "Department User", Code: "department_user", IsSystem: true, IsActive: true},
+		{Name: "Escalation Manager", Code: "escalation_manager", IsSystem: true, IsActive: true},
+		{Name: "EO Administrator", Code: "eo_admin", IsSystem: true, IsActive: true},
 	} {
 		if err := db.Create(&r).Error; err != nil {
 			t.Fatalf("create role %s: %v", r.Code, err)
