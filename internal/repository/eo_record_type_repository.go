@@ -64,9 +64,10 @@ type EORecordTypeRepository interface {
 	// job.
 	Create(ctx context.Context, t *models.EORecordType) error
 	Update(ctx context.Context, t *models.EORecordType) error
-	// Delete soft-deletes a record type. Its field definitions are left
-	// alone: a mistaken delete stays recoverable, which is the same reason
-	// ValidateTypeEdit never removes a field's stored data.
+	// Delete soft-deletes a record type and, in the SAME transaction, the
+	// per-type permissions it owns and the role grants naming them. Its field
+	// definitions are left alone: a mistaken delete stays recoverable, which
+	// is the same reason ValidateTypeEdit never removes a field's stored data.
 	Delete(ctx context.Context, id uuid.UUID) error
 
 	GetFieldDef(ctx context.Context, id uuid.UUID) (*models.EOFieldDef, error)
@@ -337,7 +338,7 @@ func (r *eoRecordTypeRepository) Create(ctx context.Context, t *models.EORecordT
 		if t.IsAbstract {
 			return nil
 		}
-		return eoWriteTypePermissions(tx, *t)
+		return eoWriteTypePermissions(tx, *t, true)
 	})
 }
 
@@ -371,13 +372,13 @@ func eoLogTypeWithNoLiveCodes(tx *gorm.DB, t models.EORecordType) {
 // already in the database, in the order models.EOTypePermissionsFor writes
 // them.
 //
-// IT IS UNSCOPED, and that is not a detail. permissions.code is uniquely
-// indexed with no deleted_at predicate, so a SOFT-DELETED row still occupies
-// its code: a scoped check reports the code absent, the insert that follows
-// hits the unique constraint, and the designer answers 500 for a state the
-// operator can neither see nor act on. A deleted row is also still in the way
-// in the sense this check exists for — the code cannot be written afresh for
-// the new type — so it belongs in the refusal, where the message names it.
+// IT IS SCOPED TO LIVE ROWS. permissions.code and permissions.name are
+// uniquely indexed WHERE deleted_at IS NULL (migrations.
+// MigratePermissionsPartialUniqueIndexes), so a soft-deleted row occupies
+// nothing and a retired type's key is reusable; Delete soft-deletes the
+// type's own codes for exactly that reason. A LIVE row is still a refusal:
+// it is someone's grant, and adopting it is the privilege carryover this
+// check exists to stop.
 func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string, error) {
 	want := models.EOTypePermissionsFor(t)
 	codes := make([]string, 0, len(want))
@@ -385,7 +386,7 @@ func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string
 		codes = append(codes, p.Code)
 	}
 	var found []models.Permission
-	if err := tx.Unscoped().Where("code IN ?", codes).Find(&found).Error; err != nil {
+	if err := tx.Where("code IN ?", codes).Find(&found).Error; err != nil {
 		return nil, fmt.Errorf("check the per-type permission codes of %q: %w", t.Key, err)
 	}
 	present := map[string]bool{}
@@ -418,13 +419,24 @@ func eoExistingTypePermissionCodes(tx *gorm.DB, t models.EORecordType) ([]string
 // states about a revoked grant — a deliberate administrative act is not drift
 // to be corrected — and the alternative here is worse than inaction, because
 // the insert would fail on the unique index and take the whole edit with it.
-func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType) error {
+//
+// fresh says the caller has just established that no LIVE row holds these
+// codes (Create, and Update when the type adopts a key), so a soft-deleted row
+// of the same code is a RETIRED type's and is not in the way: the partial
+// unique indexes allow the new row beside it. When fresh is false (an ordinary
+// edit) the check stays unscoped, because a deleted code there is an
+// administrator's act and must not be resurrected.
+func eoWriteTypePermissions(tx *gorm.DB, t models.EORecordType, fresh bool) error {
 	want := models.EOTypePermissionsFor(t)
 	created := make([]models.Permission, 0, len(want))
 	for i := range want {
 		perm := want[i]
 		var existing int64
-		if err := tx.Unscoped().Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
+		check := tx.Unscoped()
+		if fresh {
+			check = tx
+		}
+		if err := check.Model(&models.Permission{}).Where("code = ?", perm.Code).Count(&existing).Error; err != nil {
 			return fmt.Errorf("check permission %q: %w", perm.Code, err)
 		}
 		if existing > 0 {
@@ -508,15 +520,64 @@ func (r *eoRecordTypeRepository) Update(ctx context.Context, t *models.EORecordT
 		if t.IsAbstract {
 			return nil
 		}
-		return eoWriteTypePermissions(tx, *t)
+		return eoWriteTypePermissions(tx, *t, adopting)
 	})
 }
 
 func (r *eoRecordTypeRepository) Delete(ctx context.Context, id uuid.UUID) error {
-	if err := r.db.WithContext(ctx).
-		Where("eo_record_types.id = ?", id).
-		Delete(&models.EORecordType{}).Error; err != nil {
-		return fmt.Errorf("delete eo record type %s: %w", id, err)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var ty models.EORecordType
+		found := tx.Where("eo_record_types.id = ?", id).Limit(1).Find(&ty)
+		if found.Error != nil {
+			return fmt.Errorf("read eo record type %s before delete: %w", id, found.Error)
+		}
+		if err := tx.Where("eo_record_types.id = ?", id).Delete(&models.EORecordType{}).Error; err != nil {
+			return fmt.Errorf("delete eo record type %s: %w", id, err)
+		}
+		if found.RowsAffected == 0 {
+			return nil
+		}
+		return eoReleaseTypePermissions(tx, ty)
+	})
+}
+
+// eoReleaseTypePermissions soft-deletes the three per-type permissions a type
+// owns and removes the role grants that point at them, so retiring a type
+// leaves no live permission naming it.
+//
+// WHY: a type's creation writes 3 permissions and 6 grants, and a delete that
+// removed only the type left them behind. Across the previous plan that was 30
+// orphan grants; in production an Executive Office that reorganises its
+// register types would accumulate live permissions, granted to real roles,
+// naming types that no longer exist.
+//
+// THE SCOPE IS EXACT CODES, NEVER A PATTERN. permissions is product-wide
+// (users.create, tickets.view, ...). The rows touched are those whose code is
+// one of models.EOTypePermissionCode(key, action) for this type's key — the
+// same constructor the gate, the filter and the writer use — compared with
+// IN, so no LIKE wildcard (an underscore in the key is one) can reach a
+// neighbour's rows. Soft-deleted rows of those codes are included so their
+// grants go too; rows already deleted are not stamped again.
+//
+// IT RUNS IN THE DELETE'S TRANSACTION: a failure here rolls the type delete
+// back rather than leaving a type gone and its grants live.
+func eoReleaseTypePermissions(tx *gorm.DB, t models.EORecordType) error {
+	codes := make([]string, 0, len(models.EOTypePermissionActions))
+	for _, a := range models.EOTypePermissionActions {
+		codes = append(codes, models.EOTypePermissionCode(t.Key, a.Action))
+	}
+	var ids []uuid.UUID
+	if err := tx.Unscoped().Model(&models.Permission{}).Where("code IN ?", codes).Pluck("id", &ids).Error; err != nil {
+		return fmt.Errorf("find the per-type permissions of %q: %w", t.Key, err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := tx.Exec("DELETE FROM role_permissions WHERE permission_id IN ?", ids).Error; err != nil {
+		return fmt.Errorf("remove the role grants of the per-type permissions of %q: %w", t.Key, err)
+	}
+	if err := tx.Where("id IN ?", ids).Delete(&models.Permission{}).Error; err != nil {
+		return fmt.Errorf("delete the per-type permissions of %q: %w", t.Key, err)
 	}
 	return nil
 }

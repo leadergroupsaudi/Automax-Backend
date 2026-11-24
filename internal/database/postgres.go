@@ -491,6 +491,14 @@ func Migrate(db *gorm.DB, cfg *config.Config) error {
 		return fmt.Errorf("EO platform migration: %w", err)
 	}
 
+	// permissions.code and permissions.name were uniquely indexed with no
+	// deleted_at predicate, so a retired EO record type's key could never be
+	// reused. CLOSED, like the EO platform migration: a live duplicate must stop
+	// the boot, not be skipped with a warning over a schema nobody changed.
+	if err := migrations.MigratePermissionsPartialUniqueIndexes(db); err != nil {
+		return fmt.Errorf("permissions partial unique indexes: %w", err)
+	}
+
 	// Default SMS templates replacing formerly hardcoded SMS text (idempotent, never overwrites edits).
 	// can remove after successfull templates migartion.
 	if err := migrations.SeedDefaultSMSTemplates(db); err != nil {

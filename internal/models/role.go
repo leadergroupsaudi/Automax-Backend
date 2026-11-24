@@ -10,8 +10,8 @@ import (
 // Permission represents a granular permission for accessing features
 type Permission struct {
 	ID          uuid.UUID `gorm:"type:uuid;primary_key" json:"id"`
-	Name        string    `gorm:"not null;size:100;uniqueIndex" json:"name"`
-	Code        string    `gorm:"not null;size:100;uniqueIndex" json:"code"` // e.g., "users.create", "tickets.view"
+	Name        string    `gorm:"not null;size:100;uniqueIndex:idx_permissions_name,where:deleted_at IS NULL" json:"name"`
+	Code        string    `gorm:"not null;size:100;uniqueIndex:idx_permissions_code,where:deleted_at IS NULL" json:"code"` // e.g., "users.create", "tickets.view"
 	Description string    `gorm:"size:500" json:"description"`
 	Module      string    `gorm:"size:50;index" json:"module"` // e.g., "users", "tickets", "reports"
 	Action      string    `gorm:"size:50" json:"action"`       // e.g., "create", "read", "update", "delete"

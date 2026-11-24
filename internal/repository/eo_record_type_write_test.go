@@ -625,18 +625,23 @@ func TestEORecordTypeCreateRefusesAKeyWhosePermissionsExist(t *testing.T) {
 	types := NewEORecordTypeRepository(db)
 	ctx := context.Background()
 
-	retired := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Objection", IsActive: true}
-	if err := types.Create(ctx, retired); err != nil {
+	// A DELETED type no longer leaves live codes (Delete releases them), so
+	// the state that still reaches this refusal is a key renamed away: its
+	// codes are stranded, LIVE, and possibly granted to a custom role.
+	first := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Objection", IsActive: true}
+	if err := types.Create(ctx, first); err != nil {
 		t.Fatalf("create the first type: %v", err)
 	}
-	if err := types.Delete(ctx, retired.ID); err != nil {
-		t.Fatalf("retire it: %v", err)
+	renamed := *first
+	renamed.Key = "eo_objection_old"
+	if err := types.Update(ctx, &renamed); err != nil {
+		t.Fatalf("rename it away: %v", err)
 	}
 
 	reused := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Supplier Objection", IsActive: true}
 	err := types.Create(ctx, reused)
 	if !errors.Is(err, ErrEOTypePermissionCodesExist) {
-		t.Fatalf("Create = %v, want ErrEOTypePermissionCodesExist: the new type would inherit the retired type's grants", err)
+		t.Fatalf("Create = %v, want ErrEOTypePermissionCodesExist: the new type would inherit the stranded codes' grants", err)
 	}
 	if !strings.Contains(err.Error(), models.EOTypePermissionCode("eo_objection", models.EOTypePermissionView)) {
 		t.Errorf("the refusal does not name the codes in the way: %v", err)
@@ -670,18 +675,22 @@ func eoCountTypeCodes(t *testing.T, db *gorm.DB, key string) int64 {
 // are reachable from the designer — and Create's refusal is worth nothing if
 // PUT can walk around it.
 func TestEORecordTypeUpdateRefusesAdoptingAnotherTypesCodes(t *testing.T) {
-	// retire sets up a key whose per-type codes exist with no live type.
+	// retire sets up a key whose per-type codes are LIVE with no live type
+	// using the key. Deleting a type now releases its codes, so the remaining
+	// way to strand them is a rename away.
 	retire := func(t *testing.T, db *gorm.DB, types EORecordTypeRepository, key string) {
 		t.Helper()
 		old := &models.EORecordType{ID: uuid.New(), Key: key, Name: key, IsActive: true}
 		if err := types.Create(context.Background(), old); err != nil {
 			t.Fatalf("create %q: %v", key, err)
 		}
-		if err := types.Delete(context.Background(), old.ID); err != nil {
-			t.Fatalf("retire %q: %v", key, err)
+		moved := *old
+		moved.Key = key + "_moved"
+		if err := types.Update(context.Background(), &moved); err != nil {
+			t.Fatalf("rename %q away: %v", key, err)
 		}
 		if n := eoCountTypeCodes(t, db, key); n != 3 {
-			t.Fatalf("%d codes survive the retirement of %q, want 3: the premise is gone", n, key)
+			t.Fatalf("%d codes survive the rename of %q, want 3: the premise is gone", n, key)
 		}
 	}
 
