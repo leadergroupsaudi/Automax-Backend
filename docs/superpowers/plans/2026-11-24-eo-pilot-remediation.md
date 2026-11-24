@@ -135,7 +135,9 @@ The mapping is **provisional and goes to the client for sign-off** — print it 
 
 Plan 3 relaxed six file fields. Two — `eo_task.evidence` and `eo_assignment.evidence` — are `at_state` and kept their `required_at_state_ids`, which is the only reason Plan 4 could restore one and prove the mechanism. The other four are **create-time `always`**: `eo_incoming_correspondence.attachments`, `eo_draft_decision_study.draft_file`, `eo_draft_decision_study.study_report`, `eo_objection.proof`. Restoring those to `always` reintroduces an unfillable form whatever Documenta is doing, because `POST /eo-records/:id/files` needs a record id and a create form has none.
 
-Decided with the client: move them to **`at_state`**, required at the first state after creation, matching what the two evidence fields already do.
+Decided with the client: move them to **`at_state`**, matching what the two evidence fields already do.
+
+**UPDATE (2026-11-24, after execution):** "the first state after creation" proved wrong as a rule and was replaced by *a named non-terminal state of the field's own workflow*. Applying it mechanically put `objection.proof` on the terminal `closed` state, which made objections unresolvable and retroactively locked three already-closed records. Three fields moved — `attachments` at `analysis`, `draft_file` at `submitted` (inferred from receipt), `study_report` at `with_he` (inferred) — and **`eo_objection.proof` stays `never`**, because that workflow runs `raised -> closed` with no non-terminal state to hold the requirement. See `docs/superpowers/eo-plan5-carry-forward.md`.
 
 - [ ] **Step 1: Write the failing test** `TestSeedEOPilot_NoFileFieldIsRequiredAtCreate` — no field of a file kind has `required_mode = always` on any seeded type.
 - [ ] **Step 2: Run it; expect FAIL** once the fields are restored.

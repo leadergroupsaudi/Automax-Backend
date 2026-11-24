@@ -236,7 +236,7 @@ action-log rows are a deliberate audit trail of confirmed destructive edits.
 ## Test state at the end of the plan
 
 `internal/repository` green (134 pass). `internal/database` green in full with
-a DSN set. **`internal/services` has 23 pre-existing failures**, confirmed
+a DSN set, which **must be the URL form** (`postgres://user:pass@host:port/db?sslmode=disable`). The timer and sequence tests append `?search_path=` to it, so a keyword-form DSN makes exactly **18 `internal/repository` tests fail** with "failed to configure TLS (sslmode is invalid)" — real failures that look like a regression and are not. This cost a round during Plan 5. **`internal/services` has 23 pre-existing failures**, confirmed
 identical in a frozen worktree at `c8a6109` and caused by none of this plan's
 work. Frontend: `npx tsc --noEmit` exits 0; lint shows 2 pre-existing errors
 (`e2e/fixtures.ts` rules-of-hooks, `useSavedViews.ts` refs during render).

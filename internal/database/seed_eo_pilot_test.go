@@ -1314,7 +1314,9 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 	// override's identity below.
 	t.Run("attachments is declared on Incoming Correspondence and relaxed for want of Documenta", func(t *testing.T) {
 		got := eoEffectiveField(t, db, eoIncomingTypeKey, "attachments")
-		// TASK B6 then moved it to the first state after creation.
+		// TASK B6 then moved it to a named non-terminal state of its own
+		// workflow — `analysis` for this field, not simply the first state
+		// after creation.
 		if got.RequiredMode != models.EORequiredAtState {
 			t.Errorf("attachments required_mode = %q, want %q", got.RequiredMode, models.EORequiredAtState)
 		}
@@ -4095,9 +4097,13 @@ func TestNoPilotFileFieldIsDemandedAtAll(t *testing.T) {
 		t.Fatalf("look for file fields that are still demanded: %v", err)
 	}
 	for _, r := range rows {
-		// Task B6's four are demanded on purpose, at the first state after
-		// creation; the client decided it and the boot report says what it
-		// costs. They are asserted positively in
+		// Task B6 demands THREE of its four on purpose, each at a named
+		// non-terminal state of its own workflow (attachments at analysis,
+		// draft_file at submitted, study_report at with_he) — not simply the
+		// first state after creation. The fourth, eo_objection.proof, stays
+		// `never`: that workflow runs raised -> closed with no non-terminal
+		// state to hold the requirement. The client decided it and the boot
+		// report says what it costs. They are asserted positively in
 		// TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState.
 		if eoIsMovedToState(r.TypeKey, r.Key) && r.RequiredMode == models.EORequiredAtState {
 			continue
