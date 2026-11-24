@@ -436,9 +436,12 @@ var eoPilotSteps = []eoPilotStep{
 	{key: eoGrantWorkflowsViewStepKey, run: eoGrantWorkflowsViewToEOAdmin},
 	{key: eoGrantProcessRoleRegistersStepKey, run: eoGrantProcessRoleRegisters},
 	// TASK B6 (remediation). ONE-SHOT, and after the relaxation it follows:
-	// it moves the four create-time file fields B2 relaxed to `at_state`,
-	// required at the first state after creation. See
-	// eoFileFieldsMovedToState for the ruling and its operational cost.
+	// it moves the create-time file fields B2 relaxed to `at_state`, each
+	// required at a named non-terminal state of its OWN workflow, derived
+	// per field from the client's matrix rather than from a position in the
+	// machine. Three of the four moved; eo_objection.proof did not, for want
+	// of a non-terminal state to attach it to. See eoFileFieldsMovedToState
+	// for the ruling and its operational cost.
 	{key: eoMoveFileRequirementToStateStepKey, run: eoMoveFileRequirementToState},
 }
 
@@ -727,8 +730,12 @@ type eoFileFieldMovedToState struct {
 //
 //	incoming.attachments  1.2 (registration)        -> analysis, the earliest
 //	                      state after creation, once the letter is registered
-//	draft_file            1.4 (stamped on receipt)   -> submitted, which is the
-//	                      receipt stamp itself
+//	draft_file            1.4 ("stamped and locked on receipt") -> submitted.
+//	                      INFERRED FROM RECEIPT: the matrix names receipt and
+//	                      `received` is this machine's INITIAL state, which a
+//	                      record is created into and which nothing transitions
+//	                      it to, so the requirement is read onto the next
+//	                      transition, submitted. Put to the client.
 //	study_report          4.2, after Q2 and before Q3 -> with_he. THIS ONE IS
 //	                      AN INFERENCE: the matrix gives a step number and no
 //	                      state, so it is the state the Office raises the
@@ -738,6 +745,15 @@ type eoFileFieldMovedToState struct {
 // the record could never be resolved, and ValidateRecordValues reads the
 // current state on an update, so it would also make every already-completed
 // record uneditable. eoMoveFileRequirementToState refuses one.
+//
+// THAT RULE DOES NOT CONTRADICT eoRequireAtClosureState, which deliberately
+// points the closure artefacts at a TERMINAL state (seven of them sit live on
+// `closed` as `at_state` today): there the matrix asks
+// for the artefact as the price of entering closure, so the state the
+// requirement names is the one the record is moving INTO and the record has
+// somewhere to go; here the requirement is being newly placed on a state a
+// record must still move OUT of, so naming a terminal one would leave it
+// nowhere to go — same column, opposite edge of the same state.
 //
 // eo_objection.proof IS DELIBERATELY NOT HERE. The matrix says "every
 // objection carries proof" at 3.1 (when it is raised), and the objection's
@@ -758,12 +774,21 @@ var eoFileFieldsMovedToState = []eoFileFieldMovedToState{
 }
 
 func eoIsMovedToState(typeKey, fieldKey string) bool {
+	_, ok := eoMovedToStateCode(typeKey, fieldKey)
+	return ok
+}
+
+// eoMovedToStateCode is eoIsMovedToState plus the state the field was moved
+// to, so the boot report can NAME it instead of describing a position in the
+// workflow that is not true of every field (study_report sits at with_he, the
+// fourth state of its machine, not the first after creation).
+func eoMovedToStateCode(typeKey, fieldKey string) (string, bool) {
 	for _, m := range eoFileFieldsMovedToState {
 		if m.TypeKey == typeKey && m.FieldKey == fieldKey {
-			return true
+			return m.StateCode, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // eoMoveFileRequirementToState is ONE-SHOT, for the reason
@@ -979,8 +1004,8 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 		}
 		switch modes[0] {
 		case models.EORequiredAtState:
-			if eoIsMovedToState(r.TypeKey, r.FieldKey) {
-				atState = append(atState, r.TypeKey+"."+r.FieldKey)
+			if code, moved := eoMovedToStateCode(r.TypeKey, r.FieldKey); moved {
+				atState = append(atState, fmt.Sprintf("%s.%s (at %s)", r.TypeKey, r.FieldKey, code))
 			} else {
 				demanded = append(demanded, fmt.Sprintf("%s.%s (%s)", r.TypeKey, r.FieldKey, modes[0]))
 			}
@@ -1010,15 +1035,19 @@ func eoLogFileFieldsAwaitingDocumenta(db *gorm.DB) {
 		}
 	}
 
-	// THE MOVED ARM (Task B6): required at the first state after creation.
-	// Satisfiable only with Documenta on, so with it off the transition into
-	// that state is blocked, and the line says so.
+	// THE MOVED ARM (Task B6): moved off create-time `always` to `at_state`,
+	// at the NAMED non-terminal state each line prints. The state is derived
+	// per field from the client's matrix, NOT from a position in the workflow
+	// — incoming.attachments is at analysis, the first state after creation,
+	// while draft_decision_study.study_report is at with_he, the fourth state
+	// of its machine. Satisfiable only with Documenta on, so with it off the
+	// transition into that state is blocked, and the line says so.
 	if len(atState) > 0 {
 		if config.EODocumentaEnabled() {
-			log.Printf("EO pilot: %d file field(s) are required at the first state after creation and EO Documenta is enabled, so they can be satisfied: %s.",
+			log.Printf("EO pilot: %d file field(s) are required at a named non-terminal state of their own workflow and EO Documenta is enabled, so they can be satisfied: %s.",
 				len(atState), strings.Join(atState, ", "))
 		} else {
-			log.Printf("EO pilot: %d file field(s) are required at the first state after creation and EO Documenta is DISABLED (EO_DOCUMENTA_ENABLED=false): %s. No file can be attached, so the transition into that state is blocked for every record that has not yet entered it, and a record sitting in that state cannot be edited until it carries the file.",
+			log.Printf("EO pilot: %d file field(s) are required at a named non-terminal state of their own workflow and EO Documenta is DISABLED (EO_DOCUMENTA_ENABLED=false): %s. No file can be attached, so the transition into that state is blocked for every record that has not yet entered it, and a record sitting in that state cannot be edited until it carries the file.",
 				len(atState), strings.Join(atState, ", "))
 		}
 	}
@@ -4411,23 +4440,48 @@ var eoPilotRegisterKeys = []string{
 	"eo_incoming_correspondence", "eo_referral", "eo_outgoing_reply", "eo_task",
 }
 
+// eoHeadOfOfficeRegisterKeys is eoPilotRegisterKeys MINUS eo_referral, derived
+// here rather than written out so that a register added to the pilot reaches
+// the oversight role automatically and the one deliberate exclusion stays
+// visible as an exclusion. See the eo_referral paragraph on
+// eoProcessRoleRegisters for why it is excluded and what would reinstate it.
+var eoHeadOfOfficeRegisterKeys = eoRegisterKeysExcept("eo_referral")
+
+func eoRegisterKeysExcept(excluded ...string) []string {
+	skip := make(map[string]bool, len(excluded))
+	for _, e := range excluded {
+		skip[e] = true
+	}
+	out := make([]string, 0, len(eoPilotRegisterKeys))
+	for _, k := range eoPilotRegisterKeys {
+		if !skip[k] {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // eoProcessRoleRegisters is the PROVISIONAL mapping from the pilot's three
 // processes (EO-DIR, EO-DRF, EO-COM in docs/superpowers/specs/eo-field-matrix.md)
 // to the registers each process role touches. It goes to the client for
 // sign-off; a correction is an edit to this table, applied on a database that
 // has already booted by a new step, never by editing history.
 //
-//   - head_of_office: oversight, so VIEW on all eleven and update on none.
-//     The matrix gives the Head of Office an approval only in EO-MED (outside
-//     the pilot); this is an invention, disclosed as such.
-//     THE eo_referral GRANT IS INERT TODAY. Row-level visibility
-//     (repository applyEORecordVisibility) admits a referral only to an
-//     admin, its creator, or a caller whose bodies match visible_to; Head of
-//     Office has no body, so the register returns 10 of the 11 registers and
-//     a referral fetched by id is 404. The grant is kept for the oversight
-//     intent. BLOCKING CLIENT QUESTION: should an oversight role bypass
-//     body-scoping on Referral, or is Head of Office not meant to see
-//     referrals? Until answered, do not read this grant as working.
+//   - head_of_office: oversight, so VIEW on ten of the eleven and update on
+//     none. The matrix gives the Head of Office an approval only in EO-MED
+//     (outside the pilot); this is an invention, disclosed as such.
+//     eo_referral IS DELIBERATELY NOT GRANTED, and the absence is the
+//     disclosure. A view code on Referral could never return a row: row-level
+//     visibility (repository applyEORecordVisibility) admits a referral only
+//     to an admin, its creator, or a caller whose bodies match visible_to,
+//     and Head of Office has no body — so the grant would list an eleventh
+//     register that shows nothing and 404s by id. A permission that can never
+//     return a row is one of the defects this plan exists to remove, so the
+//     intent is carried by the question below and not by a dead row.
+//     BLOCKING CLIENT QUESTION: should an oversight role bypass body-scoping
+//     on Referral, or is Head of Office not meant to see referrals? If the
+//     answer is the former, the fix is in applyEORecordVisibility and the
+//     grant goes in with it; granting it alone would change nothing.
 //   - escalation_manager: EO-DIR's escalation ladder (+3/+7/+14 days) acts on
 //     directives, their plans, assignments and tasks.
 //   - department_user: the executing bodies. Assignments (owner, completion,
@@ -4443,7 +4497,7 @@ var eoPilotRegisterKeys = []string{
 //   - protocol: no pilot process is Protocol's (EO-VIS is outside the pilot);
 //     it holds the universal Task, which is what EO-VIS raises for it.
 var eoProcessRoleRegisters = []eoRegisterGrant{
-	{roleCode: "head_of_office", view: eoPilotRegisterKeys},
+	{roleCode: "head_of_office", view: eoHeadOfOfficeRegisterKeys},
 	{roleCode: "escalation_manager",
 		view:   []string{"eo_directive", "eo_execution_plan", "eo_assignment", "eo_task"},
 		update: []string{"eo_directive", "eo_execution_plan", "eo_assignment", "eo_task"}},

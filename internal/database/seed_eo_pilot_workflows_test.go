@@ -398,7 +398,8 @@ func TestEoClosureArtefactsNameTheirTypesTerminalState(t *testing.T) {
 			want[typeKey+"."+engineKey] = true
 		}
 	}
-	// Task B6's four name the first state after creation, on purpose.
+	// Task B6's three name a non-terminal state of their own workflow, on
+	// purpose — each derived from the matrix, not from workflow position.
 	for _, m := range eoFileFieldsMovedToState {
 		want[m.TypeKey+"."+m.FieldKey] = true
 	}

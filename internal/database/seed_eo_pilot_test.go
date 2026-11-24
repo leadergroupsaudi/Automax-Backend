@@ -2133,8 +2133,9 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				// TestNoPilotFileFieldIsDemandedAtAll checks the converse,
 				// that no file field anywhere is left demanded. This is
 				// therefore not a way round the matrix.
-				// TASK B6: the four create-time ones were then moved to
-				// `at_state` at the first state after creation.
+				// TASK B6: the create-time ones listed in
+				// eoFileFieldsMovedToState were then moved to `at_state` at a
+				// named non-terminal state of their own workflow.
 				if eoIsMovedToState(typeKey, row.Key) {
 					want(models.EORequiredAtState, models.EOProvenanceUser)
 					return
@@ -4542,16 +4543,22 @@ func eoSeedWorkflowsViewPermission(t *testing.T, db *gorm.DB) {
 }
 
 // eoB5Grants is how many role_permissions rows Task B5 adds on a fresh seed:
-// 22 view + 9 update codes across the five process roles (counted from
+// 21 view + 9 update codes across the five process roles (counted from
 // eoWantRegisterView/Update below, which TestSeedEOPilot_EveryEORoleCanRead-
 // Something holds the seed to) plus workflows:view for eo_admin.
-const eoB5Grants = 22 + 9 + 1
+//
+// It was 22 view until head_of_office's eo_referral view grant was dropped:
+// row-level visibility means it could never return a row. See the eo_referral
+// paragraph on eoProcessRoleRegisters.
+const eoB5Grants = 21 + 9 + 1
 
 // eoWantRegisterView / eoWantRegisterUpdate are WRITTEN OUT here, not derived
 // from eoProcessRoleRegisters, so editing the seed table without editing the
 // sign-off mapping fails a test.
 var eoWantRegisterView = map[string][]string{
-	"head_of_office":     {"eo_assignment", "eo_decision_record", "eo_directive", "eo_draft_decision_study", "eo_execution_plan", "eo_execution_plan_stage", "eo_incoming_correspondence", "eo_objection", "eo_outgoing_reply", "eo_referral", "eo_task"},
+	// Ten registers, not eleven: eo_referral is deliberately absent because a
+	// view grant on it could never return a row for a body-less oversight role.
+	"head_of_office":     {"eo_assignment", "eo_decision_record", "eo_directive", "eo_draft_decision_study", "eo_execution_plan", "eo_execution_plan_stage", "eo_incoming_correspondence", "eo_objection", "eo_outgoing_reply", "eo_task"},
 	"escalation_manager": {"eo_assignment", "eo_directive", "eo_execution_plan", "eo_task"},
 	"department_user":    {"eo_assignment", "eo_execution_plan_stage", "eo_referral", "eo_task"},
 	"public_relations":   {"eo_incoming_correspondence", "eo_task"},

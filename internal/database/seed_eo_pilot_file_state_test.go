@@ -139,6 +139,12 @@ func TestSeedEOPilot_CreateTimeFileFieldsAreRequiredAtAState(t *testing.T) {
 			// NEVER A TERMINAL STATE: at least one transition must leave it,
 			// or the record can never move on and (updates validate against
 			// the current state) completed records become uneditable.
+			// No contradiction with
+			// TestEoClosureArtefactsNameTheirTypesTerminalState, which
+			// requires the exact opposite of the closure artefacts:
+			// there the terminal state is the one the record moves INTO and
+			// the artefact is the price of entering it, while a field moved
+			// here is newly placed on a state the record must still leave.
 			for _, id := range ids {
 				var out int64
 				if err := db.Raw(`SELECT COUNT(*) FROM workflow_transitions WHERE from_state_id = ?`, id).Scan(&out).Error; err != nil {
