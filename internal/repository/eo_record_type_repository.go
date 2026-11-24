@@ -260,23 +260,22 @@ func (r *eoRecordTypeRepository) List(ctx context.Context) ([]models.EORecordTyp
 // retained Ministerial ones, under a permission whose description still names
 // the old type. Refusing makes that an operator's deliberate act.
 //
-// WHAT HAPPENS TO A RETIRED TYPE'S CODES AND RECORDS is deliberately NOT
-// settled here: this repository neither deletes nor renames them, and the
+// WHAT HAPPENS TO A RETIRED TYPE'S CODES: Delete soft-deletes them, and Update
+// renames them with the key (eoRenameTypePermissions). THE RECORDS are
+// deliberately NOT settled here: the
 // register still matches a soft-deleted type's key, so a retired type's
 // retained records stay readable by whoever held its codes. Whether that is
 // right is a records-management question for the client, recorded as an open
 // product question in the task report.
 //
-// THREE OTHER STATES REACH THIS REFUSAL, and the message an operator reads
-// must be true of all four. Besides a retired type: a type made abstract and
-// then concrete again meets ITS OWN codes (permissions record no owning type,
-// so they cannot be told apart); a key renamed away leaves its codes behind,
-// so renaming back is refused; and a DELETED permission still occupies its
-// code, because permissions.code is uniquely indexed with no deleted_at
-// predicate. That last one also means the obvious remedy does not work —
-// DELETE /api/v1/admin/permissions/:id is a soft delete and frees nothing.
-// The only remedies are a different key or direct database access, and
-// i18n key eo_record_type_key_has_permissions says exactly that.
+// WHAT STILL REACHES THIS REFUSAL is a LIVE permission under the key's codes:
+// a type made abstract and then concrete again meets ITS OWN codes
+// (permissions record no owning type, so they cannot be told apart), or codes
+// an administrator created by hand. A deleted type's codes and a renamed
+// type's old codes no longer reach it: Delete soft-deletes them and Update
+// moves them to the new key. A soft-deleted permission frees its code (the
+// unique indexes are partial), so DELETE /api/v1/admin/permissions/:id IS a
+// remedy; i18n key eo_record_type_key_has_permissions says so.
 var ErrEOTypePermissionCodesExist = errors.New("per-type permission codes already exist for this record type key")
 
 // ErrEOTypePermissionRoleMissing marks a write refused because a role in
@@ -517,6 +516,11 @@ func (r *eoRecordTypeRepository) Update(ctx context.Context, t *models.EORecordT
 		if err := tx.Save(t).Error; err != nil {
 			return fmt.Errorf("update eo record type %q: %w", t.Key, err)
 		}
+		if before.Key != t.Key && !before.IsAbstract {
+			if err := eoRenameTypePermissions(tx, before, *t); err != nil {
+				return err
+			}
+		}
 		if t.IsAbstract {
 			return nil
 		}
@@ -539,6 +543,40 @@ func (r *eoRecordTypeRepository) Delete(ctx context.Context, id uuid.UUID) error
 		}
 		return eoReleaseTypePermissions(tx, ty)
 	})
+}
+
+// eoRenameTypePermissions makes a type's per-type permissions follow its key.
+//
+// WITHOUT IT a rename strands the old key's codes: live, still granted, naming
+// a key no type uses, and (because Create refuses live codes) a key that can
+// never be created again even after the type is deleted. It UPDATES the
+// existing rows in place rather than re-creating them, so their ids, and with
+// them every role grant, survive: an administrator renaming a type must not
+// silently revoke everyone's access to its register, nor lose a custom role's
+// grant.
+//
+// Only the old key's three exact codes are touched, live rows only. Rows come
+// out of models.EOTypePermissionsFor for the new key so name, code, action and
+// descriptions agree with what Create writes. A code the old key did not have
+// (an administrator deleted it) is left for eoWriteTypePermissions, which
+// writes what is missing. The caller has already refused the rename if the NEW
+// key has live codes, so the update cannot collide.
+func eoRenameTypePermissions(tx *gorm.DB, before, after models.EORecordType) error {
+	oldRows := models.EOTypePermissionsFor(before)
+	newRows := models.EOTypePermissionsFor(after)
+	for i := range oldRows {
+		res := tx.Model(&models.Permission{}).Where("code = ?", oldRows[i].Code).Updates(map[string]any{
+			"code":           newRows[i].Code,
+			"name":           newRows[i].Name,
+			"action":         newRows[i].Action,
+			"description":    newRows[i].Description,
+			"description_ar": newRows[i].DescriptionAr,
+		})
+		if res.Error != nil {
+			return fmt.Errorf("rename permission %q to %q: %w", oldRows[i].Code, newRows[i].Code, res.Error)
+		}
+	}
+	return nil
 }
 
 // eoReleaseTypePermissions soft-deletes the three per-type permissions a type

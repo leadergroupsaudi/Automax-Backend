@@ -626,16 +626,17 @@ func TestEORecordTypeCreateRefusesAKeyWhosePermissionsExist(t *testing.T) {
 	ctx := context.Background()
 
 	// A DELETED type no longer leaves live codes (Delete releases them), so
-	// the state that still reaches this refusal is a key renamed away: its
-	// codes are stranded, LIVE, and possibly granted to a custom role.
+	// the state that still reaches this refusal is codes left live under an
+	// unused key: stranded, LIVE, and possibly granted to a custom role.
 	first := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Objection", IsActive: true}
 	if err := types.Create(ctx, first); err != nil {
 		t.Fatalf("create the first type: %v", err)
 	}
-	renamed := *first
-	renamed.Key = "eo_objection_old"
-	if err := types.Update(ctx, &renamed); err != nil {
-		t.Fatalf("rename it away: %v", err)
+	// Straight SQL, not Update: the designer's rename now carries the codes
+	// along, so only an out-of-band change leaves them live under a key no
+	// type uses.
+	if err := db.Model(&models.EORecordType{}).Where("id = ?", first.ID).Update("key", "eo_objection_old").Error; err != nil {
+		t.Fatalf("move the key out of band: %v", err)
 	}
 
 	reused := &models.EORecordType{ID: uuid.New(), Key: "eo_objection", Name: "Supplier Objection", IsActive: true}
@@ -677,17 +678,15 @@ func eoCountTypeCodes(t *testing.T, db *gorm.DB, key string) int64 {
 func TestEORecordTypeUpdateRefusesAdoptingAnotherTypesCodes(t *testing.T) {
 	// retire sets up a key whose per-type codes are LIVE with no live type
 	// using the key. Deleting a type now releases its codes, so the remaining
-	// way to strand them is a rename away.
+	// way to strand them is an out-of-band key change.
 	retire := func(t *testing.T, db *gorm.DB, types EORecordTypeRepository, key string) {
 		t.Helper()
 		old := &models.EORecordType{ID: uuid.New(), Key: key, Name: key, IsActive: true}
 		if err := types.Create(context.Background(), old); err != nil {
 			t.Fatalf("create %q: %v", key, err)
 		}
-		moved := *old
-		moved.Key = key + "_moved"
-		if err := types.Update(context.Background(), &moved); err != nil {
-			t.Fatalf("rename %q away: %v", key, err)
+		if err := db.Model(&models.EORecordType{}).Where("id = ?", old.ID).Update("key", key+"_moved").Error; err != nil {
+			t.Fatalf("move %q away out of band: %v", key, err)
 		}
 		if n := eoCountTypeCodes(t, db, key); n != 3 {
 			t.Fatalf("%d codes survive the rename of %q, want 3: the premise is gone", n, key)
@@ -811,27 +810,12 @@ func TestEORecordTypeUpdateDoesNotResurrectADeletedPermission(t *testing.T) {
 	}
 }
 
-// TestEORecordTypeRenameStrandsTheOldCodes pins what a key rename actually
-// does to §7.11's codes, because all three consequences are invisible from
-// the designer and none of them was tested.
-//
-// Renaming eo_a → eo_b creates eo_b's codes and leaves eo_a's rows and grants
-// exactly where they were. So:
-//
-//  1. a custom role holding eo:eo_a:view silently loses the type — the new
-//     codes go to models.EOTypePermissionRoleCodes and nowhere else;
-//  2. eo_a's codes are stranded, held by whoever held them, naming a type key
-//     no live type uses;
-//  3. renaming back is permanently REFUSED, because those stranded codes are
-//     indistinguishable from a retired type's.
-//
-// This test does NOT assert that any of that is desirable. Migrating grants
-// across a rename is parked: permission rows record no owning type, so
-// nothing here can tell "this type's own codes" from "somebody else's", and
-// the fix is a schema change to a table every module shares. What the test
-// does is make the behaviour visible, so the next person meets it here rather
-// than in a deployment.
-func TestEORecordTypeRenameStrandsTheOldCodes(t *testing.T) {
+// TestEORecordTypeRenameCarriesTheCodesAndGrants: renaming eo_a -> eo_b moves
+// the three codes IN PLACE (same permission ids), so every grant, including a
+// custom role's, follows the type. The old key's codes no longer exist, so
+// the old key is free again, renaming back works, and a rename-then-delete
+// leaves nothing behind.
+func TestEORecordTypeRenameCarriesTheCodesAndGrants(t *testing.T) {
 	db := eoRecordDB(t)
 	types := NewEORecordTypeRepository(db)
 	ctx := context.Background()
@@ -854,6 +838,7 @@ func TestEORecordTypeRenameStrandsTheOldCodes(t *testing.T) {
 	if err := db.Model(&counsel).Association("Permissions").Append([]models.Permission{viewPerm}); err != nil {
 		t.Fatalf("grant it: %v", err)
 	}
+	grantsBefore := eoCount(t, db, `SELECT COUNT(*) FROM role_permissions`)
 
 	renamed := *ty
 	renamed.Key = "eo_b"
@@ -861,35 +846,76 @@ func TestEORecordTypeRenameStrandsTheOldCodes(t *testing.T) {
 		t.Fatalf("rename: %v", err)
 	}
 
-	// 1. the new key's codes exist and are granted to the seeded roles only.
+	newView := models.EOTypePermissionCode("eo_b", models.EOTypePermissionView)
 	if n := eoCountTypeCodes(t, db, "eo_b"); n != 3 {
 		t.Errorf("%d codes for the new key, want 3", n)
 	}
-	newView := models.EOTypePermissionCode("eo_b", models.EOTypePermissionView)
-	if user := eoRoleUser(t, db, "executive_office"); !user.HasPermission(newView) {
-		t.Errorf("executive_office does not hold %q after the rename", newView)
+	if n := eoCountTypeCodes(t, db, "eo_a"); n != 0 {
+		t.Errorf("%d codes left under the old key, want 0", n)
 	}
-	// 2. the custom role was NOT carried across: it still holds the old code,
-	//    and the old code now names nothing live.
-	legal := eoRoleUser(t, db, "legal_review")
-	if legal.HasPermission(newView) {
-		t.Error("the custom role was granted the new code; this test's premise, and the parked design question, are stale")
+	var moved models.Permission
+	if err := db.Where("code = ?", newView).First(&moved).Error; err != nil {
+		t.Fatalf("read %q: %v", newView, err)
 	}
-	if !legal.HasPermission(oldView) {
-		t.Errorf("the custom role lost %q as well, which is not what a rename does", oldView)
+	if moved.ID != viewPerm.ID {
+		t.Error("the view permission was re-created, not renamed: its grants would not follow")
 	}
-	if n := eoCountTypeCodes(t, db, "eo_a"); n != 3 {
-		t.Errorf("%d stranded codes for the old key, want 3", n)
+	if moved.Name != "EO View eo_b" || moved.Action != "eo_b:view" {
+		t.Errorf("name/action not rewritten: %q / %q", moved.Name, moved.Action)
+	}
+	if got := eoCount(t, db, `SELECT COUNT(*) FROM role_permissions`); got != grantsBefore {
+		t.Errorf("grants %d -> %d across a rename, want unchanged", grantsBefore, got)
+	}
+	if !eoRoleUser(t, db, "legal_review").HasPermission(newView) {
+		t.Error("the custom role lost the type on rename")
+	}
+	if !eoRoleUser(t, db, "executive_office").HasPermission(newView) {
+		t.Error("executive_office lost the type on rename")
 	}
 
-	// 3. and renaming back is refused, with the message that says so.
+	// renaming back is allowed: nothing is stranded under eo_a.
 	back := renamed
 	back.Key = "eo_a"
-	err := types.Update(ctx, &back)
-	if !errors.Is(err, ErrEOTypePermissionCodesExist) {
-		t.Fatalf("renaming back = %v, want ErrEOTypePermissionCodesExist", err)
+	if err := types.Update(ctx, &back); err != nil {
+		t.Fatalf("renaming back: %v", err)
 	}
-	if !strings.Contains(err.Error(), oldView) {
-		t.Errorf("the refusal does not name the stranded codes: %v", err)
+	if n := eoCountTypeCodes(t, db, "eo_a"); n != 3 {
+		t.Errorf("%d codes after renaming back, want 3", n)
+	}
+}
+
+// TestEORecordType_RenamedThenDeletedKeyIsReusable: the case the first B3
+// round missed. Rename, delete, then create under the ORIGINAL key.
+func TestEORecordType_RenamedThenDeletedKeyIsReusable(t *testing.T) {
+	db := eoRecordDB(t)
+	types := NewEORecordTypeRepository(db)
+	ctx := context.Background()
+
+	ty := &models.EORecordType{ID: uuid.New(), Key: "eo_task_note", Name: "Task Note", IsActive: true}
+	if err := types.Create(ctx, ty); err != nil {
+		t.Fatal(err)
+	}
+	renamed := *ty
+	renamed.Key = "eo_note_moved"
+	if err := types.Update(ctx, &renamed); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if err := types.Delete(ctx, ty.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for _, key := range []string{"eo_task_note", "eo_note_moved"} {
+		if n := eoCountTypeCodes(t, db, key); n != 0 {
+			t.Errorf("%d live codes under %q after rename+delete, want 0", n, key)
+		}
+		if n := eoTypeGrants(t, db, key); n != 0 {
+			t.Errorf("%d grants under %q after rename+delete, want 0", n, key)
+		}
+	}
+	again := &models.EORecordType{ID: uuid.New(), Key: "eo_task_note", Name: "Task Note 2", IsActive: true}
+	if err := types.Create(ctx, again); err != nil {
+		t.Fatalf("re-create the original key: %v", err)
+	}
+	if n := eoCountTypeCodes(t, db, "eo_task_note"); n != 3 {
+		t.Errorf("%d live codes after re-create, want 3", n)
 	}
 }
