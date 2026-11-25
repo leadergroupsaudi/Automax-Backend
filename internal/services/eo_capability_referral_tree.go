@@ -96,6 +96,27 @@ const EOReferralTreeKey = "referral_tree"
 // values.referral_tree. Content is still not copied, and the ids answer 403/404
 // on every follow-up path, so it is metadata only. It needs an owner's decision.
 //
+// THAT DECISION HAS BEEN RAISED WITH THE CLIENT (2026-11-25) AND IS NOT YET
+// ANSWERED. Until it is, read this file's behaviour as settled and its
+// confidentiality posture as follows: the tree DOES disclose a branch's
+// reference and id to any reader entitled to the parent letter, whatever the
+// branch's own `visible_to` says and whatever view codes the reader holds on
+// the referral register. That is not a hypothesis — in the live register
+// IN-2026-0003's tree lists IN-2026-0003-R2 as outstanding while R2 itself
+// carries values.visible_to and is §7.11-restricted.
+//
+// THE CONSEQUENCE LIVES IN ANOTHER LAYER, so it is recorded here too. R2 is
+// linked eo_referral_parent → IN-2026-0003 on a link type with
+// blocks_parent_closure, i.e. it is exactly the kind of child
+// handlers.eoBlockerProbe.split counts WITHOUT naming, on the same record
+// detail page that has already loaded this tree. So B1's hidden count is a
+// second line of defence on that page rather than a confidentiality boundary:
+// it is correct in its own layer and defeated by this payload beside it. Do
+// not "fix" the asymmetry by loosening B1; and do not trim this list on a
+// hunch either — per THE RESIDUAL above, if the shape of the tree is
+// confidential the answer is to stop storing it on the letter. Either way it
+// is the client's call, and nothing here changes until that call is made.
+//
 // WHO IT IS FOR AND WHERE IT IS READ: the Executive Office drafting the one
 // Outgoing Reply, reading it on the letter it is stored on. The answers
 // themselves stay in the branches, where §7.11 governs them, and the Office

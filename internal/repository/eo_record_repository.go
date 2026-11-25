@@ -353,7 +353,9 @@ func (r *eoRecordRepository) History(ctx context.Context, recordID, recordTypeID
 
 	out := make([]models.EORecordHistoryEntry, 0, len(rows))
 	for i := range rows {
-		entry := models.EORecordHistoryEntry{EORecordHistory: rows[i]}
+		// The served fields, copied by name: models.EOHistoryEntryOf is the
+		// one place that decides what the audit route carries.
+		entry := models.EOHistoryEntryOf(rows[i])
 		if id := rows[i].PerformedByID; id != nil {
 			entry.PerformedByName = actors[*id]
 		}

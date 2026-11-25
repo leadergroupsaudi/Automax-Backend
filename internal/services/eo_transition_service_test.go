@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"testing"
@@ -2406,5 +2407,60 @@ func TestAvailableTransitionsGathersTheBlockingInputsOnce(t *testing.T) {
 	}
 	if !eoTxByCode(t, got, "close").Blocked {
 		t.Error("close not blocked: the shared inputs were not decided over")
+	}
+}
+
+// TestAvailableTransitionsSkipsATransitionWhoseTargetStateIsGone.
+//
+// WorkflowRepository.ListByRecordTypeID preloads States, and the preload
+// excludes soft-deleted rows. So retiring a state that is still some
+// transition's target leaves that transition pointing at a state the workflow
+// no longer has — one misconfigured row, in configuration an administrator can
+// change at runtime.
+//
+// The list must survive it. Failing the whole read would mean an officer in
+// that state is offered NO move at all on a record in a statutory register —
+// the list lost, not one entry — which is strictly worse than the behaviour
+// before the to-state check was added. But the broken transition must not be
+// OFFERED either: with no to-state the blocking rule cannot be decided, and
+// offering it undecided hands the officer a move Execute then refuses.
+//
+// And it must not be SILENT: a move that vanishes with no explanation is its
+// own defect. The skip is logged naming the transition, its workflow and the
+// missing state, which is the only trace an operator gets, so it is asserted
+// here rather than taken on trust.
+func TestAvailableTransitionsSkipsATransitionWhoseTargetStateIsGone(t *testing.T) {
+	f := eoNewTxFixture(t)
+	retired := uuid.New() // a state id that is NOT among wf.States
+	f.addTransition(&models.WorkflowTransition{
+		Code: "archive", Name: "Archive", FromStateID: f.review.ID, ToStateID: retired, IsActive: true,
+	})
+
+	var logged strings.Builder
+	restore := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(restore) })
+
+	got, err := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+	if err != nil {
+		t.Fatalf("available: %v — one misconfigured transition must not deny the officer every other move", err)
+	}
+
+	codes := eoTxCodes(got)
+	// The healthy moves out of `review` are still served, whole.
+	for _, code := range []string{"raise", "close"} {
+		eoTxByCode(t, got, code)
+	}
+	for _, tr := range got {
+		if tr.Code == "archive" {
+			t.Errorf("the broken transition is offered (%v): without a to-state its blocking rule was never decided, and Execute would refuse it", codes)
+		}
+	}
+
+	out := logged.String()
+	for _, want := range []string{"archive", f.workflows.wf.Code, retired.String()} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the skip was logged without %q — an operator has no other trace of it: %q", want, out)
+		}
 	}
 }

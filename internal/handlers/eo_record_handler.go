@@ -598,7 +598,7 @@ func (h *EORecordHandler) AvailableTransitions(c *fiber.Ctx) error {
 	// A blocked move is offered WITH its reason, but the reason is filtered by
 	// what this caller may see. Several transitions share the same blockers, so
 	// each blocker is probed once.
-	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[uuid.UUID]bool{}}
+	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[eoBlockerKey]bool{}}
 	for i := range out {
 		if len(out[i].BlockedBy) == 0 {
 			continue
@@ -612,6 +612,23 @@ func (h *EORecordHandler) AvailableTransitions(c *fiber.Ctx) error {
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_transitions_retrieved"), out)
 }
 
+// eoBlockerKey identifies one blocking child for the probe's cache.
+//
+// IT IS THE COMPOSITE KEY, both halves, because an EO record id alone is NOT
+// unique: eo_records is partitioned by record_type_id, Postgres requires the
+// partition key in every unique constraint, so the primary key is
+// (id, record_type_id) and two records in two registers may legitimately
+// share an id. (repository.TestEORecordHistoryIsScopedToOneRecord constructs
+// exactly that pair on purpose.) Keyed on the bare id, two blockers of one
+// parent sharing an id across registers would share ONE cached verdict, and
+// whichever was probed first would decide for both — naming a child the
+// caller may not see, or counting one it may. Every other composite-key site
+// in this package spells both halves out; so does this one.
+type eoBlockerKey struct {
+	ID     uuid.UUID
+	TypeID uuid.UUID
+}
+
 // eoBlockerProbe splits blocking children into the ones the caller may open and
 // the ones it may not, asking the register's own visibility rule
 // (eoVisibleScoped) rather than a copy of it.
@@ -619,27 +636,45 @@ type eoBlockerProbe struct {
 	h    *EORecordHandler
 	c    *fiber.Ctx
 	user *models.User
-	seen map[uuid.UUID]bool
+	seen map[eoBlockerKey]bool
 }
 
 // split returns the references of the blockers the caller can see, and a COUNT
-// of the rest. A blocker the caller cannot see is counted, never named: its
-// reference would disclose a record §7.11 conceals. When the caller sees some
-// and not others, it is shown the visible references and the count of the
-// remainder, so the total always adds up and nothing hidden is identifiable.
+// of the rest. A blocker the caller cannot see is counted, never named. When
+// the caller sees some and not others, it is shown the visible references and
+// the count of the remainder, so the total always adds up and nothing hidden
+// is identifiable from THIS payload.
+//
+// THIS IS DEFENCE IN DEPTH, NOT A CONFIDENTIALITY BOUNDARY, and the difference
+// matters to anyone relying on it. GET /eo-records/:id serves
+// `values.referral_tree`, which names outstanding referral branches by
+// reference AND id to any caller entitled to the parent — including branches
+// that are §7.11-restricted to a body the caller does not belong to, and
+// including the very children counted here (a referral link type carries
+// blocks_parent_closure, so an unanswered branch IS a blocker). The record
+// detail page loads that payload beside this one. So a caller who is refused a
+// name here can, today, read the same reference out of the sibling payload.
+//
+// The split is still correct in its own layer and is kept: this route must not
+// be the one that discloses. But do not read the hidden count as proof that
+// the child is concealed from this caller — it is not, on that page, until the
+// referral tree is settled. That question is with the client (see
+// services/eo_capability_referral_tree.go); until it is answered, treat
+// `values.referral_tree` as the disclosure and this count as a second line.
 func (p *eoBlockerProbe) split(blocked []models.EORecord) ([]string, int, error) {
 	refs := []string{}
 	hidden := 0
 	for i := range blocked {
 		b := &blocked[i]
-		visible, known := p.seen[b.ID]
+		key := eoBlockerKey{ID: b.ID, TypeID: b.RecordTypeID}
+		visible, known := p.seen[key]
 		if !known {
 			v, err := eoVisibleScoped(p.c, p.h.records, b, p.user)
 			if err != nil {
 				return nil, 0, err
 			}
 			visible = v
-			p.seen[b.ID] = v
+			p.seen[key] = v
 		}
 		if visible {
 			refs = append(refs, b.Reference)
@@ -660,7 +695,7 @@ type eoBlockedRefusal struct {
 }
 
 func (h *EORecordHandler) eoBlockedResponse(c *fiber.Ctx, user *models.User, blocked *services.EOTransitionBlockedError) error {
-	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[uuid.UUID]bool{}}
+	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[eoBlockerKey]bool{}}
 	refs, hidden, err := probe.split(blocked.Blocked)
 	if err != nil {
 		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
@@ -772,8 +807,14 @@ func (h *EORecordHandler) Children(c *fiber.Ctx) error {
 // It is NOT an EORecordFilter: the trail is selected by the record in the
 // path and by nothing else, and binding the register's filter here would
 // advertise a dozen query parameters that silently do nothing.
-// TestGetEORecordHistoryIsPagedNewestFirst pins the maximum against
-// eoMaxPageLimit, so the tag below cannot drift from the constant unnoticed.
+// THE `max=100` BELOW IS A LITERAL AND THE STRUCT TAG CANNOT REFERENCE
+// eoMaxPageLimit, so nothing in this file links the two. What keeps them
+// together is a test, and only that test: TestGetEORecordHistoryIsPagedNewestFirst
+// drives the route at eoMaxPageLimit (which must be accepted and passed down)
+// and at eoMaxPageLimit+1 (which must be a 400), so changing the constant
+// without changing this tag fails one of those two cases. If that test is ever
+// weakened to a hard-coded 100 or 101, the link is gone and the tag will drift
+// silently — keep it written against the constant.
 type eoHistoryQuery struct {
 	Page  int `query:"page" json:"page" validate:"omitempty,min=1"`
 	Limit int `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`

@@ -207,9 +207,27 @@ func (s *eoTransitionService) AvailableTransitions(ctx context.Context, rec *mod
 		case err == nil:
 			// The same rule Execute refuses on, asked now so the offer and the
 			// refusal cannot disagree. A failure to ask is a failure, not "free".
+			//
+			// A TRANSITION WHOSE TARGET STATE IS GONE IS SKIPPED, LOUDLY, and
+			// the rest of the list is still served. ListByRecordTypeID
+			// preloads States, which excludes soft-deleted rows, so retiring a
+			// state that is still some transition's target leaves that
+			// transition pointing at nothing. Failing the whole read there
+			// would mean one misconfigured transition denies an officer EVERY
+			// move on a record in a statutory register — losing the list, not
+			// one entry — which is strictly worse than the pre-B1 behaviour
+			// this check was added to. But the transition cannot be OFFERED
+			// either: without a to-state the blocking rule cannot be decided,
+			// and offering it undecided hands the officer a move Execute then
+			// refuses. So: skip it, and say so at a volume an operator will
+			// see, naming the transition, its workflow and the missing state.
+			// It is never silent, because a move that vanishes with no
+			// explanation is its own kind of defect.
 			toState := eoStateByID(wf, tr.ToStateID)
 			if toState == nil {
-				return nil, fmt.Errorf("available transitions: target state %s of transition %q is not a state of workflow %q", tr.ToStateID, tr.Code, wf.Code)
+				log.Printf("eo: CONFIGURATION ERROR: transition %q (%s) of workflow %q targets state %s, which is not a live state of that workflow (retired?); the transition is NOT offered on record %s and Execute would refuse it — restore the state or repoint the transition",
+					tr.Code, tr.ID, wf.Code, tr.ToStateID, rec.ID)
+				continue
 			}
 			if inputs == nil {
 				inputs, err = loadBlockingInputs(ctx, s.records, s.types, rec)

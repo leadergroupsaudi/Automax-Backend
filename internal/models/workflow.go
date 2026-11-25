@@ -286,6 +286,15 @@ type WorkflowTransition struct {
 	// child the caller cannot see discloses a record §7.11 conceals. The handler
 	// fills BlockingReferences with the VISIBLE ones and BlockingHiddenCount with
 	// the rest, which are counted and never named.
+	//
+	// THAT COUNT IS DEFENCE IN DEPTH, NOT A BOUNDARY. GET /eo-records/:id serves
+	// `values.referral_tree`, which today names outstanding referral branches —
+	// blockers among them, since a referral link type carries
+	// blocks_parent_closure — by reference and id to any caller entitled to the
+	// parent, §7.11-restricted or not. So this route withholding a name does not
+	// mean the caller cannot learn it: the record detail page loads both. See
+	// handlers.eoBlockerProbe.split and services/eo_capability_referral_tree.go;
+	// the policy question is with the client and unanswered.
 	Blocked             bool       `gorm:"-" json:"blocked,omitempty"`
 	BlockedBy           []EORecord `gorm:"-" json:"-"`
 	BlockingReferences  []string   `gorm:"-" json:"blocking_references,omitempty"`

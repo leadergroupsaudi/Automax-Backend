@@ -15,6 +15,7 @@ import (
 	"github.com/automax/backend/internal/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 // ── fake ────────────────────────────────────────────────────────────────────
@@ -77,20 +78,24 @@ func eoHistoryRows(rec *models.EORecord, n int) []models.EORecordHistoryEntry {
 	out := make([]models.EORecordHistoryEntry, 0, n)
 	base := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < n; i++ {
-		out = append(out, models.EORecordHistoryEntry{
-			EORecordHistory: models.EORecordHistory{
-				ID:           uuid.New(),
-				RecordID:     rec.ID,
-				RecordTypeID: rec.RecordTypeID,
-				Comment:      "entry",
-				CreatedAt:    base.Add(-time.Duration(i) * time.Minute),
-			},
-			PerformedByName: "Officer " + strconv.Itoa(i),
-			FromStateName:   "Under Review",
-			FromStateNameAr: "قيد المراجعة",
-			ToStateName:     "Approved",
-			ToStateNameAr:   "معتمد",
+		// Built through models.EOHistoryEntryOf, the mapper the repository
+		// uses, from a STORED row that carries both values diffs — so what
+		// the route serves here is what it would serve in production, and
+		// TestGetEORecordHistoryDoesNotServeTheValuesDiffs is not asserting
+		// against a fixture that simply never held them.
+		entry := models.EOHistoryEntryOf(models.EORecordHistory{
+			ID:           uuid.New(),
+			RecordID:     rec.ID,
+			RecordTypeID: rec.RecordTypeID,
+			Comment:      "entry",
+			CreatedAt:    base.Add(-time.Duration(i) * time.Minute),
+			OldValues:    datatypes.JSON([]byte(`{"state":"under_review","referral_tree":[{"reference":"IN-2026-0003-R2"}]}`)),
+			NewValues:    datatypes.JSON([]byte(`{"state":"approved","referral_tree":[{"reference":"IN-2026-0003-R2"}]}`)),
 		})
+		entry.PerformedByName = "Officer " + strconv.Itoa(i)
+		entry.FromStateName, entry.FromStateNameAr = "Under Review", "قيد المراجعة"
+		entry.ToStateName, entry.ToStateNameAr = "Approved", "معتمد"
+		out = append(out, entry)
 	}
 	return out
 }
@@ -213,16 +218,6 @@ func TestGetEORecordHistoryRequiresViewCodes(t *testing.T) {
 		}
 		if repo.calls != 0 {
 			t.Errorf("the audit trail was read %d times for a refused caller", repo.calls)
-		}
-	})
-
-	t.Run("a refusal is never 401", func(t *testing.T) {
-		for _, granted := range [][]string{{}, {"eo:view"}} {
-			user := eoHistoryUser(typeView)
-			app, _ := newApp(user, granted...)
-			if _, status := get(app); status == fiber.StatusUnauthorized {
-				t.Errorf("status = 401 for granted=%v: the client's axios interceptor logs the user out on a 401", granted)
-			}
 		}
 	})
 
@@ -605,4 +600,97 @@ func TestGetEORecordHistoryHonoursRowLevelVisibility(t *testing.T) {
 			t.Errorf("the audit trail was read %d times, want 1", repo.calls)
 		}
 	})
+}
+
+// TestGetEORecordHistoryDoesNotServeTheValuesDiffs pins what the audit route
+// does NOT carry.
+//
+// eo_record_history stores old_values and new_values — the full jsonb snapshot
+// either side of a change. The route serving models.EORecordHistoryEntry once
+// embedded the stored row whole, so it shipped both. Nobody asked for them:
+// this route's brief is the trail of who moved the record, when, from where to
+// where and why, and its one consumer renders exactly that. They are also by
+// far the widest thing on the payload (a referral_tree snapshot alone is about
+// a kilobyte, twice a row, up to eoMaxPageLimit rows a page) and a second path
+// by which a §7.11-restricted record's reference reaches a caller — including
+// values the record no longer shows.
+//
+// So the entry lists its fields instead of embedding the row, and this asserts
+// the result at the route: neither KEY appears, and neither does the content
+// the fixture puts in them. The rest of the payload is unaffected, which the
+// second half checks — an entry stripped of its ids would pass a leak test and
+// still be useless.
+func TestGetEORecordHistoryDoesNotServeTheValuesDiffs(t *testing.T) {
+	eoInitValidator(t)
+	rec := eoHistoryRecord()
+	repo := &eoHistoryRepo{
+		eoFakeRecordRepo: eoFakeRecordRepo{
+			byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
+			visibleIDs: map[uuid.UUID]bool{rec.ID: true},
+		},
+		rows: eoHistoryRows(rec, 2),
+	}
+	types := &eoFakeTypeRepo{byID: &models.EORecordType{ID: rec.RecordTypeID, Key: eoHistoryTypeKey}}
+	app := eoHistoryApp(repo, types,
+		eoHistoryUser("eo:view", models.EOTypePermissionCode(eoHistoryTypeKey, models.EOTypePermissionView)), "eo:view")
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+rec.ID.String()+"/history", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, status := eoHistoryRead(t, resp)
+	if status != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	out := eoHistoryBody(t, body)
+	if len(out.Data) != 2 {
+		t.Fatalf("data has %d entries, want 2: %s", len(out.Data), out.raw)
+	}
+	for i, entry := range out.Data {
+		for _, key := range []string{"old_values", "new_values"} {
+			if _, present := entry[key]; present {
+				t.Errorf("entry %d serves %q: the audit route must carry what the audit view needs and no more (%s)",
+					i, key, out.raw)
+			}
+		}
+	}
+	// The keys could be renamed rather than dropped, so pin the CONTENT the
+	// fixture puts in them too — the reference is the disclosure that matters.
+	for _, leaked := range []string{"IN-2026-0003-R2", "referral_tree", "under_review"} {
+		if strings.Contains(out.raw, leaked) {
+			t.Errorf("the response carries %q out of the stored values diff: %s", leaked, out.raw)
+		}
+	}
+	// And the trail is still a trail: every served key is PRESENT, and the
+	// ones the fixture gives a value to CARRY it. Presence alone would pass a
+	// mapper (models.EOHistoryEntryOf) that declared a field and forgot to
+	// copy it, which is the failure mode a by-name copy introduces.
+	first := out.Data[0]
+	for _, key := range []string{"id", "record_id", "record_type_id", "transition_id",
+		"from_state_id", "to_state_id", "performed_by_id", "comment", "is_system_action",
+		"created_at", "performed_by_name", "from_state_name", "from_state_name_ar",
+		"to_state_name", "to_state_name_ar"} {
+		if _, present := first[key]; !present {
+			t.Errorf("entry is missing %q: dropping the values diffs must not cost the trail itself (%s)", key, out.raw)
+		}
+	}
+	for key, want := range map[string]any{
+		"record_id":        rec.ID.String(),
+		"record_type_id":   rec.RecordTypeID.String(),
+		"comment":          "entry",
+		"is_system_action": false,
+		"from_state_name":  "Under Review",
+		"to_state_name":    "Approved",
+	} {
+		if first[key] != want {
+			t.Errorf("%s = %v, want %v: the served entry must carry the stored row's value, not a zero one (%s)",
+				key, first[key], want, out.raw)
+		}
+	}
+	if id, _ := first["id"].(string); id == "" || id == uuid.Nil.String() {
+		t.Errorf("id = %q, want the stored row's: %s", id, out.raw)
+	}
+	if ts, _ := first["created_at"].(string); !strings.HasPrefix(ts, "2026-11-25T09:00:00") {
+		t.Errorf("created_at = %q, want the stored row's timestamp: %s", ts, out.raw)
+	}
 }

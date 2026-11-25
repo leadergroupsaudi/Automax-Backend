@@ -207,8 +207,21 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
-// EORecordHistoryEntry is one audit row AS THE API SERVES IT: the stored row
-// unchanged, plus the display names its three ids stand for.
+// EORecordHistoryEntry is one audit row AS THE API SERVES IT: the trail the
+// history view renders, plus the display names its three ids stand for.
+//
+// IT LISTS ITS FIELDS RATHER THAN EMBEDDING EORecordHistory, and that is the
+// point of the type. Embedding served whatever the table happened to hold, so
+// the route shipped old_values and new_values — two jsonb diffs nobody asked
+// for, no consumer reads, and which are by far the widest thing on it (one
+// referral_tree snapshot is about a kilobyte, twice per row, up to
+// eoMaxPageLimit rows a page). They are also a second path by which a
+// §7.11-restricted record's reference can reach a caller, including values the
+// current record no longer shows. An audit payload carries what the audit view
+// needs and no more; re-adding a column here is then a deliberate act with a
+// use case behind it, not a side effect of a migration. THE COLUMNS STAY in
+// EORecordHistory and in the table — this is about what the route serves, not
+// what is stored.
 //
 // It exists because the consumer cannot resolve those ids itself. There is no
 // route that turns a user id into a name, and adding one so that a history tab
@@ -228,10 +241,10 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 // would be a third convention standing for data that does not exist.
 //
 // AN UNRESOLVABLE NAME IS THE EMPTY STRING, never a placeholder sentence, and
-// never a reason to blank or drop the row: every id, timestamp, comment and
-// values diff is still served, and the client renders its own wording in its
-// own language — which an English literal baked in here could not do. Three
-// cases reach it, and the payload tells them apart:
+// never a reason to blank or drop the row: every id, timestamp and comment is
+// still served, and the client renders its own wording in its own language —
+// which an English literal baked in here could not do. Three cases reach it,
+// and the payload tells them apart:
 //
 //   - performed_by_id is null and is_system_action is true: a timer or an
 //     escalation sweep acted and there is no person to name.
@@ -239,13 +252,45 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 //     (A merely soft-deleted one still resolves — see the repository.)
 //   - from_state_id is null: a create row has no state to come from.
 type EORecordHistoryEntry struct {
-	EORecordHistory
+	ID           uuid.UUID `json:"id"`
+	RecordID     uuid.UUID `json:"record_id"`
+	RecordTypeID uuid.UUID `json:"record_type_id"`
+
+	TransitionID *uuid.UUID `json:"transition_id"`
+	FromStateID  *uuid.UUID `json:"from_state_id"`
+	ToStateID    *uuid.UUID `json:"to_state_id"`
+
+	PerformedByID *uuid.UUID `json:"performed_by_id"`
+
+	Comment        string    `json:"comment"`
+	IsSystemAction bool      `json:"is_system_action"`
+	CreatedAt      time.Time `json:"created_at"`
 
 	PerformedByName string `json:"performed_by_name"`
 	FromStateName   string `json:"from_state_name"`
 	FromStateNameAr string `json:"from_state_name_ar"`
 	ToStateName     string `json:"to_state_name"`
 	ToStateNameAr   string `json:"to_state_name_ar"`
+}
+
+// EOHistoryEntryOf is the ONE place a stored row becomes a served entry.
+// Everything the route serves is copied here by name, so a column added to
+// EORecordHistory does not appear on the API until someone adds it here on
+// purpose — which is exactly the property old_values and new_values were
+// shipped for want of.
+func EOHistoryEntryOf(h EORecordHistory) EORecordHistoryEntry {
+	return EORecordHistoryEntry{
+		ID:             h.ID,
+		RecordID:       h.RecordID,
+		RecordTypeID:   h.RecordTypeID,
+		TransitionID:   h.TransitionID,
+		FromStateID:    h.FromStateID,
+		ToStateID:      h.ToStateID,
+		PerformedByID:  h.PerformedByID,
+		Comment:        h.Comment,
+		IsSystemAction: h.IsSystemAction,
+		CreatedAt:      h.CreatedAt,
+	}
 }
 
 // PersonDisplayName is the one rule for rendering a person as a line of text:

@@ -64,7 +64,25 @@ type eoFakeRecordRepo struct {
 	// visibleIDs, when non-nil, is the set of ids a SINGLE-record visibility
 	// probe (filter.RecordID) finds. It is strictly narrower than the real
 	// WHERE clause, never wider.
-	visibleIDs    map[uuid.UUID]bool
+	//
+	// It models the BODY axis of §7.11 only, and it is keyed on the bare id,
+	// which the schema does not guarantee to be unique — see visibleKeys for
+	// the case where that matters.
+	visibleIDs map[uuid.UUID]bool
+	// visibleKeys, when non-nil, replaces visibleIDs for the single-record
+	// probe and decides on the COMPOSITE key (id, record_type_id), which is
+	// what eo_records is actually keyed by. It exists so a test can express
+	// two records that share an id in two registers with DIFFERENT
+	// visibility — legal, since the partition key must appear in the primary
+	// key — which visibleIDs cannot represent at all.
+	visibleKeys map[eoFakeRecordKey]bool
+	// typeViewKeys, when non-nil, turns on the PER-TYPE axis of §7.11: it
+	// maps a record type id to its key, and List then answers a probe only
+	// if filter.PermissionCodes carries that type's eo:<key>:view. This is
+	// the repository's own clause (applyEORecordVisibility narrows to the
+	// types the codes grant view on) modelled just far enough to be driven
+	// from a handler test; the clause itself is covered in the repository.
+	typeViewKeys  map[uuid.UUID]string
 	childrenCalls int
 	linksFrom     []models.EORecordLink
 	createdLinks  []*models.EORecordLink
@@ -92,9 +110,18 @@ func (f *eoFakeRecordRepo) List(_ context.Context, filter *models.EORecordFilter
 		}
 		return nil, total, nil
 	}
-	if f.visibleIDs != nil && filter.RecordID != nil {
-		if f.visibleIDs[*filter.RecordID] {
-			return []models.EORecord{{ID: *filter.RecordID}}, 1, nil
+	if (f.visibleIDs != nil || f.visibleKeys != nil) && filter.RecordID != nil {
+		typeID, err := f.probeTypeID(filter)
+		if err != nil {
+			return nil, 0, err
+		}
+		// The per-type gate first: a caller holding no view code on this
+		// register sees nothing of it, whatever the body rule would say.
+		if !f.typeViewGranted(typeID, filter.PermissionCodes) {
+			return nil, 0, nil
+		}
+		if f.probeVisible(eoFakeRecordKey{ID: *filter.RecordID, TypeID: typeID}) {
+			return []models.EORecord{{ID: *filter.RecordID, RecordTypeID: typeID}}, 1, nil
 		}
 		return nil, 0, nil
 	}
@@ -102,6 +129,44 @@ func (f *eoFakeRecordRepo) List(_ context.Context, filter *models.EORecordFilter
 		return f.visibleRows, f.visibleTotal, nil
 	}
 	return f.listOut, f.listTotal, nil
+}
+
+// eoFakeRecordKey is the register's REAL key for a record: eo_records is
+// partitioned by record_type_id, so the primary key is composite and an id
+// alone identifies nothing.
+type eoFakeRecordKey struct {
+	ID     uuid.UUID
+	TypeID uuid.UUID
+}
+
+// probeTypeID is the single type a visibility probe names. eoVisibleScoped
+// always sets exactly one; anything else is the handler asking a question the
+// repository was never asked, so the fake fails rather than guessing.
+func (f *eoFakeRecordRepo) probeTypeID(filter *models.EORecordFilter) (uuid.UUID, error) {
+	if len(filter.RecordTypeID) != 1 {
+		return uuid.Nil, fmt.Errorf("visibility probe named %d record types, want exactly 1", len(filter.RecordTypeID))
+	}
+	return uuid.Parse(filter.RecordTypeID[0])
+}
+
+func (f *eoFakeRecordRepo) probeVisible(key eoFakeRecordKey) bool {
+	if f.visibleKeys != nil {
+		return f.visibleKeys[key]
+	}
+	return f.visibleIDs[key.ID]
+}
+
+func (f *eoFakeRecordRepo) typeViewGranted(typeID uuid.UUID, codes []string) bool {
+	if f.typeViewKeys == nil {
+		return true
+	}
+	want := models.EOTypePermissionCode(f.typeViewKeys[typeID], models.EOTypePermissionView)
+	for _, code := range codes {
+		if code == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *eoFakeRecordRepo) GetAnyByID(_ context.Context, id uuid.UUID) (*models.EORecord, error) {
@@ -1508,12 +1573,21 @@ func eoNewBlockedFixture(t *testing.T, svc *eoFakeTransitionService) *eoBlockedF
 	}
 	// The caller may open the parent and R1 only.
 	records := &eoFakeRecordRepo{anyByID: f.rec, visibleIDs: map[uuid.UUID]bool{f.rec.ID: true, f.visible.ID: true}}
-	h := NewEORecordHandler(&eoFakeRecordService{}, svc, records, &eoFakeTypeRepo{})
-	f.app = fiber.New()
-	f.app.Use(eoTestActor(&models.User{ID: uuid.New()}))
-	f.app.Get("/eo-records/:id/transitions", h.AvailableTransitions)
-	f.app.Post("/eo-records/:id/transition", h.Transition)
+	f.app = eoMountBlocked(svc, records, &models.User{ID: uuid.New()})
 	return f
+}
+
+// eoMountBlocked wires the two transition routes over the register and caller
+// given. It is split out of eoNewBlockedFixture so a test can vary the
+// caller's permission codes and the register's answers — the two axes of
+// §7.11 — without a second copy of the fixture's request helpers.
+func eoMountBlocked(svc services.EOTransitionService, records repository.EORecordRepository, user *models.User) *fiber.App {
+	h := NewEORecordHandler(&eoFakeRecordService{}, svc, records, &eoFakeTypeRepo{})
+	app := fiber.New()
+	app.Use(eoTestActor(user))
+	app.Get("/eo-records/:id/transitions", h.AvailableTransitions)
+	app.Post("/eo-records/:id/transition", h.Transition)
+	return app
 }
 
 func (f *eoBlockedFixture) get(t *testing.T) (int, string) {
@@ -1640,4 +1714,152 @@ func TestBlockedReasonHidesInvisibleChildren(t *testing.T) {
 			t.Errorf("body = %s, want [] and hidden 1", body)
 		}
 	})
+}
+
+// TestBlockedReasonProbesTheCompositeKey is the collision the probe's cache
+// must survive.
+//
+// An EO record id is NOT unique: eo_records is partitioned by record_type_id,
+// Postgres requires the partition key in every unique constraint, so the
+// primary key is (id, record_type_id) and two records in two registers may
+// share an id — repository.TestEORecordHistoryIsScopedToOneRecord builds that
+// pair deliberately. Two blockers of one parent can therefore collide, and a
+// cache keyed on the bare id would give them ONE visibility verdict: whichever
+// was probed first decides for both, so a concealed blocker gets NAMED (or a
+// visible one wrongly counted) depending on the order the service happened to
+// return them in. The order is the mutation's lever, so the test drives both.
+func TestBlockedReasonProbesTheCompositeKey(t *testing.T) {
+	shared := uuid.New() // the one id, in two registers
+	parent := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "IN-2026-0003"}
+	seen := models.EORecord{ID: shared, RecordTypeID: uuid.New(), Reference: "IN-2026-0003-R1"}
+	concealed := models.EORecord{ID: shared, RecordTypeID: uuid.New(), Reference: "SEC-2026-0007-SECRET"}
+
+	// Visibility is decided on the COMPOSITE key, which is the only way to
+	// say "this id is visible in one register and not in the other".
+	records := &eoFakeRecordRepo{anyByID: parent, visibleKeys: map[eoFakeRecordKey]bool{
+		{ID: parent.ID, TypeID: parent.RecordTypeID}: true,
+		{ID: seen.ID, TypeID: seen.RecordTypeID}:     true,
+		// concealed is absent: §7.11 restricts it to another body.
+	}}
+
+	for _, order := range []struct {
+		name    string
+		blocked []models.EORecord
+	}{
+		{"visible first", []models.EORecord{seen, concealed}},
+		{"concealed first", []models.EORecord{concealed, seen}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			svc := &eoFakeTransitionService{
+				available: []models.WorkflowTransition{
+					{ID: uuid.New(), Code: "close", Blocked: true, BlockedBy: order.blocked},
+				},
+			}
+			f := &eoBlockedFixture{rec: parent}
+			f.app = eoMountBlocked(svc, records, &models.User{ID: uuid.New()})
+
+			status, body := f.get(t)
+			if status != fiber.StatusOK {
+				t.Fatalf("status = %d: %s", status, body)
+			}
+			if strings.Contains(body, concealed.Reference) {
+				t.Fatalf("the concealed blocker is NAMED — the probe's cache collided on the bare id: %s", body)
+			}
+			var out struct {
+				Data []struct {
+					Refs   []string `json:"blocking_references"`
+					Hidden int      `json:"blocking_hidden_count"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(body), &out); err != nil {
+				t.Fatalf("decode %q: %v", body, err)
+			}
+			if len(out.Data) != 1 {
+				t.Fatalf("body = %s, want one transition", body)
+			}
+			if len(out.Data[0].Refs) != 1 || out.Data[0].Refs[0] != seen.Reference {
+				t.Errorf("blocking_references = %v, want only %q: the visible blocker must still be named",
+					out.Data[0].Refs, seen.Reference)
+			}
+			if out.Data[0].Hidden != 1 {
+				t.Errorf("blocking_hidden_count = %d, want 1: the concealed blocker is counted", out.Data[0].Hidden)
+			}
+		})
+	}
+}
+
+// TestBlockedReasonHidesABlockerInAnUnreadableRegister drives the PER-TYPE
+// axis of §7.11, which the body axis above does not reach.
+//
+// A caller can be entitled to every body a record belongs to and still hold no
+// eo:<type_key>:view code on the register it lives in. eoScopeFilter puts
+// those codes on every scoped read, including the single-record probe, and the
+// repository narrows the query to the types they grant view on. This asserts
+// the consequence at the route: a blocker in a register the caller cannot read
+// is COUNTED, never NAMED — exactly as one hidden by the body rule is.
+func TestBlockedReasonHidesABlockerInAnUnreadableRegister(t *testing.T) {
+	const (
+		parentKey    = "eo_incoming_correspondence"
+		readableKey  = "eo_task"
+		forbiddenKey = "eo_security_memo"
+	)
+	parent := &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "IN-2026-0003"}
+	readable := models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "TSK-2026-0011"}
+	forbidden := models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "SEC-2026-0007-SECRET"}
+
+	// EVERY record passes the body rule: all three ids are visible. The only
+	// thing that separates them is the caller's per-type view codes, so a
+	// route that ignored PermissionCodes would name all three.
+	records := &eoFakeRecordRepo{
+		anyByID: parent,
+		visibleIDs: map[uuid.UUID]bool{
+			parent.ID: true, readable.ID: true, forbidden.ID: true,
+		},
+		typeViewKeys: map[uuid.UUID]string{
+			parent.RecordTypeID:    parentKey,
+			readable.RecordTypeID:  readableKey,
+			forbidden.RecordTypeID: forbiddenKey,
+		},
+	}
+	// The caller reads the letter register and the task register, and holds
+	// nothing at all on the security-memo register.
+	user := &models.User{ID: uuid.New(), Roles: []models.Role{{Permissions: []models.Permission{
+		{Code: models.EOTypePermissionCode(parentKey, models.EOTypePermissionView), IsActive: true},
+		{Code: models.EOTypePermissionCode(readableKey, models.EOTypePermissionView), IsActive: true},
+	}}}}
+
+	blocked := []models.EORecord{readable, forbidden}
+	svc := &eoFakeTransitionService{
+		available: []models.WorkflowTransition{
+			{ID: uuid.New(), Code: "close", Blocked: true, BlockedBy: blocked},
+		},
+		executeErr: &services.EOTransitionBlockedError{Code: "close", Blocked: blocked},
+	}
+	f := &eoBlockedFixture{rec: parent}
+	f.app = eoMountBlocked(svc, records, user)
+
+	for _, tc := range []struct {
+		name string
+		call func(*testing.T) (int, string)
+		want int
+	}{
+		{"available transitions", f.get, fiber.StatusOK},
+		{"the refusal", f.post, fiber.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := tc.call(t)
+			if status != tc.want {
+				t.Fatalf("status = %d, want %d: %s", status, tc.want, body)
+			}
+			if strings.Contains(body, forbidden.Reference) || strings.Contains(body, forbidden.ID.String()) {
+				t.Fatalf("a blocker in a register the caller holds no view code on is NAMED: %s", body)
+			}
+			if !strings.Contains(body, readable.Reference) {
+				t.Errorf("the blocker the caller CAN read is missing, so the split proves nothing: %s", body)
+			}
+			if !strings.Contains(body, `"blocking_hidden_count":1`) {
+				t.Errorf("body = %s, want blocking_hidden_count 1", body)
+			}
+		})
+	}
 }
