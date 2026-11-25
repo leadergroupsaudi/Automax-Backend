@@ -117,3 +117,18 @@ func EOSequenceScope(pattern string, parentRef string, year int) (string, error)
 	}
 	return pattern + "|" + strconv.Itoa(year), nil
 }
+
+// EOParentRefFits reports whether pattern can render against ref: the same
+// test RenderReference applies, asked as a question. A pattern that is not
+// parent-derived has no parent to fit and reports false. The expectation is
+// read from the pattern (its segments before the suffix), never hard-coded.
+func EOParentRefFits(pattern, ref string) (bool, error) {
+	p, err := parseEOPattern(pattern)
+	if err != nil {
+		return false, err
+	}
+	if !p.derived || ref == "" {
+		return false, nil
+	}
+	return len(strings.Split(ref, "-")) == len(p.segments)-1, nil
+}

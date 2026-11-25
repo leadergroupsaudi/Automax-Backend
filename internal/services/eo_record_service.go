@@ -1210,8 +1210,14 @@ func (s *eoRecordService) allocateReference(ctx context.Context, rec *models.EOR
 		return fmt.Errorf("create eo record: record type %q has no reference pattern", t.Key)
 	}
 	parentRef := ""
-	if parent != nil {
-		parentRef = parent.Reference
+	// Only a parent-derived pattern reads the parent; an own-sequence pattern
+	// ignores it, as before.
+	if parent != nil && strings.Contains(pattern, "#") {
+		var err error
+		parentRef, err = s.resolveParentReference(ctx, t, pattern, parent)
+		if err != nil {
+			return err
+		}
 	}
 	year := time.Now().Year()
 	scope, err := EOSequenceScope(pattern, parentRef, year)
@@ -1228,6 +1234,38 @@ func (s *eoRecordService) allocateReference(ctx context.Context, rec *models.EOR
 	}
 	rec.Reference = ref
 	return nil
+}
+
+// resolveParentReference walks up from the immediate parent and returns the
+// reference of the nearest ancestor the pattern can render against (asked of
+// the pattern via EOParentRefFits). The immediate parent is tried first, so a
+// record created directly under the type the pattern names numbers as before.
+// The sequence counter is keyed by the reference returned here, so siblings
+// reached through different intermediate parents share one counter.
+func (s *eoRecordService) resolveParentReference(ctx context.Context, t *models.EORecordType, pattern string, parent *models.EORecord) (string, error) {
+	seen := map[uuid.UUID]bool{}
+	var tried []string
+	for cur := parent; cur != nil && !seen[cur.ID]; {
+		seen[cur.ID] = true
+		fits, err := EOParentRefFits(pattern, cur.Reference)
+		if err != nil {
+			return "", fmt.Errorf("create eo record of type %q: %w", t.Key, err)
+		}
+		if fits {
+			return cur.Reference, nil
+		}
+		tried = append(tried, cur.Reference)
+		if cur.ParentRecordID == nil {
+			break
+		}
+		next, err := s.records.GetAnyByID(ctx, *cur.ParentRecordID)
+		if err != nil {
+			return "", fmt.Errorf("create eo record of type %q: load ancestor: %w", t.Key, err)
+		}
+		cur = next
+	}
+	segs := len(strings.Split(pattern, "-")) - 1
+	return "", fmt.Errorf("create eo record of type %q: pattern %q needs an ancestor whose reference has %d segments, and none of the chain %q has one", t.Key, pattern, segs, tried)
 }
 
 // applyLinkRules writes the typed link to the parent and applies the rules the

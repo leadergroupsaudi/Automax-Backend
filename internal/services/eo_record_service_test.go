@@ -2147,3 +2147,79 @@ func TestEOAWaiterDoesNotInheritTheLeadersCancellation(t *testing.T) {
 		t.Errorf("ListFiles calls = %d, want 2: the leader's cancelled one, then the waiter's own", len(client.lists))
 	}
 }
+
+// referenceFixture builds a directive -> plan chain for "EO-DIR-YYYY-NNN-A#".
+func eoRefChain(t *testing.T, f *eoSvcFixture, planRefs ...string) (dir *models.EORecord, plans []*models.EORecord) {
+	t.Helper()
+	f.recordType.ReferenceMode = models.EOReferenceModeParent
+	f.recordType.ReferencePattern = "EO-DIR-YYYY-NNN-A#"
+	dir = &models.EORecord{ID: uuid.New(), Reference: "EO-DIR-2026-001"}
+	f.records.stored[dir.ID] = dir
+	for _, r := range planRefs {
+		p := &models.EORecord{ID: uuid.New(), Reference: r, ParentRecordID: &dir.ID}
+		f.records.stored[p.ID] = p
+		plans = append(plans, p)
+	}
+	return
+}
+
+func TestAllocateReference_AssignmentUnderDirectiveIsUnchanged(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	dir, _ := eoRefChain(t, f)
+	s := f.svc.(*eoRecordService)
+	rec := &models.EORecord{}
+	if err := s.allocateReference(context.Background(), rec, f.recordType, dir); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Reference != "EO-DIR-2026-001-A1" {
+		t.Errorf("reference = %q", rec.Reference)
+	}
+}
+
+func TestAllocateReference_AssignmentUnderPlanNumbersFromTheDirective(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	_, plans := eoRefChain(t, f, "EO-DIR-2026-001-P1", "EO-DIR-2026-001-P2")
+	s := f.svc.(*eoRecordService)
+	// Two assignments under DIFFERENT plans of one directive, plus one directly
+	// under the directive, share the directive's counter.
+	var got []string
+	for _, p := range []*models.EORecord{plans[1], plans[0], plans[1]} {
+		rec := &models.EORecord{}
+		if err := s.allocateReference(context.Background(), rec, f.recordType, p); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, rec.Reference)
+	}
+	want := []string{"EO-DIR-2026-001-A1", "EO-DIR-2026-001-A2", "EO-DIR-2026-001-A3"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v", got, want)
+			break
+		}
+	}
+	if len(f.sequences.counters) != 1 {
+		t.Errorf("counters = %v, want one shared scope", f.sequences.counters)
+	}
+}
+
+func TestAllocateReference_RefusesWhenNoAncestorFits(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	f.recordType.ReferenceMode = models.EOReferenceModeParent
+	f.recordType.ReferencePattern = "EO-DIR-YYYY-NNN-A#"
+	root := &models.EORecord{ID: uuid.New(), Reference: "EO-X-1-2-3"}
+	mid := &models.EORecord{ID: uuid.New(), Reference: "EO-X-1-2-3-P1", ParentRecordID: &root.ID}
+	f.records.stored[root.ID], f.records.stored[mid.ID] = root, mid
+	s := f.svc.(*eoRecordService)
+	err := s.allocateReference(context.Background(), &models.EORecord{}, f.recordType, mid)
+	if err == nil {
+		t.Fatal("want refusal")
+	}
+	for _, w := range []string{"EO-DIR-YYYY-NNN-A#", "4 segments", "EO-X-1-2-3-P1"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q lacks %q", err, w)
+		}
+	}
+	if len(f.sequences.scopes) != 0 {
+		t.Errorf("a number was burned: %v", f.sequences.scopes)
+	}
+}
