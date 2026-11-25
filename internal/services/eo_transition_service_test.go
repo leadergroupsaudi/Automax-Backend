@@ -2287,3 +2287,88 @@ func TestCloseParentCheckRefusesAnEmptyTransition(t *testing.T) {
 		})
 	}
 }
+
+// ── a transition says why it cannot run ─────────────────────────────────────
+
+func eoTxByCode(t *testing.T, trs []models.WorkflowTransition, code string) models.WorkflowTransition {
+	t.Helper()
+	for _, tr := range trs {
+		if tr.Code == code {
+			return tr
+		}
+	}
+	t.Fatalf("transition %q not offered (have %v)", code, eoTxCodes(trs))
+	return models.WorkflowTransition{}
+}
+
+func TestAvailableTransitionsMarksBlockedOnes(t *testing.T) {
+	newFixture := func(t *testing.T) *eoTxFixture {
+		t.Helper()
+		f := eoNewTxFixture(t)
+		f.types.linkTypes["assignment_of"] = &models.EOLinkType{Key: "assignment_of", BlocksParentClosure: true}
+		f.types.linkTypes["objection_to"] = &models.EOLinkType{Key: "objection_to", BlocksParentTransitionKey: "raise"}
+		return f
+	}
+
+	t.Run("an open blocking child marks the move it blocks, with its reference", func(t *testing.T) {
+		f := newFixture(t)
+		child := f.addChild("assignment_of", false)
+		got, err := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		if err != nil {
+			t.Fatalf("available: %v", err)
+		}
+		closeTr := eoTxByCode(t, got, "close")
+		if !closeTr.Blocked || len(closeTr.BlockedBy) != 1 || closeTr.BlockedBy[0].Reference != child.Reference {
+			t.Errorf("close = blocked %v by %v, want blocked by %q", closeTr.Blocked, closeTr.BlockedBy, child.Reference)
+		}
+		if raise := eoTxByCode(t, got, "raise"); raise.Blocked {
+			t.Error("raise is marked blocked by a blocks_parent_closure child")
+		}
+	})
+
+	t.Run("the offer and the refusal come from one rule", func(t *testing.T) {
+		f := newFixture(t)
+		f.addChild("objection_to", false)
+		got, err := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		if err != nil {
+			t.Fatalf("available: %v", err)
+		}
+		for _, code := range []string{"raise", "close"} {
+			offered := eoTxByCode(t, got, code)
+			_, runErr := f.run(code, f.actor, models.EOTransitionInput{Values: map[string]any{"closure_note": "done"}})
+			if offered.Blocked != errors.Is(runErr, ErrEOTransitionBlocked) {
+				t.Errorf("%s: offered blocked=%v but Execute returned %v", code, offered.Blocked, runErr)
+			}
+		}
+	})
+
+	t.Run("a closed child, or none, blocks nothing", func(t *testing.T) {
+		f := newFixture(t)
+		got, _ := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		for _, tr := range got {
+			if tr.Blocked || len(tr.BlockedBy) != 0 {
+				t.Errorf("%s blocked with no children", tr.Code)
+			}
+		}
+		f.addChild("assignment_of", true)
+		got, _ = f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		for _, tr := range got {
+			if tr.Blocked {
+				t.Errorf("%s blocked by a closed child", tr.Code)
+			}
+		}
+	})
+
+	t.Run("the refusal carries the blocking records", func(t *testing.T) {
+		f := newFixture(t)
+		child := f.addChild("assignment_of", false)
+		_, err := f.run("close", f.actor, models.EOTransitionInput{Values: map[string]any{"closure_note": "done"}})
+		var be *EOTransitionBlockedError
+		if !errors.As(err, &be) || len(be.Blocked) != 1 || be.Blocked[0].ID != child.ID {
+			t.Fatalf("err = %v, want *EOTransitionBlockedError naming the child", err)
+		}
+		if !errors.Is(err, ErrEOTransitionBlocked) {
+			t.Error("typed error no longer matches ErrEOTransitionBlocked")
+		}
+	})
+}

@@ -280,6 +280,16 @@ type WorkflowTransition struct {
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+
+	// Computed per record by the EO available-transitions read; never stored.
+	// BlockedBy holds every blocking child and is json:"-" on purpose: naming a
+	// child the caller cannot see discloses a record §7.11 conceals. The handler
+	// fills BlockingReferences with the VISIBLE ones and BlockingHiddenCount with
+	// the rest, which are counted and never named.
+	Blocked             bool       `gorm:"-" json:"blocked,omitempty"`
+	BlockedBy           []EORecord `gorm:"-" json:"-"`
+	BlockingReferences  []string   `gorm:"-" json:"blocking_references,omitempty"`
+	BlockingHiddenCount int        `gorm:"-" json:"blocking_hidden_count,omitempty"`
 }
 
 func (t *WorkflowTransition) BeforeCreate(tx *gorm.DB) error {

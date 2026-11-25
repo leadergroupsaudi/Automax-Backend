@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -1488,4 +1489,147 @@ func TestEOChildrenReportTheFullCountWhenTruncated(t *testing.T) {
 	if out.Page != 1 || out.Limit != eoDefaultPageLimit {
 		t.Errorf("page/limit = %d/%d, want 1/%d: the client needs both to ask for the rest", out.Page, out.Limit, eoDefaultPageLimit)
 	}
+}
+
+// ── blocked transitions: counted, never named, when the caller cannot see them ──
+
+type eoBlockedFixture struct {
+	app                  *fiber.App
+	rec                  *models.EORecord
+	visible, hiddenChild models.EORecord
+}
+
+func eoNewBlockedFixture(t *testing.T, svc *eoFakeTransitionService) *eoBlockedFixture {
+	t.Helper()
+	f := &eoBlockedFixture{
+		rec:         &models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "IN-2026-0003"},
+		visible:     models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "IN-2026-0003-R1"},
+		hiddenChild: models.EORecord{ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "IN-2026-0003-R2-SECRET"},
+	}
+	// The caller may open the parent and R1 only.
+	records := &eoFakeRecordRepo{anyByID: f.rec, visibleIDs: map[uuid.UUID]bool{f.rec.ID: true, f.visible.ID: true}}
+	h := NewEORecordHandler(&eoFakeRecordService{}, svc, records, &eoFakeTypeRepo{})
+	f.app = fiber.New()
+	f.app.Use(eoTestActor(&models.User{ID: uuid.New()}))
+	f.app.Get("/eo-records/:id/transitions", h.AvailableTransitions)
+	f.app.Post("/eo-records/:id/transition", h.Transition)
+	return f
+}
+
+func (f *eoBlockedFixture) get(t *testing.T) (int, string) {
+	t.Helper()
+	resp, err := f.app.Test(httptest.NewRequest("GET", "/eo-records/"+f.rec.ID.String()+"/transitions", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func (f *eoBlockedFixture) post(t *testing.T) (int, string) {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{"transition_id": uuid.New().String()})
+	req := httptest.NewRequest("POST", "/eo-records/"+f.rec.ID.String()+"/transition", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := f.app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestTransitionBlockedRefusalNamesTheBlockingRecords(t *testing.T) {
+	// Baseline: the sentence of a plain refusal, which must not change.
+	plain := eoNewBlockedFixture(t, &eoFakeTransitionService{executeErr: services.ErrEOTransitionBlocked})
+	_, plainBody := plain.post(t)
+	var plainOut struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(plainBody), &plainOut); err != nil || plainOut.Error == "" {
+		t.Fatalf("baseline body %q: %v", plainBody, err)
+	}
+
+	svc := &eoFakeTransitionService{}
+	f := eoNewBlockedFixture(t, svc)
+	svc.executeErr = &services.EOTransitionBlockedError{Code: "close", Blocked: []models.EORecord{f.visible}}
+	status, body := f.post(t)
+	if status != fiber.StatusConflict {
+		t.Fatalf("status = %d, want 409", status)
+	}
+	var out struct {
+		Success bool     `json:"success"`
+		Error   string   `json:"error"`
+		Refs    []string `json:"blocking_references"`
+		Hidden  int      `json:"blocking_hidden_count"`
+	}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatalf("decode %q: %v", body, err)
+	}
+	if out.Error != plainOut.Error {
+		t.Errorf("sentence changed: %q, was %q", out.Error, plainOut.Error)
+	}
+	if out.Success || len(out.Refs) != 1 || out.Refs[0] != f.visible.Reference || out.Hidden != 0 {
+		t.Errorf("body = %s, want the visible reference and no hidden count", body)
+	}
+}
+
+func TestBlockedReasonHidesInvisibleChildren(t *testing.T) {
+	svc := &eoFakeTransitionService{}
+	f := eoNewBlockedFixture(t, svc)
+	mixed := []models.EORecord{f.visible, f.hiddenChild}
+	svc.executeErr = &services.EOTransitionBlockedError{Code: "close", Blocked: mixed}
+	svc.available = []models.WorkflowTransition{{ID: uuid.New(), Code: "close", Blocked: true, BlockedBy: mixed}}
+
+	t.Run("refusal: visible named, hidden counted, never named", func(t *testing.T) {
+		_, body := f.post(t)
+		if strings.Contains(body, f.hiddenChild.Reference) || strings.Contains(body, f.hiddenChild.ID.String()) {
+			t.Fatalf("the refusal leaks a child the caller cannot see: %s", body)
+		}
+		var out struct {
+			Refs   []string `json:"blocking_references"`
+			Hidden int      `json:"blocking_hidden_count"`
+		}
+		_ = json.Unmarshal([]byte(body), &out)
+		if len(out.Refs) != 1 || out.Refs[0] != f.visible.Reference || out.Hidden != 1 {
+			t.Errorf("body = %s, want [R1] and hidden 1", body)
+		}
+	})
+
+	t.Run("available transitions: same split, no leak", func(t *testing.T) {
+		status, body := f.get(t)
+		if status != fiber.StatusOK {
+			t.Fatalf("status = %d", status)
+		}
+		if strings.Contains(body, f.hiddenChild.Reference) || strings.Contains(body, f.hiddenChild.ID.String()) {
+			t.Fatalf("available transitions leak a hidden child: %s", body)
+		}
+		var out struct {
+			Data []struct {
+				Blocked bool     `json:"blocked"`
+				Refs    []string `json:"blocking_references"`
+				Hidden  int      `json:"blocking_hidden_count"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal([]byte(body), &out)
+		if len(out.Data) != 1 || !out.Data[0].Blocked || len(out.Data[0].Refs) != 1 || out.Data[0].Hidden != 1 {
+			t.Errorf("body = %s, want blocked, [R1], hidden 1", body)
+		}
+	})
+
+	t.Run("all hidden: a count only", func(t *testing.T) {
+		svc.executeErr = &services.EOTransitionBlockedError{Code: "close", Blocked: []models.EORecord{f.hiddenChild}}
+		_, body := f.post(t)
+		if strings.Contains(body, f.hiddenChild.Reference) {
+			t.Fatalf("leak: %s", body)
+		}
+		var out struct {
+			Refs   []string `json:"blocking_references"`
+			Hidden int      `json:"blocking_hidden_count"`
+		}
+		_ = json.Unmarshal([]byte(body), &out)
+		if out.Refs == nil || len(out.Refs) != 0 || out.Hidden != 1 {
+			t.Errorf("body = %s, want [] and hidden 1", body)
+		}
+	})
 }

@@ -590,7 +590,81 @@ func (h *EORecordHandler) AvailableTransitions(c *fiber.Ctx) error {
 	if out == nil {
 		out = []models.WorkflowTransition{}
 	}
+	// A blocked move is offered WITH its reason, but the reason is filtered by
+	// what this caller may see. Several transitions share the same blockers, so
+	// each blocker is probed once.
+	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[uuid.UUID]bool{}}
+	for i := range out {
+		if len(out[i].BlockedBy) == 0 {
+			continue
+		}
+		refs, hidden, err := probe.split(out[i].BlockedBy)
+		if err != nil {
+			return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+		}
+		out[i].BlockingReferences, out[i].BlockingHiddenCount = refs, hidden
+	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_transitions_retrieved"), out)
+}
+
+// eoBlockerProbe splits blocking children into the ones the caller may open and
+// the ones it may not, asking the register's own visibility rule
+// (eoVisibleScoped) rather than a copy of it.
+type eoBlockerProbe struct {
+	h    *EORecordHandler
+	c    *fiber.Ctx
+	user *models.User
+	seen map[uuid.UUID]bool
+}
+
+// split returns the references of the blockers the caller can see, and a COUNT
+// of the rest. A blocker the caller cannot see is counted, never named: its
+// reference would disclose a record §7.11 conceals. When the caller sees some
+// and not others, it is shown the visible references and the count of the
+// remainder, so the total always adds up and nothing hidden is identifiable.
+func (p *eoBlockerProbe) split(blocked []models.EORecord) ([]string, int, error) {
+	refs := []string{}
+	hidden := 0
+	for i := range blocked {
+		b := &blocked[i]
+		visible, known := p.seen[b.ID]
+		if !known {
+			v, err := eoVisibleScoped(p.c, p.h.records, b, p.user)
+			if err != nil {
+				return nil, 0, err
+			}
+			visible = v
+			p.seen[b.ID] = v
+		}
+		if visible {
+			refs = append(refs, b.Reference)
+		} else {
+			hidden++
+		}
+	}
+	return refs, hidden, nil
+}
+
+// eoBlockedRefusal is the 409 body of a blocked transition: the fixed sentence
+// exactly as before (success, error), with the blockers added BESIDE it.
+type eoBlockedRefusal struct {
+	Success             bool     `json:"success"`
+	Error               string   `json:"error"`
+	BlockingReferences  []string `json:"blocking_references"`
+	BlockingHiddenCount int      `json:"blocking_hidden_count"`
+}
+
+func (h *EORecordHandler) eoBlockedResponse(c *fiber.Ctx, user *models.User, blocked *services.EOTransitionBlockedError) error {
+	probe := eoBlockerProbe{h: h, c: c, user: user, seen: map[uuid.UUID]bool{}}
+	refs, hidden, err := probe.split(blocked.Blocked)
+	if err != nil {
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	message := i18n.T(c.UserContext(), "eo_transition_blocked")
+	c.Locals(utils.LocalErrorMessage, message)
+	return c.Status(fiber.StatusConflict).JSON(eoBlockedRefusal{
+		Error: message, BlockingReferences: refs, BlockingHiddenCount: hidden,
+	})
 }
 
 // eoTransitionRequest is the transition modal's payload: which transition, and
@@ -622,6 +696,10 @@ func (h *EORecordHandler) Transition(c *fiber.Ctx) error {
 	}
 	out, err := h.transitions.Execute(c.UserContext(), rec, req.TransitionID, user, req.EOTransitionInput)
 	if err != nil {
+		var blocked *services.EOTransitionBlockedError
+		if errors.As(err, &blocked) {
+			return h.eoBlockedResponse(c, user, blocked)
+		}
 		return eoServiceError(c, err)
 	}
 	return utils.SuccessResponse(c, fiber.StatusOK, i18n.T(c.UserContext(), "eo_transition_executed"), out)

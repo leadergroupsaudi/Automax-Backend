@@ -119,8 +119,10 @@ type EOTransitionActionDispatcher interface {
 type EOTransitionService interface {
 	// AvailableTransitions lists the transitions out of the record's current
 	// state that this actor is permitted to run. It answers "who may act",
-	// not "would it succeed": requirements, field values and blocking
-	// children are evaluated by Execute, against the input the actor supplies.
+	// not "would it succeed": requirements and field values are evaluated by
+	// Execute, against the input the actor supplies. Blocking children need no
+	// input, so they ARE reported: each transition carries Blocked and BlockedBy
+	// (json:"-" — the handler names only the blockers the caller may see).
 	AvailableTransitions(ctx context.Context, rec *models.EORecord, actor *models.User) ([]models.WorkflowTransition, error)
 	Execute(ctx context.Context, rec *models.EORecord, transitionID uuid.UUID, actor *models.User, input models.EOTransitionInput) (*models.EORecord, error)
 }
@@ -201,7 +203,20 @@ func (s *eoTransitionService) AvailableTransitions(ctx context.Context, rec *mod
 		}
 		switch err := s.checkActor(ctx, s.records, rec, tr, actor); {
 		case err == nil:
-			out = append(out, *tr)
+			// The same rule Execute refuses on, asked now so the offer and the
+			// refusal cannot disagree. A failure to ask is a failure, not "free".
+			toState := eoStateByID(wf, tr.ToStateID)
+			if toState == nil {
+				return nil, fmt.Errorf("available transitions: target state %s of transition %q is not a state of workflow %q", tr.ToStateID, tr.Code, wf.Code)
+			}
+			blocked, err := s.blockingChildren(ctx, s.records, s.types, rec, tr, toState)
+			if err != nil {
+				return nil, fmt.Errorf("available transitions: blocking children of %s for %q: %w", rec.ID, tr.Code, err)
+			}
+			out0 := *tr
+			out0.Blocked = len(blocked) > 0
+			out0.BlockedBy = blocked
+			out = append(out, out0)
 		case errors.Is(err, ErrEOTransitionNotPermitted):
 			// Not for this actor; not an error.
 		default:
@@ -1035,19 +1050,34 @@ func eoStoredAttachmentValues(rec *models.EORecord) []any {
 // are both inside it, so a transitive descendant set would silently stop
 // blocking.
 func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) error {
-	children, err := r.Children(ctx, rec.ID, nil)
+	blocked, err := s.blockingChildren(ctx, r, types, rec, transition, toState)
 	if err != nil {
 		return err
 	}
+	if len(blocked) > 0 {
+		return eoBlockedError(transition.Code, blocked)
+	}
+	return nil
+}
+
+// blockingChildren is THE blocking rule: the open children that stop this
+// transition, named question first and closure question second, each child
+// once. Execute refuses on it and AvailableTransitions reports it; there is no
+// second implementation to drift.
+func (s *eoTransitionService) blockingChildren(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) ([]models.EORecord, error) {
+	children, err := r.Children(ctx, rec.ID, nil)
+	if err != nil {
+		return nil, err
+	}
 	if len(children) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// A link's direction varies by link type (Task.parent_record points child
 	// to parent, spawned_task points parent to child), so both ends are read.
 	links, err := r.LinksFrom(ctx, rec.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	seen := make(map[uuid.UUID]bool, len(links))
 	for _, l := range links {
@@ -1056,7 +1086,7 @@ func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repos
 	for _, c := range children {
 		fromChild, err := r.LinksFrom(ctx, c.ID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, l := range fromChild {
 			if !seen[l.ID] {
@@ -1073,7 +1103,7 @@ func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repos
 		}
 		lt, err := types.GetLinkTypeByKey(ctx, l.LinkTypeKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if lt != nil {
 			linkTypes[l.LinkTypeKey] = *lt
@@ -1082,25 +1112,46 @@ func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repos
 
 	// An empty transition key asks the CLOSURE question, so the named check
 	// is only run for a transition that has a code to be named by.
-	if transition.Code != "" {
-		if blocked := BlockingChildren(children, links, linkTypes, transition.Code); len(blocked) > 0 {
-			return eoBlockedError(transition.Code, blocked)
+	var out []models.EORecord
+	have := map[uuid.UUID]bool{}
+	add := func(blocked []models.EORecord) {
+		for _, b := range blocked {
+			if !have[b.ID] {
+				have[b.ID] = true
+				out = append(out, b)
+			}
 		}
+	}
+	if transition.Code != "" {
+		add(BlockingChildren(children, links, linkTypes, transition.Code))
 	}
 	if IsTerminal(toState) {
-		if blocked := BlockingChildren(children, links, linkTypes, ""); len(blocked) > 0 {
-			return eoBlockedError(transition.Code, blocked)
-		}
+		add(BlockingChildren(children, links, linkTypes, ""))
 	}
-	return nil
+	return out, nil
 }
 
-func eoBlockedError(code string, blocked []models.EORecord) error {
-	refs := make([]string, 0, len(blocked))
-	for _, b := range blocked {
+// EOTransitionBlockedError is ErrEOTransitionBlocked carrying the blocking
+// records. Its text is the historical one. The records are for the HANDLER, and
+// only after it has filtered them by what the caller may see: a blocker the
+// caller cannot see is counted, never named.
+type EOTransitionBlockedError struct {
+	Code    string
+	Blocked []models.EORecord
+}
+
+func (e *EOTransitionBlockedError) Error() string {
+	refs := make([]string, 0, len(e.Blocked))
+	for _, b := range e.Blocked {
 		refs = append(refs, b.Reference)
 	}
-	return fmt.Errorf("transition %q: %w: %s", code, ErrEOTransitionBlocked, strings.Join(refs, ", "))
+	return fmt.Sprintf("transition %q: %v: %s", e.Code, ErrEOTransitionBlocked, strings.Join(refs, ", "))
+}
+
+func (e *EOTransitionBlockedError) Unwrap() error { return ErrEOTransitionBlocked }
+
+func eoBlockedError(code string, blocked []models.EORecord) error {
+	return &EOTransitionBlockedError{Code: code, Blocked: blocked}
 }
 
 // ── field changes ───────────────────────────────────────────────────────────
