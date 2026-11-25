@@ -2282,3 +2282,63 @@ func TestCreateRefusedByTheLinkTypeBurnsNoNumber(t *testing.T) {
 		t.Errorf("reference = %q, want A1 (nothing burned)", rec.Reference)
 	}
 }
+
+// The headline behaviour of the reference work, end to end through Create with
+// the fakes: an Assignment may hang from an Execution Plan, and numbers from
+// the Directive it descends from, on the Directive's counter.
+func TestCreateAssignmentUnderExecutionPlanNumbersFromTheDirective(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	dirType := f.recordType
+	// The plan and assignment types inherit the directive's fields (the
+	// fixture's definitions live on it), as the pilot's child types do.
+	mk := func(key, pattern string) *models.EORecordType {
+		ty := f.types.add(&models.EORecordType{
+			Key: key, Name: key, IsActive: true, ParentTypeID: &dirType.ID,
+			ReferenceMode: models.EOReferenceModeParent, ReferencePattern: pattern,
+		})
+		wf := eoWfBound("wf-"+key, &ty.ID, "incident")
+		wf.States = []models.WorkflowState{f.initial}
+		f.workflows.workflows = append(f.workflows.workflows, wf)
+		return ty
+	}
+	planType := mk("eo_execution_plan", "EO-DIR-YYYY-NNN-P#")
+	asgType := mk("eo_assignment", "EO-DIR-YYYY-NNN-A#")
+	f.types.linkTypes["plan_parent"] = &models.EOLinkType{
+		ID: uuid.New(), Key: "plan_parent", Label: "Plan of",
+		SourceTypeIDs: eoLinkTypeIDs(t, []string{planType.ID.String()}),
+		TargetTypeIDs: eoLinkTypeIDs(t, []string{dirType.ID.String()}),
+		Cardinality:   models.EOCardinalityOne,
+	}
+	f.types.linkTypes["asg_parent"] = &models.EOLinkType{
+		ID: uuid.New(), Key: "asg_parent", Label: "Assignment of",
+		SourceTypeIDs: eoLinkTypeIDs(t, []string{asgType.ID.String()}),
+		TargetTypeIDs: eoLinkTypeIDs(t, []string{dirType.ID.String(), planType.ID.String()}),
+		Cardinality:   models.EOCardinalityOne,
+	}
+	ctx := context.Background()
+	create := func(ty *models.EORecordType, parent *models.EORecord, link string) *models.EORecord {
+		t.Helper()
+		req := &models.EORecordCreateRequest{RecordTypeID: ty.ID, Values: map[string]any{"subject_ar": "x"}}
+		if parent != nil {
+			req.ParentRecordID, req.ParentLinkTypeKey = &parent.ID, link
+		}
+		rec, err := f.svc.Create(ctx, req, f.actor)
+		if err != nil {
+			t.Fatalf("create %s: %v", ty.Key, err)
+		}
+		return rec
+	}
+	dir := create(dirType, nil, "")
+	plan := create(planType, dir, "plan_parent")
+	if want := dir.Reference + "-P1"; plan.Reference != want {
+		t.Fatalf("plan reference = %q, want %q", plan.Reference, want)
+	}
+	a1 := create(asgType, plan, "asg_parent")
+	a2 := create(asgType, plan, "asg_parent")
+	a3 := create(asgType, dir, "asg_parent") // directly under the directive: same counter
+	for i, got := range []string{a1.Reference, a2.Reference, a3.Reference} {
+		if want := fmt.Sprintf("%s-A%d", dir.Reference, i+1); got != want {
+			t.Errorf("assignment %d reference = %q, want %q", i+1, got, want)
+		}
+	}
+}

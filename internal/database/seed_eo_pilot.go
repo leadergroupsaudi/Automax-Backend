@@ -2330,13 +2330,13 @@ var eoPilotChildTypes = []eoPilotTypeSpec{
 		mode: models.EOReferenceModeParent, prefix: "",
 		// The matrix says "Sub of Execution Plan, OR of Directive directly"
 		// and gives one pattern, EO-DIR-YYYY-NNN-A#, whose parent segment
-		// count is the Directive's. An assignment created under a PLAN
-		// (EO-DIR-2026-001-P1, five segments) is refused by RenderReference,
-		// which checks the parent reference's segment count against the
-		// pattern. That is the matrix's own tension, not a seeding choice;
-		// the report carries it, and the conservative reading — the pattern
-		// the client wrote — is what is seeded, because ValidateTypeEdit
-		// makes a pattern change destructive once records exist.
+		// count is the Directive's. That is not a conflict: the reference is
+		// resolved against the nearest ancestor the pattern can render
+		// against (services.eoRecordService.resolveParentReference), so an
+		// assignment created under a PLAN (EO-DIR-2026-001-P1, five
+		// segments) numbers from the Directive (EO-DIR-2026-001-A<n>), on the
+		// Directive's counter, exactly as one created under it directly.
+		// The pattern is seeded as the client wrote it.
 		pattern: "EO-DIR-YYYY-NNN-A#",
 		fields: []eoPilotFieldSpec{
 			{matrixKey: "assigned_body", label: "Assigned body",

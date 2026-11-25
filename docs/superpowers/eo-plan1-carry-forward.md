@@ -266,10 +266,9 @@ referral, under the client's own pattern.** The matrix gives Referral a
 `parent_referral` row ("a sub-referral stays visible in the parent letter's
 tree", matrix:304), and `services.RenderReference` refuses it: `IN-YYYY-NNNN-R#`
 is read as a three-segment parent reference plus one segment, so a referral
-created under `IN-2026-0001-R1` failed at `allocateReference` with "expects a
+created under `IN-2026-0001-R1` fails at `allocateReference` with "expects a
 parent reference of 3 segments, IN-2026-0001-R1 has 4" — **before** any link
-rule was consulted. (SUPERSEDED by Task B1: numbering now walks to the letter
-and the link type's target list refuses it, before a number is drawn.) A4 therefore seeded `eo_referral_parent` with the LETTER as
+rule is consulted. A4 therefore seeded `eo_referral_parent` with the LETTER as
 its only target (a Referral target would have been a permission nothing could
 ever use) and pinned the refusal in
 `TestEoPilotReferralUnderALetterInheritsItsDeadline`. The consequence to put to
@@ -1250,3 +1249,6 @@ Each was raised by a task review and deliberately not fixed. File references are
 - **T19** — no test proves the real eoOrderClause returns ErrEOUnsupportedSort for a bad sort_dir; the handler test fakes the repository error.
 - **T20** — the e2e reads eo_timers with raw SQL rather than through the timer repository — not a §7.7 violation (that rule is about records, which the seed honours completely), but a repository call would survive a schema change.
 - **T20** — TestUpdateEORecordValidatesAgainstTheLockedRow proves less than its name says.
+
+
+**CORRECTION (2026-11-25, Plan 6 Task B1):** the Task A4 sub-referral entry and A3's "Assignment-under-a-plan tension" above are superseded. `allocateReference` now resolves a parent-derived reference against the nearest ancestor whose reference the pattern can render against, and `Create` applies the link rules before drawing a number. A referral under a referral is therefore refused by the link type's target list (`ValidateLink`), not by numbering, and burns no number; an Assignment under an Execution Plan numbers from its Directive (`EO-DIR-YYYY-NNN-A<n>`, on the Directive's counter). The A3 Assignment tension is closed (see the 2026-11-25 notes in the Plan 4 and 5 carry-forwards).
