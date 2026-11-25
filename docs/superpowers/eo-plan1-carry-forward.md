@@ -266,9 +266,10 @@ referral, under the client's own pattern.** The matrix gives Referral a
 `parent_referral` row ("a sub-referral stays visible in the parent letter's
 tree", matrix:304), and `services.RenderReference` refuses it: `IN-YYYY-NNNN-R#`
 is read as a three-segment parent reference plus one segment, so a referral
-created under `IN-2026-0001-R1` fails at `allocateReference` with "expects a
+created under `IN-2026-0001-R1` failed at `allocateReference` with "expects a
 parent reference of 3 segments, IN-2026-0001-R1 has 4" — **before** any link
-rule is consulted. A4 therefore seeded `eo_referral_parent` with the LETTER as
+rule was consulted. (SUPERSEDED by Task B1: numbering now walks to the letter
+and the link type's target list refuses it, before a number is drawn.) A4 therefore seeded `eo_referral_parent` with the LETTER as
 its only target (a Referral target would have been a permission nothing could
 ever use) and pinned the refusal in
 `TestEoPilotReferralUnderALetterInheritsItsDeadline`. The consequence to put to

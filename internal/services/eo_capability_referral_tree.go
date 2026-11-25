@@ -40,9 +40,9 @@ const EOReferralTreeKey = "referral_tree"
 //
 // HOW THE TREE IS BUILT, which is the thing most easily got wrong.
 // EVERY referral is a record-child of the LETTER, sub-referrals included: the
-// client's reference pattern IN-YYYY-NNNN-R# is a three-segment parent plus
-// one segment, so services.RenderReference refuses a referral created under
-// another referral before any link rule is consulted (Task A4). A
+// seeded link type's only target is the letter, so ValidateLink refuses a
+// referral created under another referral (Task A4). Numbering would not stop
+// it: the reference walk resolves against the letter. A
 // sub-referral's relationship to the branch it descends from is carried by the
 // `parent_referral` LINK FIELD on the referral — a value naming a SIBLING —
 // which A3 seeded and nothing has read until now.

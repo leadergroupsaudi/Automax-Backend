@@ -2999,13 +2999,12 @@ var eoPilotLinkTypes = []eoLinkTypeSpec{
 		key: eoAssignmentLinkKey, label: "Parent directive or execution plan",
 		childTypeKey: eoAssignmentTypeKey,
 		// "Sub of Execution Plan, or of Directive directly." (matrix:105)
-		// Both, in that order. The matrix's own tension — an Assignment
-		// numbered EO-DIR-YYYY-NNN-A# cannot be rendered under a five-segment
-		// plan reference — is A3's, is pinned by
-		// TestEoPilotReferencePatternsRenderAndRefuse, and is refused EARLIER
-		// than this rule (allocateReference runs before applyLinkRules). The
-		// link type states what the client's document states; narrowing it to
-		// the Directive alone would hide the tension rather than resolve it.
+		// Both, in that order. There is no tension: an Assignment numbered
+		// EO-DIR-YYYY-NNN-A# resolves its reference against the nearest
+		// ancestor the pattern can render against, so under a plan it numbers
+		// from the Directive (services.resolveParentReference). The link rules
+		// run BEFORE the number is drawn. The link type states what the
+		// client's document states.
 		parentTypeKeys: []string{eoDirectiveTypeKey, eoExecutionPlanTypeKey},
 		cardinality:    models.EOCardinalityOne,
 		blocksClosure:  true,
@@ -3286,7 +3285,7 @@ var eoLinkRuleDecisions = []eoLinkRuleDecision{
 		"Sub of Execution Plan, or of Directive directly. Blocks the parent from closing.",
 		"blocks_parent_closure, with BOTH parent types permitted",
 		"services.BlockingChildren with an empty transition key; the endpoint list is read by services.eoTypeAllowed through ValidateLink",
-		"Two target types, because the client's sentence names two. The matrix's own tension — the single pattern EO-DIR-YYYY-NNN-A# cannot be rendered under a five-segment plan reference — is NOT resolved here and is not this rule's to resolve: services.RenderReference refuses it at allocateReference, which runs BEFORE applyLinkRules, so the link type never sees that create. Narrowing the targets to the Directive would make the configuration agree with the numbering and disagree with the client. A3 pinned the refusal; A4/A5 put the question to the client."},
+		"Two target types, because the client's sentence names two. Numbering is not an obstacle to either: services.eoRecordService.resolveParentReference resolves EO-DIR-YYYY-NNN-A# against the nearest ancestor of the pattern's shape, so an Assignment under a plan numbers from the Directive (EO-DIR-YYYY-NNN-A#), exactly as under a Directive directly. The link rules run before a number is drawn."},
 
 	{eoObjectionLinkKey, eoObjectionTypeKey,
 		"Must be resolved or dismissed before the parent can go to H.E. Blocks the raising step, not closure.",
@@ -3304,7 +3303,7 @@ var eoLinkRuleDecisions = []eoLinkRuleDecision{
 		"Deadline derived from the parent, not typed. Blocks the parent from closing.",
 		fmt.Sprintf("derive_deadline_from_parent with an offset of %d days, and blocks_parent_closure", eoReferralDeadlineOffsetDays),
 		"services.DeriveDeadlineFromParent, called by applyLinkRules on create, writing the child's rec.DueDate column; and services.BlockingChildren for the closure half",
-		"THE RULE A3 LEFT UNARMED AND THIS TASK ARMS. Referral's `deadline` is the inherited due_date column, narrowed to provenance `auto` so no clerk may supply one (ValidateRecordValues refuses a submitted value for an auto field), and DeriveDeadlineFromParent is the only mechanism that fills it. Until this flag was seeded every Referral had an empty deadline and no way to acquire one — and an absent deadline is not an error anywhere in the engine, so nothing would have reported it. The offset is a READING of the matrix, not a client figure; see eoReferralDeadlineOffsetDays. The parent value it reads is populated because A2 made the letter's `sender_deadline` BE the due_date column and required it. THE TARGET IS THE LETTER ALONE, sub-referrals included: the client's pattern IN-YYYY-NNNN-R# cannot be rendered under a four-segment referral reference, so a referral under a referral is refused at allocateReference before this rule is reached, and the matrix carries the sub-referral on the `parent_referral` LINK FIELD instead. Every referral therefore counts back from the sender's deadline, which is what matrix:300 says."},
+		"THE RULE A3 LEFT UNARMED AND THIS TASK ARMS. Referral's `deadline` is the inherited due_date column, narrowed to provenance `auto` so no clerk may supply one (ValidateRecordValues refuses a submitted value for an auto field), and DeriveDeadlineFromParent is the only mechanism that fills it. Until this flag was seeded every Referral had an empty deadline and no way to acquire one — and an absent deadline is not an error anywhere in the engine, so nothing would have reported it. The offset is a READING of the matrix, not a client figure; see eoReferralDeadlineOffsetDays. The parent value it reads is populated because A2 made the letter's `sender_deadline` BE the due_date column and required it. THE TARGET IS THE LETTER ALONE, sub-referrals included: a referral under a referral is refused by THIS link type's target list (services.ValidateLink), which runs before a number is drawn, and the matrix carries the sub-referral on the `parent_referral` LINK FIELD instead. Every referral therefore counts back from the sender's deadline, which is what matrix:300 says."},
 
 	{eoOutgoingLinkKey, eoOutgoingTypeKey,
 		"Closes the parent. One per letter, however many rounds of direction it took.",

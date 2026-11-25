@@ -401,18 +401,21 @@ func TestEoPilotReferralUnderALetterInheritsItsDeadline(t *testing.T) {
 	})
 
 	// EVERY referral counts back from the LETTER, sub-referrals included: the
-	// client's pattern IN-YYYY-NNNN-R# cannot be rendered under a referral's
-	// own four-segment reference, so a referral under a referral is refused
-	// before any link rule runs — which is why the seeded link type targets
-	// the letter alone and the matrix carries the sub-referral on the
-	// `parent_referral` link field instead. This pins the refusal, so the
-	// narrow target list is a decision on record rather than an omission.
+	// seeded link type targets the letter alone, and the matrix carries the
+	// sub-referral on the `parent_referral` link field instead. A referral
+	// under a referral is refused by the LINK RULE (ValidateLink: the link
+	// type does not allow a referral as target). Create applies the link rules
+	// before drawing a reference, so the refusal burns no number. This pins
+	// the refusal, so the narrow target list is a decision on record rather
+	// than an omission.
+	// UNVERIFIED BY EXECUTION: this file skips without AUTOMAX_TEST_DB_DSN and
+	// the assertion below was changed by reading eo_links.go:84.
 	t.Run("a referral cannot be a record child of another referral", func(t *testing.T) {
 		_, err := f.eoPilotTryCreate(t, eoPilotReferralTypeKey, stored, eoPilotReferralLinkKey, nil)
 		if err == nil {
 			t.Fatalf("a sub-referral was created under a referral; the seeded target list should be widened to match")
 		}
-		if !strings.Contains(err.Error(), "segments") {
+		if !strings.Contains(err.Error(), "does not allow a target record of type") {
 			t.Errorf("refused for an unexpected reason: %v", err)
 		}
 	})
