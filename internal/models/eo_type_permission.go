@@ -31,6 +31,29 @@ const (
 	EOTypePermissionUpdate = "update"
 )
 
+// EOPermissionViewAllBodies is the module-level permission that lifts §7.11's
+// ROW-LEVEL body restriction (a record's visible_to) for the caller. It is
+// the oversight role's grant (decided with the client, 2026-11-25).
+//
+// IT COMPOSES; IT DOES NOT SUBSTITUTE. It is not a per-type code and grants
+// no register: the caller must still hold eo:<type_key>:view for every
+// register it reads, and this only removes the body restriction inside those.
+// Its shape (eo:records:view_all_bodies) is deliberately not eo:<key>:view, so
+// EOTypeKeysFromPermissionCodes cannot read it as a grant on a type.
+const EOPermissionViewAllBodies = "eo:records:view_all_bodies"
+
+// EOCanViewAllBodies reports whether the caller's permission codes include
+// EOPermissionViewAllBodies. It is the one place the handler asks, so the flag
+// on the filter is derived from the code and never set independently.
+func EOCanViewAllBodies(codes []string) bool {
+	for _, c := range codes {
+		if c == EOPermissionViewAllBodies {
+			return true
+		}
+	}
+	return false
+}
+
 // eoTypePermissionPrefix and the separator are split out so the builder and
 // the parser below cannot disagree about them.
 const eoTypePermissionPrefix = "eo:"

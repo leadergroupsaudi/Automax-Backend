@@ -684,6 +684,11 @@ var eoModulePermissions = []models.Permission{
 	{Name: "EO Delete Records", Code: "eo:delete", Module: "eo", Action: "delete", ActionAr: "حذف", Description: "Delete executive-office records"},
 	{Name: "EO Transition Records", Code: "eo:transition", Module: "eo", Action: "transition", ActionAr: "نقل", Description: "Move executive-office records between workflow stages"},
 	{Name: "EO Manage Record Types", Code: "eo:types:manage", Module: "eo", Action: "types:manage", ActionAr: "إدارة الأنواع", Description: "Create and configure executive-office record types"},
+	// Oversight (decided with the client, 2026-11-25): lifts the row-level
+	// body restriction (visible_to) inside the registers the holder may already
+	// see. It grants NO register: the per-type eo:<type_key>:view code is still
+	// required. See models.EOPermissionViewAllBodies.
+	{Name: "EO View Records Across Bodies", Code: models.EOPermissionViewAllBodies, Module: "eo", Action: "records:view_all_bodies", ActionAr: "عرض السجلات عبر الجهات", Description: "See executive-office records restricted to other bodies, in the registers the holder may already view (does not grant any register)"},
 }
 
 // eoSeededRole is one EO platform role as Seed creates it.

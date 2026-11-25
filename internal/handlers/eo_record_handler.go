@@ -265,6 +265,9 @@ func eoScopeFilter(filter *models.EORecordFilter, user *models.User) {
 	// MyAssigned, Children and the single-record visibility probe — carries
 	// them without each remembering to.
 	filter.PermissionCodes = user.PermissionCodes()
+	// The oversight grant, derived from the same codes and nowhere else: it
+	// lifts the body restriction only; the per-type gate above still applies.
+	filter.ViewAllBodies = models.EOCanViewAllBodies(filter.PermissionCodes)
 	filter.RecordID = nil
 }
 

@@ -131,6 +131,9 @@ func eoPilotDB(t *testing.T) *gorm.DB {
 	// workflows:view is created by Seed's permission block in production; the
 	// pilot seed grants it to eo_admin (Task B5).
 	eoSeedWorkflowsViewPermission(t, db)
+	// The oversight permission is created by Seed's permission block in
+	// production (eoModulePermissions); the oversight grant step needs it.
+	eoSeedOversightPermission(t, db)
 	if err := migrations.MigrateEOPlatform(db); err != nil {
 		t.Fatalf("create eo_records and its siblings: %v", err)
 	}
@@ -261,7 +264,7 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 		// executive_office. TestEoEveryConcreteTypeHasItsThreePermissions is
 		// what holds those rows to spec §7.11; this is the arithmetic that
 		// stops the smoke removal hiding behind them.
-		grants: before.grants - 12 + 6*int64(len(eoPilotTypeKeys)) + eoB5Grants,
+		grants: before.grants - 12 + 6*int64(len(eoPilotTypeKeys)) + eoB5Grants + eoOversightGrants,
 	}
 	want.perms = before.perms - 6 + 3*int64(len(eoPilotTypeKeys))
 	// Plan 1's two smoke workflows and its one-step escalation policy go;
@@ -384,7 +387,7 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			// theirs, while a type the case above invented does not.
 			pending := eoTypesAwaitingPermissions(t, db) + int64(len(eoPilotRootTypes)+len(eoPilotChildTypes))
 			want.perms += 3 * pending
-			want.grants += 6*pending + eoB5Grants
+			want.grants += 6*pending + eoB5Grants + eoOversightGrants
 			// And A6's removal of a field definition an enabled capability
 			// reserves.
 			want.fields -= int64(len(eoCapabilityReservedFieldRemovals))
@@ -4557,22 +4560,41 @@ func eoSeedWorkflowsViewPermission(t *testing.T, db *gorm.DB) {
 }
 
 // eoB5Grants is how many role_permissions rows Task B5 adds on a fresh seed:
-// 21 view + 9 update codes across the five process roles (counted from
+// 22 view + 9 update codes across the five process roles (counted from
 // eoWantRegisterView/Update below, which TestSeedEOPilot_EveryEORoleCanRead-
 // Something holds the seed to) plus workflows:view for eo_admin.
 //
-// It was 22 view until head_of_office's eo_referral view grant was dropped:
-// row-level visibility means it could never return a row. See the eo_referral
-// paragraph on eoProcessRoleRegisters.
-const eoB5Grants = 21 + 9 + 1
+// It was 21 view while head_of_office's eo_referral view grant was withheld
+// (row-level visibility meant it could never return a row); the client decided
+// on 2026-11-25 that oversight bypasses body-scoping, and it is 22 again. See
+// the head_of_office paragraph on eoProcessRoleRegisters.
+//
+// On a fresh seed the oversight step adds ONE further row on top of this:
+// eoOversightGrants (the permission; the referral view is already granted
+// here, and Append is idempotent).
+const eoB5Grants = 22 + 9 + 1
+
+// eoOversightGrants is the role_permissions rows eoGrantHeadOfOfficeOversight
+// adds on a fresh seed: eo:records:view_all_bodies for head_of_office.
+const eoOversightGrants = 1
+
+// eoSeedOversightPermission creates the oversight permission, which Seed
+// creates in production from eoModulePermissions.
+func eoSeedOversightPermission(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	p := models.Permission{Name: "EO View Records Across Bodies", Code: models.EOPermissionViewAllBodies, Module: "eo", Action: "records:view_all_bodies", IsActive: true}
+	if err := db.Where("code = ?", p.Code).FirstOrCreate(&p).Error; err != nil {
+		t.Fatalf("create %s: %v", p.Code, err)
+	}
+}
 
 // eoWantRegisterView / eoWantRegisterUpdate are WRITTEN OUT here, not derived
 // from eoProcessRoleRegisters, so editing the seed table without editing the
 // sign-off mapping fails a test.
 var eoWantRegisterView = map[string][]string{
-	// Ten registers, not eleven: eo_referral is deliberately absent because a
-	// view grant on it could never return a row for a body-less oversight role.
-	"head_of_office":     {"eo_assignment", "eo_decision_record", "eo_directive", "eo_draft_decision_study", "eo_execution_plan", "eo_execution_plan_stage", "eo_incoming_correspondence", "eo_objection", "eo_outgoing_reply", "eo_task"},
+	// All eleven: eo_referral was withheld until the client decided on
+	// 2026-11-25 that oversight bypasses body-scoping (eo:records:view_all_bodies).
+	"head_of_office":     {"eo_assignment", "eo_decision_record", "eo_directive", "eo_draft_decision_study", "eo_execution_plan", "eo_execution_plan_stage", "eo_incoming_correspondence", "eo_objection", "eo_outgoing_reply", "eo_referral", "eo_task"},
 	"escalation_manager": {"eo_assignment", "eo_directive", "eo_execution_plan", "eo_task"},
 	"department_user":    {"eo_assignment", "eo_execution_plan_stage", "eo_referral", "eo_task"},
 	"public_relations":   {"eo_incoming_correspondence", "eo_task"},
@@ -4695,8 +4717,8 @@ func TestSeedEOPilot_B5IsIdempotentAndLeavesExistingGrants(t *testing.T) {
 	}
 	before := eoCountRaw(t, db, "role_permissions")
 
-	// Force both B5 steps to run again, and the whole seed to be asked.
-	if err := db.Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Delete(&models.EOSeedStep{}).Error; err != nil {
+	// Force all three grant steps to run again, and the whole seed to be asked.
+	if err := db.Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey, eoGrantHeadOfOfficeOversightStepKey}).Delete(&models.EOSeedStep{}).Error; err != nil {
 		t.Fatal(err)
 	}
 	seedEOPilot(db)
@@ -4704,9 +4726,9 @@ func TestSeedEOPilot_B5IsIdempotentAndLeavesExistingGrants(t *testing.T) {
 		t.Errorf("re-running the grant steps changed the grant count from %d to %d", before, after)
 	}
 	var steps int64
-	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Count(&steps)
-	if steps != 2 {
-		t.Errorf("%d B5 step rows after the re-run, want 2", steps)
+	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey, eoGrantHeadOfOfficeOversightStepKey}).Count(&steps)
+	if steps != 3 {
+		t.Errorf("%d B5 step rows after the re-run, want 3", steps)
 	}
 }
 
@@ -4723,7 +4745,7 @@ func TestSeedEOPilot_B5RetriesWhenARoleIsMissing(t *testing.T) {
 	}
 	seedEOPilot(db)
 	var n int64
-	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey}).Count(&n)
+	db.Model(&models.EOSeedStep{}).Where("key IN ?", []string{eoGrantWorkflowsViewStepKey, eoGrantProcessRoleRegistersStepKey, eoGrantHeadOfOfficeOversightStepKey}).Count(&n)
 	if n != 0 {
 		t.Fatalf("%d B5 steps recorded as applied with the roles missing", n)
 	}
@@ -4902,5 +4924,120 @@ func TestSeedEOPilot_SubjectTaxonomyRestoresASoftDeletedValue(t *testing.T) {
 	db.Unscoped().Model(&models.LookupValue{}).Where("category_id = ? AND code = ?", cats[0].ID, "drainage").Count(&all)
 	if all != 1 {
 		t.Errorf("rows for drainage = %d, want 1 (restored, not duplicated)", all)
+	}
+}
+
+// ── Task B2 (oversight): Head of Office reads Referral across bodies ────────
+
+// Head of Office holds the oversight permission and all eleven view codes, and
+// the oversight permission is held by NO other seeded role but admin (which
+// receives every module permission from Seed, not from this step). Mutation:
+// drop eoGrantHeadOfOfficeOversightStepKey from eoPilotSteps; grant the
+// permission to another process role; leave eo_referral out of the view set.
+func TestSeedEOPilot_HeadOfOfficeSeesReferrals(t *testing.T) {
+	db := eoB5Fixture(t)
+	seedEOPilot(db)
+
+	hoo := eoSessionFor(t, db, "head_of_office").PermissionCodes()
+	if !contains(hoo, models.EOPermissionViewAllBodies) {
+		t.Errorf("head_of_office lacks %s: it can list Referral and see none", models.EOPermissionViewAllBodies)
+	}
+	got := models.EOTypeKeysFromPermissionCodes(hoo, models.EOTypePermissionView)
+	sort.Strings(got)
+	want := append([]string{}, eoPilotRegisterKeys...)
+	sort.Strings(want)
+	if len(got) != 11 || !reflect.DeepEqual(got, want) {
+		t.Errorf("head_of_office can view %v, want all eleven %v", got, want)
+	}
+	if n := len(models.EOTypeKeysFromPermissionCodes(hoo, models.EOTypePermissionUpdate)); n != 0 {
+		t.Errorf("head_of_office can update %d registers; oversight is read-only", n)
+	}
+
+	// Additive: nobody else gained it.
+	for _, role := range []string{"escalation_manager", "department_user", "public_relations", "protocol", "eo_admin", "user", "executive_office"} {
+		if contains(eoSessionFor(t, db, role).PermissionCodes(), models.EOPermissionViewAllBodies) {
+			t.Errorf("%s holds the oversight permission", role)
+		}
+	}
+}
+
+// Already-seeded databases ran the register step before this decision. The
+// oversight step must still reach them: simulate one by removing the new
+// step's row and the two grants, and re-seed. Mutation: fold the oversight
+// grant into eoProcessRoleRegisters only (it would never reach this database).
+func TestSeedEOPilot_OversightReachesADatabaseAlreadySeeded(t *testing.T) {
+	db := eoB5Fixture(t)
+	seedEOPilot(db)
+
+	if err := db.Exec(`DELETE FROM role_permissions WHERE role_id = (SELECT id FROM roles WHERE code = 'head_of_office')
+		AND permission_id IN (SELECT id FROM permissions WHERE code IN (?, ?))`,
+		models.EOPermissionViewAllBodies, "eo:eo_referral:view").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("key = ?", eoGrantHeadOfOfficeOversightStepKey).Delete(&models.EOSeedStep{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	before := eoCountRaw(t, db, "role_permissions")
+	seedEOPilot(db)
+	if after := eoCountRaw(t, db, "role_permissions"); after != before+2 {
+		t.Errorf("the oversight step added %d rows, want 2 (the permission and eo_referral:view)", after-before)
+	}
+	hoo := eoSessionFor(t, db, "head_of_office").PermissionCodes()
+	if !contains(hoo, models.EOPermissionViewAllBodies) || !contains(hoo, "eo:eo_referral:view") {
+		t.Errorf("head_of_office after the step: %v", hoo)
+	}
+	// And a third run adds nothing.
+	db.Where("key = ?", eoGrantHeadOfOfficeOversightStepKey).Delete(&models.EOSeedStep{})
+	seedEOPilot(db)
+	if again := eoCountRaw(t, db, "role_permissions"); again != before+2 {
+		t.Errorf("re-running the oversight step changed the count to %d", again)
+	}
+}
+
+// DB-FREE checks of the oversight seed tables, runnable without
+// AUTOMAX_TEST_DB_DSN. Mutation: drop eo_referral from head_of_office's view
+// set; remove the permission from eoModulePermissions; move the step before
+// the register step.
+func TestEOOversightSeedTablesWithoutADatabase(t *testing.T) {
+	var hoo *eoRegisterGrant
+	for i := range eoProcessRoleRegisters {
+		if eoProcessRoleRegisters[i].roleCode == "head_of_office" {
+			hoo = &eoProcessRoleRegisters[i]
+		}
+	}
+	if hoo == nil {
+		t.Fatal("no head_of_office entry")
+	}
+	got := append([]string{}, hoo.view...)
+	want := append([]string{}, eoPilotRegisterKeys...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != 11 || !reflect.DeepEqual(got, want) || len(hoo.update) != 0 {
+		t.Errorf("head_of_office view %v update %v, want all eleven and no update", got, hoo.update)
+	}
+	// The oversight grant goes to head_of_office alone: no other process role
+	// entry may carry it, and it is a registered permission.
+	found := 0
+	for _, p := range eoModulePermissions {
+		if p.Code == models.EOPermissionViewAllBodies {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Errorf("%s appears %d times in eoModulePermissions, want 1", models.EOPermissionViewAllBodies, found)
+	}
+	for _, r := range eoSeededRoles {
+		if contains(r.perms, models.EOPermissionViewAllBodies) {
+			t.Errorf("seeded role %q is created holding the oversight permission; it is granted by the one-shot step", r.code)
+		}
+	}
+	idx := map[string]int{}
+	for i, st := range eoPilotSteps {
+		idx[st.key] = i
+	}
+	reg, ok1 := idx[eoGrantProcessRoleRegistersStepKey]
+	ov, ok2 := idx[eoGrantHeadOfOfficeOversightStepKey]
+	if !ok1 || !ok2 || ov <= reg {
+		t.Errorf("the oversight step must be registered after the register step: %v %v", idx[eoGrantProcessRoleRegistersStepKey], idx[eoGrantHeadOfOfficeOversightStepKey])
 	}
 }

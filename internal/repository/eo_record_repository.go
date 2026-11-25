@@ -463,8 +463,19 @@ func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error
 // include that body; a record with none is unrestricted. A caller with no
 // bodies and no UserID therefore sees unrestricted records only. The
 // sensitivity label is deliberately not consulted: there is no clearance policy.
+//
+// A caller carrying ViewAllBodies (the eo:records:view_all_bodies permission,
+// the oversight role's grant) sees every record in the registers it may
+// otherwise see: this function lifts only the BODY restriction.
+// applyEORecordTypePermissions is a separate clause, ANDed by
+// applyEORecordFilters, and still limits the caller to the types it holds a
+// view code on — so the flag composes with the per-type gate and widens no
+// register.
 func applyEORecordVisibility(q *gorm.DB, f *models.EORecordFilter) *gorm.DB {
 	if f.IsAdmin {
+		return q
+	}
+	if f.ViewAllBodies {
 		return q
 	}
 	const restrictedTo = `eo_records."values"->>'` + eoVisibleToKey + `'`

@@ -435,6 +435,10 @@ var eoPilotSteps = []eoPilotStep{
 	// seed_type_permissions, whose codes the second one hands out.
 	{key: eoGrantWorkflowsViewStepKey, run: eoGrantWorkflowsViewToEOAdmin},
 	{key: eoGrantProcessRoleRegistersStepKey, run: eoGrantProcessRoleRegisters},
+	// ONE-SHOT, after the step above, for the same reason: a grant. The client
+	// decided on 2026-11-25 that oversight bypasses body-scoping; this grants
+	// Head of Office the permission AND restores eo:eo_referral:view.
+	{key: eoGrantHeadOfOfficeOversightStepKey, run: eoGrantHeadOfOfficeOversight},
 	// TASK B6 (remediation). ONE-SHOT, and after the relaxation it follows:
 	// it moves the create-time file fields B2 relaxed to `at_state`, each
 	// required at a named non-terminal state of its OWN workflow, derived
@@ -4406,8 +4410,9 @@ func eoSeedSubjectTaxonomy(tx *gorm.DB) (bool, error) {
 
 const (
 	// PERMANENT identifiers; never rename or reuse (see eoPilotStep).
-	eoGrantWorkflowsViewStepKey        = "grant_workflows_view_to_eo_admin"
-	eoGrantProcessRoleRegistersStepKey = "grant_process_role_registers"
+	eoGrantWorkflowsViewStepKey         = "grant_workflows_view_to_eo_admin"
+	eoGrantProcessRoleRegistersStepKey  = "grant_process_role_registers"
+	eoGrantHeadOfOfficeOversightStepKey = "grant_head_of_office_oversight"
 )
 
 // eoAdminRoleCode is the role that configures the platform.
@@ -4442,26 +4447,10 @@ var eoPilotRegisterKeys = []string{
 	"eo_incoming_correspondence", "eo_referral", "eo_outgoing_reply", "eo_task",
 }
 
-// eoHeadOfOfficeRegisterKeys is eoPilotRegisterKeys MINUS eo_referral, derived
-// here rather than written out so that a register added to the pilot reaches
-// the oversight role automatically and the one deliberate exclusion stays
-// visible as an exclusion. See the eo_referral paragraph on
-// eoProcessRoleRegisters for why it is excluded and what would reinstate it.
-var eoHeadOfOfficeRegisterKeys = eoRegisterKeysExcept("eo_referral")
-
-func eoRegisterKeysExcept(excluded ...string) []string {
-	skip := make(map[string]bool, len(excluded))
-	for _, e := range excluded {
-		skip[e] = true
-	}
-	out := make([]string, 0, len(eoPilotRegisterKeys))
-	for _, k := range eoPilotRegisterKeys {
-		if !skip[k] {
-			out = append(out, k)
-		}
-	}
-	return out
-}
+// eoHeadOfOfficeRegisterKeys is every pilot register: the oversight role reads
+// all eleven, Referral included, since 2026-11-25. A register added to the
+// pilot reaches it automatically.
+var eoHeadOfOfficeRegisterKeys = eoPilotRegisterKeys
 
 // eoProcessRoleRegisters is the PROVISIONAL mapping from the pilot's three
 // processes (EO-DIR, EO-DRF, EO-COM in docs/superpowers/specs/eo-field-matrix.md)
@@ -4469,21 +4458,20 @@ func eoRegisterKeysExcept(excluded ...string) []string {
 // sign-off; a correction is an edit to this table, applied on a database that
 // has already booted by a new step, never by editing history.
 //
-//   - head_of_office: oversight, so VIEW on ten of the eleven and update on
-//     none. The matrix gives the Head of Office an approval only in EO-MED
+//   - head_of_office: oversight, so VIEW on all eleven and update on none.
+//     The matrix gives the Head of Office an approval only in EO-MED
 //     (outside the pilot); this is an invention, disclosed as such.
-//     eo_referral IS DELIBERATELY NOT GRANTED, and the absence is the
-//     disclosure. A view code on Referral could never return a row: row-level
-//     visibility (repository applyEORecordVisibility) admits a referral only
-//     to an admin, its creator, or a caller whose bodies match visible_to,
-//     and Head of Office has no body — so the grant would list an eleventh
-//     register that shows nothing and 404s by id. A permission that can never
-//     return a row is one of the defects this plan exists to remove, so the
-//     intent is carried by the question below and not by a dead row.
-//     BLOCKING CLIENT QUESTION: should an oversight role bypass body-scoping
-//     on Referral, or is Head of Office not meant to see referrals? If the
-//     answer is the former, the fix is in applyEORecordVisibility and the
-//     grant goes in with it; granting it alone would change nothing.
+//     eo_referral WAS withheld (Plan 5) because row-level visibility admits a
+//     referral only to an admin, its creator, or a caller whose bodies match
+//     visible_to, and Head of Office has no body: the view code could never
+//     return a row. DECIDED BY THE CLIENT 2026-11-25: oversight DOES bypass
+//     body-scoping. That is the explicit permission
+//     models.EOPermissionViewAllBodies (eo:records:view_all_bodies), which
+//     applyEORecordVisibility honours; it COMPOSES with the per-type codes and
+//     grants no register by itself. The permission and the restored
+//     eo:eo_referral:view are granted by eoGrantHeadOfOfficeOversight, a
+//     separate one-shot step, because the step that applies this table has
+//     already run on every booted database.
 //   - escalation_manager: EO-DIR's escalation ladder (+3/+7/+14 days) acts on
 //     directives, their plans, assignments and tasks.
 //   - department_user: the executing bodies. Assignments (owner, completion,
@@ -4600,6 +4588,54 @@ func eoGrantProcessRoleRegisters(tx *gorm.DB) (bool, error) {
 		if err := tx.Model(&role).Association("Permissions").Append(perms); err != nil {
 			return false, fmt.Errorf("grant the registers to %q: %w", g.roleCode, err)
 		}
+	}
+	return true, nil
+}
+
+// eoHeadOfOfficeRoleCode is the oversight role.
+const eoHeadOfOfficeRoleCode = "head_of_office"
+
+// eoGrantHeadOfOfficeOversight grants Head of Office the oversight permission
+// (models.EOPermissionViewAllBodies) together with eo:eo_referral:view, so
+// that the role holds all eleven registers AND can read the one whose records
+// are body-scoped. The two go together: the view code alone shows nothing, the
+// permission alone grants no register.
+//
+// ONE-SHOT and ALL-OR-NOTHING, like eoGrantProcessRoleRegisters: a missing
+// role or permission grants nothing and returns done=false so it is asked
+// again. Append is idempotent, so on a fresh database, where the step above
+// has already granted the referral view, it adds only the oversight code.
+func eoGrantHeadOfOfficeOversight(tx *gorm.DB) (bool, error) {
+	var role models.Role
+	if err := tx.Where("code = ?", eoHeadOfOfficeRoleCode).First(&role).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("EO pilot: role %q not found; the oversight grant was NOT applied and will be retried on the next boot", eoHeadOfOfficeRoleCode)
+			return false, nil
+		}
+		return false, fmt.Errorf("read role %q: %w", eoHeadOfOfficeRoleCode, err)
+	}
+	codes := []string{
+		models.EOPermissionViewAllBodies,
+		models.EOTypePermissionCode(eoReferralTypeKey, models.EOTypePermissionView),
+	}
+	var perms []models.Permission
+	if err := tx.Where("code IN ?", codes).Find(&perms).Error; err != nil {
+		return false, fmt.Errorf("read the oversight permissions: %w", err)
+	}
+	if len(perms) != len(codes) {
+		have := map[string]bool{}
+		for _, p := range perms {
+			have[p.Code] = true
+		}
+		for _, c := range codes {
+			if !have[c] {
+				log.Printf("EO pilot: permission %q has no live row; the oversight grant to %q was NOT applied and will be retried on the next boot", c, eoHeadOfOfficeRoleCode)
+			}
+		}
+		return false, nil
+	}
+	if err := tx.Model(&role).Association("Permissions").Append(perms); err != nil {
+		return false, fmt.Errorf("grant the oversight permissions to %q: %w", eoHeadOfOfficeRoleCode, err)
 	}
 	return true, nil
 }
