@@ -408,8 +408,6 @@ func TestEoPilotReferralUnderALetterInheritsItsDeadline(t *testing.T) {
 	// before drawing a reference, so the refusal burns no number. This pins
 	// the refusal, so the narrow target list is a decision on record rather
 	// than an omission.
-	// UNVERIFIED BY EXECUTION: this file skips without AUTOMAX_TEST_DB_DSN and
-	// the assertion below was changed by reading eo_links.go:84.
 	t.Run("a referral cannot be a record child of another referral", func(t *testing.T) {
 		_, err := f.eoPilotTryCreate(t, eoPilotReferralTypeKey, stored, eoPilotReferralLinkKey, nil)
 		if err == nil {

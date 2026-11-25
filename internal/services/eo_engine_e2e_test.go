@@ -143,6 +143,8 @@ func eoE2ETables() []any {
 		&models.EORecordType{},
 		&models.EOFieldDef{},
 		&models.EOLinkType{},
+		&models.LookupCategory{},
+		&models.LookupValue{},
 	}
 }
 
