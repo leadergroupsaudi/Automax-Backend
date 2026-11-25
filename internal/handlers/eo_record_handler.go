@@ -124,6 +124,11 @@ func (h *EORecordHandler) RegisterRoutes(r fiber.Router, perm EOPermissionMiddle
 	// to demand and inventing one would name a code no role has ever held.
 	r.Post("/:id/transition", perm("eo:transition"), typePerm(update), h.Transition)
 	r.Get("/:id/children", perm("eo:view"), typePerm(view), h.Children)
+	// The audit trail is the record read in full, so it carries exactly the
+	// guards GET /:id carries — and, inside the handler, the same
+	// record-level gate: these two codes are TYPE-scoped and say nothing
+	// about THIS record.
+	r.Get("/:id/history", perm("eo:view"), typePerm(view), h.History)
 	r.Post("/:id/links", perm("eo:update"), typePerm(update), h.CreateLink)
 }
 
@@ -752,6 +757,82 @@ func (h *EORecordHandler) Children(c *fiber.Ctx) error {
 	// h.list validates, clamps page and limit, applies the caller's scope and
 	// answers with the paginated envelope — the one place all of that lives.
 	return h.list(c, &filter, user)
+}
+
+// eoHistoryQuery is the history route's paging.
+//
+// It is the REGISTER'S shape, not a second convention: the parameters are
+// `page` and `limit`, with the same bounds EORecordFilter declares — min 1,
+// max eoMaxPageLimit — so a limit above the maximum is the caller's mistake
+// answered with a field error, and an absent or zero one falls back to
+// eoDefaultPageLimit. The answer is utils.PaginatedSuccessResponse's envelope
+// (page, limit, total_items, total_pages), the same one GET /eo-records
+// returns. A client that can page the register can page this unchanged.
+//
+// It is NOT an EORecordFilter: the trail is selected by the record in the
+// path and by nothing else, and binding the register's filter here would
+// advertise a dozen query parameters that silently do nothing.
+// TestGetEORecordHistoryIsPagedNewestFirst pins the maximum against
+// eoMaxPageLimit, so the tag below cannot drift from the constant unnoticed.
+type eoHistoryQuery struct {
+	Page  int `query:"page" json:"page" validate:"omitempty,min=1"`
+	Limit int `query:"limit" json:"limit" validate:"omitempty,min=1,max=100"`
+}
+
+// History serves one record's audit trail (spec §7.9), newest first.
+//
+// THE RECORD IS LOADED UNDER THE CALLER'S SCOPE FIRST, and that is the whole
+// gate. The route's two permission codes — eo:view and the type's
+// eo:<type_key>:view — are TYPE-scoped: they say the caller may see records
+// of this register, not that it may see THIS record. §7.11 narrows further,
+// and a caller holding both codes but belonging to another body is refused
+// the record itself and cannot find it in the register. Serving that caller
+// the trail would disclose precisely what §7.11 conceals — every state
+// change, every actor, every timestamp, and the record's existence with them.
+//
+// eoLoadRecord is that rule, asked rather than re-derived: it re-queries the
+// register (List under the caller's scope) for this one record, so the
+// clause lives in one place. It answers 404 for a record the caller may not
+// see AND for one that does not exist, deliberately: a 403 for the first
+// would make this route an oracle for which ids exist, and would disagree
+// with the 404 GET /eo-records/:id already gives for the same record.
+//
+// An EMPTY trail is a 200 with an empty list and a zero total. A record with
+// no history is a record, not a missing one.
+func (h *EORecordHandler) History(c *fiber.Ctx) error {
+	user, ok, err := eoActor(c)
+	if !ok {
+		return err
+	}
+	id, ok, err := eoParamUUID(c, "id")
+	if !ok {
+		return err
+	}
+	// The record first, as Children does: the trail of a record the caller
+	// may not see is not the caller's to read either.
+	rec, ok, err := h.eoLoadRecord(c, id, user)
+	if !ok {
+		return err
+	}
+	var q eoHistoryQuery
+	if err := c.QueryParser(&q); err != nil {
+		return utils.ErrorResponse(c, fiber.StatusBadRequest, i18n.T(c.UserContext(), "invalid_request_body"))
+	}
+	if fieldErrs := validation.ValidateStruct(c.UserContext(), &q); len(fieldErrs) > 0 {
+		return eoFieldErrors(c, fieldErrs)
+	}
+	// Clamped a SECOND time, for the same reason h.list clamps: a limit of
+	// zero reaching utils.PaginatedSuccessResponse is a division by zero.
+	page, limit := eoClampPaging(q.Page, q.Limit)
+	rows, total, err := h.records.History(c.UserContext(), rec.ID, rec.RecordTypeID, page, limit)
+	if err != nil {
+		return utils.InternalErrorResponse(c, err, i18n.T(c.UserContext(), "internal_server_error"))
+	}
+	if rows == nil {
+		// An empty ARRAY, never null: the history tab maps over it.
+		rows = []models.EORecordHistory{}
+	}
+	return utils.PaginatedSuccessResponse(c, rows, page, limit, total)
 }
 
 // eoLinkRequest asks for one typed link from the record in the path to another

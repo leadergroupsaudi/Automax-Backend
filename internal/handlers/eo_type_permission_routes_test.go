@@ -70,6 +70,7 @@ func TestEORecordRoutesCarryThePerTypeGate(t *testing.T) {
 		{"AvailableTransitions", "GET", "/eo-records/" + id + "/transitions", []string{"eo:view"}, models.EOTypePermissionView},
 		{"Transition", "POST", "/eo-records/" + id + "/transition", []string{"eo:transition"}, models.EOTypePermissionUpdate},
 		{"Children", "GET", "/eo-records/" + id + "/children", []string{"eo:view"}, models.EOTypePermissionView},
+		{"History", "GET", "/eo-records/" + id + "/history", []string{"eo:view"}, models.EOTypePermissionView},
 		{"CreateLink", "POST", "/eo-records/" + id + "/links", []string{"eo:update"}, models.EOTypePermissionUpdate},
 	}
 

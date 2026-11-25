@@ -68,6 +68,18 @@ type EORecordRepository interface {
 	CreateLink(ctx context.Context, link *models.EORecordLink) error
 	LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
 	CreateHistory(ctx context.Context, entry *models.EORecordHistory) error
+	// History is one record's audit trail, NEWEST FIRST, paged. It returns
+	// the page and the total across all pages — the same contract List has —
+	// and it clamps page and limit the same way, so a client that can page
+	// the register can page this without learning a second convention.
+	//
+	// It applies NO row-level visibility of its own and takes no actor: a
+	// trail belongs to its record, so the caller must first have established
+	// that it may see THAT RECORD (handlers.eoLoadRecord, which asks List
+	// under the caller's scope). Serving this without that check would
+	// disclose every state change, actor and timestamp of a record §7.11
+	// conceals — and the record's existence with it.
+	History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistory, int64, error)
 	// EnteredStateIDs is every state the record has ever entered, from
 	// eo_record_history. It is not the current state: is_locked_after asks
 	// whether a record has ever been in a state, and EO workflows have return
@@ -274,6 +286,45 @@ func (r *eoRecordRepository) CreateHistory(ctx context.Context, entry *models.EO
 	return nil
 }
 
+// eoHistoryOrder is the audit trail's TOTAL order.
+//
+// created_at DESC alone is not one. A create writes more than one row in a
+// single transaction (eo_record_service.go:938/953/1163) and a transition
+// writes another (eo_transition_service.go:446), so rows share a timestamp
+// routinely — and Postgres may return tied rows in any order, and need not
+// return the same order twice. Under LIMIT/OFFSET paging that is not a
+// cosmetic wobble: a tied row can land on two pages while another lands on
+// none, so a client paging an audit trail silently loses entries. The id
+// breaks the tie, exactly as eoOrderClause does for the register.
+const eoHistoryOrder = "eo_record_history.created_at DESC, eo_record_history.id ASC"
+
+func (r *eoRecordRepository) History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistory, int64, error) {
+	page, limit = eoClampPaging(page, limit)
+	// Both the count and the page are built from the same predicate, so they
+	// cannot drift. The composite key is spelled out because the record id
+	// alone is not unique across partitions.
+	scope := func() *gorm.DB {
+		return r.db.WithContext(ctx).
+			Model(&models.EORecordHistory{}).
+			Where("eo_record_history.record_id = ? AND eo_record_history.record_type_id = ?", recordID, recordTypeID)
+	}
+
+	var total int64
+	if err := scope().Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("count history of eo record %s: %w", recordID, err)
+	}
+
+	var out []models.EORecordHistory
+	if err := scope().
+		Order(eoHistoryOrder).
+		Offset((page - 1) * limit).
+		Limit(limit).
+		Find(&out).Error; err != nil {
+		return nil, 0, fmt.Errorf("read history of eo record %s: %w", recordID, err)
+	}
+	return out, total, nil
+}
+
 func (r *eoRecordRepository) EnteredStateIDs(ctx context.Context, recordID, recordTypeID uuid.UUID) (map[uuid.UUID]bool, error) {
 	var ids []uuid.UUID
 	if err := r.db.WithContext(ctx).
@@ -311,6 +362,21 @@ const (
 	eoMaxLimit     = 100
 )
 
+// eoClampPaging resolves page and limit to the EO register's own defaults and
+// maximum. It is the one copy: List and History both page, and a second clamp
+// written beside one of them is a second convention a client would have to
+// learn. A limit of zero never leaves this function — it would be an
+// unbounded read, and a division by zero in the paginated envelope.
+func eoClampPaging(page, limit int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > eoMaxLimit {
+		limit = eoDefaultLimit
+	}
+	return page, limit
+}
+
 // eoVisibleToKey is the values key a record carries when it is restricted to
 // one body ("the referred body only", §7.11).
 const eoVisibleToKey = "visible_to"
@@ -324,13 +390,7 @@ func (r *eoRecordRepository) List(ctx context.Context, filter *models.EORecordFi
 		return nil, 0, err
 	}
 	// Page and limit are resolved into locals; the caller's struct is left alone.
-	page, limit := filter.Page, filter.Limit
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > eoMaxLimit {
-		limit = eoDefaultLimit
-	}
+	page, limit := eoClampPaging(filter.Page, filter.Limit)
 
 	var total int64
 	countQ, err := applyEORecordFilters(r.db.WithContext(ctx).Model(&models.EORecord{}), filter)
