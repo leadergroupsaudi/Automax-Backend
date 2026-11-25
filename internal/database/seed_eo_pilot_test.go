@@ -4582,7 +4582,7 @@ const eoOversightGrants = 1
 // creates in production from eoModulePermissions.
 func eoSeedOversightPermission(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	p := models.Permission{Name: "EO View Records Across Bodies", Code: models.EOPermissionViewAllBodies, Module: "eo", Action: "records:view_all_bodies", IsActive: true}
+	p := models.Permission{Name: "EO Records Across Bodies (Oversight)", Code: models.EOPermissionViewAllBodies, Module: "eo", Action: "records:view_all_bodies", IsActive: true}
 	if err := db.Where("code = ?", p.Code).FirstOrCreate(&p).Error; err != nil {
 		t.Fatalf("create %s: %v", p.Code, err)
 	}

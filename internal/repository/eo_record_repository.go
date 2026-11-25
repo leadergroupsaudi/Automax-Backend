@@ -466,7 +466,9 @@ func applyEORecordFilters(q *gorm.DB, f *models.EORecordFilter) (*gorm.DB, error
 //
 // A caller carrying ViewAllBodies (the eo:records:view_all_bodies permission,
 // the oversight role's grant) sees every record in the registers it may
-// otherwise see: this function lifts only the BODY restriction.
+// otherwise see: this function lifts only the BODY restriction. It is not a
+// read-only lift: every caller of this function, including the paths that
+// locate a record for update, transition or delete, is lifted too.
 // applyEORecordTypePermissions is a separate clause, ANDed by
 // applyEORecordFilters, and still limits the caller to the types it holds a
 // view code on — so the flag composes with the per-type gate and widens no

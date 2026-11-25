@@ -4448,8 +4448,11 @@ var eoPilotRegisterKeys = []string{
 }
 
 // eoHeadOfOfficeRegisterKeys is every pilot register: the oversight role reads
-// all eleven, Referral included, since 2026-11-25. A register added to the
-// pilot reaches it automatically.
+// all eleven, Referral included, since 2026-11-25. A register added to this
+// list reaches the role ONLY ON A FRESH DATABASE: the step that applies it is
+// one-shot and has already run on every booted database, so a register added
+// later needs its own new grant step there, exactly as the Referral view did
+// (eoGrantHeadOfOfficeOversight). Editing this list does not propagate.
 var eoHeadOfOfficeRegisterKeys = eoPilotRegisterKeys
 
 // eoProcessRoleRegisters is the PROVISIONAL mapping from the pilot's three

@@ -87,6 +87,15 @@ const EOReferralTreeKey = "referral_tree"
 // the tree confidential, the answer is not to trim this list silently — it is
 // to stop storing it on the letter.
 //
+// IT CROSSES THE PER-TYPE GATE AS WELL AS THE BODY GATE (found in review,
+// 2026-11-25; PRE-EXISTING, behaviour unchanged). The reasoning above is only
+// about the body restriction. The copy also carries a branch's id, reference
+// and answered-status onto the letter regardless of whether the letter's reader
+// holds a view code on the REFERRAL register: a caller with the letter register
+// but NOT eo:eo_referral:view (and no oversight) reads them from
+// values.referral_tree. Content is still not copied, and the ids answer 403/404
+// on every follow-up path, so it is metadata only. It needs an owner's decision.
+//
 // WHO IT IS FOR AND WHERE IT IS READ: the Executive Office drafting the one
 // Outgoing Reply, reading it on the letter it is stored on. The answers
 // themselves stay in the branches, where §7.11 governs them, and the Office

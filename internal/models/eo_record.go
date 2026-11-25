@@ -271,7 +271,9 @@ type EORecordFilter struct {
 	VisibleToDepartmentIDs []uuid.UUID `query:"-" json:"-"`
 
 	// ViewAllBodies lifts the row-level body restriction (visible_to) for an
-	// oversight caller. It is set by the handler from the caller's own
+	// oversight caller, on EVERY path that builds this filter, including the
+	// ones that locate a record for update, transition or delete (not only
+	// reads). It is set by the handler from the caller's own
 	// permission codes (models.EOCanViewAllBodies) and nowhere else.
 	//
 	// IT COMPOSES WITH THE PER-TYPE GATE; it does not replace it. It is

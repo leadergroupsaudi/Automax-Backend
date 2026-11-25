@@ -353,6 +353,10 @@ func (f *eoComFixture) referralsVisibleTo(t *testing.T, reader *models.User, bod
 		// codes come from the role the pilot seed granted.
 		PermissionCodes: reader.PermissionCodes(),
 	}
+	// Parity with handlers.eoScopeFilter, which derives the oversight flag
+	// from the same codes. (services cannot import handlers; this is the one
+	// line to keep in step with it.)
+	filter.ViewAllBodies = models.EOCanViewAllBodies(filter.PermissionCodes)
 	recs, _, err := f.repo.List(context.Background(), filter)
 	if err != nil {
 		t.Fatalf("list referrals as %s: %v", reader.Username, err)

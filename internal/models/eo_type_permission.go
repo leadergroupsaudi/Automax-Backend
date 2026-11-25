@@ -35,6 +35,16 @@ const (
 // ROW-LEVEL body restriction (a record's visible_to) for the caller. It is
 // the oversight role's grant (decided with the client, 2026-11-25).
 //
+// THE CODE SAYS "view" BUT THE LIFT IS NOT VIEW-ONLY. It lifts the body
+// restriction on EVERY path that builds a record filter (eoScopeFilter ->
+// applyEORecordVisibility): list, search, children, the single-record
+// visibility probe AND the lookup that locates a record for update, transition
+// or delete. Whether the holder can WRITE is decided separately, by the
+// per-type update/create codes and the module codes; a holder of those AND this
+// permission can write to a record restricted to another body. Head of Office
+// is view-only, so nothing live reaches that today. The code is already
+// seeded live and is NOT renamed; this comment is the accurate description.
+//
 // IT COMPOSES; IT DOES NOT SUBSTITUTE. It is not a per-type code and grants
 // no register: the caller must still hold eo:<type_key>:view for every
 // register it reads, and this only removes the body restriction inside those.

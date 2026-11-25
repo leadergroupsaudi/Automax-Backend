@@ -243,3 +243,5 @@ work. Frontend: `npx tsc --noEmit` exits 0; lint shows 2 pre-existing errors
 
 
 **CORRECTION (2026-11-25, Plan 6 Task B1):** the `eo_assignment_parent` entry above ("Still open … The client chooses: narrow the link type's targets, or widen the pattern") is **CLOSED**. The cause was the numbering, which resolved against the immediate parent only; B1 made it resolve against the nearest ancestor the pattern can render against, so an Assignment under an Execution Plan numbers from its Directive. Neither the link type nor the pattern changes, and **the client decision is no longer required**. Pinned by `TestCreateAssignmentUnderExecutionPlanNumbersFromTheDirective`.
+
+**QUALIFICATION (2026-11-25, final fix wave, Plan 6):** the CORRECTION above (`eo_assignment_parent` CLOSED) rests on a **traced code path** plus a **fakes-based test** (`TestCreateAssignmentUnderExecutionPlanNumbersFromTheDirective`, no database). **No create was performed against live data.** The client decision is no longer required, but the closure is not yet observed in production.
