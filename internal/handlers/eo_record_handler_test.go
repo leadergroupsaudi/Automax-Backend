@@ -1566,6 +1566,14 @@ func TestTransitionBlockedRefusalNamesTheBlockingRecords(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		t.Fatalf("decode %q: %v", body, err)
 	}
+	// Pin the bytes the Plan 5 frontend was verified against, not just the key.
+	const wantSentence = "An open child record blocks this transition"
+	if plainOut.Error != wantSentence {
+		t.Errorf("baseline sentence = %q, want %q", plainOut.Error, wantSentence)
+	}
+	if out.Error != wantSentence {
+		t.Errorf("refusal sentence = %q, want the literal %q", out.Error, wantSentence)
+	}
 	if out.Error != plainOut.Error {
 		t.Errorf("sentence changed: %q, was %q", out.Error, plainOut.Error)
 	}

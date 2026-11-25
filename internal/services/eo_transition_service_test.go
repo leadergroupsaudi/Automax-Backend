@@ -2344,14 +2344,20 @@ func TestAvailableTransitionsMarksBlockedOnes(t *testing.T) {
 
 	t.Run("a closed child, or none, blocks nothing", func(t *testing.T) {
 		f := newFixture(t)
-		got, _ := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		got, err := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		if err != nil || len(got) == 0 {
+			t.Fatalf("available = %v, err = %v; want transitions to inspect", eoTxCodes(got), err)
+		}
 		for _, tr := range got {
 			if tr.Blocked || len(tr.BlockedBy) != 0 {
 				t.Errorf("%s blocked with no children", tr.Code)
 			}
 		}
 		f.addChild("assignment_of", true)
-		got, _ = f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		got, err = f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+		if err != nil || len(got) == 0 {
+			t.Fatalf("available = %v, err = %v; want transitions to inspect", eoTxCodes(got), err)
+		}
 		for _, tr := range got {
 			if tr.Blocked {
 				t.Errorf("%s blocked by a closed child", tr.Code)
@@ -2371,4 +2377,34 @@ func TestAvailableTransitionsMarksBlockedOnes(t *testing.T) {
 			t.Error("typed error no longer matches ErrEOTransitionBlocked")
 		}
 	})
+}
+
+// TestAvailableTransitionsGathersTheBlockingInputsOnce pins the structure, not
+// the answer: the rule's inputs are fetched once per request however many
+// transitions are offered, and the decision still runs per transition.
+func TestAvailableTransitionsGathersTheBlockingInputsOnce(t *testing.T) {
+	f := eoNewTxFixture(t)
+	f.types.linkTypes["assignment_of"] = &models.EOLinkType{Key: "assignment_of", BlocksParentClosure: true}
+	const kids = 3
+	for i := 0; i < kids; i++ {
+		f.addChild("assignment_of", false)
+	}
+	f.records.childrenTotal, f.records.linksTotal = 0, 0
+
+	got, err := f.svc.AvailableTransitions(context.Background(), f.rec, f.actor)
+	if err != nil {
+		t.Fatalf("available: %v", err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("offered %v, want at least two transitions so per-transition work would show", eoTxCodes(got))
+	}
+	if f.records.childrenTotal != 1 {
+		t.Errorf("Children called %d times for %d transitions, want 1", f.records.childrenTotal, len(got))
+	}
+	if want := 1 + kids; f.records.linksTotal != want {
+		t.Errorf("LinksFrom called %d times, want %d (record + each child, once)", f.records.linksTotal, want)
+	}
+	if !eoTxByCode(t, got, "close").Blocked {
+		t.Error("close not blocked: the shared inputs were not decided over")
+	}
 }

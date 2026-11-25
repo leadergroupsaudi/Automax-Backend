@@ -187,6 +187,8 @@ func (s *eoTransitionService) AvailableTransitions(ctx context.Context, rec *mod
 	}
 
 	var out []models.WorkflowTransition
+	// Fetched on first need, then shared by every transition offered.
+	var inputs *eoBlockingInputs
 	for _, candidate := range wf.Transitions {
 		if !candidate.IsActive || candidate.FromStateID != *rec.StateID {
 			continue
@@ -209,10 +211,13 @@ func (s *eoTransitionService) AvailableTransitions(ctx context.Context, rec *mod
 			if toState == nil {
 				return nil, fmt.Errorf("available transitions: target state %s of transition %q is not a state of workflow %q", tr.ToStateID, tr.Code, wf.Code)
 			}
-			blocked, err := s.blockingChildren(ctx, s.records, s.types, rec, tr, toState)
-			if err != nil {
-				return nil, fmt.Errorf("available transitions: blocking children of %s for %q: %w", rec.ID, tr.Code, err)
+			if inputs == nil {
+				inputs, err = loadBlockingInputs(ctx, s.records, s.types, rec)
+				if err != nil {
+					return nil, fmt.Errorf("available transitions: blocking children of %s: %w", rec.ID, err)
+				}
 			}
+			blocked := inputs.blockingChildren(tr, toState)
 			out0 := *tr
 			out0.Blocked = len(blocked) > 0
 			out0.BlockedBy = blocked
@@ -1050,27 +1055,37 @@ func eoStoredAttachmentValues(rec *models.EORecord) []any {
 // are both inside it, so a transitive descendant set would silently stop
 // blocking.
 func (s *eoTransitionService) checkBlockingChildren(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) error {
-	blocked, err := s.blockingChildren(ctx, r, types, rec, transition, toState)
+	in, err := loadBlockingInputs(ctx, r, types, rec)
 	if err != nil {
 		return err
 	}
+	blocked := in.blockingChildren(transition, toState)
 	if len(blocked) > 0 {
 		return eoBlockedError(transition.Code, blocked)
 	}
 	return nil
 }
 
-// blockingChildren is THE blocking rule: the open children that stop this
-// transition, named question first and closure question second, each child
-// once. Execute refuses on it and AvailableTransitions reports it; there is no
-// second implementation to drift.
-func (s *eoTransitionService) blockingChildren(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord, transition *models.WorkflowTransition, toState *models.WorkflowState) ([]models.EORecord, error) {
+// eoBlockingInputs is what the blocking rule reads: the record's direct
+// children, the links at both ends and the link types they name. It does not
+// depend on the transition, so a request that asks the rule about several
+// transitions gathers it ONCE.
+type eoBlockingInputs struct {
+	children  []models.EORecord
+	links     []models.EORecordLink
+	linkTypes map[string]models.EOLinkType
+}
+
+// loadBlockingInputs fetches the rule's inputs. A record with no children
+// yields empty inputs after a single query.
+func loadBlockingInputs(ctx context.Context, r repository.EORecordRepository, types repository.EORecordTypeRepository, rec *models.EORecord) (*eoBlockingInputs, error) {
 	children, err := r.Children(ctx, rec.ID, nil)
 	if err != nil {
 		return nil, err
 	}
+	in := &eoBlockingInputs{children: children}
 	if len(children) == 0 {
-		return nil, nil
+		return in, nil
 	}
 
 	// A link's direction varies by link type (Task.parent_record points child
@@ -1109,7 +1124,19 @@ func (s *eoTransitionService) blockingChildren(ctx context.Context, r repository
 			linkTypes[l.LinkTypeKey] = *lt
 		}
 	}
+	in.links, in.linkTypes = links, linkTypes
+	return in, nil
+}
 
+// blockingChildren is THE blocking rule: the open children that stop this
+// transition, named question first and closure question second, each child
+// once. Execute refuses on it and AvailableTransitions reports it; there is no
+// second implementation to drift. It only decides; the inputs are fetched by
+// loadBlockingInputs, once per request.
+func (in *eoBlockingInputs) blockingChildren(transition *models.WorkflowTransition, toState *models.WorkflowState) []models.EORecord {
+	if len(in.children) == 0 {
+		return nil
+	}
 	// An empty transition key asks the CLOSURE question, so the named check
 	// is only run for a transition that has a code to be named by.
 	var out []models.EORecord
@@ -1123,12 +1150,12 @@ func (s *eoTransitionService) blockingChildren(ctx context.Context, r repository
 		}
 	}
 	if transition.Code != "" {
-		add(BlockingChildren(children, links, linkTypes, transition.Code))
+		add(BlockingChildren(in.children, in.links, in.linkTypes, transition.Code))
 	}
 	if IsTerminal(toState) {
-		add(BlockingChildren(children, links, linkTypes, ""))
+		add(BlockingChildren(in.children, in.links, in.linkTypes, ""))
 	}
-	return out, nil
+	return out
 }
 
 // EOTransitionBlockedError is ErrEOTransitionBlocked carrying the blocking
