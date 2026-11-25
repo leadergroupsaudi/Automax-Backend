@@ -3044,14 +3044,17 @@ var eoPilotLinkTypes = []eoLinkTypeSpec{
 		// and the client's own sentence puts a sub-referral in THE PARENT
 		// LETTER'S tree rather than under the referral it branched from.
 		//
-		// The client's own reference pattern says the same thing and the
-		// engine enforces it: services.RenderReference reads IN-YYYY-NNNN-R#
-		// as "a three-segment parent reference plus one segment", so a
-		// referral created under another referral is refused at
-		// allocateReference — "expects a parent reference of 3 segments,
-		// IN-2026-0001-R1 has 4" — BEFORE any link rule is consulted.
-		// Permitting a Referral target here would therefore be a permission
-		// nothing could ever use: present, plausible and dead.
+		// The client's own reference pattern points the same way:
+		// services.RenderReference reads IN-YYYY-NNNN-R# as "a three-segment
+		// parent reference plus one segment". A referral created under
+		// another referral would have its number resolved against the
+		// LETTER (the nearest ancestor of the right shape), so numbering does
+		// not stop it; what refuses it is THIS link type, whose only target
+		// is the letter. Create applies the link rules BEFORE drawing a
+		// number, so the refusal burns no number from the letter's branch
+		// counter. Permitting a Referral target here would therefore add a
+		// permission that numbering would accept but the matrix never
+		// described: a sub-referral is a link field, not a record parent.
 		//
 		// The consequence for the deadline is the matrix's own wording:
 		// every referral, however deep the branch, counts back from THE

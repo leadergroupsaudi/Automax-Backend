@@ -869,21 +869,27 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		return nil, err
 	}
 
-	// 2. allocate the reference. The number is drawn only once the payload is
-	// known to be good; a failure after this point leaves a gap, since the
-	// counter never goes backwards.
-	if err := s.allocateReference(ctx, rec, t, parent); err != nil {
-		return nil, err
-	}
-
-	// 3. the initial state.
+	// 2. the initial state.
 	rec.StateID = &initial.ID
 
-	// 4. link rules: the typed link to the parent, its derived deadline and
-	// its sensitivity cascade.
+	// 3. link rules: the typed link to the parent, its derived deadline and
+	// its sensitivity cascade. This runs BEFORE the reference is drawn: the
+	// link type's parent-type and cardinality checks are what refuse a create
+	// under the wrong kind of parent, and a refusal the code can make up front
+	// must not burn a number from the counter of a real ancestor (the
+	// reference walk finds a fitting ancestor even when the immediate parent
+	// is the wrong type).
 	link, err := s.applyLinkRules(ctx, rec, parent, req.ParentLinkTypeKey, actor)
 	if err != nil {
 		return nil, fmt.Errorf("create eo record: %w", err)
+	}
+
+	// 4. allocate the reference. The number is drawn only once the payload
+	// and the parent link are known to be good; a failure after this point
+	// (Documenta, the transaction) leaves a gap, since the counter never goes
+	// backwards.
+	if err := s.allocateReference(ctx, rec, t, parent); err != nil {
+		return nil, err
 	}
 
 	// 5. derived fields, over the values written above.
@@ -1305,7 +1311,7 @@ func (s *eoRecordService) applyLinkRules(ctx context.Context, rec, parent *model
 		rec.DueDate = due
 		if due.Before(time.Now()) {
 			log.Printf("eo: record %s of type %s inherits a deadline that has already passed (%s): parent %s is due %s and link type %q counts back %d days",
-				rec.Reference, rec.RecordTypeID, due.Format(time.RFC3339), parent.Reference,
+				rec.ID, rec.RecordTypeID, due.Format(time.RFC3339), parent.Reference,
 				parent.DueDate.Format(time.RFC3339), lt.Key, lt.DeadlineOffsetDays)
 		}
 	}

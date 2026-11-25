@@ -2223,3 +2223,62 @@ func TestAllocateReference_RefusesWhenNoAncestorFits(t *testing.T) {
 		t.Errorf("a number was burned: %v", f.sequences.scopes)
 	}
 }
+
+func TestAllocateReference_ResolvesAgainstTheNearestFittingAncestor(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	f.recordType.ReferenceMode = models.EOReferenceModeParent
+	f.recordType.ReferencePattern = "EO-DIR-YYYY-NNN-A#"
+	// Two ancestors fit (4 segments), at different depths, with a 5-segment
+	// record between and below them. The nearest is ZZ-ZZ-2026-009.
+	root := &models.EORecord{ID: uuid.New(), Reference: "EO-DIR-2026-001"}
+	mid5 := &models.EORecord{ID: uuid.New(), Reference: "EO-DIR-2026-001-P1", ParentRecordID: &root.ID}
+	mid4 := &models.EORecord{ID: uuid.New(), Reference: "ZZ-ZZ-2026-009", ParentRecordID: &mid5.ID}
+	leaf := &models.EORecord{ID: uuid.New(), Reference: "ZZ-ZZ-2026-009-Q1", ParentRecordID: &mid4.ID}
+	for _, r := range []*models.EORecord{root, mid5, mid4, leaf} {
+		f.records.stored[r.ID] = r
+	}
+	rec := &models.EORecord{}
+	if err := f.svc.(*eoRecordService).allocateReference(context.Background(), rec, f.recordType, leaf); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Reference != "ZZ-ZZ-2026-009-A1" {
+		t.Errorf("reference = %q, want it numbered from the NEAREST fitting ancestor ZZ-ZZ-2026-009", rec.Reference)
+	}
+}
+
+// A create the link type refuses must not draw a number: the ancestor walk
+// finds a fitting ancestor above a wrong-type parent, so numbering first would
+// advance that ancestor's live counter for a record that is never written.
+func TestCreateRefusedByTheLinkTypeBurnsNoNumber(t *testing.T) {
+	f := eoNewSvcFixture(t)
+	f.recordType.ReferenceMode = models.EOReferenceModeParent
+	f.recordType.ReferencePattern = "EO-PRG-YYYY-NNN-A#"
+	lt := &models.EOLinkType{ID: uuid.New(), Key: "covers_item", Label: "Covers", Cardinality: models.EOCardinalityOne}
+	prog := eoSvcParent(t, f, lt, nil, "") // only target type: the programme
+	plan := &models.EORecord{
+		ID: uuid.New(), RecordTypeID: uuid.New(), Reference: "EO-PRG-2026-007-P1",
+		SubjectAr: "خطة", ParentRecordID: &prog.ID,
+	}
+	f.records.stored[plan.ID] = plan
+	create := func(parent *models.EORecord) (*models.EORecord, error) {
+		return f.svc.Create(context.Background(), &models.EORecordCreateRequest{
+			RecordTypeID: f.recordType.ID, ParentRecordID: &parent.ID,
+			ParentLinkTypeKey: "covers_item", Values: map[string]any{"subject_ar": "بند"},
+		}, f.actor)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := create(plan); err == nil {
+			t.Fatal("create under a wrong-type parent succeeded")
+		}
+	}
+	if len(f.sequences.scopes) != 0 {
+		t.Fatalf("a refused create drew numbers: %v", f.sequences.scopes)
+	}
+	rec, err := create(prog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Reference != "EO-PRG-2026-007-A1" {
+		t.Errorf("reference = %q, want A1 (nothing burned)", rec.Reference)
+	}
+}

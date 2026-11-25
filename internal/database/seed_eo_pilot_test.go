@@ -2620,14 +2620,22 @@ func TestEoPilotReferencePatternsRenderAndRefuse(t *testing.T) {
 			}
 		})
 	}
-	// The matrix's own tension, pinned rather than hidden: the Assignment
-	// pattern counts the DIRECTIVE's segments, while the matrix says an
-	// Assignment may be "sub of Execution Plan, or of Directive directly".
-	// Under a plan, the create is refused at numbering.
-	t.Run("an Assignment under an Execution Plan is refused at numbering", func(t *testing.T) {
+	// The Assignment pattern counts the DIRECTIVE's segments, while the matrix
+	// says an Assignment may be "sub of Execution Plan, or of Directive
+	// directly". That is not a tension: the engine resolves the reference
+	// against the nearest ancestor whose reference the pattern can render
+	// against (services.eoRecordService.resolveParentReference), so a plan
+	// parent is walked past to the directive. What is pinned here is the
+	// premise that makes the walk necessary and sufficient: the pattern
+	// renders against the directive's reference and not against the plan's.
+	// The service-level behaviour is pinned in services' TestAllocateReference_*.
+	t.Run("an Assignment pattern renders against the Directive's reference, not the plan's", func(t *testing.T) {
 		ty := eoRootType(t, db, eoAssignmentTypeKey)
+		if err := eoPatternRenders(ty.ReferencePattern, "EO-DIR-2026-001"); err != nil {
+			t.Errorf("the pattern must render against a directive reference: %v", err)
+		}
 		if err := eoPatternRenders(ty.ReferencePattern, "EO-DIR-2026-001-P1"); err == nil {
-			t.Error("it rendered; the report records this as the matrix's tension, so a change here is a decision, not a fix")
+			t.Error("it rendered against a plan's reference; the ancestor walk would then never be reached for a plan parent")
 		}
 	})
 }
