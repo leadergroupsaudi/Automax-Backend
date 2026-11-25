@@ -68,10 +68,17 @@ type EORecordRepository interface {
 	CreateLink(ctx context.Context, link *models.EORecordLink) error
 	LinksFrom(ctx context.Context, recordID uuid.UUID) ([]models.EORecordLink, error)
 	CreateHistory(ctx context.Context, entry *models.EORecordHistory) error
-	// History is one record's audit trail, NEWEST FIRST, paged. It returns
-	// the page and the total across all pages — the same contract List has —
-	// and it clamps page and limit the same way, so a client that can page
-	// the register can page this without learning a second convention.
+	// History is one record's audit trail, NEWEST FIRST, paged, with each
+	// row's three ids resolved to the display names they stand for
+	// (models.EORecordHistoryEntry). It returns the page and the total across
+	// all pages — the same contract List has — and it clamps page and limit
+	// the same way, so a client that can page the register can page this
+	// without learning a second convention.
+	//
+	// IT ISSUES A FIXED NUMBER OF QUERIES, never one per row: the count, the
+	// page, then one batch read of that page's distinct actors and one of its
+	// distinct states. The page size bounds the work, so the query count does
+	// not grow with the number of rows.
 	//
 	// It applies NO row-level visibility of its own and takes no actor: a
 	// trail belongs to its record, so the caller must first have established
@@ -79,7 +86,7 @@ type EORecordRepository interface {
 	// under the caller's scope). Serving this without that check would
 	// disclose every state change, actor and timestamp of a record §7.11
 	// conceals — and the record's existence with it.
-	History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistory, int64, error)
+	History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistoryEntry, int64, error)
 	// EnteredStateIDs is every state the record has ever entered, from
 	// eo_record_history. It is not the current state: is_locked_after asks
 	// whether a record has ever been in a state, and EO workflows have return
@@ -298,7 +305,7 @@ func (r *eoRecordRepository) CreateHistory(ctx context.Context, entry *models.EO
 // breaks the tie, exactly as eoOrderClause does for the register.
 const eoHistoryOrder = "eo_record_history.created_at DESC, eo_record_history.id ASC"
 
-func (r *eoRecordRepository) History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistory, int64, error) {
+func (r *eoRecordRepository) History(ctx context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistoryEntry, int64, error) {
 	page, limit = eoClampPaging(page, limit)
 	// Both the count and the page are built from the same predicate, so they
 	// cannot drift. The composite key is spelled out because the record id
@@ -314,15 +321,141 @@ func (r *eoRecordRepository) History(ctx context.Context, recordID, recordTypeID
 		return nil, 0, fmt.Errorf("count history of eo record %s: %w", recordID, err)
 	}
 
-	var out []models.EORecordHistory
+	var rows []models.EORecordHistory
 	if err := scope().
 		Order(eoHistoryOrder).
 		Offset((page - 1) * limit).
 		Limit(limit).
-		Find(&out).Error; err != nil {
+		Find(&rows).Error; err != nil {
 		return nil, 0, fmt.Errorf("read history of eo record %s: %w", recordID, err)
 	}
+	if len(rows) == 0 {
+		// No ids to resolve, so no further query is issued at all. The empty
+		// trail costs the count and the page and nothing else.
+		return []models.EORecordHistoryEntry{}, total, nil
+	}
+
+	// ONE batch read per entity kind, over the page's DISTINCT ids. Resolving
+	// a name per row would be an N+1 on an audit route whose page may hold
+	// eoMaxLimit rows.
+	actors, err := r.eoActorNames(ctx, eoDistinctIDs(rows, func(h *models.EORecordHistory) []*uuid.UUID {
+		return []*uuid.UUID{h.PerformedByID}
+	}))
+	if err != nil {
+		return nil, 0, fmt.Errorf("read history of eo record %s: %w", recordID, err)
+	}
+	states, err := r.eoStateNames(ctx, eoDistinctIDs(rows, func(h *models.EORecordHistory) []*uuid.UUID {
+		return []*uuid.UUID{h.FromStateID, h.ToStateID}
+	}))
+	if err != nil {
+		return nil, 0, fmt.Errorf("read history of eo record %s: %w", recordID, err)
+	}
+
+	out := make([]models.EORecordHistoryEntry, 0, len(rows))
+	for i := range rows {
+		entry := models.EORecordHistoryEntry{EORecordHistory: rows[i]}
+		if id := rows[i].PerformedByID; id != nil {
+			entry.PerformedByName = actors[*id]
+		}
+		// An id that resolves to nothing leaves the name EMPTY and the row
+		// otherwise intact; models.EORecordHistoryEntry says why.
+		if id := rows[i].FromStateID; id != nil {
+			entry.FromStateName, entry.FromStateNameAr = states[*id].Name, states[*id].NameAr
+		}
+		if id := rows[i].ToStateID; id != nil {
+			entry.ToStateName, entry.ToStateNameAr = states[*id].Name, states[*id].NameAr
+		}
+		out = append(out, entry)
+	}
 	return out, total, nil
+}
+
+// eoDistinctIDs collects the non-nil ids pick returns for each row, without
+// repeats. It is what keeps the batch reads proportional to the number of
+// DISTINCT actors and states on the page rather than to its length.
+func eoDistinctIDs(rows []models.EORecordHistory, pick func(*models.EORecordHistory) []*uuid.UUID) []uuid.UUID {
+	seen := map[uuid.UUID]bool{}
+	out := []uuid.UUID{}
+	for i := range rows {
+		for _, id := range pick(&rows[i]) {
+			if id == nil || *id == uuid.Nil || seen[*id] {
+				continue
+			}
+			seen[*id] = true
+			out = append(out, *id)
+		}
+	}
+	return out
+}
+
+// eoNamePair is a configured thing's bilingual name, as every EO payload
+// spells it: the primary name and its Arabic counterpart.
+type eoNamePair struct {
+	Name   string
+	NameAr string
+}
+
+// eoActorNames resolves user ids to one display name each, in ONE query.
+//
+// IT NAMES THE TABLE RATHER THAN THE MODEL, and that is not an optimisation:
+// Model(&models.User{}) would add deleted_at IS NULL, so an officer who acted
+// and later left — a soft-deleted user — would vanish from the trail of the
+// actions they took. An audit trail records who did something, and that fact
+// does not expire when the account is archived. (A user row that has been
+// genuinely purged resolves to nothing, and the name is then empty.)
+//
+// It selects five columns rather than SELECT *: a User row carries a password
+// hash and a dozen relations, none of which belong in a history payload.
+func (r *eoRecordRepository) eoActorNames(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ID         uuid.UUID
+		FirstName  string
+		MiddleName string
+		LastName   string
+		Username   string
+	}
+	if err := r.db.WithContext(ctx).
+		Table("users").
+		Select("id, first_name, middle_name, last_name, username").
+		Where("id IN ?", ids).
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("read history actor names: %w", err)
+	}
+	for _, row := range rows {
+		out[row.ID] = models.PersonDisplayName(row.FirstName, row.MiddleName, row.LastName, row.Username)
+	}
+	return out, nil
+}
+
+// eoStateNames resolves workflow state ids to their bilingual names, in ONE
+// query, and names the table for the same reason eoActorNames does: a state
+// that was retired after a record passed through it still has to appear in
+// that record's trail.
+func (r *eoRecordRepository) eoStateNames(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]eoNamePair, error) {
+	out := map[uuid.UUID]eoNamePair{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ID     uuid.UUID
+		Name   string
+		NameAr string
+	}
+	if err := r.db.WithContext(ctx).
+		Table("workflow_states").
+		Select("id, name, name_ar").
+		Where("id IN ?", ids).
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("read history state names: %w", err)
+	}
+	for _, row := range rows {
+		out[row.ID] = eoNamePair{Name: row.Name, NameAr: row.NameAr}
+	}
+	return out, nil
 }
 
 func (r *eoRecordRepository) EnteredStateIDs(ctx context.Context, recordID, recordTypeID uuid.UUID) (map[uuid.UUID]bool, error) {

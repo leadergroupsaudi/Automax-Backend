@@ -171,17 +171,12 @@ func (s *callRecordingAuditService) List(ctx context.Context, filter *models.Cal
 	return items, total, counts, nil
 }
 
+// userDisplayName renders a user as a line of text. The RULE lives in
+// models.PersonDisplayName, where a caller holding only the name columns — the
+// EO history read, which selects five columns from `users` — reaches the same
+// one instead of writing a second copy beside it.
 func userDisplayName(u *models.User) string {
-	parts := make([]string, 0, 3)
-	for _, p := range []string{u.FirstName, u.MiddleName, u.LastName} {
-		if p = strings.TrimSpace(p); p != "" {
-			parts = append(parts, p)
-		}
-	}
-	if len(parts) == 0 {
-		return u.Username
-	}
-	return strings.Join(parts, " ")
+	return models.PersonDisplayName(u.FirstName, u.MiddleName, u.LastName, u.Username)
 }
 
 func userRoleNames(u *models.User) string {

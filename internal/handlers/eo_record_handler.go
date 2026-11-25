@@ -799,6 +799,12 @@ type eoHistoryQuery struct {
 //
 // An EMPTY trail is a 200 with an empty list and a zero total. A record with
 // no history is a record, not a missing one.
+//
+// The rows are models.EORecordHistoryEntry: the stored row plus the display
+// names its actor and state ids stand for. The consumer cannot resolve them
+// itself — no route turns a user id into a name — and the repository batches
+// the lookups, so this handler neither resolves nor paginates them a second
+// time.
 func (h *EORecordHandler) History(c *fiber.Ctx) error {
 	user, ok, err := eoActor(c)
 	if !ok {
@@ -830,7 +836,7 @@ func (h *EORecordHandler) History(c *fiber.Ctx) error {
 	}
 	if rows == nil {
 		// An empty ARRAY, never null: the history tab maps over it.
-		rows = []models.EORecordHistory{}
+		rows = []models.EORecordHistoryEntry{}
 	}
 	return utils.PaginatedSuccessResponse(c, rows, page, limit, total)
 }

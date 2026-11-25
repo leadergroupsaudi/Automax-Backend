@@ -30,7 +30,7 @@ import (
 // it passed down.
 type eoHistoryRepo struct {
 	eoFakeRecordRepo
-	rows []models.EORecordHistory
+	rows []models.EORecordHistoryEntry
 	err  error
 
 	calls     int
@@ -40,7 +40,7 @@ type eoHistoryRepo struct {
 	gotLimit  int
 }
 
-func (f *eoHistoryRepo) History(_ context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistory, int64, error) {
+func (f *eoHistoryRepo) History(_ context.Context, recordID, recordTypeID uuid.UUID, page, limit int) ([]models.EORecordHistoryEntry, int64, error) {
 	f.calls++
 	f.gotRecord, f.gotType, f.gotPage, f.gotLimit = recordID, recordTypeID, page, limit
 	if f.err != nil {
@@ -73,16 +73,23 @@ func eoHistoryRecord() *models.EORecord {
 }
 
 // eoHistoryRows are n entries NEWEST FIRST, the order the route must preserve.
-func eoHistoryRows(rec *models.EORecord, n int) []models.EORecordHistory {
-	out := make([]models.EORecordHistory, 0, n)
+func eoHistoryRows(rec *models.EORecord, n int) []models.EORecordHistoryEntry {
+	out := make([]models.EORecordHistoryEntry, 0, n)
 	base := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < n; i++ {
-		out = append(out, models.EORecordHistory{
-			ID:           uuid.New(),
-			RecordID:     rec.ID,
-			RecordTypeID: rec.RecordTypeID,
-			Comment:      "entry",
-			CreatedAt:    base.Add(-time.Duration(i) * time.Minute),
+		out = append(out, models.EORecordHistoryEntry{
+			EORecordHistory: models.EORecordHistory{
+				ID:           uuid.New(),
+				RecordID:     rec.ID,
+				RecordTypeID: rec.RecordTypeID,
+				Comment:      "entry",
+				CreatedAt:    base.Add(-time.Duration(i) * time.Minute),
+			},
+			PerformedByName: "Officer " + strconv.Itoa(i),
+			FromStateName:   "Under Review",
+			FromStateNameAr: "قيد المراجعة",
+			ToStateName:     "Approved",
+			ToStateNameAr:   "معتمد",
 		})
 	}
 	return out
@@ -367,6 +374,92 @@ func TestGetEORecordHistoryIsPagedNewestFirst(t *testing.T) {
 			t.Errorf("the repository was asked for limit %d, want %d", repo.gotLimit, eoMaxPageLimit)
 		}
 	})
+}
+
+// TestGetEORecordHistoryServesDisplayNamesBesideTheIDs.
+//
+// The consumer cannot resolve `performed_by_id`, `from_state_id` or
+// `to_state_id` itself: no route turns a user id into a name, so a history tab
+// reading this payload alone would render "user 3f2a… moved 9b1c… → 7d4e…".
+// The names therefore travel with the rows — and BESIDE the ids, never in
+// place of them, because a consumer may legitimately key on an id and an audit
+// payload must not lose one.
+//
+// The state names are bilingual, the convention WorkflowState and EORecordType
+// already use (`name` + `name_ar`). The actor's is not: models.User has no
+// Arabic name column.
+func TestGetEORecordHistoryServesDisplayNamesBesideTheIDs(t *testing.T) {
+	eoInitValidator(t)
+	rec := eoHistoryRecord()
+	rows := eoHistoryRows(rec, 2)
+	actor, fromState, toState := uuid.New(), uuid.New(), uuid.New()
+	for i := range rows {
+		rows[i].PerformedByID = &actor
+		rows[i].FromStateID = &fromState
+		rows[i].ToStateID = &toState
+	}
+	repo := &eoHistoryRepo{
+		eoFakeRecordRepo: eoFakeRecordRepo{
+			byID:       map[uuid.UUID]*models.EORecord{rec.ID: rec},
+			visibleIDs: map[uuid.UUID]bool{rec.ID: true},
+		},
+		rows: rows,
+	}
+	types := &eoFakeTypeRepo{byID: &models.EORecordType{ID: rec.RecordTypeID, Key: eoHistoryTypeKey}}
+	app := eoHistoryApp(repo, types,
+		eoHistoryUser("eo:view", models.EOTypePermissionCode(eoHistoryTypeKey, models.EOTypePermissionView)), "eo:view")
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/eo-records/"+rec.ID.String()+"/history", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, status := eoHistoryRead(t, resp)
+	if status != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", status, body)
+	}
+	out := eoHistoryBody(t, body)
+	if len(out.Data) != 2 {
+		t.Fatalf("data has %d entries, want 2: %s", len(out.Data), out.raw)
+	}
+	first := out.Data[0]
+
+	for _, tc := range []struct{ key, want string }{
+		{"performed_by_name", rows[0].PerformedByName},
+		{"from_state_name", "Under Review"},
+		{"from_state_name_ar", "قيد المراجعة"},
+		{"to_state_name", "Approved"},
+		{"to_state_name_ar", "معتمد"},
+	} {
+		got, _ := first[tc.key].(string)
+		if got != tc.want {
+			t.Errorf("data[0].%s = %q, want %q — a history tab has no other way to resolve it: %s",
+				tc.key, got, tc.want, out.raw)
+		}
+	}
+
+	// THE IDS SURVIVE. Replacing them with names would be a lossy change to an
+	// audit payload.
+	for _, tc := range []struct {
+		key  string
+		want uuid.UUID
+	}{
+		{"performed_by_id", actor},
+		{"from_state_id", fromState},
+		{"to_state_id", toState},
+		{"record_id", rec.ID},
+	} {
+		got, _ := first[tc.key].(string)
+		if got != tc.want.String() {
+			t.Errorf("data[0].%s = %q, want %q — the names are added beside the ids, not instead of them",
+				tc.key, got, tc.want)
+		}
+	}
+
+	// No Arabic actor name is invented: models.User has no column for one, and
+	// a key standing for data that does not exist is a third convention.
+	if _, ok := first["performed_by_name_ar"]; ok {
+		t.Errorf("performed_by_name_ar is present: models.User has no Arabic name column to fill it from: %s", out.raw)
+	}
 }
 
 // TestGetEORecordHistoryOnARecordWithNone — Review Focus 3. A record whose

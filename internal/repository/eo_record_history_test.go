@@ -2,12 +2,18 @@ package repository
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/automax/backend/internal/models"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // eoHistoryEntry writes one audit row at an EXACT timestamp. The timestamp is
@@ -30,7 +36,7 @@ func eoHistoryEntry(t *testing.T, repo EORecordRepository, rec *models.EORecord,
 	return entry
 }
 
-func eoHistoryComments(rows []models.EORecordHistory) []string {
+func eoHistoryComments(rows []models.EORecordHistoryEntry) []string {
 	out := make([]string, len(rows))
 	for i, r := range rows {
 		out[i] = r.Comment
@@ -260,4 +266,373 @@ func TestEORecordHistoryClampsPagingLikeTheRegister(t *testing.T) {
 			t.Fatalf("page 0 row %d = %s, want page 1's %s", i, zeroth[i].ID, first[i].ID)
 		}
 	}
+}
+
+// ── the display names the trail is read with ────────────────────────────────
+
+// eoHistoryDB is eoRecordDB plus the two tables the history read RESOLVES
+// NAMES FROM. They are created here and not in eoRecordDB because only this
+// read needs them, and a test schema should say what the code under it
+// touches.
+//
+// users needs the user_call_status enum first: models.User declares a column
+// of that type, and CreateTable fails without it (the same two lines
+// internal/database and internal/services already carry).
+func eoHistoryDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := eoRecordDB(t)
+	if err := db.Exec(`CREATE TYPE user_call_status AS ENUM ('offline', 'online', 'busy', 'in_call', 'available')`).Error; err != nil {
+		t.Fatalf("create user_call_status enum: %v", err)
+	}
+	m := db.Session(&gorm.Session{})
+	m.Config.DisableForeignKeyConstraintWhenMigrating = true
+	if err := m.Migrator().CreateTable(&models.WorkflowState{}, &models.User{}); err != nil {
+		t.Fatalf("create the name tables: %v", err)
+	}
+	return db
+}
+
+func eoHistoryUser(t *testing.T, db *gorm.DB, first, middle, last, username string) *models.User {
+	t.Helper()
+	u := &models.User{
+		ID: uuid.New(), FirstName: first, MiddleName: middle, LastName: last,
+		Username: username, Email: username + "@eo.gov", Password: "x",
+	}
+	if err := db.Create(u).Error; err != nil {
+		t.Fatalf("create user %q: %v", username, err)
+	}
+	return u
+}
+
+func eoHistoryState(t *testing.T, db *gorm.DB, name, nameAr string) *models.WorkflowState {
+	t.Helper()
+	s := &models.WorkflowState{ID: uuid.New(), WorkflowID: uuid.New(), Name: name, NameAr: nameAr, Code: name}
+	if err := db.Create(s).Error; err != nil {
+		t.Fatalf("create state %q: %v", name, err)
+	}
+	return s
+}
+
+// TestEORecordHistoryResolvesActorAndStateNames.
+//
+// The consumer cannot resolve these ids itself — no route turns a user id into
+// a name — so a trail served as ids alone reads "user 3f2a… moved 9b1c… →
+// 7d4e…" and fails the officer the record detail page is for. The names are
+// added BESIDE the ids, never in place of them.
+func TestEORecordHistoryResolvesActorAndStateNames(t *testing.T) {
+	db := eoHistoryDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+	rec := eoListRec(t, repo, uuid.New(), "H-NAMES", nil)
+
+	actor := eoHistoryUser(t, db, "Layla", "A.", "Mansour", "lmansour")
+	from := eoHistoryState(t, db, "Under Review", "قيد المراجعة")
+	to := eoHistoryState(t, db, "Approved", "معتمد")
+
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	entry := eoHistoryEntry(t, repo, rec, at, "moved")
+	if err := db.Model(&models.EORecordHistory{}).Where("id = ?", entry.ID).
+		Updates(map[string]any{"performed_by_id": actor.ID, "from_state_id": from.ID, "to_state_id": to.ID}).Error; err != nil {
+		t.Fatalf("attach ids: %v", err)
+	}
+
+	rows, _, err := repo.History(ctx, rec.ID, rec.RecordTypeID, 1, 100)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	got := rows[0]
+
+	if got.PerformedByName != "Layla A. Mansour" {
+		t.Errorf("performed_by_name = %q, want %q", got.PerformedByName, "Layla A. Mansour")
+	}
+	// BILINGUAL, the convention WorkflowState and EORecordType already use.
+	if got.FromStateName != "Under Review" || got.FromStateNameAr != "قيد المراجعة" {
+		t.Errorf("from state = %q / %q, want %q / %q", got.FromStateName, got.FromStateNameAr, "Under Review", "قيد المراجعة")
+	}
+	if got.ToStateName != "Approved" || got.ToStateNameAr != "معتمد" {
+		t.Errorf("to state = %q / %q, want %q / %q", got.ToStateName, got.ToStateNameAr, "Approved", "معتمد")
+	}
+	// THE IDS SURVIVE: a consumer may key on them, and losing one from an
+	// audit payload would be a lossy change.
+	if got.PerformedByID == nil || *got.PerformedByID != actor.ID {
+		t.Errorf("performed_by_id = %v, want %s", got.PerformedByID, actor.ID)
+	}
+	if got.FromStateID == nil || *got.FromStateID != from.ID {
+		t.Errorf("from_state_id = %v, want %s", got.FromStateID, from.ID)
+	}
+	if got.ToStateID == nil || *got.ToStateID != to.ID {
+		t.Errorf("to_state_id = %v, want %s", got.ToStateID, to.ID)
+	}
+
+	// A user with no name parts falls back to the username — models.PersonDisplayName's
+	// rule, the one the rest of the codebase renders people with.
+	nameless := eoHistoryUser(t, db, "", "", "", "kiosk")
+	second := eoHistoryEntry(t, repo, rec, at.Add(-time.Minute), "kiosk entry")
+	if err := db.Model(&models.EORecordHistory{}).Where("id = ?", second.ID).
+		Update("performed_by_id", nameless.ID).Error; err != nil {
+		t.Fatalf("attach nameless actor: %v", err)
+	}
+	rows, _, err = repo.History(ctx, rec.ID, rec.RecordTypeID, 1, 100)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if rows[1].PerformedByName != "kiosk" {
+		t.Errorf("performed_by_name = %q, want the username %q", rows[1].PerformedByName, "kiosk")
+	}
+
+	// AN ARCHIVED ACTOR STILL HAS A NAME. An audit trail records who did
+	// something, and that fact does not expire when the account is
+	// soft-deleted — which is why the read names the TABLE rather than the
+	// model, where GORM would add deleted_at IS NULL.
+	if err := db.Delete(&models.User{}, "id = ?", actor.ID).Error; err != nil {
+		t.Fatalf("soft-delete actor: %v", err)
+	}
+	if err := db.Delete(&models.WorkflowState{}, "id = ?", from.ID).Error; err != nil {
+		t.Fatalf("soft-delete state: %v", err)
+	}
+	rows, _, err = repo.History(ctx, rec.ID, rec.RecordTypeID, 1, 100)
+	if err != nil {
+		t.Fatalf("history after soft delete: %v", err)
+	}
+	if rows[0].PerformedByName != "Layla A. Mansour" {
+		t.Errorf("performed_by_name = %q after the user was archived, want it unchanged: the trail records who acted", rows[0].PerformedByName)
+	}
+	if rows[0].FromStateName != "Under Review" {
+		t.Errorf("from_state_name = %q after the state was retired, want it unchanged", rows[0].FromStateName)
+	}
+}
+
+// TestEORecordHistoryServesRowsWhoseNamesCannotBeResolved — the two edge cases
+// that must not blank a row or fail the request.
+//
+// A null performed_by_id is a SYSTEM action (a timer, an escalation sweep) and
+// there is no person to name. A null from_state_id is a CREATE row, which came
+// from no state. A performed_by_id naming a purged user resolves to nothing.
+//
+// All three answer with an EMPTY NAME and an otherwise complete row. The name
+// is empty rather than a placeholder sentence because an English literal baked
+// into the payload would have no Arabic counterpart in a bilingual register —
+// the client renders its own wording, and `is_system_action` and the surviving
+// ids tell it which case it is looking at.
+func TestEORecordHistoryServesRowsWhoseNamesCannotBeResolved(t *testing.T) {
+	db := eoHistoryDB(t)
+	repo := NewEORecordRepository(db)
+	ctx := context.Background()
+	rec := eoListRec(t, repo, uuid.New(), "H-UNRESOLVED", nil)
+	to := eoHistoryState(t, db, "Registered", "مسجل")
+	purged := uuid.New() // a user id that names nobody
+
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	created := eoHistoryEntry(t, repo, rec, at, "created")
+	if err := db.Model(&models.EORecordHistory{}).Where("id = ?", created.ID).
+		Updates(map[string]any{"to_state_id": to.ID, "performed_by_id": purged}).Error; err != nil {
+		t.Fatalf("attach ids: %v", err)
+	}
+	system := eoHistoryEntry(t, repo, rec, at.Add(-time.Minute), "escalated")
+	if err := db.Model(&models.EORecordHistory{}).Where("id = ?", system.ID).
+		Updates(map[string]any{"is_system_action": true, "to_state_id": to.ID}).Error; err != nil {
+		t.Fatalf("mark system action: %v", err)
+	}
+
+	rows, total, err := repo.History(ctx, rec.ID, rec.RecordTypeID, 1, 100)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if total != 2 || len(rows) != 2 {
+		t.Fatalf("total = %d, rows = %d, want 2 and 2 — an unresolvable name must not drop a row", total, len(rows))
+	}
+
+	t.Run("a create row has no from-state and is served whole", func(t *testing.T) {
+		got := rows[0]
+		if got.FromStateID != nil {
+			t.Fatalf("fixture is wrong: from_state_id = %v, want nil", got.FromStateID)
+		}
+		if got.FromStateName != "" || got.FromStateNameAr != "" {
+			t.Errorf("from state = %q / %q, want empty", got.FromStateName, got.FromStateNameAr)
+		}
+		// The rest of the row is intact — this is the "not blanked" half.
+		if got.Comment != "created" || got.ToStateName != "Registered" || got.ToStateNameAr != "مسجل" {
+			t.Errorf("row = %+v, want its comment and to-state intact", got)
+		}
+		if got.ID == uuid.Nil || got.CreatedAt.IsZero() {
+			t.Errorf("row lost its id or timestamp: %+v", got)
+		}
+	})
+
+	t.Run("an actor who no longer exists leaves a name empty, not a row missing", func(t *testing.T) {
+		got := rows[0]
+		if got.PerformedByName != "" {
+			t.Errorf("performed_by_name = %q, want empty for a purged user", got.PerformedByName)
+		}
+		// The id is still there, so a client can say so rather than guess.
+		if got.PerformedByID == nil || *got.PerformedByID != purged {
+			t.Errorf("performed_by_id = %v, want %s kept", got.PerformedByID, purged)
+		}
+	})
+
+	t.Run("a system action names nobody and says so", func(t *testing.T) {
+		got := rows[1]
+		if got.PerformedByID != nil {
+			t.Fatalf("fixture is wrong: performed_by_id = %v, want nil", got.PerformedByID)
+		}
+		if got.PerformedByName != "" {
+			t.Errorf("performed_by_name = %q, want empty: no person acted", got.PerformedByName)
+		}
+		if !got.IsSystemAction {
+			t.Error("is_system_action = false: it is what tells the client this was not a purged user")
+		}
+		if got.ToStateName != "Registered" {
+			t.Errorf("to_state_name = %q, want Registered: a system row still resolves its states", got.ToStateName)
+		}
+	})
+}
+
+// eoQueryCounter records every SQL statement GORM runs on the session it is
+// installed on. It is a logger rather than a callback because Count, Find and
+// Scan do not all pass through the same callback processor, and a counter that
+// missed one would under-report exactly the query an N+1 adds.
+type eoQueryCounter struct {
+	mu   sync.Mutex
+	sqls []string
+}
+
+func (c *eoQueryCounter) LogMode(logger.LogLevel) logger.Interface      { return c }
+func (c *eoQueryCounter) Info(context.Context, string, ...interface{})  {}
+func (c *eoQueryCounter) Warn(context.Context, string, ...interface{})  {}
+func (c *eoQueryCounter) Error(context.Context, string, ...interface{}) {}
+func (c *eoQueryCounter) Trace(_ context.Context, _ time.Time, fc func() (string, int64), _ error) {
+	sql, _ := fc()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sqls = append(c.sqls, sql)
+}
+func (c *eoQueryCounter) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sqls = nil
+}
+func (c *eoQueryCounter) statements() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sqls...)
+}
+
+// TestEORecordHistoryResolvesNamesInAFixedNumberOfQueries.
+//
+// Resolving a name per row would be an N+1 on a route whose page may hold
+// eoMaxLimit rows — the risk the decoration introduces, so it is the thing
+// that has to be measured rather than asserted. The count must not grow with
+// the number of rows, nor with the number of DISTINCT actors: the count, the
+// page, one batch read of the page's actors and one of its states, and nothing
+// else.
+func TestEORecordHistoryResolvesNamesInAFixedNumberOfQueries(t *testing.T) {
+	db := eoHistoryDB(t)
+	ctx := context.Background()
+	writer := NewEORecordRepository(db)
+	rec := eoListRec(t, writer, uuid.New(), "H-NPLUS1", nil)
+
+	states := []*models.WorkflowState{
+		eoHistoryState(t, db, "Registered", "مسجل"),
+		eoHistoryState(t, db, "Under Review", "قيد المراجعة"),
+		eoHistoryState(t, db, "Approved", "معتمد"),
+	}
+
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	// Every row gets its OWN actor, so a per-row resolver cannot be rescued by
+	// a cache keyed on the actor.
+	written := 0
+	write := func(n int) {
+		for k := 0; k < n; k++ {
+			i := written
+			written++
+			u := eoHistoryUser(t, db, "Officer", "", strconv.Itoa(i), "officer"+strconv.Itoa(i))
+			e := eoHistoryEntry(t, writer, rec, at.Add(-time.Duration(len(states)*i)*time.Minute), "moved")
+			if err := db.Model(&models.EORecordHistory{}).Where("id = ?", e.ID).
+				Updates(map[string]any{
+					"performed_by_id": u.ID,
+					"from_state_id":   states[i%len(states)].ID,
+					"to_state_id":     states[(i+1)%len(states)].ID,
+				}).Error; err != nil {
+				t.Fatalf("attach ids: %v", err)
+			}
+		}
+	}
+
+	counter := &eoQueryCounter{}
+	repo := NewEORecordRepository(db.Session(&gorm.Session{Logger: counter}))
+
+	measure := func(wantRows int) []string {
+		t.Helper()
+		counter.reset()
+		rows, total, err := repo.History(ctx, rec.ID, rec.RecordTypeID, 1, eoMaxLimit)
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		if len(rows) != wantRows || total != int64(wantRows) {
+			t.Fatalf("rows = %d total = %d, want %d", len(rows), total, wantRows)
+		}
+		for i, row := range rows {
+			if row.PerformedByName == "" || row.ToStateName == "" {
+				t.Fatalf("row %d resolved nothing (%+v): the measurement below would be meaningless", i, row)
+			}
+		}
+		return counter.statements()
+	}
+
+	write(2)
+	small := measure(2)
+	write(18)
+	large := measure(20)
+
+	if len(small) != len(large) {
+		t.Fatalf("2 rows took %d queries, 20 rows took %d — the name resolution is an N+1; the 20-row run issued:\n%s",
+			len(small), len(large), eoFirstStatements(large, 6))
+	}
+	// The count, the page, the actors, the states.
+	if want := 4; len(large) != want {
+		t.Errorf("a page of history took %d queries, want %d (count, page, actors, states):\n%s",
+			len(large), want, eoFirstStatements(large, 6))
+	}
+
+	// The batch reads go over the page's DISTINCT ids: twenty rows move
+	// between three states, so the state lookup must name three, not forty.
+	// Without that, the query COUNT stays at four while the IN list grows
+	// with the page — an N+1 by another name.
+	var stateQuery string
+	for _, sql := range large {
+		if strings.Contains(sql, "workflow_states") {
+			stateQuery = sql
+		}
+	}
+	if stateQuery == "" {
+		t.Fatalf("no state lookup was issued: %s", eoFirstStatements(large, 6))
+	}
+	for _, st := range states {
+		if n := strings.Count(stateQuery, st.ID.String()); n != 1 {
+			t.Errorf("state %s appears %d times in the lookup, want 1 — the ids are not de-duplicated: %s",
+				st.Name, n, eoTruncate(stateQuery, 160))
+		}
+	}
+}
+
+// eoTruncate shortens a statement for a failure message: an un-deduplicated
+// IN list runs to thousands of characters and the point is its shape.
+func eoTruncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("… (%d chars)", len(s))
+}
+
+// eoFirstStatements renders at most n statements, one per line. A failing
+// N+1 run issues dozens of near-identical queries and printing them all
+// buries the number that matters.
+func eoFirstStatements(sqls []string, n int) string {
+	if len(sqls) > n {
+		sqls = append(append([]string(nil), sqls[:n]...), fmt.Sprintf("… and %d more", len(sqls)-n))
+	}
+	return strings.Join(sqls, "\n")
 }

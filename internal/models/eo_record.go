@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -204,6 +205,69 @@ func (x *EORecordHistory) BeforeCreate(tx *gorm.DB) error {
 		x.ID = uuid.New()
 	}
 	return nil
+}
+
+// EORecordHistoryEntry is one audit row AS THE API SERVES IT: the stored row
+// unchanged, plus the display names its three ids stand for.
+//
+// It exists because the consumer cannot resolve those ids itself. There is no
+// route that turns a user id into a name, and adding one so that a history tab
+// could render would be a worse design than resolving the names where the rows
+// are already being read. A trail that says "user 3f2a… moved 9b1c… → 7d4e…"
+// is unreadable to the officer the record detail page is for.
+//
+// THE IDS STAY. The names are added BESIDE them, never in place of them: a
+// consumer may legitimately key on an id, and dropping one from an audit
+// payload would be a lossy change.
+//
+// The state names follow the bilingual convention the rest of the EO payloads
+// already use (WorkflowState, EORecordType): `name` is the primary name and
+// `name_ar` its Arabic counterpart, both returned. There is deliberately no
+// performed_by_name_ar: models.User has no Arabic name column — the schema
+// carries first/middle/last and a username and nothing else — so the field
+// would be a third convention standing for data that does not exist.
+//
+// AN UNRESOLVABLE NAME IS THE EMPTY STRING, never a placeholder sentence, and
+// never a reason to blank or drop the row: every id, timestamp, comment and
+// values diff is still served, and the client renders its own wording in its
+// own language — which an English literal baked in here could not do. Three
+// cases reach it, and the payload tells them apart:
+//
+//   - performed_by_id is null and is_system_action is true: a timer or an
+//     escalation sweep acted and there is no person to name.
+//   - performed_by_id is set but resolves to nobody: the user row was purged.
+//     (A merely soft-deleted one still resolves — see the repository.)
+//   - from_state_id is null: a create row has no state to come from.
+type EORecordHistoryEntry struct {
+	EORecordHistory
+
+	PerformedByName string `json:"performed_by_name"`
+	FromStateName   string `json:"from_state_name"`
+	FromStateNameAr string `json:"from_state_name_ar"`
+	ToStateName     string `json:"to_state_name"`
+	ToStateNameAr   string `json:"to_state_name_ar"`
+}
+
+// PersonDisplayName is the one rule for rendering a person as a line of text:
+// the name parts that are present, joined by spaces, falling back to the
+// username when a user carries no name at all.
+//
+// It is a package-level function over the four strings rather than a method on
+// User so that a caller holding only those columns — the EO history read,
+// which selects five columns from `users` and never materialises a User — uses
+// the same rule as a caller holding the whole row, instead of writing a second
+// one beside it.
+func PersonDisplayName(firstName, middleName, lastName, username string) string {
+	parts := make([]string, 0, 3)
+	for _, p := range []string{firstName, middleName, lastName} {
+		if p = strings.TrimSpace(p); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return strings.TrimSpace(username)
+	}
+	return strings.Join(parts, " ")
 }
 
 // EORecordFilter selects and pages the records of one register (spec §7.7).
