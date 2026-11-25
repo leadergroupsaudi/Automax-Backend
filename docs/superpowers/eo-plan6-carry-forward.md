@@ -102,3 +102,31 @@ and database (`eo_devtest`) is now the way to run `internal/repository` and
   only the Head of Office Referral question.
 - Unrelated, found during recovery: `SeedDevLicenseIfNeeded` logs "license
   already active" for a row it cannot decrypt, leaving the deployment unlicensed.
+
+
+## Correction, 2026-11-25: the `internal/services` failures were ours, not pre-existing
+
+The "pre-existing" label above was wrong. The failures were **introduced by
+`423c55b`** ("Seed the provisional eo_subject_taxonomy lookup category", Plan 5
+Task B1). **Root cause:** `eoE2ETables()` in
+`internal/services/eo_engine_e2e_test.go` did not list `models.LookupCategory`
+or `models.LookupValue`, so B1's new seed step aborted `SeedEOPilot` with
+*relation "lookup_categories" does not exist*. Everything else (`:358`'s
+"deactivated 2 bound workflows", the 16 "pilot seed did not create record type
+eo_directive") was a symptom. **Fixed by commit `d81ab02`** (the two models added to
+the helper). The label was wrong because every check compared against a commit
+that already carried the failures. A bisect shows `3959512` 0 failures,
+`423c55b` 23, `613b5f3` 0. The rewritten subtest *a referral cannot be a record child of another referral* now executes and **passes**; its UNVERIFIED comment was removed.
+
+**Also struck:** the instruction above to "fix the helper's expected count" was the wrong fix (it targets the symptom at `:358`); and the claim that the live permission row still holds pre-correction text is **false** — it was reconciled by hand.
+Unmasked by that fix, a *separate* regression: 6 tests (`TestEOCOMEndToEnd`,
+`TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit`,
+`TestEoPilotOpenObjectionBlocksTheSeededRaiseToHE`,
+`TestEoPilotChildrenThatCloseTheirParent`,
+`TestEoPilotCloseParentFailureIsVisibleOnTheParent`,
+`TestEoPilotCloseParentOnAnAlreadyClosedParentIsANoOp`) still fail with "eo
+record is not valid: draft_file: Original attachment is required" /
+"attachments: Attachments is required". Introduced by `e780404` (file fields
+required at the first state after creation); their fixtures submit without
+files. Not fixed in `d81ab02`.
+

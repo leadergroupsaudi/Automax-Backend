@@ -245,3 +245,29 @@ work. Frontend: `npx tsc --noEmit` exits 0; lint shows 2 pre-existing errors
 **CORRECTION (2026-11-25, Plan 6 Task B1):** the `eo_assignment_parent` entry above ("Still open … The client chooses: narrow the link type's targets, or widen the pattern") is **CLOSED**. The cause was the numbering, which resolved against the immediate parent only; B1 made it resolve against the nearest ancestor the pattern can render against, so an Assignment under an Execution Plan numbers from its Directive. Neither the link type nor the pattern changes, and **the client decision is no longer required**. Pinned by `TestCreateAssignmentUnderExecutionPlanNumbersFromTheDirective`.
 
 **QUALIFICATION (2026-11-25, final fix wave, Plan 6):** the CORRECTION above (`eo_assignment_parent` CLOSED) rests on a **traced code path** plus a **fakes-based test** (`TestCreateAssignmentUnderExecutionPlanNumbersFromTheDirective`, no database). **No create was performed against live data.** The client decision is no longer required, but the closure is not yet observed in production.
+
+
+## Correction, 2026-11-25: the `internal/services` failures were ours, not pre-existing
+
+The "pre-existing" label above was wrong. The failures were **introduced by
+`423c55b`** ("Seed the provisional eo_subject_taxonomy lookup category", Plan 5
+Task B1). **Root cause:** `eoE2ETables()` in
+`internal/services/eo_engine_e2e_test.go` did not list `models.LookupCategory`
+or `models.LookupValue`, so B1's new seed step aborted `SeedEOPilot` with
+*relation "lookup_categories" does not exist*. Everything else (`:358`'s
+"deactivated 2 bound workflows", the 16 "pilot seed did not create record type
+eo_directive") was a symptom. **Fixed by commit `d81ab02`** (the two models added to
+the helper). The label was wrong because every check compared against a commit
+that already carried the failures. A bisect shows `3959512` 0 failures,
+`423c55b` 23, `613b5f3` 0.
+Unmasked by that fix, a *separate* regression: 6 tests (`TestEOCOMEndToEnd`,
+`TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit`,
+`TestEoPilotOpenObjectionBlocksTheSeededRaiseToHE`,
+`TestEoPilotChildrenThatCloseTheirParent`,
+`TestEoPilotCloseParentFailureIsVisibleOnTheParent`,
+`TestEoPilotCloseParentOnAnAlreadyClosedParentIsANoOp`) still fail with "eo
+record is not valid: draft_file: Original attachment is required" /
+"attachments: Attachments is required". Introduced by `e780404` (file fields
+required at the first state after creation); their fixtures submit without
+files. Not fixed in `d81ab02`.
+
