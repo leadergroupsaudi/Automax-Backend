@@ -471,7 +471,7 @@ func (f *eoComFixture) runEOCOM(t *testing.T) {
 	// 3.1 brief, 4.2 record the direction. Referrals are issued from
 	// `directed`, which is where the matrix puts step 4.3.
 	for _, code := range []string{"analyse", "brief", "direct"} {
-		letter = f.move(t, f.reread(t, letter), code, models.EOTransitionInput{})
+		letter = f.move(t, f.reread(t, letter), code, eoAnalyseInput(code))
 	}
 
 	// ── Step 2: two referrals, to two different bodies ──────────────────
@@ -884,4 +884,25 @@ func TestEoIncomingCorrespondenceIsCreatableWithoutAttachments(t *testing.T) {
 	if fresh == nil {
 		t.Fatal("the letter cannot be read back")
 	}
+}
+
+// eoRequiredFileID is a canonical Documenta node id, the shape a file field
+// stores. The pilot seed requires some file fields AT A WORKFLOW STATE (the
+// draft's original at `submitted`, a letter's attachments at `analysis`); a
+// fixture that drives such a transition must put a file on the record first,
+// as a clerk would. No Documenta client is consulted: eoValidate checks the
+// stored value's shape and presence, never that the node exists, and an upload
+// answers 503 here because EO_DOCUMENTA_ENABLED=false. The requirement itself
+// is untouched; the record simply satisfies it.
+func eoRequiredFileID() string { return uuid.NewString() }
+
+// eoAnalyseInput is the input for a letter's transition `code`. `analyse`
+// carries the attachment the seed requires at the analysis state, through the
+// engine's own Attachments route (stored into the record's attachments key);
+// every other transition carries nothing.
+func eoAnalyseInput(code string) models.EOTransitionInput {
+	if code == "analyse" {
+		return models.EOTransitionInput{Attachments: []string{eoRequiredFileID()}}
+	}
+	return models.EOTransitionInput{}
 }

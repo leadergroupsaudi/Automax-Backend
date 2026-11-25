@@ -375,7 +375,7 @@ func TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit(t *testing.T) {
 	f := eoWfNewFixture(t)
 	ctx := context.Background()
 
-	study := f.create(t, eoPilotDraftTypeKey, nil, "", map[string]any{"draft_text": "the original as proposed"})
+	study := f.create(t, eoPilotDraftTypeKey, nil, "", map[string]any{"draft_text": "the original as proposed", "draft_file": eoRequiredFileID()})
 
 	// BEFORE the submit stamp the original is still editable: the lock is
 	// "after this state", not "always".
@@ -425,7 +425,7 @@ func TestEoPilotDraftOriginalIsRefusedAnEditAfterSubmit(t *testing.T) {
 func TestEoPilotOpenObjectionBlocksTheSeededRaiseToHE(t *testing.T) {
 	f := eoWfNewFixture(t)
 
-	study := f.create(t, eoPilotDraftTypeKey, nil, "", nil)
+	study := f.create(t, eoPilotDraftTypeKey, nil, "", map[string]any{"draft_file": eoRequiredFileID(), "study_report": eoRequiredFileID()})
 	study = f.move(t, study, "submit", models.EOTransitionInput{})
 	study = f.move(t, f.reread(t, study), "begin_study", models.EOTransitionInput{})
 
@@ -469,6 +469,8 @@ func TestEoPilotChildrenThatCloseTheirParent(t *testing.T) {
 		// required at the state the close enters, so it is supplied before
 		// the decision record closes it.
 		study := f.create(t, eoPilotDraftTypeKey, nil, "", map[string]any{
+			"draft_file":    eoRequiredFileID(),
+			"study_report":  eoRequiredFileID(),
 			"he_decision":   "approved_original",
 			"he_reason":     "as proposed",
 			"decision_date": time.Now().Format(time.RFC3339),
@@ -508,7 +510,7 @@ func TestEoPilotChildrenThatCloseTheirParent(t *testing.T) {
 		f := eoWfNewFixture(t)
 
 		letter := f.create(t, eoPilotIncomingTypeKey, nil, "", nil)
-		letter = f.move(t, letter, "analyse", models.EOTransitionInput{})
+		letter = f.move(t, letter, "analyse", eoAnalyseInput("analyse"))
 		letter = f.move(t, f.reread(t, letter), "brief", models.EOTransitionInput{})
 		letter = f.move(t, f.reread(t, letter), "direct", models.EOTransitionInput{})
 
@@ -715,7 +717,7 @@ func TestEoPilotCloseParentFailureIsVisibleOnTheParent(t *testing.T) {
 
 	// No he_decision / he_reason / decision_date: all three are required at
 	// the state `close` enters.
-	study := f.create(t, eoPilotDraftTypeKey, nil, "", nil)
+	study := f.create(t, eoPilotDraftTypeKey, nil, "", map[string]any{"draft_file": eoRequiredFileID(), "study_report": eoRequiredFileID()})
 	study = f.move(t, study, "submit", models.EOTransitionInput{})
 	study = f.move(t, f.reread(t, study), "begin_study", models.EOTransitionInput{})
 	study = f.move(t, f.reread(t, study), eoPilotRaiseToHECode, models.EOTransitionInput{})
@@ -775,7 +777,7 @@ func TestEoPilotCloseParentOnAnAlreadyClosedParentIsANoOp(t *testing.T) {
 
 	letter := f.create(t, eoPilotIncomingTypeKey, nil, "", nil)
 	for _, code := range []string{"analyse", "brief", "direct", "consolidate"} {
-		letter = f.move(t, f.reread(t, letter), code, models.EOTransitionInput{})
+		letter = f.move(t, f.reread(t, letter), code, eoAnalyseInput(code))
 	}
 	reply := f.create(t, eoPilotOutgoingTypeKey, f.reread(t, letter), eoPilotOutgoingLinkKey, nil)
 	reply = f.move(t, reply, "approve", models.EOTransitionInput{})

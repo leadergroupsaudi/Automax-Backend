@@ -130,3 +130,6 @@ record is not valid: draft_file: Original attachment is required" /
 required at the first state after creation); their fixtures submit without
 files. Not fixed in `d81ab02`.
 
+
+---
+**Correction, 2026-11-25 (second regression, appended; nothing above rewritten).** The six services tests listed above, unmasked once the lookup-table fix landed, were not caused by that fix. They were introduced by `e780404` (Plan 5 B6), which deliberately made three file fields required at a named workflow state: fixtures that predate that client-requested requirement submitted/analysed with no file. Fixed by fixture change only (files attached before the guarded transition; requirement and assertions unchanged). `internal/services` is now at zero failures, stable over three consecutive `-count=1` runs.
