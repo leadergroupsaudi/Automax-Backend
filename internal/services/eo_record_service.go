@@ -817,8 +817,18 @@ func (s *eoRecordService) Create(ctx context.Context, req *models.EORecordCreate
 		// live on the link type. Without this, omitting one JSON field lets a
 		// client set its own deadline (which the SLA sweep and escalation run
 		// on) and its own sensitivity label.
+		//
+		// A VALIDATION ERROR, NOT A BARE ONE. This refuses a malformed
+		// REQUEST, and a bare error reaches the handler's default arm as a 500
+		// "Internal server error" — which tells the caller the server broke
+		// when in fact they omitted a field, and buries the one sentence that
+		// says which. Returned as a field error it answers 400 against
+		// `parent_link_type_key`, where a client can show it next to the
+		// input, exactly as every other refusal on this path does.
 		if strings.TrimSpace(req.ParentLinkTypeKey) == "" {
-			return nil, fmt.Errorf("create eo record: parent %s was given with no link type: the link type carries the rules that apply to a child (derived deadline, sensitivity cascade), so it cannot be omitted", parent.ID)
+			return nil, eoValidationError(map[string]string{
+				"parent_link_type_key": fmt.Sprintf("parent %s was given with no link type: the link type carries the rules that apply to a child (derived deadline, sensitivity cascade), so it cannot be omitted", parent.ID),
+			})
 		}
 	}
 

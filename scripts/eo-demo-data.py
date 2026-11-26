@@ -53,6 +53,11 @@ def call(method, path, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
+    # Identify the client. urllib's default is "Python-urllib/X.Y", which a
+    # Cloudflare-fronted deployment rejects outright with 403 error 1010 before
+    # the request reaches the API — the whole run then fails on the login call
+    # with no hint that a WAF, not the server, refused it.
+    req.add_header("User-Agent", "automax-eo-demo-data/1.0")
     if TOKEN:
         req.add_header("Authorization", "Bearer " + TOKEN)
     try:
