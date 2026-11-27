@@ -447,6 +447,10 @@ var eoPilotSteps = []eoPilotStep{
 	// of a non-terminal state to attach it to. See eoFileFieldsMovedToState
 	// for the ruling and its operational cost.
 	{key: eoMoveFileRequirementToStateStepKey, run: eoMoveFileRequirementToState},
+	// ONE-SHOT. The Directive's inherited `source` is overridden by a field
+	// derived from `directive_origin`, so its create form asks the question
+	// once. See eoDeriveDirectiveSource.
+	{key: eoDeriveDirectiveSourceStepKey, run: eoDeriveDirectiveSource},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -3349,6 +3353,10 @@ const (
 	eoDecisionsBaseCapabilityKey = "decisions_base"
 	// eoReferralTreeCapabilityKey is services.EOReferralTreeKey.
 	eoReferralTreeCapabilityKey = "referral_tree"
+	// eoUniqueValuesCapabilityKey is services.EOUniqueValuesKey.
+	eoUniqueValuesCapabilityKey = "unique_values"
+	// eoPlanGateCapabilityKey is services.EOPlanGateKey.
+	eoPlanGateCapabilityKey = "plan_gate"
 	// eoApprovalCapabilityKey is services.EOApprovalKey. Nothing enables it;
 	// it is named so the decision below can be grepped from the key.
 	eoApprovalCapabilityKey = "approval"
@@ -3410,6 +3418,20 @@ var eoPilotCapabilities = []eoCapabilityEnablement{
 		CapabilityKey: eoReferralTreeCapabilityKey,
 		Config:        `{"branch_type_key":"` + eoReferralTypeKey + `"}`,
 		Why:           "EO-COM step 6.1, the consolidation: one letter is referred to several bodies and each referral may be referred on again, and the Office answers once. `branch_type_key` is the seeded Referral type; `parent_key` is left at its default, `parent_referral`, which is the VALUES key the matrix gives a sub-referral (no `parent_referral` link type is seeded, and EORecordHandler.CreateLink refuses a link type that resolves to none, so the shape cannot live in eo_record_links); `target_key` is left at its default, `referral_tree`, which no seeded field definition claims — unlike decisions_base's key, this one needed no cleanup. The letter's own `consolidated` field is left alone: it is the officer's prose, and the capability refuses it as a target by name.",
+	},
+	{
+		TypeKey:       eoDirectiveTypeKey,
+		CapabilityKey: eoUniqueValuesCapabilityKey,
+		Config:        `{"keys":["subject_ar","subject_en"]}`,
+		Why:           "QA defect: two Directives with identical details (EO-DIR-2026-005 and -006, \"Update the visitor protocol\") both saved, because the only unique thing about a Directive is its engine-drawn reference. A Directive's subject must be unique within the type: the Arabic subject and the English subject are each checked on their own, ignoring case and spacing, against every live Directive, closed ones included. Directive is a type key no entry named before, so its capability column is still the default `[]` and this entry reaches existing databases at the next boot, not only fresh ones.",
+	},
+	{
+		TypeKey:       eoAssignmentTypeKey,
+		CapabilityKey: eoPlanGateCapabilityKey,
+		Config: `{"plan_type_key":"` + eoExecutionPlanTypeKey + `",` +
+			`"approved_states":["approved"],` +
+			`"plan_required_key":"plan_required"}`,
+		Why: "AMAX-4706 / AC-05.2, AC-05.3, EO-DIR step 2.2: \"no assignment can be issued before the plan is approved\". An Assignment issued under an Execution Plan needs that plan in `approved`; one issued directly under a Directive needs the Directive's plan approved if it has one, and is refused if the Directive answered Q1 `plan_required` yes but has no plan yet. A Directive that answered no is assigned directly, as `assign_directly` intends. Only the issue is gated, not later edits or transitions. Assignment had no capabilities configured, so this entry reaches existing databases at the next boot.",
 	},
 }
 
