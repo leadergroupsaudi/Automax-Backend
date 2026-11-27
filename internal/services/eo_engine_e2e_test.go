@@ -368,7 +368,7 @@ func TestEOEngineEndToEnd(t *testing.T) {
 	if !errors.As(err, &invalid) {
 		t.Fatalf("step 1 — a record missing its inherited required fields was accepted: %v", err)
 	}
-	for _, key := range []string{"priority", "sensitivity", "source", "owning_body_id"} {
+	for _, key := range []string{"priority", "sensitivity", "owning_body_id"} {
 		if _, ok := invalid.Fields[key]; !ok {
 			t.Errorf("step 1 — inherited field %q is required on the base type but was not reported: %v", key, invalid.Fields)
 		}
@@ -381,7 +381,6 @@ func TestEOEngineEndToEnd(t *testing.T) {
 			"subject_en":     "Smoke directive",
 			"priority":       "high",
 			"sensitivity":    "confidential",
-			"source":         "direct_instruction",
 			"owning_body_id": f.bodyID.String(),
 			"due_date":       parentDue.Format(time.RFC3339),
 		},
@@ -414,7 +413,6 @@ func TestEOEngineEndToEnd(t *testing.T) {
 			"subject_ar":     "مهمة أولى",
 			"priority":       "normal",
 			"sensitivity":    "internal", // the link type's cascade must overrule this
-			"source":         "direct_instruction",
 			"owning_body_id": f.bodyID.String(),
 		},
 	}, f.actor)
@@ -522,7 +520,6 @@ func TestEOEngineEndToEnd(t *testing.T) {
 			"subject_ar":     "مهمة ثانية",
 			"priority":       "normal",
 			"sensitivity":    "internal",
-			"source":         "direct_instruction",
 			"owning_body_id": f.bodyID.String(),
 		},
 	}, f.actor)
@@ -567,7 +564,6 @@ func TestEOEngineEndToEnd(t *testing.T) {
 			"subject_ar":     "توجيه آخر",
 			"priority":       "normal",
 			"sensitivity":    "internal",
-			"source":         "direct_instruction",
 			"owning_body_id": f.bodyID.String(),
 		},
 	}, f.actor)
@@ -585,7 +581,6 @@ func TestEOEngineEndToEnd(t *testing.T) {
 			"subject_ar":     "مهمة تابعة لتوجيه آخر",
 			"priority":       "normal",
 			"sensitivity":    "internal",
-			"source":         "direct_instruction",
 			"owning_body_id": f.bodyID.String(),
 		},
 	}, f.actor)

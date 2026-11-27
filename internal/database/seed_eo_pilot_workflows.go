@@ -1222,7 +1222,6 @@ var eoPilotSpawnActions = []eoSpawnSpec{
 			"subject_en":     "{{subject_en}}",
 			"priority":       "{{priority}}",
 			"sensitivity":    "{{sensitivity}}",
-			"source":         "{{source}}",
 			"owning_body_id": "{{owning_body_id}}",
 			// matrix:520 — "The clock that drives reminders and escalation".
 			// The directive's own due date, not a new one: a task invented
