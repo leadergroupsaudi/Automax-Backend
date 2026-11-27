@@ -403,6 +403,11 @@ func TestEoClosureArtefactsNameTheirTypesTerminalState(t *testing.T) {
 	for _, m := range eoFileFieldsMovedToState {
 		want[m.TypeKey+"."+m.FieldKey] = true
 	}
+	// The plan's approval record is required at `approved`, a non-terminal
+	// state, by eoPlanApprovalAtState.
+	for _, k := range eoPlanApprovalFieldKeys {
+		want[eoExecutionPlanTypeKey+"."+k] = true
+	}
 	for _, r := range rows {
 		if !want[r.TypeKey+"."+r.Key] {
 			t.Errorf("%s.%s names a required-at state and is not a declared closure artefact", r.TypeKey, r.Key)
@@ -1090,6 +1095,8 @@ func eoPilotWorkflowSpecCounts() eoPilotWorkflowSpecCount {
 			}
 		}
 	}
+	// eoPlanApprovalAtState declares the approval record on `approve`.
+	c.fieldChanges += int64(len(eoPlanApprovalFieldKeys))
 	return c
 }
 

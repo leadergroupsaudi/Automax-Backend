@@ -451,6 +451,12 @@ var eoPilotSteps = []eoPilotStep{
 	// derived from `directive_origin`, so its create form asks the question
 	// once. See eoDeriveDirectiveSource.
 	{key: eoDeriveDirectiveSourceStepKey, run: eoDeriveDirectiveSource},
+	// ONE-SHOT. The Execution Plan's approval record is asked for when the
+	// plan is approved, not when it is drafted. See eoPlanApprovalAtState.
+	{key: eoPlanApprovalAtStateStepKey, run: eoPlanApprovalAtState},
+	// ONE-SHOT. plan_route on the Directive, for databases whose Directive
+	// was configured before the entry existed. See eoEnableDirectivePlanRoute.
+	{key: eoEnableDirectivePlanRouteStepKey, run: eoEnableDirectivePlanRoute},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -3357,6 +3363,8 @@ const (
 	eoUniqueValuesCapabilityKey = "unique_values"
 	// eoPlanGateCapabilityKey is services.EOPlanGateKey.
 	eoPlanGateCapabilityKey = "plan_gate"
+	// eoPlanRouteCapabilityKey is services.EOPlanRouteKey.
+	eoPlanRouteCapabilityKey = "plan_route"
 	// eoApprovalCapabilityKey is services.EOApprovalKey. Nothing enables it;
 	// it is named so the decision below can be grepped from the key.
 	eoApprovalCapabilityKey = "approval"
@@ -3432,6 +3440,12 @@ var eoPilotCapabilities = []eoCapabilityEnablement{
 			`"approved_states":["approved"],` +
 			`"plan_required_key":"plan_required"}`,
 		Why: "AMAX-4706 / AC-05.2, AC-05.3, EO-DIR step 2.2: \"no assignment can be issued before the plan is approved\". An Assignment issued under an Execution Plan needs that plan in `approved`; one issued directly under a Directive needs the Directive's plan approved if it has one, and is refused if the Directive answered Q1 `plan_required` yes but has no plan yet. A Directive that answered no is assigned directly, as `assign_directly` intends. Only the issue is gated, not later edits or transitions. Assignment had no capabilities configured, so this entry reaches existing databases at the next boot.",
+	},
+	{
+		TypeKey:       eoDirectiveTypeKey,
+		CapabilityKey: eoPlanRouteCapabilityKey,
+		Config:        eoDirectivePlanRouteConfig,
+		Why:           "EO-DIR Q1 and step 2.2: the Directive's own `plan_required` answer chooses its route, and the plan branch leads to execution only through an approved plan. `require_plan` runs only when `plan_required` is yes and `assign_directly` only when it is no; `plan_approved` runs only when the directive has an Execution Plan in `approved`. Before this the three transitions were offered and run regardless, so a directive needing a plan could be assigned directly, and one whose plan was still in drafting could enter execution. The Directive was configured before this entry existed, so existing databases receive it from the one-shot step eoEnableDirectivePlanRoute.",
 	},
 }
 
