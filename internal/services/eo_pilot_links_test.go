@@ -265,14 +265,32 @@ func (f *eoPilotFixture) eoPilotWorkflow(t *testing.T, ty *models.EORecordType, 
 // submitted (ValidateRecordValues refuses one).
 func (f *eoPilotFixture) eoPilotValues(t *testing.T, typeKey string) map[string]any {
 	t.Helper()
+	out := map[string]any{}
+	for _, d := range eoPilotEffectiveDefs(t, f.db, typeKey) {
+		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
+			continue
+		}
+		out[d.Key] = eoPilotFieldValue(d, f.bodyID, f.actor.ID)
+	}
+	out["subject_ar"] = "اختبار"
+	return out
+}
+
+// eoPilotEffectiveDefs is typeKey's field definitions as the engine resolves
+// them: a type's own definition of an inherited key REPLACES the ancestor's
+// (services.ResolveEffectiveFields), so the Directive's derived `source` is
+// never mistaken for the base's user-entered one.
+func eoPilotEffectiveDefs(t *testing.T, db *gorm.DB, typeKey string) []models.EOFieldDef {
+	t.Helper()
 	var defs []models.EOFieldDef
-	err := f.db.Raw(`
+	err := db.Raw(`
 		WITH RECURSIVE chain AS (
-			SELECT id, parent_type_id FROM eo_record_types WHERE key = ?
+			SELECT id, parent_type_id, 0 AS depth FROM eo_record_types WHERE key = ?
 			UNION ALL
-			SELECT p.id, p.parent_type_id FROM eo_record_types p JOIN chain c ON p.id = c.parent_type_id
+			SELECT p.id, p.parent_type_id, c.depth + 1 FROM eo_record_types p JOIN chain c ON p.id = c.parent_type_id
 		)
-		SELECT * FROM eo_field_defs WHERE record_type_id IN (SELECT id FROM chain) AND deleted_at IS NULL`, typeKey).
+		SELECT f.* FROM eo_field_defs f JOIN chain c ON c.id = f.record_type_id
+		WHERE f.deleted_at IS NULL ORDER BY c.depth DESC`, typeKey).
 		Scan(&defs).Error
 	if err != nil {
 		t.Fatalf("read the field definitions of %q: %v", typeKey, err)
@@ -280,14 +298,16 @@ func (f *eoPilotFixture) eoPilotValues(t *testing.T, typeKey string) map[string]
 	if len(defs) == 0 {
 		t.Fatalf("record type %q has no field definitions", typeKey)
 	}
-	out := map[string]any{}
-	for _, d := range defs {
-		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
+	byKey := map[string]int{}
+	var out []models.EOFieldDef
+	for _, d := range defs { // ancestors first, so the nearest definition wins
+		if i, seen := byKey[d.Key]; seen {
+			out[i] = d
 			continue
 		}
-		out[d.Key] = eoPilotFieldValue(d, f.bodyID)
+		byKey[d.Key] = len(out)
+		out = append(out, d)
 	}
-	out["subject_ar"] = "اختبار"
 	return out
 }
 
@@ -307,10 +327,14 @@ func (f *eoPilotFixture) eoPilotValues(t *testing.T, typeKey string) map[string]
 // through to "x" fails the shape check loudly and names the field, which is
 // what should happen. A fixture that silently fabricates a document
 // reference is the thing B2 refused to let the UPLOAD ROUTE do.
-func eoPilotFieldValue(d models.EOFieldDef, bodyID uuid.UUID) any {
+func eoPilotFieldValue(d models.EOFieldDef, bodyID, userID uuid.UUID) any {
 	switch {
 	case d.Key == "owning_body_id":
 		return bodyID.String()
+	// A column of type uuid: the acting user, so a transition reserved to
+	// the assignee is runnable by the fixture's own actor.
+	case d.Key == "assigned_user_id":
+		return userID.String()
 	case d.Key == "due_date":
 		return time.Now().Add(30 * 24 * time.Hour).Format(time.RFC3339)
 	default:
