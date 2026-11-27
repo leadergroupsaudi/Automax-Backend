@@ -2464,3 +2464,30 @@ func TestAvailableTransitionsSkipsATransitionWhoseTargetStateIsGone(t *testing.T
 		}
 	}
 }
+
+// A requirement refusal is a validation error, so the handler answers 400
+// with the reason, not "Internal server error" (the staging "Analyse the
+// letter" 500, where the designer had added a mandatory attachment).
+func TestEoRequirementRefusalsAreValidationErrors(t *testing.T) {
+	for _, tc := range []struct {
+		kind, key string
+		in        models.EOTransitionInput
+	}{
+		{"comment", "comment", models.EOTransitionInput{}},
+		{"attachment", eoAttachmentsFieldKey, models.EOTransitionInput{Comment: "x"}},
+		{"feedback", "transition", models.EOTransitionInput{Comment: "x"}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			tr := &models.WorkflowTransition{Name: "Analyse the letter", Code: "analyse",
+				Requirements: []models.TransitionRequirement{{RequirementType: tc.kind, IsMandatory: eoTxMandatory(true)}}}
+			err := eoCheckRequirements(tr, tc.in)
+			var invalid *EOValidationError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("refusal is %T (%v), want *EOValidationError", err, err)
+			}
+			if invalid.Fields[tc.key] == "" {
+				t.Errorf("refusal names %v, want %q", invalid.Fields, tc.key)
+			}
+		})
+	}
+}
