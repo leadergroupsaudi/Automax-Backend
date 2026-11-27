@@ -731,10 +731,14 @@ func eoCheckRequirements(transition *models.WorkflowTransition, input models.EOT
 		if req.IsMandatory == nil || !*req.IsMandatory {
 			continue
 		}
+		// Every refusal below is an EOValidationError, so the handler answers
+		// 400 with the reason on the field the actor can act on. A plain
+		// error fell through eoServiceError to "Internal server error", and
+		// the actor was never told the transition wanted a comment or a file.
 		switch req.RequirementType {
 		case "comment":
 			if strings.TrimSpace(input.Comment) == "" {
-				return eoRequirementError(req, "a comment is required for this transition")
+				return eoRequirementError(req, "comment", "a comment is required for this transition")
 			}
 		case "attachment":
 			// The ids are counted here and FILED by eoFileAttachments after
@@ -745,14 +749,18 @@ func eoCheckRequirements(transition *models.WorkflowTransition, input models.EOT
 			// eoAttachmentIDs.
 			ids := eoAttachmentIDs(input.Attachments)
 			if len(ids) == 0 {
-				return eoRequirementError(req, "an attachment is required for this transition")
+				return eoRequirementError(req, eoAttachmentsFieldKey, "an attachment is required for this transition")
 			}
 			if (req.IsMultiple == nil || !*req.IsMultiple) && len(ids) > 1 {
-				return errors.New("only one attachment is allowed for this transition")
+				return eoValidationError(map[string]string{eoAttachmentsFieldKey: "only one attachment is allowed for this transition"})
 			}
 		default:
-			return fmt.Errorf("transition %q requires %q, which the EO engine does not evaluate; configure it as a field requirement instead",
-				transition.Code, req.RequirementType)
+			// Still refused — a control the engine cannot evaluate must not
+			// become no control — but said to the actor in words an
+			// administrator can act on, not as a server failure.
+			return eoValidationError(map[string]string{"transition": fmt.Sprintf(
+				"%q carries a mandatory %q requirement, which EO records do not support; an administrator must remove it from the workflow or make it a field requirement",
+				transition.Name, req.RequirementType)})
 		}
 	}
 	return nil
@@ -879,11 +887,12 @@ func eoCheckCloseParentHasAParent(ctx context.Context, r repository.EORecordRepo
 
 // eoRequirementError prefers the message the configuration carries, so a
 // bilingual or process-specific wording reaches the actor unchanged.
-func eoRequirementError(req models.TransitionRequirement, fallback string) error {
-	if msg := strings.TrimSpace(req.ErrorMessage); msg != "" {
-		return errors.New(msg)
+func eoRequirementError(req models.TransitionRequirement, key, fallback string) error {
+	msg := strings.TrimSpace(req.ErrorMessage)
+	if msg == "" {
+		msg = fallback
 	}
-	return errors.New(fallback)
+	return eoValidationError(map[string]string{key: msg})
 }
 
 // ── attachments ─────────────────────────────────────────────────────────────
