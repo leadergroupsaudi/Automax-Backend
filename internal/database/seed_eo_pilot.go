@@ -447,6 +447,12 @@ var eoPilotSteps = []eoPilotStep{
 	// of a non-terminal state to attach it to. See eoFileFieldsMovedToState
 	// for the ruling and its operational cost.
 	{key: eoMoveFileRequirementToStateStepKey, run: eoMoveFileRequirementToState},
+	// Client's 2026-11-27 Arabic sign-off. CONVERGENT: overwrites label_ar
+	// only where it still equals the English placeholder — a translation an
+	// administrator has since edited by hand stays. See seed_eo_arabic.go
+	// for the map and the per-table queries.
+	{key: eoApplyArabicLabelsStepKey, run: eoApplyArabicLabels,
+		convergent: true, pending: eoApplyArabicLabelsPending},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
