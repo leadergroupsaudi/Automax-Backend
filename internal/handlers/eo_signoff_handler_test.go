@@ -252,12 +252,12 @@ func eoSignoffMarked(t *testing.T, db *gorm.DB) (labels, states, transitions int
 // from, so a change to them is a change to what the client was told is
 // outstanding and must be a deliberate one.
 //
-// Labels: 127 as Plan 6 left them, then two client rulings on the Directive.
-// Its own `source` (derived from directive_origin) and its own
-// `assigned_user_id` (required) each copy the base definition and with it the
-// base's awaiting-Arabic marker (+2); `responsible_officer` is removed (-1).
+// Labels: 127 as Plan 6 left them, then client rulings. The Directive's own
+// `assigned_user_id` (required) copies the base definition and with it the
+// base's awaiting-Arabic marker (+1); its `responsible_officer` is removed
+// (-1); the inherited `source` is removed (-1).
 const (
-	eoSignoffSeededLabels      = 128
+	eoSignoffSeededLabels      = 126
 	eoSignoffSeededStates      = 37
 	eoSignoffSeededTransitions = 27
 )

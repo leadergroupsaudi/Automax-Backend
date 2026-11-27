@@ -88,7 +88,11 @@ func eoDeriveDirectiveSource(tx *gorm.DB) (bool, error) {
 		return false, fmt.Errorf("read the inherited `source` definition: %w", err)
 	}
 	if base.ID == uuid.Nil {
-		return false, fmt.Errorf("the parent of %s defines no `source` field to override", eoDirectiveTypeKey)
+		// The inherited `source` was removed by a later client ruling
+		// (eoRemoveInheritedSource); on a fresh database there is nothing to
+		// override.
+		log.Printf("EO pilot: the parent of %s defines no `source` field; nothing to derive", eoDirectiveTypeKey)
+		return true, nil
 	}
 
 	def := models.EOFieldDef{

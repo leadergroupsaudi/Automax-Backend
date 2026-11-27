@@ -364,7 +364,7 @@ var (
 		{"state_id", "uuid", 0, true},
 		{"priority", "character varying", 50, false},
 		{"sensitivity", "character varying", 50, false},
-		{"source", "character varying", 100, true},
+		{"source", "character varying", 100, false},
 		{"owning_body_id", "uuid", 0, true},
 		{"assigned_user_id", "uuid", 0, true},
 		{"due_date", "timestamp with time zone", 0, true},

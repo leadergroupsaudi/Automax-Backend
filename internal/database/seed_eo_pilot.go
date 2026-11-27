@@ -461,6 +461,11 @@ var eoPilotSteps = []eoPilotStep{
 	// officer; the Directive -> Task map follows. See
 	// eoDirectiveAssigneeReplacesResponsibleOfficer.
 	{key: eoDirectiveAssigneeStepKey, run: eoDirectiveAssigneeReplacesResponsibleOfficer},
+	// ONE-SHOT, after the step above, which still rewrites the map's
+	// `source` on a database that has not run it. The inherited `source`
+	// field is removed; Directive source is the only one. See
+	// eoRemoveInheritedSource.
+	{key: eoRemoveInheritedSourceStepKey, run: eoRemoveInheritedSource},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every

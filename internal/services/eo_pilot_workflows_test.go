@@ -825,11 +825,9 @@ func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
 	// The values that make the mapping checkable: each is distinct, so a map
 	// that filled the task from the wrong source would not pass by accident.
 	origin := map[string]any{
-		"directive_text": "Issue building permits within five working days",
-		"priority":       "urgent",
-		"sensitivity":    "confidential",
-		// The Directive's `source` is derived from this (client ruling), so
-		// the Task's source is too.
+		"directive_text":   "Issue building permits within five working days",
+		"priority":         "urgent",
+		"sensitivity":      "confidential",
 		"directive_origin": "weekly_meeting",
 		"subject_ar":       "تقليص مدة إصدار التراخيص",
 		"subject_en":       "Shorten the permit cycle",
@@ -896,7 +894,6 @@ func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
 			{"subject_en", task.SubjectEn, origin["subject_en"].(string)},
 			{"priority", task.Priority, origin["priority"].(string)},
 			{"sensitivity", task.Sensitivity, origin["sensitivity"].(string)},
-			{"source from directive_origin", task.Source, origin["directive_origin"].(string)},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				if tc.got != tc.want {

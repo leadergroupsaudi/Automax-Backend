@@ -190,7 +190,6 @@ type eoClientRulingOverride struct {
 }
 
 var eoClientRulingOverrides = []eoClientRulingOverride{
-	{eoDirectiveTypeKey, "source", models.EORequiredNever, models.EOProvenanceDerived, eoDeriveDirectiveSourceStepKey},
 	{eoDirectiveTypeKey, eoAssignedUserKey, models.EORequiredAlways, models.EOProvenanceUser, eoDirectiveAssigneeStepKey},
 }
 
