@@ -173,6 +173,7 @@ func RegisterEOCapabilities() {
 	RegisterCapability(NewEOReferralTreeCapability())
 	RegisterCapability(NewEOUniqueValuesCapability())
 	RegisterCapability(NewEOPlanGateCapability())
+	RegisterCapability(NewEOPlanRouteCapability())
 	eoDefaultCapabilities.seal()
 }
 

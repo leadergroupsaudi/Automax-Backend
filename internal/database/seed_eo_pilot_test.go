@@ -2145,6 +2145,12 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 					want(models.EORequiredAtState, models.EOProvenanceUser)
 					return
 				}
+				// The Execution Plan's approval record is required at
+				// `approved`, not at drafting (eoPlanApprovalAtState).
+				if eoIsPlanApprovalAtState(typeKey, row.Key) {
+					want(models.EORequiredAtState, models.EOProvenanceUser)
+					return
+				}
 				if eoIsRelaxedUntilDocumenta(typeKey, row.Key) {
 					want(models.EORequiredNever, models.EOProvenanceUser)
 					return
