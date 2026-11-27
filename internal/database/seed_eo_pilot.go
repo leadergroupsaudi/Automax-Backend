@@ -466,6 +466,13 @@ var eoPilotSteps = []eoPilotStep{
 	// field is removed; Directive source is the only one. See
 	// eoRemoveInheritedSource.
 	{key: eoRemoveInheritedSourceStepKey, run: eoRemoveInheritedSource},
+	// Client's 2026-11-27 Arabic sign-off. CONVERGENT, and placed LAST so it
+	// reads the catalogue as every step above has shaped it: overwrites
+	// label_ar only where it still equals the English placeholder, so a
+	// translation an administrator has since edited by hand stays. See
+	// seed_eo_arabic.go for the map and the per-table queries.
+	{key: eoApplyArabicLabelsStepKey, run: eoApplyArabicLabels,
+		convergent: true, pending: eoApplyArabicLabelsPending},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
