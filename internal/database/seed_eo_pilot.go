@@ -447,10 +447,30 @@ var eoPilotSteps = []eoPilotStep{
 	// of a non-terminal state to attach it to. See eoFileFieldsMovedToState
 	// for the ruling and its operational cost.
 	{key: eoMoveFileRequirementToStateStepKey, run: eoMoveFileRequirementToState},
-	// Client's 2026-11-27 Arabic sign-off. CONVERGENT: overwrites label_ar
-	// only where it still equals the English placeholder — a translation an
-	// administrator has since edited by hand stays. See seed_eo_arabic.go
-	// for the map and the per-table queries.
+	// ONE-SHOT. The Directive's inherited `source` is overridden by a field
+	// derived from `directive_origin`, so its create form asks the question
+	// once. See eoDeriveDirectiveSource.
+	{key: eoDeriveDirectiveSourceStepKey, run: eoDeriveDirectiveSource},
+	// ONE-SHOT. The Execution Plan's approval record is asked for when the
+	// plan is approved, not when it is drafted. See eoPlanApprovalAtState.
+	{key: eoPlanApprovalAtStateStepKey, run: eoPlanApprovalAtState},
+	// ONE-SHOT. plan_route on the Directive, for databases whose Directive
+	// was configured before the entry existed. See eoEnableDirectivePlanRoute.
+	{key: eoEnableDirectivePlanRouteStepKey, run: eoEnableDirectivePlanRoute},
+	// ONE-SHOT. The Directive keeps Assigned user and drops Responsible
+	// officer; the Directive -> Task map follows. See
+	// eoDirectiveAssigneeReplacesResponsibleOfficer.
+	{key: eoDirectiveAssigneeStepKey, run: eoDirectiveAssigneeReplacesResponsibleOfficer},
+	// ONE-SHOT, after the step above, which still rewrites the map's
+	// `source` on a database that has not run it. The inherited `source`
+	// field is removed; Directive source is the only one. See
+	// eoRemoveInheritedSource.
+	{key: eoRemoveInheritedSourceStepKey, run: eoRemoveInheritedSource},
+	// Client's 2026-11-27 Arabic sign-off. CONVERGENT, and placed LAST so it
+	// reads the catalogue as every step above has shaped it: overwrites
+	// label_ar only where it still equals the English placeholder, so a
+	// translation an administrator has since edited by hand stays. See
+	// seed_eo_arabic.go for the map and the per-table queries.
 	{key: eoApplyArabicLabelsStepKey, run: eoApplyArabicLabels,
 		convergent: true, pending: eoApplyArabicLabelsPending},
 }
@@ -1434,9 +1454,9 @@ var eoRootConditionalDecisions = []eoConditionalDecision{
 		"Root type; see eo_directive.parent_ticket."},
 
 	{eoDirectiveTypeKey, "assigned_user",
-		"Set by the transition's assignment rules (auto_detect_department, auto_match_user).",
-		models.EORequiredNever,
-		"A workflow statement, not a form condition: the value is written by a transition's assignment rules, which belong to the workflow Task A5 binds. There is no expression over the record's own values that means \"a transition has run\", and making it required at creation would refuse the very first save, before any transition exists to assign anyone."},
+		"Chosen by the officer registering the directive; a transition's assignment rules may still reassign it.",
+		models.EORequiredAlways,
+		"CLIENT RULING (replaces the earlier `never`): the Directive keeps Assigned user and drops its own `responsible_officer`, which named the same person and was required at creation. So Assigned user carries that requirement and is required at creation; eoDirectiveAssigneeReplacesResponsibleOfficer writes the Directive's own definition, and the Directive -> Task map fills the Task's owner from it."},
 	{eoDraftStudyTypeKey, "assigned_user",
 		"Set by the transition's assignment rules.",
 		models.EORequiredNever,
@@ -2113,6 +2133,10 @@ var eoMatrixFieldsNotSeeded = []eoMatrixFieldNotSeeded{
 	{eoDraftStudyTypeKey, "related_refs",
 		"the decisions_base capability, which WRITES the key and reserves it",
 		"TASK A6. Task A3 seeded it, as the matrix asks: Auto, multi_link, \"Related references\". Task B2's decisions_base returns `related_refs` from ReservedKeys, and services.eoCapabilitiesCheckConfig refuses a record type whose field definitions name a reserved key — at the FIRST REQUEST against the type, not at seed time. The capability and the declaration cannot both stand, and ReservedKeys is the only guard against a request writing a key the capability owns (a transition field change needs no field definition to be admitted), so the declaration goes. It is removed by eoEnableCapabilities, in the same step that enables the capability, rather than by editing A3's spec: A3's applied row means a spec edit would never re-run on a database that has booted, and the two changes must land together or the type is unusable in between. THE COST, which the client can see: the matrix lists `related_refs` as a labelled field and the seeded configuration now has no label, no Arabic and no entry in the effective field set for it, so a definition-driven UI has nothing to render the capability-written value with. That is an engine gap — a capability that owns a key should be able to describe it — and not a reason to keep a declaration that disables the type. See eoCapabilityReservedFieldRemovals.",
+	},
+	{eoDirectiveTypeKey, "responsible_officer",
+		"the Directive's own `assigned_user_id`, required at creation",
+		"CLIENT RULING: Responsible officer and Assigned user named the same person, so the form asked twice. Assigned user stays — it is the column My Assigned and the assignee transition rules read — and is required on the Directive; Responsible officer is removed by eoDirectiveAssigneeReplacesResponsibleOfficer, which also repoints the Directive -> Task map's `owner` at it.",
 	},
 	{eoExecutionPlanTypeKey, "plan_stages",
 		"the child record type " + eoStageTypeKey,
@@ -3355,6 +3379,12 @@ const (
 	eoDecisionsBaseCapabilityKey = "decisions_base"
 	// eoReferralTreeCapabilityKey is services.EOReferralTreeKey.
 	eoReferralTreeCapabilityKey = "referral_tree"
+	// eoUniqueValuesCapabilityKey is services.EOUniqueValuesKey.
+	eoUniqueValuesCapabilityKey = "unique_values"
+	// eoPlanGateCapabilityKey is services.EOPlanGateKey.
+	eoPlanGateCapabilityKey = "plan_gate"
+	// eoPlanRouteCapabilityKey is services.EOPlanRouteKey.
+	eoPlanRouteCapabilityKey = "plan_route"
 	// eoApprovalCapabilityKey is services.EOApprovalKey. Nothing enables it;
 	// it is named so the decision below can be grepped from the key.
 	eoApprovalCapabilityKey = "approval"
@@ -3416,6 +3446,26 @@ var eoPilotCapabilities = []eoCapabilityEnablement{
 		CapabilityKey: eoReferralTreeCapabilityKey,
 		Config:        `{"branch_type_key":"` + eoReferralTypeKey + `"}`,
 		Why:           "EO-COM step 6.1, the consolidation: one letter is referred to several bodies and each referral may be referred on again, and the Office answers once. `branch_type_key` is the seeded Referral type; `parent_key` is left at its default, `parent_referral`, which is the VALUES key the matrix gives a sub-referral (no `parent_referral` link type is seeded, and EORecordHandler.CreateLink refuses a link type that resolves to none, so the shape cannot live in eo_record_links); `target_key` is left at its default, `referral_tree`, which no seeded field definition claims — unlike decisions_base's key, this one needed no cleanup. The letter's own `consolidated` field is left alone: it is the officer's prose, and the capability refuses it as a target by name.",
+	},
+	{
+		TypeKey:       eoDirectiveTypeKey,
+		CapabilityKey: eoUniqueValuesCapabilityKey,
+		Config:        `{"keys":["subject_ar","subject_en"]}`,
+		Why:           "QA defect: two Directives with identical details (EO-DIR-2026-005 and -006, \"Update the visitor protocol\") both saved, because the only unique thing about a Directive is its engine-drawn reference. A Directive's subject must be unique within the type: the Arabic subject and the English subject are each checked on their own, ignoring case and spacing, against every live Directive, closed ones included. Directive is a type key no entry named before, so its capability column is still the default `[]` and this entry reaches existing databases at the next boot, not only fresh ones.",
+	},
+	{
+		TypeKey:       eoAssignmentTypeKey,
+		CapabilityKey: eoPlanGateCapabilityKey,
+		Config: `{"plan_type_key":"` + eoExecutionPlanTypeKey + `",` +
+			`"approved_states":["approved"],` +
+			`"plan_required_key":"plan_required"}`,
+		Why: "AMAX-4706 / AC-05.2, AC-05.3, EO-DIR step 2.2: \"no assignment can be issued before the plan is approved\". An Assignment issued under an Execution Plan needs that plan in `approved`; one issued directly under a Directive needs the Directive's plan approved if it has one, and is refused if the Directive answered Q1 `plan_required` yes but has no plan yet. A Directive that answered no is assigned directly, as `assign_directly` intends. Only the issue is gated, not later edits or transitions. Assignment had no capabilities configured, so this entry reaches existing databases at the next boot.",
+	},
+	{
+		TypeKey:       eoDirectiveTypeKey,
+		CapabilityKey: eoPlanRouteCapabilityKey,
+		Config:        eoDirectivePlanRouteConfig,
+		Why:           "EO-DIR Q1 and step 2.2: the Directive's own `plan_required` answer chooses its route, and the plan branch leads to execution only through an approved plan. `require_plan` runs only when `plan_required` is yes and `assign_directly` only when it is no; `plan_approved` runs only when the directive has an Execution Plan in `approved`. Before this the three transitions were offered and run regardless, so a directive needing a plan could be assigned directly, and one whose plan was still in drafting could enter execution. The Directive was configured before this entry existed, so existing databases receive it from the one-shot step eoEnableDirectivePlanRoute.",
 	},
 }
 

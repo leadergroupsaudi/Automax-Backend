@@ -403,6 +403,11 @@ func TestEoClosureArtefactsNameTheirTypesTerminalState(t *testing.T) {
 	for _, m := range eoFileFieldsMovedToState {
 		want[m.TypeKey+"."+m.FieldKey] = true
 	}
+	// The plan's approval record is required at `approved`, a non-terminal
+	// state, by eoPlanApprovalAtState.
+	for _, k := range eoPlanApprovalFieldKeys {
+		want[eoExecutionPlanTypeKey+"."+k] = true
+	}
 	for _, r := range rows {
 		if !want[r.TypeKey+"."+r.Key] {
 			t.Errorf("%s.%s names a required-at state and is not a declared closure artefact", r.TypeKey, r.Key)
@@ -1090,6 +1095,8 @@ func eoPilotWorkflowSpecCounts() eoPilotWorkflowSpecCount {
 			}
 		}
 	}
+	// eoPlanApprovalAtState declares the approval record on `approve`.
+	c.fieldChanges += int64(len(eoPlanApprovalFieldKeys))
 	return c
 }
 
@@ -1512,12 +1519,8 @@ func TestEoSpawnSeedRefusesAMisconfiguredSpawn(t *testing.T) {
 
 	// The shipped spec, copied so a case can break one thing about it.
 	base := func(edit func(*eoSpawnSpec)) eoSpawnSpec {
-		s := eoPilotSpawnActions[0]
-		fm := make(map[string]string, len(s.fieldMap))
-		for k, v := range s.fieldMap {
-			fm[k] = v
-		}
-		s.fieldMap = fm
+		// The map as a database that has run every step stores it.
+		s := eoEffectiveSpawnSpec(eoPilotSpawnActions[0])
 		if edit != nil {
 			edit(&s)
 		}
@@ -1543,12 +1546,12 @@ func TestEoSpawnSeedRefusesAMisconfiguredSpawn(t *testing.T) {
 				"whole {{placeholders}}"},
 			{"a placeholder the source type does not define", func(s *eoSpawnSpec) { s.fieldMap["task_text"] = "{{nope}}" },
 				`from {{nope}}, which "eo_directive" does not define`},
-			// `assigned_user_id` and not `decision_reference`: it is the one
-			// optional field on the Directive of the SAME KIND as `owner`,
-			// so this case tests the requiredness rule and nothing else. A
-			// text source would be refused by the kind rule first and this
-			// case would pass for the wrong reason.
-			{"a required field filled from an optional one", func(s *eoSpawnSpec) { s.fieldMap["owner"] = "{{assigned_user_id}}" },
+			// `decision_reference` into `subject_ar`: an optional text field
+			// of the Directive into a required text field of the Task, the
+			// SAME KIND, so this case tests the requiredness rule and nothing
+			// else. (`assigned_user_id` used to be the example; a client
+			// ruling made it required on the Directive.)
+			{"a required field filled from an optional one", func(s *eoSpawnSpec) { s.fieldMap["subject_ar"] = "{{decision_reference}}" },
 				"rather than user/always"},
 			{"a field filled from a source of another kind", func(s *eoSpawnSpec) { s.fieldMap["due_date"] = "{{directive_text}}" },
 				`from "eo_directive".directive_text, which is "long_text"`},

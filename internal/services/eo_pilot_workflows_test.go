@@ -122,27 +122,12 @@ func eoWfNewFixture(t *testing.T) *eoWfFixture {
 // deliberately absent: that absence is what several tests below are about.
 func (f *eoWfFixture) eoWfValues(t *testing.T, typeKey string) map[string]any {
 	t.Helper()
-	var defs []models.EOFieldDef
-	err := f.db.Raw(`
-		WITH RECURSIVE chain AS (
-			SELECT id, parent_type_id FROM eo_record_types WHERE key = ?
-			UNION ALL
-			SELECT p.id, p.parent_type_id FROM eo_record_types p JOIN chain c ON p.id = c.parent_type_id
-		)
-		SELECT * FROM eo_field_defs WHERE record_type_id IN (SELECT id FROM chain) AND deleted_at IS NULL`, typeKey).
-		Scan(&defs).Error
-	if err != nil {
-		t.Fatalf("read the field definitions of %q: %v", typeKey, err)
-	}
-	if len(defs) == 0 {
-		t.Fatalf("record type %q has no field definitions", typeKey)
-	}
 	out := map[string]any{}
-	for _, d := range defs {
+	for _, d := range eoPilotEffectiveDefs(t, f.db, typeKey) {
 		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
 			continue
 		}
-		out[d.Key] = eoPilotFieldValue(d, f.bodyID)
+		out[d.Key] = eoPilotFieldValue(d, f.bodyID, f.actor.ID)
 	}
 	out["subject_ar"] = "اختبار"
 	return out
@@ -840,13 +825,14 @@ func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
 	// The values that make the mapping checkable: each is distinct, so a map
 	// that filled the task from the wrong source would not pass by accident.
 	origin := map[string]any{
-		"directive_text":      "Issue building permits within five working days",
-		"responsible_officer": "officer-99",
-		"priority":            "urgent",
-		"sensitivity":         "confidential",
-		"source":              "weekly_meeting",
-		"subject_ar":          "تقليص مدة إصدار التراخيص",
-		"subject_en":          "Shorten the permit cycle",
+		"directive_text":   "Issue building permits within five working days",
+		"priority":         "urgent",
+		"sensitivity":      "confidential",
+		"directive_origin": "weekly_meeting",
+		"subject_ar":       "تقليص مدة إصدار التراخيص",
+		"subject_en":       "Shorten the permit cycle",
+		// assigned_user_id is the fixture's actor (eoPilotFieldValue): the
+		// Task's owner comes from it since Responsible officer was removed.
 	}
 
 	// eoA7TaskChildren reads the Tasks hanging off a record, through the same
@@ -903,12 +889,11 @@ func TestEoDirectiveSpawnsATaskOnItsTransition(t *testing.T) {
 			name, got, want string
 		}{
 			{"task_text from directive_text", eoA7String(bag["task_text"]), origin["directive_text"].(string)},
-			{"owner from responsible_officer", eoA7String(bag["owner"]), origin["responsible_officer"].(string)},
+			{"owner from assigned_user_id", eoA7String(bag["owner"]), f.actor.ID.String()},
 			{"subject_ar", task.SubjectAr, origin["subject_ar"].(string)},
 			{"subject_en", task.SubjectEn, origin["subject_en"].(string)},
 			{"priority", task.Priority, origin["priority"].(string)},
 			{"sensitivity", task.Sensitivity, origin["sensitivity"].(string)},
-			{"source", task.Source, origin["source"].(string)},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				if tc.got != tc.want {

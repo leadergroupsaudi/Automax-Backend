@@ -202,12 +202,13 @@ func TestBaseTypeHasSeventeenInheritedFields(t *testing.T) {
 	if err := db.Where("record_type_id = ?", base.ID).Order("sort_order").Find(&fields).Error; err != nil {
 		t.Fatalf("read base fields: %v", err)
 	}
-	if len(fields) != 17 {
+	// The matrix's 17 less `source`, removed by a client ruling.
+	if len(fields) != 16 {
 		keys := make([]string, 0, len(fields))
 		for _, f := range fields {
 			keys = append(keys, f.Key)
 		}
-		t.Fatalf("the base record type has %d field definitions, want the field matrix's 17: %v", len(fields), keys)
+		t.Fatalf("the base record type has %d field definitions, want 16 (the field matrix's 17 less source): %v", len(fields), keys)
 	}
 
 	seen := map[string]bool{}
@@ -307,8 +308,8 @@ func TestSeedEOPlatformIsAtomic(t *testing.T) {
 	}
 	seedEOPlatform(db)
 
-	if got := eoCountRows(t, db, &models.EOFieldDef{}); got != 18 {
-		t.Errorf("after the repairing run there are %d field definitions, want 18 (17 inherited plus the smoke roll-up)", got)
+	if got := eoCountRows(t, db, &models.EOFieldDef{}); got != 17 {
+		t.Errorf("after the repairing run there are %d field definitions, want 17 (16 inherited plus the smoke roll-up)", got)
 	}
 	var concrete int64
 	if err := db.Model(&models.EORecordType{}).Where("is_abstract = ?", false).Count(&concrete).Error; err != nil {

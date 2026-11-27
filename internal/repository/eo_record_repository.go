@@ -61,6 +61,10 @@ type EORecordRepository interface {
 	// links whose endpoints are both inside it, so a transitive set would
 	// silently stop blocking.
 	Children(ctx context.Context, parentID uuid.UUID, recordTypeID *uuid.UUID) ([]models.EORecord, error)
+	// StateCodes resolves workflow state ids to their codes ("approved",
+	// "drafting", …), in one query. An id that names no state is absent from
+	// the map. Retired states are included: a record may still sit in one.
+	StateCodes(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error)
 	// List is the register query: filtered, row-level-visible, sorted and
 	// paged. It returns the page and the total across all pages. filter is
 	// not modified. An unknown filter.SortBy is an error.
@@ -456,6 +460,28 @@ func (r *eoRecordRepository) eoStateNames(ctx context.Context, ids []uuid.UUID) 
 	}
 	for _, row := range rows {
 		out[row.ID] = eoNamePair{Name: row.Name, NameAr: row.NameAr}
+	}
+	return out, nil
+}
+
+func (r *eoRecordRepository) StateCodes(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		ID   uuid.UUID
+		Code string
+	}
+	if err := r.db.WithContext(ctx).
+		Table("workflow_states").
+		Select("id, code").
+		Where("id IN ?", ids).
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("read workflow state codes: %w", err)
+	}
+	for _, row := range rows {
+		out[row.ID] = row.Code
 	}
 	return out, nil
 }

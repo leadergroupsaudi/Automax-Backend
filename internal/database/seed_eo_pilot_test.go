@@ -100,6 +100,9 @@ func TestEOMatrixKeyCoversTheBaseType(t *testing.T) {
 	got := map[string]bool{}
 	for _, mk := range eoMatrixInheritedKeys {
 		key, isCol, _ := eoMatrixKey(mk)
+		if eoInheritedFieldRemovedByRuling(key) {
+			continue // removed by a client ruling (eoRemoveInheritedSource)
+		}
 		got[key] = true
 		if !seeded[key] {
 			t.Errorf("matrix key %q maps to %q, which the base type does not seed", mk, key)
@@ -253,7 +256,10 @@ func TestSeedEOPilotRemovesTheSmokeConfiguration(t *testing.T) {
 		// Task A6 REMOVES a field definition an enabled capability reserves
 		// (eoCapabilityReservedFieldRemovals), so the root types end the seed
 		// with one fewer than their specs declare.
-		fields: 17 + eoRootFieldCount(t) - int64(len(eoCapabilityReservedFieldRemovals)),
+		// Client rulings add a type's own override and remove a field.
+		// 16 inherited: the matrix's 17 less `source` (eoRemoveInheritedSource).
+		fields: 16 + eoRootFieldCount(t) - int64(len(eoCapabilityReservedFieldRemovals)) +
+			int64(len(eoClientRulingOverrides)-len(eoClientRulingRemovals)),
 		// Plan 1's one smoke link type goes; Task A4's eight replace it,
 		// counted from the specs for the same reason eoRootFieldCount is:
 		// this test is about the smoke REMOVAL and must not fail every time
@@ -391,6 +397,8 @@ func TestSeedEOPilotIsSafeOnADatabaseWithRecords(t *testing.T) {
 			// And A6's removal of a field definition an enabled capability
 			// reserves.
 			want.fields -= int64(len(eoCapabilityReservedFieldRemovals))
+			// And the client rulings' overrides and removals.
+			want.fields += int64(len(eoClientRulingOverrides) - len(eoClientRulingRemovals))
 			seedEOPilot(db)
 			if got := eoTake(t, db); got != want {
 				t.Errorf("a populated database changed: %+v, want %+v (was %+v)", got, want, snapBefore)
@@ -776,7 +784,7 @@ func TestUntranslatedLabelsAreQueryable(t *testing.T) {
 	// designer does (load, change, save the whole struct).
 	repo := repository.NewEORecordTypeRepository(db)
 	var def models.EOFieldDef
-	if err := db.Where("key = ?", "source").First(&def).Error; err != nil {
+	if err := db.Where("key = ?", "priority").First(&def).Error; err != nil {
 		t.Fatal(err)
 	}
 	stored, err := repo.GetFieldDef(t.Context(), def.ID)
@@ -900,8 +908,8 @@ func TestBaseFieldsAreCreatedMarkedUntranslated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(set) != 17 {
-		t.Errorf("%d base labels marked straight after the platform seed, want 17", len(set))
+	if len(set) != 16 {
+		t.Errorf("%d base labels marked straight after the platform seed, want 16", len(set))
 	}
 }
 
@@ -1085,7 +1093,7 @@ func eoMatrixExpectations(t *testing.T, m map[string][]eoMatrixRow, typeKey stri
 	add := func(rows []eoMatrixRow) {
 		for _, r := range rows {
 			key, _, managed := eoMatrixKey(r.Key)
-			if managed {
+			if managed || eoInheritedFieldRemovedByRuling(key) {
 				continue
 			}
 			out[key] = r
@@ -1251,6 +1259,9 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 				}
 			}
 			for k := range got {
+				if _, ruled := eoClientRuling(typeKey, k); ruled {
+					continue // a client ruling's override, pinned below
+				}
 				if !want[k] {
 					// A narrowing of an inherited column key is legitimate and
 					// is pinned by its own test; everything else is a surprise.
@@ -1263,23 +1274,31 @@ func TestRootTypeFieldsMatchTheMatrix(t *testing.T) {
 		})
 	}
 
-	// The Directive's own tail is exactly the matrix's thirteen rows, plus the
-	// one inherited key it narrows.
-	t.Run("Directive declares 13 own fields and one narrowing", func(t *testing.T) {
+	// The Directive's own tail is the matrix's thirteen rows less the one a
+	// client ruling removed (responsible_officer), plus the one inherited key
+	// it narrows and the one inherited key a client ruling overrides.
+	t.Run("Directive declares 12 own fields, one narrowing and one ruled override", func(t *testing.T) {
 		defs := eoOwnFieldDefs(t, db, eoDirectiveTypeKey)
-		own, narrowed := 0, 0
+		own, narrowed, ruled := 0, 0, 0
 		for _, d := range defs {
+			if _, ok := eoClientRuling(eoDirectiveTypeKey, d.Key); ok {
+				ruled++
+				continue
+			}
 			if _, isColumn, _ := eoMatrixKey(d.Key); isColumn {
 				narrowed++
 				continue
 			}
 			own++
 		}
-		if own != 13 {
-			t.Errorf("%d own fields, want 13", own)
+		if own != 12 {
+			t.Errorf("%d own fields, want 12", own)
 		}
 		if narrowed != 1 {
 			t.Errorf("%d narrowed inherited fields, want 1 (due_date)", narrowed)
+		}
+		if ruled != 1 {
+			t.Errorf("%d ruled overrides, want 1 (assigned_user_id)", ruled)
 		}
 	})
 
@@ -1867,7 +1886,10 @@ func TestRootTypeFieldsPassTheDesignerShapeRules(t *testing.T) {
 						if o.Value == "" || o.Label == "" {
 							t.Errorf("option %+v has no value or no label", o)
 						}
-						if o.LabelAr != o.Label {
+						// A client ruling's override copies the BASE definition's
+						// options, whose Arabic is the platform seed's own and is
+						// checked there; it is not Arabic this pilot invented.
+						if _, ruled := eoClientRuling(typeKey, d.Key); !ruled && o.LabelAr != o.Label {
 							t.Errorf("option %q carries Arabic %q the client has not signed off", o.Value, o.LabelAr)
 						}
 					}
@@ -2103,6 +2125,13 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				// against the database, so this is not a way round the
 				// matrix — it is the place where "the matrix says Derived and
 				// the engine writes a column" is written down.
+				if r, ok := eoClientRuling(typeKey, engineKey); ok {
+					if got.RequiredMode != r.Mode || got.Provenance != r.Provenance {
+						t.Errorf("seeded %q/%q, the client ruling (step %s) says %q/%q",
+							got.RequiredMode, got.Provenance, r.Step, r.Mode, r.Provenance)
+					}
+					return
+				}
 				if d, ok := renamed[typeKey+"."+row.Key]; ok {
 					if d.EngineKey != engineKey {
 						t.Errorf("the decision says %q lives in column %q; the matrix key resolves to %q", row.Key, d.EngineKey, engineKey)
@@ -2142,6 +2171,12 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 				// eoFileFieldsMovedToState were then moved to `at_state` at a
 				// named non-terminal state of their own workflow.
 				if eoIsMovedToState(typeKey, row.Key) {
+					want(models.EORequiredAtState, models.EOProvenanceUser)
+					return
+				}
+				// The Execution Plan's approval record is required at
+				// `approved`, not at drafting (eoPlanApprovalAtState).
+				if eoIsPlanApprovalAtState(typeKey, row.Key) {
 					want(models.EORequiredAtState, models.EOProvenanceUser)
 					return
 				}
@@ -2196,7 +2231,8 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 	// types, plus each type's own rows that are not already one of those 15
 	// and are not recorded as deliberately unseeded:
 	//
-	//	Directive               15+13   Execution Plan      15+7
+	//	Directive               15+12   Execution Plan      15+7
+	//	  (`responsible_officer` is removed by a client ruling)
 	//	Draft Decision Study    15+20     (8 rows less `plan_stages`)
 	//	  (`related_refs` is removed by Task A6: decisions_base WRITES and
 	//	   reserves that key, so no field definition may declare it)
@@ -2214,8 +2250,10 @@ func TestSeededRequiredModesMatchTheMatrix(t *testing.T) {
 	//
 	// The per-section row counts in eoReadFieldMatrix are the primary guard
 	// against a parse that finds nothing; this is the second.
-	if checked != 28+35+29+22+15+25+21+21+23+22+22 {
-		t.Errorf("checked %d (type, field) pairs, want %d", checked, 28+35+29+22+15+25+21+21+23+22+22)
+	// Less one per type: the inherited `source` was removed by a client
+	// ruling (eoRemoveInheritedSource).
+	if want := 27 + 35 + 29 + 22 + 15 + 25 + 21 + 21 + 23 + 22 + 22 - 11; checked != want {
+		t.Errorf("checked %d (type, field) pairs, want %d", checked, want)
 	}
 }
 
