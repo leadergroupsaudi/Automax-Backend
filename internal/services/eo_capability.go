@@ -171,6 +171,8 @@ func RegisterEOCapabilities() {
 	RegisterCapability(NewEOApprovalCapability())
 	RegisterCapability(NewEODecisionsBaseCapability())
 	RegisterCapability(NewEOReferralTreeCapability())
+	RegisterCapability(NewEOUniqueValuesCapability())
+	RegisterCapability(NewEOPlanGateCapability())
 	eoDefaultCapabilities.seal()
 }
 
@@ -319,6 +321,14 @@ type EOCapabilityReader interface {
 	// that names no type, is an error, never an empty base, because a typo
 	// must not look like "nothing standing".
 	RecordsOfType(ctx context.Context, recordTypeKey string) ([]models.EORecord, error)
+	// RecordsOfTypeID is RecordsOfType for a type the caller holds by id —
+	// the record's own type, which is what unique_values compares within.
+	// Same ordering and the same absence of row-level visibility.
+	RecordsOfTypeID(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error)
+	// StateCode returns the code of a workflow state ("approved"), or "" for
+	// a nil id or one that names no state. Configuration names states by
+	// code because their ids differ on every database.
+	StateCode(ctx context.Context, stateID *uuid.UUID) (string, error)
 }
 
 // eoCapabilityReader binds the interface above to one pair of repository
@@ -367,6 +377,24 @@ func (d *eoCapabilityReader) RecordsOfType(ctx context.Context, recordTypeKey st
 		return nil, fmt.Errorf("no record type with key %q", recordTypeKey)
 	}
 	return d.records.RecordsOfType(ctx, t.ID)
+}
+
+func (d *eoCapabilityReader) RecordsOfTypeID(ctx context.Context, recordTypeID uuid.UUID) ([]models.EORecord, error) {
+	if recordTypeID == uuid.Nil {
+		return nil, fmt.Errorf("records of type: no record type id")
+	}
+	return d.records.RecordsOfType(ctx, recordTypeID)
+}
+
+func (d *eoCapabilityReader) StateCode(ctx context.Context, stateID *uuid.UUID) (string, error) {
+	if stateID == nil || *stateID == uuid.Nil {
+		return "", nil
+	}
+	codes, err := d.records.StateCodes(ctx, []uuid.UUID{*stateID})
+	if err != nil {
+		return "", err
+	}
+	return codes[*stateID], nil
 }
 
 // ── embeddable no-ops ───────────────────────────────────────────────────────
