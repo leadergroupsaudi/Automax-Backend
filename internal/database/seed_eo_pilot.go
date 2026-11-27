@@ -1554,7 +1554,7 @@ var eoPilotRootTypes = []eoPilotTypeSpec{
 		key: eoDirectiveTypeKey, name: "Directive", icon: "clipboard-list",
 		mode: models.EOReferenceModeOwn, prefix: "EO-DIR", pattern: "EO-DIR-YYYY-NNN",
 		fields: []eoPilotFieldSpec{
-			{matrixKey: "directive_origin", label: "Directive origin",
+			{matrixKey: "directive_origin", label: "Directive source",
 				kind: models.EOKindDropdown, provenance: models.EOProvenanceUser, required: models.EORequiredAlways,
 				config: `{"options":[` +
 					`{"value":"weekly_meeting","label":"Weekly meeting","label_ar":"Weekly meeting"},` +
