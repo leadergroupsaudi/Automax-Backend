@@ -85,3 +85,37 @@ func TestEoDirectivePlanRouteReachesAConfiguredDirective(t *testing.T) {
 		}
 	}
 }
+
+// plan_route tolerates codes a workflow lacks, so a typo in the seeded config
+// would silently never fire. This holds it to the seeded workflow.
+func TestEoDirectivePlanRouteNamesSeededTransitions(t *testing.T) {
+	db := eoPilotDB(t)
+	seedEOPilot(db)
+	var cfg struct {
+		Plan    []string `json:"plan_transitions"`
+		Direct  []string `json:"direct_transitions"`
+		Approve []string `json:"approve_transitions"`
+		States  []string `json:"approved_states"`
+	}
+	if err := json.Unmarshal([]byte(eoDirectivePlanRouteConfig), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range append(append(cfg.Plan, cfg.Direct...), cfg.Approve...) {
+		var n int64
+		db.Model(&models.WorkflowTransition{}).
+			Joins("JOIN workflows w ON w.id = workflow_transitions.workflow_id").
+			Where("w.code = ? AND workflow_transitions.code = ?", eoWorkflowCode(eoDirectiveTypeKey), code).Count(&n)
+		if n != 1 {
+			t.Errorf("plan_route names transition %q; the seeded Directive workflow has %d", code, n)
+		}
+	}
+	for _, code := range cfg.States {
+		var n int64
+		db.Model(&models.WorkflowState{}).
+			Joins("JOIN workflows w ON w.id = workflow_states.workflow_id").
+			Where("w.code = ? AND workflow_states.code = ?", eoWorkflowCode(eoExecutionPlanTypeKey), code).Count(&n)
+		if n != 1 {
+			t.Errorf("plan_route names plan state %q; the seeded plan workflow has %d", code, n)
+		}
+	}
+}

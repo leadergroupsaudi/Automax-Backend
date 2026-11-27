@@ -457,6 +457,10 @@ var eoPilotSteps = []eoPilotStep{
 	// ONE-SHOT. plan_route on the Directive, for databases whose Directive
 	// was configured before the entry existed. See eoEnableDirectivePlanRoute.
 	{key: eoEnableDirectivePlanRouteStepKey, run: eoEnableDirectivePlanRoute},
+	// ONE-SHOT. The Directive keeps Assigned user and drops Responsible
+	// officer; the Directive -> Task map follows. See
+	// eoDirectiveAssigneeReplacesResponsibleOfficer.
+	{key: eoDirectiveAssigneeStepKey, run: eoDirectiveAssigneeReplacesResponsibleOfficer},
 }
 
 // The two step keys Task A6 adds. They are PERMANENT identifiers, like every
@@ -1438,9 +1442,9 @@ var eoRootConditionalDecisions = []eoConditionalDecision{
 		"Root type; see eo_directive.parent_ticket."},
 
 	{eoDirectiveTypeKey, "assigned_user",
-		"Set by the transition's assignment rules (auto_detect_department, auto_match_user).",
-		models.EORequiredNever,
-		"A workflow statement, not a form condition: the value is written by a transition's assignment rules, which belong to the workflow Task A5 binds. There is no expression over the record's own values that means \"a transition has run\", and making it required at creation would refuse the very first save, before any transition exists to assign anyone."},
+		"Chosen by the officer registering the directive; a transition's assignment rules may still reassign it.",
+		models.EORequiredAlways,
+		"CLIENT RULING (replaces the earlier `never`): the Directive keeps Assigned user and drops its own `responsible_officer`, which named the same person and was required at creation. So Assigned user carries that requirement and is required at creation; eoDirectiveAssigneeReplacesResponsibleOfficer writes the Directive's own definition, and the Directive -> Task map fills the Task's owner from it."},
 	{eoDraftStudyTypeKey, "assigned_user",
 		"Set by the transition's assignment rules.",
 		models.EORequiredNever,
@@ -2117,6 +2121,10 @@ var eoMatrixFieldsNotSeeded = []eoMatrixFieldNotSeeded{
 	{eoDraftStudyTypeKey, "related_refs",
 		"the decisions_base capability, which WRITES the key and reserves it",
 		"TASK A6. Task A3 seeded it, as the matrix asks: Auto, multi_link, \"Related references\". Task B2's decisions_base returns `related_refs` from ReservedKeys, and services.eoCapabilitiesCheckConfig refuses a record type whose field definitions name a reserved key — at the FIRST REQUEST against the type, not at seed time. The capability and the declaration cannot both stand, and ReservedKeys is the only guard against a request writing a key the capability owns (a transition field change needs no field definition to be admitted), so the declaration goes. It is removed by eoEnableCapabilities, in the same step that enables the capability, rather than by editing A3's spec: A3's applied row means a spec edit would never re-run on a database that has booted, and the two changes must land together or the type is unusable in between. THE COST, which the client can see: the matrix lists `related_refs` as a labelled field and the seeded configuration now has no label, no Arabic and no entry in the effective field set for it, so a definition-driven UI has nothing to render the capability-written value with. That is an engine gap — a capability that owns a key should be able to describe it — and not a reason to keep a declaration that disables the type. See eoCapabilityReservedFieldRemovals.",
+	},
+	{eoDirectiveTypeKey, "responsible_officer",
+		"the Directive's own `assigned_user_id`, required at creation",
+		"CLIENT RULING: Responsible officer and Assigned user named the same person, so the form asked twice. Assigned user stays — it is the column My Assigned and the assignee transition rules read — and is required on the Directive; Responsible officer is removed by eoDirectiveAssigneeReplacesResponsibleOfficer, which also repoints the Directive -> Task map's `owner` at it.",
 	},
 	{eoExecutionPlanTypeKey, "plan_stages",
 		"the child record type " + eoStageTypeKey,

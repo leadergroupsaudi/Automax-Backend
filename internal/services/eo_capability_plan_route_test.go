@@ -101,15 +101,14 @@ func TestPlanRouteRefusesABadConfig(t *testing.T) {
 	}
 }
 
-func TestPlanRouteValidateWorkflowNamesMissingTransitions(t *testing.T) {
+// A workflow without some of the codes is accepted: those rules never apply.
+func TestPlanRouteValidateWorkflowToleratesMissingTransitions(t *testing.T) {
 	c := NewEOPlanRouteCapability()
-	wf := &models.Workflow{Code: "eo_directive_wf", Transitions: []models.WorkflowTransition{
-		{ID: uuid.New(), Code: "require_plan"}, {ID: uuid.New(), Code: "assign_directly"}, {ID: uuid.New(), Code: "plan_approved"}}}
+	wf := &models.Workflow{Code: "custom", Transitions: []models.WorkflowTransition{{ID: uuid.New(), Code: "close"}}}
 	if err := c.ValidateWorkflow(eoPlanRouteCfg, wf); err != nil {
-		t.Fatalf("a workflow with all three transitions refused: %v", err)
+		t.Fatalf("a workflow without the plan transitions refused: %v", err)
 	}
-	wf.Transitions = wf.Transitions[:2]
-	if err := c.ValidateWorkflow(eoPlanRouteCfg, wf); err == nil {
-		t.Fatal("a workflow missing plan_approved was accepted")
+	if err := c.ValidateWorkflow(datatypes.JSON(`{}`), wf); err == nil {
+		t.Fatal("a bad config was accepted")
 	}
 }

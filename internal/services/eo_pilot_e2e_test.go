@@ -238,27 +238,12 @@ func eoComNewFixture(t *testing.T, withDocumenta bool) *eoComFixture {
 // field of the pilot is `always` any more, so none is ever selected here.
 func (f *eoComFixture) values(t *testing.T, typeKey string) map[string]any {
 	t.Helper()
-	var defs []models.EOFieldDef
-	err := f.db.Raw(`
-		WITH RECURSIVE chain AS (
-			SELECT id, parent_type_id FROM eo_record_types WHERE key = ?
-			UNION ALL
-			SELECT p.id, p.parent_type_id FROM eo_record_types p JOIN chain c ON p.id = c.parent_type_id
-		)
-		SELECT * FROM eo_field_defs WHERE record_type_id IN (SELECT id FROM chain) AND deleted_at IS NULL`, typeKey).
-		Scan(&defs).Error
-	if err != nil {
-		t.Fatalf("read the field definitions of %q: %v", typeKey, err)
-	}
-	if len(defs) == 0 {
-		t.Fatalf("record type %q has no field definitions", typeKey)
-	}
 	out := map[string]any{}
-	for _, d := range defs {
+	for _, d := range eoPilotEffectiveDefs(t, f.db, typeKey) {
 		if d.Provenance != models.EOProvenanceUser || d.RequiredMode != models.EORequiredAlways {
 			continue
 		}
-		out[d.Key] = eoPilotFieldValue(d, f.officeBodyID)
+		out[d.Key] = eoPilotFieldValue(d, f.officeBodyID, f.officer.ID)
 	}
 	out["subject_ar"] = "اختبار"
 	return out

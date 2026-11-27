@@ -168,25 +168,15 @@ func (c *eoPlanRouteCapability) OnTransition(ctx context.Context, read EOCapabil
 	return nil
 }
 
-// ValidateWorkflow refuses a config naming a transition the workflow does not
-// have: the rule would never fire, and nothing would say so.
+// ValidateWorkflow checks only the config itself. A transition code the
+// workflow does not have is NOT refused: an administrator may bind the
+// Directive to a workflow without, say, the plan branch, and refusing would
+// stop every transition of the type. Such a code never matches, so its rule
+// simply does not apply. The seeded configuration is held to the seeded
+// workflow by database.TestEoDirectivePlanRouteNamesSeededTransitions.
 func (c *eoPlanRouteCapability) ValidateWorkflow(cfg datatypes.JSON, wf *models.Workflow) error {
-	conf, err := c.parse(cfg)
-	if err != nil {
-		return err
-	}
-	have := map[string]bool{}
-	for _, tr := range wf.Transitions {
-		have[tr.Code] = true
-	}
-	for _, list := range [][]string{conf.PlanTransitions, conf.DirectTransitions, conf.ApproveTransitions} {
-		for _, code := range list {
-			if !have[code] {
-				return fmt.Errorf("plan_route: transition %q is not a transition of workflow %q, so it would never be checked", code, wf.Code)
-			}
-		}
-	}
-	return nil
+	_, err := c.parse(cfg)
+	return err
 }
 
 func (c *eoPlanRouteCapability) Validate(ctx context.Context, read EOCapabilityReader, rec *models.EORecord, cfg datatypes.JSON) (map[string]string, error) {
